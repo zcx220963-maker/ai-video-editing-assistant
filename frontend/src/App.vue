@@ -1482,6 +1482,14 @@ async function confirmPlan(card) {
     card.state = "confirmed";
     card.exec_run = j.run_id || "";
     if (planModal.value === card) planModal.value = null;
+    // 用户看到的那张「按此执行」卡其实是**统一提问卡**（planCardModal 把
+    // origin='plan_confirm' 交给 openQuestionCard 渲染，见 questionPage 那段），
+    // 而不是老的 planModal。这里原先只清 planModal，于是点「执行」之后
+    // 弹窗一直挂着不关——真机反馈的原话就是「我选完点执行后弹窗不自动关闭」。
+    // 两个都清：哪条路径渲染的就关哪一个。
+    if (questionCard.value && questionCard.value.card === card) {
+      questionCard.value = null;
+    }
     msgs(cid).push({ role: "user", text: message, state: "done", attachments: [] });
     busy[cid] = j.run_id || null;
     if (activePanel.value === 'runs') loadRuns();

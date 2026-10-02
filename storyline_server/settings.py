@@ -47,6 +47,12 @@ class Capabilities:
     # 177 段逐镜一次=177 次带图往返，600s MCP 超时跑不完；8 帧/批 → 23 次请求。
     vl_frames_per_batch: int = 8
     vl_max_batches: int = 24
+    # VL 并发度。原先硬编码 4，实测（16 个带图请求跑同一份帧）：
+    #   并发 4 → 6.0s；并发 8 → 3.2s；并发 16 → 1.7s
+    # 而**单请求耗时基本不变**（1.43s→1.27s）——说明模型侧吃得下更高并发，
+    # 不是它在限流，是客户端把自己卡在 4 这个数上。24 批的 understand_clips
+    # 因此白等了好几个来回。做成可配置，默认 8（提速近一倍且留余量）。
+    vl_concurrency: int = 8
     # ASR（faster-whisper 本地 GPU）
     asr_model: str = "small"
     asr_device: str = "auto"   # auto→cuda，失败回落 cpu
@@ -152,6 +158,7 @@ class Settings:
             vl_frames_per_batch=int(c.get("vl_frames_per_batch",
                                           Capabilities.vl_frames_per_batch)),
             vl_max_batches=int(c.get("vl_max_batches", Capabilities.vl_max_batches)),
+            vl_concurrency=int(c.get("vl_concurrency", Capabilities.vl_concurrency)),
             asr_model=c.get("asr_model", Capabilities.asr_model),
             asr_device=c.get("asr_device", Capabilities.asr_device),
             asr_compute=c.get("asr_compute", Capabilities.asr_compute),
