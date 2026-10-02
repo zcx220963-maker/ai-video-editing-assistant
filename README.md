@@ -753,12 +753,21 @@ curl -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
 旁路只有一条：`{"op":"execute"}`。它是给「到点自动跑」的定时任务用的——那条消息没有坐在屏幕前
 的人来点确认，拦在规划轮里等于任务永不落地。`resume`（「继续」）也不算新诉求，仍续跑在途 run。
 
-验证：离线 `tests/test_plan_gate.py`（141 项，四重校验与帧校验的每一件，含 ⑮ 节那两条假称判据的
+验证：离线 `tests/test_plan_gate.py`（145 项，四重校验与帧校验的每一件，含 ⑮ 节那两条假称判据的
 词面——认得出真机漏过的说法，也不误伤反问与「给不出卡」）+
-`tests/test_plan_flow.py`（67 项，真装配链路：规划轮工具集物理不含剪辑节点、两段注入与中和、
+`tests/test_plan_flow.py`（68 项，真装配链路：规划轮工具集物理不含剪辑节点、两段注入与中和、
 谱系、对账三处同形、consumer 分派、guard 退回一次与预算用尽补事实）
 + 真机 `.smoke/b16_plan_gate_smoke.py`（六段，含伪造确认帧
 拒收于跑模型之前、`<approved_plan>` 探针注入、revise 出新卡，跑完自建数据零残留）。
+
+代码不再住在一个 `plan_gate.py` 里（那一文件曾把 6 种职责混成 1526 行）：现在是
+`agent_framework/plan/` 包，`gate.PlanGate` 只做装配与转发，事实/校验/编译/工具/文案/
+对账/措辞判据/技能预注入/续跑查账各占一个模块，谁也不反向依赖装配层。对外的名字仍从
+`agent_framework.plan` 取。同一轮把 `AgentOnceRun._drive` 从 325 行的 god method 收成
+77 行骨架，切出去的六块各有名字（`_open_run` 组装本轮上下文、`_tool_round` 走三道门与
+执行、`_suppress_repeat_render`、`_pause` 统一挂起、`_nudge_back` 退回重写、`_deliver`
+收尾），控制流与原有注释照旧。**两份形状**（包依赖方向、`_drive` 不再膨胀、跨挂起的事实
+不许再退回 `ctx.extras`）由 `tests/test_plan_layout.py`（31 项）钉着。
 
 ### 3.16 HITL：弹窗提问与渲染前确认（同一条 run 内挂起）
 
@@ -967,9 +976,9 @@ python -m pytest -q                              # 全量：一条命令收完 t
 python tests/test_approval_gate.py               # 单文件直跑（exit code 判定，便于反复调一个用例）
 ```
 
-当前规模：`tests/test_*.py` **57 份脚本**，`python -m pytest` 收出 57 个用例
-（2026-10-02 全量复跑 57/57 绿；注意 `pytest.ini` 的 `addopts` 里已经有一个 `-q`，
-命令行再带 `-q` 会变成 `-qq`，末尾那行 `57 passed in …` 就不打印了，判据看 exit code 与点数）。
+当前规模：`tests/test_*.py` **58 份脚本**，`python -m pytest` 收出 58 个用例
+（2026-10-02 全量复跑 58/58 绿；注意 `pytest.ini` 的 `addopts` 里已经有一个 `-q`，
+命令行再带 `-q` 会变成 `-qq`，末尾那行 `58 passed in …` 就不打印了，判据看 exit code 与点数）。
 
 **`tests/` 里每份文件都是自带 `asyncio.run(main())` 的独立脚本，一个真 pytest 用例也没有**。
 `pytest.ini` 写着 `testpaths = tests`，直接收集会把脚本里的 `async def` 判成「缺异步插件」、
@@ -1031,6 +1040,10 @@ MCP `title`、技能 frontmatter `display`，以及规划轮那张独立注册�
 去重帧不重复推、qa 片段跨挂起不断档、收尾只留承诺、分叉继承承诺而清单重建），
 `test_plan_flow.py`（68 项，真装配链路：规划轮物理不含剪辑节点、两段注入与中和、谱系、
 对账三处同形、consumer 分派、guard 退一次与预算用尽补事实）、
+`test_plan_layout.py`（31 项，**形状**而非剪辑逻辑：计划门包一文件一职责且没有一模块长回
+god file、依赖方向（底层不引上层、装配层不被任何运行期引用，只为形参标注引 PlanGate 不算环）、
+对外名字一个都不缺且仍只从 `agent_framework.plan` 取、`_drive` 保持骨架且六块具名助手在位、
+跨挂起的事实不再退回 `ctx.extras` 的约定键）、
 `test_render_watchdog.py`（§3.10 的停滞看门狗：无进展收口、慢渲染不误杀、`stall_sec=0` 不建循环）、
 `test_hooks.py`（21 项，除生命周期接线外钉住「`result` 截到 600 字后帧上的 `render` 视图仍完整」）。
 
