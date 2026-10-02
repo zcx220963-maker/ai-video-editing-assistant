@@ -34,6 +34,58 @@ _CUSTOM_OPEN = (
     "不得静默吞掉，不得臆造资源或参数：\n")
 
 
+def _parallel_pairs(compiled: Mapping[str, Any]) -> list[str]:
+    """从计划里算出「互不依赖、可以同轮发出去」的步骤组。
+
+    判据只用计划自身的信息，不靠硬编码的节点名清单：如果两步之间**不存在**
+    「一步的产物被另一步需要」的关系，它们就没有先后约束，放同一轮即可并行。
+
+    "谁依赖谁"取自计划里声明的 `requires`（编译时由 DAG 契约带上的真实依赖），
+    没有 requires 时退回「同一步里声明过的上游」这一保守口径——
+    宁可少提示（退化成串行，只是慢），也不要错提示（并发跑错顺序，会算错）。
+    """
+    steps = [s for s in (compiled.get("steps") or []) if isinstance(s, Mapping)]
+    if len(steps) < 2:
+        return []
+    # 每个节点的直接上游集合（计划声明优先；缺失则该节点视为无上游声明）
+    ups: dict[str, set[str]] = {}
+    for s in steps:
+        node = str(s.get("node") or "")
+        req = s.get("requires")
+        ups[node] = {str(x) for x in req} if isinstance(req, (list, tuple, set)) else set()
+
+    def depends(a: str, b: str) -> bool:
+        """a 是否直接或间接需要 b 的产物。"""
+        seen: set[str] = set()
+        stack = list(ups.get(a, ()))
+        while stack:
+            x = stack.pop()
+            if x == b:
+                return True
+            if x in seen:
+                continue
+            seen.add(x)
+            stack.extend(ups.get(x, ()))
+        return False
+
+    # 按「没有任何上游依赖」的节点两两组合：它们都只依赖已完成的上游，
+    # 彼此之间无先后关系 → 可同轮。
+    nodes = [str(s.get("node") or "") for s in steps]
+    groups: list[str] = []
+    for i, a in enumerate(nodes):
+        if not a:
+            continue
+        mates = [b for j, b in enumerate(nodes)
+                 if j != i and b and not depends(a, b) and not depends(b, a)]
+        # 同一步可能被算进多个组；只报「同层」的：两个节点的上游集合相同
+        mates = [b for b in mates if ups.get(a, set()) == ups.get(b, set())]
+        if mates:
+            pair = " + ".join(sorted({a, *mates}, key=nodes.index))
+            if pair not in groups:
+                groups.append(pair)
+    return groups
+
+
 def render_injections(compiled: Mapping[str, Any]) -> list[str]:
     """两段分离注入：``<approved_plan>``（承诺）+ ``<user_custom_requests>``（诉求）。
 
@@ -57,6 +109,17 @@ def render_injections(compiled: Mapping[str, Any]) -> list[str]:
         lines.append("；".join(bits))
     if compiled.get("skipped"):
         lines.append("用户要求跳过的步骤序号：" + "、".join(str(s) for s in compiled["skipped"]))
+    # 并批提速：把「互不依赖的步骤要同轮发出去」钉进**承诺段**。
+    #
+    # 为什么必须写在这里，而不是只靠技能正文：执行轮是另一次 run，
+    # 规划轮加载过的技能不会继承下来；执行轮能否看到并批说明，取决于计划卡的
+    # skills_hint 恰好带了那份技能——真机实测它就漏了：模型在 load_media 之后
+    # 单独调 asr、拿到结果才调 split_shots，把本可并行的链路退化成一前一后，
+    # 白等一整段 ASR（227 秒）。写进承诺段，每次执行都带着它。
+    pairs = _parallel_pairs(compiled)
+    if pairs:
+        lines.append("可并行：以下步骤互不依赖，请放进**同一次回复**里一起调用"
+                     "（分成两次就是串行，白等一倍时间）：" + "；".join(pairs))
     lines.append("</approved_plan>")
     out = ["\n".join(lines)]
     custom = compiled.get("custom") or []
