@@ -728,7 +728,7 @@ curl -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
   对上号——现在按 `call_id` 各回各家。
 * 注册表里查无此名时抛 **`UnknownToolError`**（类型化，而不是混在一般异常里）：这种调用从未打到
   后端，于是帧上 `invoked=false`，前端不把它记进剪辑进度（规划轮挡下的一次试差不算「剪辑受阻」），
-  `PlanReconcileHook` 也不把它收进 `tool_calls_seen`——否则对账会把**没跑过的步当成跑过**。
+  `PlanReconcileHook` 也不把它收进 `calls_executed`——否则对账会把**没跑过的步当成跑过**。
 
 执行轮**中途停下来问一句就收尾**是常态（要用户挑一版文案、确认一个口径），这类账不能就这么烂掉：
 下一条用户消息进来时 `pending_continuation` 会查最近一条执行轮，若它确认过计划却仍有未履行步骤，
@@ -913,6 +913,53 @@ curl -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
   既有行为不变。§3.11 的 Redis 广播解决的是**回投**跨实例，这一节解决的是**执行权**跨实例，两件事。
 * **离线 17 项**：`tests/test_replica_claim.py`（认领无主 / 租约过期 / 续租 / 归还 / 跨实例互斥）。
 
+### 3.23 一次 run 的可恢复状态：挂起之后对账不丢
+
+`agent_framework/run_state.py` 把「跨挂起仍然要成立」的事实收敛成一个**有字段清单的对象**
+（`RunState`），随指针行落盘（`cp.plan["state"]`，不新增列、不需要迁移）。
+
+改之前这些事实挂在 `ctx.extras` 的约定键上，而 `extras` 是纯内存字典、不进 checkpoint，
+于是任何一次挂起→续跑（渲染确认门、`ask_user` 弹窗、兜底方案选择）都把它们清零。四种表现：
+
+| 症状 | 清零的键 |
+| --- | --- |
+| 执行轮在渲染门前停过一次，续跑那半截再没有一条 `plan reconciliation` 帧 | `approved_plan` |
+| 挂起前真跑过的步骤，续跑后被「本轮一次步骤都没调用」的硬保证当成假称 | 调用清单 |
+| 规划轮弹过问题再续跑，界面上确实在着的卡被判成「没有出卡」 | `plan_candidates` |
+| 最后那条 assistant 行只剩续跑之后的半截，挂起前的思考与调用气泡全丢 | `qa_parts` |
+
+字段清单：`approved_plan`、`calls_attempted`（含失败的调用，供「未调用步骤不许声称已执行」
+那道保证）、`calls_executed`（其中真打到注册表的那些，供对账）、`plan_candidates` /
+`plan_warnings` / `plan_card_pushed`、`audit_pushed` / `plan_audit`、`qa_parts`。
+写回指针行只有四处：`_drive` 开头一次、每个一致点（`save_progress` 之前）、每个挂起点
+（`await_approval` 之前）、异常路径（`mark_failed` 之前）——**与消息同批**，
+崩溃恢复取到的调用清单才不会对不上当时的那条一致点。
+
+两处刻意的设计：
+
+* **候选计划不在 state 里重复存一份**。`submit_plan` 已经把它写进 `cp.plan["candidates"]`
+  （确认接口与 `/plans/{id}` 的数据源），`restore()` 从那一列 hydrate 回来——库里只有一份真相。
+* **收尾后只留「认过的承诺」**（`retain_residue`）。完成的 run 不再被恢复，transcript 撤下
+  （已在 assistant 行的 `qa.parts` 里）；但 `approved_plan` 必须留着：它是**编译后的那一份
+  计划**在库里唯一的落点，从这条 run 的某个一致点分叉时子 run 要继承同一个承诺，否则
+  执行轮的对账与那句硬保证会一起失效。`CheckpointManager.fork` 就按这一条把承诺带给子 run，
+  而调用清单按子 run 上下文里**真有的**回执重建（`tool_names_in`）——分叉点之后那些步骤
+  这次要重跑，照父 run 的清单对账会恰好把「用户要求重做的几步」判成已履行。
+
+仍然留在 `extras` 的是**本轮调用私有**的注入，落盘反而失真：`run_id`、`checkpoint`、
+`checkpoint_manager`（每次 `_drive` 由调用方重新给）、`handover`（分叉工具申请、同一轮里
+就被消费掉）、`confirm_plan_requested`（同上）、以及两处本轮去重计数
+（`_fail_counts`、`_media_urls_pushed`）。原先那个写了四次、从来没人读的
+`approval_paused` 顺手删掉了。
+
+顺带一条对账口径的修正：`ask_user` 进了 `NON_STEP_TOOLS`（与 `render_status`、
+`read_node_history` 同一列）。提问是**交互动作**，不是模型偷偷多做的一步——执行轮只要问过
+一个问题，角标就会挂一条「计划外 · 询问用户」，那是噪声；它仍然记在 `calls_executed` 里，
+只是不作为创作步骤出现在偏差里。
+
+* **离线 34 项**：`tests/test_run_state.py`（序列化往返与脏数据 / 指针行往返 /
+  **端到端挂起→续跑后对账仍然算得出来**、去重帧不重复推、qa 片段不断档、收尾残留、分叉继承）。
+
 ## 4. 测试
 
 ```bash
@@ -920,9 +967,9 @@ python -m pytest -q                              # 全量：一条命令收完 t
 python tests/test_approval_gate.py               # 单文件直跑（exit code 判定，便于反复调一个用例）
 ```
 
-当前规模：`tests/test_*.py` **56 份脚本**，`python -m pytest` 收出 56 个用例
-（2026-10-02 全量复跑 56/56 绿，约 130s；注意 `pytest.ini` 的 `addopts` 里已经有一个 `-q`，
-命令行再带 `-q` 会变成 `-qq`，末尾那行 `56 passed in …` 就不打印了，判据看 exit code 与点数）。
+当前规模：`tests/test_*.py` **57 份脚本**，`python -m pytest` 收出 57 个用例
+（2026-10-02 全量复跑 57/57 绿；注意 `pytest.ini` 的 `addopts` 里已经有一个 `-q`，
+命令行再带 `-q` 会变成 `-qq`，末尾那行 `57 passed in …` 就不打印了，判据看 exit code 与点数）。
 
 **`tests/` 里每份文件都是自带 `asyncio.run(main())` 的独立脚本，一个真 pytest 用例也没有**。
 `pytest.ini` 写着 `testpaths = tests`，直接收集会把脚本里的 `async def` 判成「缺异步插件」、
@@ -978,8 +1025,11 @@ Store 只调 `render_video`——`order_trace` 恰好多一个节点、时长对
 MCP `title`、技能 frontmatter `display`，以及规划轮那张独立注册表也得进表）、
 `test_display_outlets.py`（29 项，六个 HTTP 口 + WS 序列化 + 工具文本的出口全覆盖，
 **结尾一条判据是 `frontend/dist` 已按当前源码重建**——源码改了没重新 build，前端那半就等于没做）、
-`test_plan_gate.py`（141 项，§3.15 的四重校验、两种 action 帧、跳过降级与 ⑮ 节两条假称判据的词面）、
-`test_plan_flow.py`（67 项，真装配链路：规划轮物理不含剪辑节点、两段注入与中和、谱系、
+`test_plan_gate.py`（145 项，§3.15 的四重校验、两种 action 帧、跳过降级与 ⑮ 节两条假称判据的词面）、
+`test_run_state.py`（34 项，§3.23 的可恢复状态：字段往返与脏数据兜住、指针行读写、
+**执行轮挂起一次之后对账仍然算得出来**（改之前那里整条链再无 `plan reconciliation` 帧）、
+去重帧不重复推、qa 片段跨挂起不断档、收尾只留承诺、分叉继承承诺而清单重建），
+`test_plan_flow.py`（68 项，真装配链路：规划轮物理不含剪辑节点、两段注入与中和、谱系、
 对账三处同形、consumer 分派、guard 退一次与预算用尽补事实）、
 `test_render_watchdog.py`（§3.10 的停滞看门狗：无进展收口、慢渲染不误杀、`stall_sec=0` 不建循环）、
 `test_hooks.py`（21 项，除生命周期接线外钉住「`result` 截到 600 字后帧上的 `render` 视图仍完整」）。
