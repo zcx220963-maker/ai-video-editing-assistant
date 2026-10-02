@@ -1390,6 +1390,83 @@ async def _localize_timeline(tl: dict[str, Any], workspace, dst_dir: Path) -> di
     return out
 
 
+_REF_LOOKALIKE = re.compile(r"(obj:)?([A-Za-z0-9_\-./]*mat-[a-z0-9]+[A-Za-z0-9_\-./]*)")
+
+
+def _object_keys_in(tl: Any) -> list[str]:
+    """把时间线里所有**指向对象存储的引用**抠出来（裸键与 ``obj:`` 前缀两种都认）。"""
+    out: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, Mapping):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                walk(v)
+        elif isinstance(node, str):
+            s = node
+            if s.startswith("obj:"):
+                out.append(s[4:])
+            elif "/" in s and ("mat-" in s or s.startswith(("renders/", "derived/"))):
+                out.append(s)
+
+    walk(tl)
+    return out
+
+
+async def validate_timeline_objects(timeline: Any, storage: Any) -> None:
+    """渲染前校验时间线里每个对象键**真的存在**，不存在就**立刻**报错。
+
+    为什么要这一道（真机事故）：模型可以自己手写 ``timeline`` JSON（原声混剪时它常这么
+    做，好把出镜画面钉到对应句子的原镜头时间码上）。而 ``render_video`` 原先对手写的
+    timeline **逐字使用、不校验**——于是键写错要等到渲染器深处才炸：
+
+        对象不存在：users/u-d9a478c9a6d7/convs/d2ef8d12…/mat-0fe987.mp3
+
+    BGM 其实来自**音乐库**（另一个 owner / 另一个会话），真键是
+    ``users/u-bgm-library/convs/c-bgm-library/mat-0fe987.mp3``；模型照抄了另外两条
+    同会话素材的样式，把 BGM 也套上了当前会话前缀。渲染跑了十分钟才失败，
+    而且报错只说"对象不存在"，不说"你要的其实是哪个键"。
+
+    所以这里：一次 HEAD 就能拦下，并把**正确的键**一并告诉模型（按素材 id 反查
+    materials 表），让它一次改对而不是猜。
+    """
+    if not timeline or storage is None:
+        return
+    keys = _object_keys_in(timeline)
+    if not keys:
+        return
+    objects = getattr(storage, "objects", None)
+    if objects is None or not hasattr(objects, "head"):
+        return
+    bad: list[tuple[str, str]] = []
+    for key in dict.fromkeys(keys):          # 去重，保持顺序
+        try:
+            if await objects.head(key) is not None:
+                continue
+        except Exception:  # noqa: BLE001 - 探测失败不当作"不存在"，交给渲染阶段
+            continue
+        # 反查正确的键：键里通常带 mat-xxxxxx 这个素材 id
+        hint = ""
+        m = re.search(r"(mat-[a-z0-9]+)", key)
+        if m:
+            try:
+                row = await storage.materials.get(m.group(1))
+            except Exception:  # noqa: BLE001
+                row = None
+            real = str((row or {}).get("object_key") or "")
+            if real and real != key:
+                hint = f"（素材 {m.group(1)} 的真实对象键是：{real}）"
+        bad.append((key, hint))
+    if bad:
+        lines = [f"  · {k}{h}" for k, h in bad]
+        raise ValueError(
+            "时间线里有对象键**不存在于对象存储**，渲染会失败，先改掉再提交：\n"
+            + "\n".join(lines)
+            + "\n请用上面的真实键（素材入库/曲库返回的就是它），不要按当前会话前缀拼。")
+
+
 class RenderVideoNode(StoryNode):
     name = "render_video"
     display_name = "成片渲染"
@@ -1448,6 +1525,21 @@ class RenderVideoNode(StoryNode):
         # 令牌一旦被换掉（判死、重开），本次的迟到写就自动作废。
         row = await jobs.open(sess, artifact)
         attempt = str((row or {}).get("attempt") or "")
+        # **开启任务之后**再校验对象键是否真的存在。
+        #
+        # 为什么放在 open 之后而不是之前：渲染失败必须留下一条 failed 的渲染任务
+        # （界面与 render_status 靠它报告"这一步没成"）。若在 open 之前抛，任务压根没
+        # 建立，失败就"消失"了——tests/test_render_pipeline 正是钉这条保证。
+        #
+        # 为什么还是要校验：模型可以自己手写 timeline（原声混剪时常这么做），
+        # 而键写错原先要等渲染器深处才炸——真机实测跑了十分钟才失败，报错只说
+        # 「对象不存在：…/mat-0fe987.mp3」，不说正确的是哪个键。
+        # 现在一次 HEAD 就拦下，并把**真实的对象键**告诉它（见 validate_timeline_objects）。
+        try:
+            await validate_timeline_objects(tl, self.storage)
+        except ValueError as exc:
+            await jobs.fail(sess, artifact, str(exc), attempt=attempt)
+            raise
         # 成片也落在会话工作区：MoviePy 的 temp_audio 与兜底分片因此同在工作区内（spec §6
         # 的三处媒体面污染），被引用的字节也取在这一层（render/src），失败一并回收。
         # 成功路径保留该目录——时间线里的配音/转场仍能按引用重取，但真要说得上
