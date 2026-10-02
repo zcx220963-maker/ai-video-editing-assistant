@@ -36,6 +36,7 @@ from .plan_gate import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claim
 from .render_gate import (ADJUST_OPTION, CONFIRM_OPTION, KEEP_FULL_OPTION,
                           RENDER_NODE, TRUNCATE_OPTION, build_render_ask,
                           decision_is_confirm, decision_text, should_gate_render)
+from .run_state import RunState, tool_names_in
 from .session import Session, SessionManager
 from .tool import ToolError, ToolRegistry, is_tool_error, plan_batches
 
@@ -436,7 +437,11 @@ class AgentOnceRun:
         interactive: bool = True,
     ) -> str:
         reg = registry if registry is not None else self.registry
-        ctx = AgentHookContext(session=session, messages=messages)
+        # 跨挂起仍然成立的事实从指针行恢复（没有 checkpoint 时就是全新的）：执行轮在渲染
+        # 确认门/弹窗上停过一次之后，批准的计划、已经跑过的调用、攒下的 qa 片段都还在，
+        # 不必从零开始——这就是「续跑之后对账丢了」那类现象的根因所在。
+        state = RunState.restore(cp)
+        ctx = AgentHookContext(session=session, messages=messages, state=state)
         # Hook（如 OutboundStreamHook）按 run_id 标注这段流属于哪次执行，供回投/前端聚合。
         ctx.extras["run_id"] = run_id
         # 分叉工具（rerun_from）要能读到「当前这个 run 走到哪了、快照管理器是谁」，
@@ -444,8 +449,9 @@ class AgentOnceRun:
         ctx.extras["checkpoint"] = cp
         ctx.extras["checkpoint_manager"] = self.checkpoint
         # 执行轮带着批准计划进来：对账钩子据此算「计划外 / 未履行」，只观测不拦截。
+        # 调用方显式给的优先——同一 run 不会带着两份承诺跑，但 fork 出来的子 run 要认新的。
         if approved_plan is not None:
-            ctx.extras["approved_plan"] = approved_plan
+            state.approved_plan = dict(approved_plan)
         # 暴露当前 ctx 与 hooks 给工具（如 SpawnTool）触发子 Agent 生命周期节点。
         hooks_token = _current_hooks.set(self.hooks)
         ctx_token = _current_hook_ctx.set(ctx)
@@ -457,9 +463,6 @@ class AgentOnceRun:
         step_nudges = max(0, self.config.step_claim_nudges)
         # 「向用户提问必须走弹窗」的打回预算（见 ask_gate）。默认 1 次。
         popup_nudges = max(0, self.config.popup_question_nudges)
-        # 本轮真发生过的调用名（含失败的那几次）：执行轮的「一次步骤都没调用」判据用它算，
-        # 不借对账钩子的 tool_calls_seen——那道保证不该取决于装配时少没少挂一个钩子。
-        calls_this_run: list[str] = []
         # 本轮**是否已经用过 ask_user**：必须按「整轮」而不是「当前这一批」算。
         # 反例（真机实测）：模型调 ask_user 提问 → 循环挂起并把「已暂停等你选择」写成终答 →
         # 那句解释里带着「本轮不可用，你希望怎么处理」的措辞，会被判据认成「在提问却没调
@@ -468,11 +471,14 @@ class AgentOnceRun:
         # 弹的卡，不能因为「这次 _drive 还没调过」就判它没用弹窗（真机实测：续跑的每一轮
         # 都吃一条「但你没有调用 ask_user」的假打回）。
         asked_this_run = False
-        qa_parts: list[dict] = []  # 本轮 think / tool call 片段（QA .jsonl 历史用）
         # 首条记 prompt 指纹：eval 回归据此把结果归到具体版本的 prompt。
-        qa_parts.append({"type": "prompt_fingerprint", "fingerprint": self.context_builder.fingerprint()})
-        # 收尾阶段的对账钩子要往这里追加一条 plan reconciliation（在 assistant 行落库之前）。
-        ctx.extras["qa_parts"] = qa_parts
+        # 只在全新的 state 上记——续跑那半截不再补一条，否则历史里同一次执行有两个指纹。
+        if not state.qa_parts:
+            state.qa_parts.append(
+                {"type": "prompt_fingerprint",
+                 "fingerprint": self.context_builder.fingerprint()})
+        qa_parts = state.qa_parts
+        state.persist(cp)
         try:
             try:
                 while iteration < self.config.max_iterations:
@@ -485,7 +491,10 @@ class AgentOnceRun:
                         iteration += 1
                         continue
                     # 一致点：即将调用 LLM 之前落盘，恢复从这里续跑即可避免重放工具。
+                    # 状态与消息一起落：崩溃恢复取到的调用清单/候选计划/q 片段
+                    # 必须和这一条一致点上的 messages 同批，否则对账会多算或漏算。
                     if cp is not None:
+                        state.persist(cp)
                         await self.checkpoint.save_progress(cp, iteration=iteration, messages=messages)
                     ctx.iteration = iteration
                     await self.hooks.before_iteration(ctx)
@@ -501,7 +510,7 @@ class AgentOnceRun:
                                 "name": tc.name,
                                 "arguments": tc.arguments,
                             })
-                            calls_this_run.append(tc.name)
+                            state.note_attempted(tc.name)
                         messages.append(assistant(resp.content, resp.tool_calls))
                         if cp is not None:
                             # 确认过渲染之后，模型若又发起一次渲染：如实告诉它「已经在渲了」，
@@ -538,13 +547,13 @@ class AgentOnceRun:
                                 pending = [{"id": tc.id, "name": tc.name,
                                             "arguments": tc.arguments}
                                            for tc in resp.tool_calls]
+                                state.persist(cp)
                                 await self.checkpoint.await_approval(
                                     cp, iteration=iteration, messages=messages,
                                     pending_calls=pending,
                                     reason="以下操作需要你确认后才会执行")
                                 await self.hooks.on_approval_required(
                                     ctx, pending, "以下操作需要你确认后才会执行")
-                                ctx.extras["approval_paused"] = True
                                 return _APPROVAL_PAUSE_ANSWER
                             # 渲染确认门：编排已就绪、马上要渲染时，先把编排结果给用户看，
                             # 等确认再渲。用户明确要求「不确认绝不渲染」。
@@ -564,12 +573,12 @@ class AgentOnceRun:
                                 pending = [{"id": tc.id, "name": tc.name,
                                             "arguments": tc.arguments}
                                            for tc in resp.tool_calls]
+                                state.persist(cp)
                                 await self.checkpoint.await_approval(
                                     cp, iteration=iteration, messages=messages,
                                     pending_calls=pending, reason=ask["title"], ask=ask)
                                 await self.hooks.on_approval_required(
                                     ctx, pending, ask["title"], ask=ask)
-                                ctx.extras["approval_paused"] = True
                                 return _APPROVAL_PAUSE_ANSWER
                         await self._execute_tool_calls(ctx, resp.tool_calls, reg)
                         # 主动提问：模型调了 ask_user 就把本轮停在这里，等问题卡片
@@ -584,17 +593,18 @@ class AgentOnceRun:
                                         "arguments": tc.arguments}
                                        for tc in resp.tool_calls]
                             reason = asked["title"]
+                            state.persist(cp)
                             await self.checkpoint.await_approval(
                                 cp, iteration=iteration, messages=messages,
                                 pending_calls=pending, reason=reason, ask=asked)
                             await self.hooks.on_approval_required(
                                 ctx, pending, reason, ask=asked)
-                            ctx.extras["approval_paused"] = True
                             return _APPROVAL_PAUSE_ANSWER
                         fb = _detect_fallback_options(ctx.messages, resp.tool_calls)
                         if fb is not None and cp is not None:
                             pending = [{"id": tc.id, "name": tc.name,
                                         "arguments": tc.arguments} for tc in resp.tool_calls]
+                            state.persist(cp)
                             await self.checkpoint.await_approval(
                                 cp, iteration=iteration, messages=messages,
                                 pending_calls=pending,
@@ -603,7 +613,6 @@ class AgentOnceRun:
                             await self.hooks.on_approval_required(
                                 ctx, pending, fb.get("error", "渲染需要你选择方案"),
                                 fallback_options=fb.get("options", []))
-                            ctx.extras["approval_paused"] = True
                             return _APPROVAL_PAUSE_ANSWER
                         handover = ctx.extras.pop("handover", None)
                         if handover is not None:
@@ -613,7 +622,7 @@ class AgentOnceRun:
                             iteration += 1
                         continue
 
-                    if (planning and not ctx.extras.get("plan_candidates")
+                    if (planning and not state.plan_candidates
                             and claims_plan_card(resp.content) and card_nudges > 0):
                         # 规划轮里「卡已提交」而没有 submit_plan 成功记录＝界面上没有卡：
                         # 用户点不到确认，这一轮是死胡同。先给它一次真出卡或改口的机会。
@@ -623,7 +632,7 @@ class AgentOnceRun:
                         iteration += 1
                         continue
 
-                    if (planning and not ctx.extras.get("plan_candidates")
+                    if (planning and not state.plan_candidates
                             and looks_like_plan_card(resp.content)
                             and not declines_plan(resp.content) and card_nudges > 0):
                         # 上面那条措辞守卫按**文本**判「假称已出卡」，而真机上模型换一种说法
@@ -632,18 +641,22 @@ class AgentOnceRun:
                         # 服务端零张卡、用户永远点不到确认。这就是「剪辑流程跑不起来」的断点。
                         # 这条按**卡面形状**判（≥2 个方案标号 + 让用户挑），与具体措辞无关；
                         # 纯咨询回答（问素材能不能用、要不要出卡）不具这个形状，不会误伤。
+                        # 候选清单挂在可恢复状态上：规划轮弹过问题再续跑，卡确实在界面上，
+                        # 不能因为「这次 _drive 没跑过 submit_plan」就再打回一次。
                         card_nudges -= 1
                         messages.append(assistant(resp.content))
                         messages.append(system(NO_CARD_STRUCTURAL_TEXT))
                         iteration += 1
                         continue
 
-                    approved = ctx.extras.get("approved_plan")
-                    if (approved and _no_step_called(approved, calls_this_run)
+                    approved = state.approved_plan
+                    if (approved and _no_step_called(approved, state.calls_attempted)
                             and claims_step_executed(resp.content)
                             and step_nudges > 0):
-                        # 执行轮里「某步已跑完」而本轮零步骤调用＝Storyline 没收到请求，
+                        # 执行轮里「某步已跑完」而这条 run 零步骤调用＝Storyline 没收到请求，
                         # 界面上不会多出任何新产物：那句「已完成」是从历史里复述的旧结果。
+                        # 调用清单按整条 run 算（跨挂起仍成立），否则在渲染确认门之前真跑过
+                        # 步骤、续跑后收尾的那句会被判成假称——与 asked_this_run 同一个病灶。
                         # 先退回去要一次真调用（或一次如实说明），别把旧产物当本轮产出交出去。
                         step_nudges -= 1
                         first = (approved.get("steps") or [{}])[0].get("node") or "?"
@@ -672,6 +685,7 @@ class AgentOnceRun:
             except BaseException:
                 # 真实进程被 kill 时此处不执行，但上一致点已落盘，仍可恢复。
                 if cp is not None:
+                    state.persist(cp)
                     await self.checkpoint.mark_failed(cp, iteration=iteration, messages=messages)
                 raise
 
@@ -686,7 +700,7 @@ class AgentOnceRun:
                     and looks_like_asking_user(final)):
                 final = (final or "") + NO_POPUP_NOTE
 
-            if (planning and not ctx.extras.get("plan_candidates")
+            if (planning and not state.plan_candidates
                     and (claims_plan_card(final) or looks_like_plan_card(final))):
                 # 核对机会用尽还在声称/还在把卡面内容当交付：界面上不会多出卡，这句不能
                 # 原样进历史——末尾补一条服务端核到的事实，让用户知道该重新发起。
@@ -694,11 +708,11 @@ class AgentOnceRun:
                 # 原样交付，不被这句多余的事实更正污染。
                 final = (final or "") + NO_CARD_NOTE_TEXT
 
-            approved = ctx.extras.get("approved_plan")
-            if (approved and _no_step_called(approved, calls_this_run)
+            approved = state.approved_plan
+            if (approved and _no_step_called(approved, state.calls_attempted)
                     and claims_step_executed(final)):
-                # 同一件事在执行轮的版本：核对机会用尽还在声称某步跑完了，就把「本轮零调用、
-                # 界面上不会多出任何新产物」这条事实补在答复末尾——留原样进历史，
+                # 同一件事在执行轮的版本：核对机会用尽还在声称某步跑完了，就把「这条 run
+                # 零步骤调用、界面上不会多出任何新产物」这条事实补在答复末尾——留原样进历史，
                 # 用户读到的是上一轮的旧时长冒充这一轮的产出。
                 final = (final or "") + STEP_NOTE_TEXT
 
@@ -710,10 +724,14 @@ class AgentOnceRun:
                     # /runs/active 查不到、consumer 的自动续跑也捞不回来——用户看到
                     # 「[已达最大迭代次数 N，提前结束]」，刷新后这条 run 再也接不上。
                     # 真机会话里已经有一批这样收尾的记录。标记成 failed 让「继续」能接。
+                    state.persist(cp)
                     await self.checkpoint.mark_failed(
                         cp, iteration=iteration,
                         messages=[*messages, assistant(final or "")])
                 else:
+                    # 完成的 run 不再被恢复：指针行只留「认过的承诺」（分叉要继承它），
+                    # transcript 与调用清单撤下——前者已经在 assistant 行的 qa 字段里。
+                    RunState.retain_residue(cp, state)
                     await self.checkpoint.complete(cp, messages=[*messages, assistant(final or "")])
 
             # 落回会话历史：流式模式下这也是把攒出的完整答复写进会话的最简单情形。
@@ -740,6 +758,16 @@ class AgentOnceRun:
         ctx.extras["checkpoint"] = child
         ctx.extras["run_id"] = child.run_id
         ctx.messages = messages
+        # 子 run 有自己的状态：承诺仍然跟着它（同一份确认的计划继续管着这次重跑），
+        # 但调用清单按子 run 上下文里**真有的**回执重建——分叉点之后那些步骤已作废，
+        # 照父 run 的清单对账会恰好把「用户要求重跑的那几步」判成已履行。
+        already = tool_names_in(messages)
+        st = ctx.state
+        st.calls_attempted = list(already)
+        st.calls_executed = list(already)
+        st.audit_pushed = None
+        st.plan_audit = None
+        st.persist(child)
         messages.append(system(
             f"（已回到一致点 seq={child.forked_at_seq} 并开新执行 run={child.run_id}："
             f"该 run 之前的步骤结果保持有效，剪辑产物已换到新作用域 "

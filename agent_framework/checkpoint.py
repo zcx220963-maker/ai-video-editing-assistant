@@ -481,6 +481,13 @@ class CheckpointManager:
             plan_run_id=parent.plan_run_id,   # 分叉继承计划谱系；对账结论不跟（那是父 run 那一次的）
         )
         child.scope = await self._clone_artifacts(parent, child, invalidate)
+        # 子 run 继承「父 run 认过的承诺」：执行轮的对账与「未调用步骤不许声称已执行」
+        # 那道硬保证都以此为前提。对账结论与调用清单不跟——那是父 run 那一次的记录，
+        # 分叉点之后的步骤这次要重跑（agent._adopt_fork 按子 run 的回执重建清单）。
+        residue = (parent.plan or {}).get("state") or {}
+        approved = residue.get("approved_plan")
+        if isinstance(approved, dict) and approved:
+            child.plan = {"state": {"approved_plan": dict(approved)}}
         saved = await self.save(child)
         await self.supersede(run_id)
         return saved

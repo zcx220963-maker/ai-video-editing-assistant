@@ -628,7 +628,7 @@ async def case_submit_tool() -> None:
         r3 = await tool.execute(plans=[one_plan()])
         payload = json.loads(r3)
         check(payload["accepted"] == ["p1"], "合规计划一次通过")
-        check(ctx.extras.get("plan_candidates"), "校验后的计划挂在本轮 ctx 上")
+        check(ctx.state.plan_candidates, "校验后的计划挂在本轮的可恢复状态上")
         check((cp.plan.get("candidates") or [{}])[0].get("plan_id") == "p1",
               "候选计划同时落本 run 的指针行：确认接口取的就是这一份（不认浏览器回传）")
         check(drain_plan_cards() == [],
@@ -721,10 +721,9 @@ async def case_reconcile_hook() -> None:
           "普通轮没有批准计划：不发对账帧、不动终答")
 
     ctx = AgentHookContext(session=Session(user_id="u", conversation_id="c"))
-    ctx.extras["approved_plan"] = compiled
+    ctx.state.approved_plan = compiled
     ctx.extras["run_id"] = "r-b"
-    parts: list = []
-    ctx.extras["qa_parts"] = parts
+    ctx.state.qa_parts = []
     cp = Checkpoint(run_id="r-b", session_id="u:c", message="剪一条",
                     iteration=0, messages=[])
     ctx.extras["checkpoint"] = cp
@@ -735,8 +734,8 @@ async def case_reconcile_hook() -> None:
           and mq.frames[0]["unfulfilled"] == ["load_media", "split_shots", "select_BGM",
                                               "plan_timeline", "render_video"],
           f"未命中的调用不算跑过：五步仍全在未履行里（{mq.frames[0]['unfulfilled']}）")
-    check((ctx.extras.get("tool_calls_seen") or []) == [],
-          f"未命中的调用不算跑过：{ctx.extras.get('tool_calls_seen')}")
+    check(ctx.state.calls_executed == [],
+          f"未命中的调用不算跑过：{ctx.state.calls_executed}")
     await _call(ctx, "load_media")
     await hook.after_execute_tools(ctx)
     first = mq.frames[-1]
@@ -765,7 +764,8 @@ async def case_reconcile_hook() -> None:
           "终态结论落进指针行 plan.audit（执行记录面板按 run 取）")
     check(audit["reason"].startswith("按你的要求补了一次口播转写"),
           "偏离理由就是终答原文（同屏那一句话，不另起一套机制）")
-    check(ctx.extras.get("plan_audit") == audit, "当轮结论也挂在 ctx 上")
+    check(ctx.state.plan_audit == audit, "当轮结论也挂在可恢复状态上")
+    parts = ctx.state.qa_parts
     check(parts and parts[-1]["type"] == "plan reconciliation"
           and parts[-1]["reason"] == audit["reason"],
           "对账单进 qa_parts：随 assistant 行落库，历史里看得见")

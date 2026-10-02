@@ -67,7 +67,9 @@ _MUTATING_TOOLS = frozenset({"rerun_from", "start_subagent"})
 # 只读的记账查询不算「创作步骤」：渲染未达终态时 hint 明写「请调用 render_status 追」，
 # 再把它标成「计划外一步」就是框架自己打自己的脸（真机踩到：角标写计划外 1 步 ·
 # 渲染进度查询，用户读到的是「模型偷偷多做了一件事」）。
-NON_STEP_TOOLS = frozenset({"render_status", "read_node_history"})
+# ask_user 同一条路：弹窗提问是**交互动作**，不是多做出来的一步创作；
+# 执行轮只要问过一个问题，角标就会挂一条「计划外 · 询问用户」，那是噪声不是偏差。
+NON_STEP_TOOLS = frozenset({"render_status", "read_node_history", "ask_user"})
 
 _MCP_PREFIX = "storyline_"
 
@@ -966,8 +968,8 @@ class SubmitPlanTool(Tool):
                              + "\n- ".join(issues.errors[:8]))
         ctx = _current_hook_ctx.get()
         if ctx is not None:
-            ctx.extras["plan_candidates"] = normalized
-            ctx.extras.setdefault("plan_warnings", []).extend(issues.warnings)
+            ctx.state.plan_candidates = normalized
+            ctx.state.plan_warnings.extend(issues.warnings)
             # 候选计划同时落到本 run 的指针行：确认接口据此取回**服务端自己校验过的那一份**，
             # 浏览器只负责回传「选了哪张卡、点了哪些开关」，不回传计划本体。
             cp = ctx.extras.get("checkpoint")
@@ -1426,14 +1428,15 @@ class PlanCardHook(AgentHook):
         self._topic = topic
 
     async def after_execute_tools(self, context: AgentHookContext) -> None:
-        candidates = context.extras.get("plan_candidates")
-        if candidates and not context.extras.get("_plan_card_pushed"):
-            context.extras["_plan_card_pushed"] = True
+        candidates = context.state.plan_candidates
+        if candidates and not context.state.plan_card_pushed:
+            # 这一位落在可恢复状态上：挂起→续跑之后不会又推一张一模一样的卡。
+            context.state.plan_card_pushed = True
             session_id = context.session.session_id
             run_id = context.extras.get("run_id")
             # 落库那份多带一个 plan_run_id：历史重放时前端要靠它定位确认帧发往哪条 run
             # （实时那帧本身带 run_id，不必重复）。
-            warnings = list(context.extras.get("plan_warnings") or [])
+            warnings = list(context.state.plan_warnings)
             record_plan_card([dict(p, plan_run_id=run_id) for p in candidates], warnings)
             await self._mq.publish(
                 self._topic, session_id,
@@ -1477,11 +1480,10 @@ class PlanReconcileHook(AgentHook):
 
     @staticmethod
     def _audit(context: AgentHookContext) -> dict[str, Any] | None:
-        plan = context.extras.get("approved_plan")
+        plan = context.state.approved_plan
         if not isinstance(plan, Mapping):
             return None                 # 普通轮 / 规划轮：没有批准计划可对账
-        diff = reconcile(plan.get("steps") or [],
-                         context.extras.get("tool_calls_seen") or [])
+        diff = reconcile(plan.get("steps") or [], context.state.calls_executed)
         diff["plan_id"] = plan.get("plan_id") or ""
         return diff
 
@@ -1491,15 +1493,16 @@ class PlanReconcileHook(AgentHook):
                               call_id: str = "") -> None:
         if isinstance(error, UnknownToolError):
             return          # 调用从未发生：记进去等于把没跑的步当跑过
-        context.extras.setdefault("tool_calls_seen", []).append(tool_name)
+        context.state.note_executed(tool_name)
 
     async def after_execute_tools(self, context: AgentHookContext) -> None:
         audit = self._audit(context)
         if audit is None or self._mq is None:
             return
-        if audit == context.extras.get("_audit_pushed"):
+        if audit == context.state.audit_pushed:
             return                      # 这批工具没改变偏差，不再发重复帧
-        context.extras["_audit_pushed"] = dict(audit)
+        # 去重位也在可恢复状态上：挂起前推过的那一版偏差，续跑后不会又推一次。
+        context.state.audit_pushed = dict(audit)
         session_id = context.session.session_id
         await self._mq.publish(
             self._topic, session_id,
@@ -1517,8 +1520,7 @@ class PlanReconcileHook(AgentHook):
         cp = context.extras.get("checkpoint")
         if cp is not None:
             cp.plan["audit"] = audit        # 指针行：执行记录面板按 run 取
-        context.extras["plan_audit"] = audit
-        parts = context.extras.get("qa_parts")
-        if isinstance(parts, list):
-            parts.append({"type": "plan reconciliation", **audit})
+        context.state.plan_audit = audit
+        if isinstance(context.state.qa_parts, list):
+            context.state.qa_parts.append({"type": "plan reconciliation", **audit})
         return content

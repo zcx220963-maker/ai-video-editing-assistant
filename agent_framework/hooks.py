@@ -22,6 +22,7 @@ from .connection_manager import OUTBOUND_TOPIC
 from .media_replay import record_rendered_media
 from .messages import Message
 from .mq import MessageQueue
+from .run_state import RunState
 from .session import Session
 from .storage.db import Cond
 from .tool import UnknownToolError
@@ -39,11 +40,18 @@ _current_hooks: contextvars.ContextVar[AgentHook | None] = contextvars.ContextVa
 
 @dataclass
 class AgentHookContext:
-    """一次 AgentOnceRun 期间共享的上下文快照。"""
+    """一次 AgentOnceRun 期间共享的上下文快照。
+
+    ``state`` 是**跨挂起仍然成立**的那部分事实（批准的计划、已发生的调用、候选计划、
+    对账结论、当轮 qa 片段），由 ``_drive`` 从 checkpoint 的指针行恢复、并在每个一致点
+    写回——所以续跑之后对账不会从零开始。``extras`` 只放**本轮调用私有**的注入
+    （run_id / checkpoint / checkpoint_manager / handover 等），刻意不落盘。
+    """
 
     session: Session
     messages: list[Message] = field(default_factory=list)
     iteration: int = 0
+    state: RunState = field(default_factory=RunState)
     extras: dict[str, Any] = field(default_factory=dict)
 
 
