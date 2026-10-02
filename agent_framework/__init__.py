@@ -1,0 +1,337 @@
+"""智能创作助手 Agent 框架 —— Agent Loop 核心骨架。
+
+当前提供可端到端运行的最小闭环：
+- MainLoop：外层常驻循环，持续消费用户请求
+- AgentOnceRun：内层 ReAct 循环，带最大迭代保护
+- Tool / ToolRegistry：工具抽象与注册执行
+- AgentHook / CompositeHook：生命周期接缝（默认 no-op，后续模块填充）
+"""
+
+from .messages import Message, ToolCall
+from .llm import LLMClient, LLMResponse, StreamChunk, ScriptedLLM
+from .llm_openai import OpenAICompatClient, get_default_llm
+from .tool import Tool, ToolRegistry, EchoTool
+from .session import Session, SessionManager
+from .context import (
+    ContextBuilder,
+    ContextSource,
+    default_runtime_context,
+    DEFAULT_SYSTEM_PROMPT,
+)
+from .compress import (
+    ContextCompressor,
+    default_summarizer,
+    make_llm_summarizer,
+    default_token_counter,
+)
+from .hooks import AgentHook, CompositeHook, LoggingHook, MediaCardHook, MetricsHook, OutboundStreamHook, ToolTraceHook
+from .agent import AgentOnceRun, Agent, AgentConfig
+from .checkpoint import (
+    Checkpoint,
+    CheckpointManager,
+)
+from .memory import (
+    MemoryStore,
+    MemoryContextSource,
+    UpdateMemoryTool,
+    ReadMemoryTool,
+    register_memory_tools,
+)
+from .subagent import SubAgentRunner, SpawnTool, make_spawn_tool
+from .orchestration import (
+    Store,
+    ArtifactStore,
+    StoreManager,
+    NodeState,
+    NodeSummary,
+    BaseNode,
+    NodeRegistry,
+    Interceptor,
+    MissingNode,
+    detect_cycle,
+    topological_order,
+)
+from .video_editing import (
+    SearchMediaNode,
+    LoadMediaNode,
+    SplitShotsNode,
+    AsrNode,
+    SpeechRoughCutNode,
+    UnderstandClipsNode,
+    FilterClipsNode,
+    GroupClipsNode,
+    GenerateScriptNode,
+    ScriptTemplateRecNode,
+    GenerateAITransitionNode,
+    TransitionRecNode,
+    TextRecNode,
+    GenerateVoiceoverNode,
+    SelectBGMNode,
+    PlanTimelineNode,
+    PlanTimelineProNode,
+    PlanTimelineAITransitionNode,
+    RenderVideoNode,
+    ALL_NODE_CLASSES,
+    build_node_registry,
+    NodeTool,
+    ReadNodeHistoryTool,
+    build_agent_registry,
+    register_editing_tools,
+    load_storyline_config,
+    storyline_available_nodes,
+    storyline_server_url,
+    validate_dag,
+)
+from .editing_agent import (
+    build_editing_agent,
+    plan_team_from_dag,
+    EDITING_SYSTEM_PROMPT,
+)
+from .skill import (
+    Skill,
+    SkillLoader,
+    SkillManifestContextSource,
+    LoadSkillTool,
+    register_skill_tools,
+)
+from .message_center import (
+    MessageCenter,
+    SendMessageTool,
+    ReadInboxTool,
+    register_message_tools,
+)
+from .task_manager import (
+    TaskManager,
+    TaskError,
+    topo_order,
+    PENDING,
+    CLAIMED,
+    COMPLETED,
+)
+from .subagent_manager import (
+    SubAgentManager,
+    ManagedSubAgent,
+    build_subagent_registry,
+    WORKING,
+    IDLE,
+    SHUTDOWN,
+)
+from .team_tools import Team, register_team_tools, MAIN_AGENT_NAME
+from .tools.file import (
+    WriteTool,
+    ReadTool,
+    EditTool,
+    GrepTool,
+    register_file_tools,
+    session_workspace_root,
+)
+from .tools.web import (
+    FetchTool,
+    SearchTool,
+    SearchResult,
+    register_web_tools,
+)
+from .tools.fetch_media import FetchMediaTool, register_fetch_media_tools
+from .media_fetch import FetchPolicy, FetchRejected, fetch_media
+from .ingest import IngestRejected, ingest_bytes, ingest_local_file
+from .tools.cron import (
+    CronScheduler,
+    CronJob,
+    register_cron_tools,
+)
+from .tools.mcp import (
+    MCPServerConfig,
+    MCPToolsConfig,
+    MCPClient,
+    MCPTool,
+    MCPError,
+    StdioTransport,
+    StreamableHttpTransport,
+    load_mcp_config,
+    parse_simple_yaml,
+    register_mcp_tools,
+)
+
+# ---- 服务/运行时层（架构图：Web 接口层 / Message Queue / SessionConsumer / Heartbeat）----
+from .mq import (
+    MessageQueue,
+    InMemoryMessageQueue,
+    KafkaMessageQueue,
+    build_message_queue,
+)
+from .consumer import SessionConsumer, CHAT_TOPIC, CONSUMER_GROUP, session_key
+from .connection_manager import (
+    ConnectionManager,
+    OUTBOUND_TOPIC,
+    CONNECTION_GROUP,
+)
+from .broadcast import OutboundBroadcaster, OUTBOUND_CHANNEL
+from .heartbeat import Heartbeat
+from .auth import Authenticator, bearer_token
+from .server import (create_app, ChatRequest, ChatQueuedResponse, ChatSyncResponse,
+                     FetchMediaRequest, RegisterRequest)
+
+__all__ = [
+    "Message",
+    "ToolCall",
+    "LLMClient",
+    "LLMResponse",
+    "StreamChunk",
+    "ScriptedLLM",
+    "OpenAICompatClient",
+    "get_default_llm",
+    "Tool",
+    "ToolRegistry",
+    "EchoTool",
+    "Session",
+    "SessionManager",
+    "ContextBuilder",
+    "ContextSource",
+    "default_runtime_context",
+    "DEFAULT_SYSTEM_PROMPT",
+    "ContextCompressor",
+    "default_summarizer",
+    "make_llm_summarizer",
+    "default_token_counter",
+    "AgentHook",
+    "CompositeHook",
+    "LoggingHook",
+    "MetricsHook",
+    "OutboundStreamHook",
+    "MediaCardHook",
+    "ToolTraceHook",
+    "AgentOnceRun",
+    "Agent",
+    "AgentConfig",
+    "Checkpoint",
+    "CheckpointManager",
+    "MemoryStore",
+    "MemoryContextSource",
+    "UpdateMemoryTool",
+    "ReadMemoryTool",
+    "register_memory_tools",
+    "SubAgentRunner",
+    "SpawnTool",
+    "make_spawn_tool",
+    "Store",
+    "ArtifactStore",
+    "StoreManager",
+    "NodeState",
+    "NodeSummary",
+    "BaseNode",
+    "NodeRegistry",
+    "Interceptor",
+    "MissingNode",
+    "detect_cycle",
+    "topological_order",
+    "SearchMediaNode",
+    "LoadMediaNode",
+    "SplitShotsNode",
+    "AsrNode",
+    "SpeechRoughCutNode",
+    "UnderstandClipsNode",
+    "FilterClipsNode",
+    "GroupClipsNode",
+    "GenerateScriptNode",
+    "ScriptTemplateRecNode",
+    "GenerateAITransitionNode",
+    "TransitionRecNode",
+    "TextRecNode",
+    "GenerateVoiceoverNode",
+    "SelectBGMNode",
+    "PlanTimelineNode",
+    "PlanTimelineProNode",
+    "PlanTimelineAITransitionNode",
+    "RenderVideoNode",
+    "ALL_NODE_CLASSES",
+    "build_node_registry",
+    "NodeTool",
+    "ReadNodeHistoryTool",
+    "build_agent_registry",
+    "register_editing_tools",
+    "load_storyline_config",
+    "storyline_available_nodes",
+    "storyline_server_url",
+    "validate_dag",
+    "build_editing_agent",
+    "plan_team_from_dag",
+    "EDITING_SYSTEM_PROMPT",
+    "Skill",
+    "SkillLoader",
+    "SkillManifestContextSource",
+    "LoadSkillTool",
+    "register_skill_tools",
+    "MessageCenter",
+    "SendMessageTool",
+    "ReadInboxTool",
+    "register_message_tools",
+    "TaskManager",
+    "TaskError",
+    "topo_order",
+    "PENDING",
+    "CLAIMED",
+    "COMPLETED",
+    "SubAgentManager",
+    "ManagedSubAgent",
+    "build_subagent_registry",
+    "WORKING",
+    "IDLE",
+    "SHUTDOWN",
+    "Team",
+    "register_team_tools",
+    "MAIN_AGENT_NAME",
+    "WriteTool",
+    "ReadTool",
+    "EditTool",
+    "GrepTool",
+    "register_file_tools",
+    "session_workspace_root",
+    "FetchTool",
+    "SearchTool",
+    "SearchResult",
+    "register_web_tools",
+    "FetchMediaTool",
+    "register_fetch_media_tools",
+    "FetchPolicy",
+    "FetchRejected",
+    "fetch_media",
+    "IngestRejected",
+    "ingest_bytes",
+    "ingest_local_file",
+    "CronScheduler",
+    "CronJob",
+    "register_cron_tools",
+    "MCPServerConfig",
+    "MCPToolsConfig",
+    "MCPClient",
+    "MCPTool",
+    "MCPError",
+    "StdioTransport",
+    "StreamableHttpTransport",
+    "load_mcp_config",
+    "parse_simple_yaml",
+    "register_mcp_tools",
+    # 服务/运行时层
+    "MessageQueue",
+    "InMemoryMessageQueue",
+    "KafkaMessageQueue",
+    "build_message_queue",
+    "SessionConsumer",
+    "CHAT_TOPIC",
+    "CONSUMER_GROUP",
+    "session_key",
+    "ConnectionManager",
+    "OUTBOUND_TOPIC",
+    "CONNECTION_GROUP",
+    "OutboundBroadcaster",
+    "OUTBOUND_CHANNEL",
+    "Heartbeat",
+    "Authenticator",
+    "bearer_token",
+    "create_app",
+    "ChatRequest",
+    "RegisterRequest",
+    "FetchMediaRequest",
+    "ChatQueuedResponse",
+    "ChatSyncResponse",
+]

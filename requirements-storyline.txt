@@ -1,0 +1,10 @@
+# Storyline 真实节点服务依赖（主框架 requirements 之外的增量）
+# 系统依赖：PATH 上需有完整构建的 ffmpeg / ffprobe（含 xfade/acrossfade 滤镜）
+moviepy>=2.0          # 时间线合成与成片渲染（2.x API：subclipped/with_start/resized）
+faster-whisper>=1.0   # 本地 ASR（GPU float16，失败回落 CPU int8）
+edge-tts>=6.1         # 免费 TTS 配音（不可用时降级为静音轨）
+mcp>=1.2              # FastMCP streamable-http 服务端
+# 说明：
+# - 视觉理解走 SiliconFlow OpenAI 兼容 HTTP API（标准库 urllib，无额外依赖，
+#   key 从环境变量 SILICONFLOW_API_KEY 读取）。
+# - 文案生成复用主框架 agent_framework.llm_openai（openai 包已在主 requirements 中）。

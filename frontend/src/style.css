@@ -1,0 +1,41 @@
+:root {
+  --paper: #f6f1e7;
+  --paper-deep: #efe7d6;
+  --ink: #26221c;
+  --ink-soft: #5c554a;
+  --vermilion: #c8401f;
+  --vermilion-deep: #a5310f;
+  --gold: #b98a2f;
+  --line: #d9cdb4;
+  --bubble-user: #26221c;
+  --serif: "Noto Serif SC", "Songti SC", "SimSun", serif;
+  --sans: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #app { height: 100%; }
+
+body {
+  font-family: var(--sans);
+  color: var(--ink);
+  background:
+    radial-gradient(1200px 600px at 85% -10%, rgba(185, 138, 47, 0.10), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(200, 64, 31, 0.07), transparent 55%),
+    var(--paper);
+}
+
+/* 纸面纹理：细密噪点 */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.5;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix values='0 0 0 0 0.94 0 0 0 0 0.91 0 0 0 0 0.85 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+::selection { background: rgba(200, 64, 31, 0.22); }
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }

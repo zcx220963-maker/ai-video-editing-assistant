@@ -1,0 +1,39 @@
+[
+  {
+    "name": "plain_answer",
+    "description": "无工具调用，直接答复",
+    "input": "你好",
+    "llm_steps": [["answer", "你好！我是智能创作助手。"]],
+    "assertions": [
+      {"type": "equals", "value": "你好！我是智能创作助手。"}
+    ]
+  },
+  {
+    "name": "tool_then_answer",
+    "description": "一次工具调用后收尾",
+    "input": "查一下素材",
+    "llm_steps": [["tool", "list_materials", {}], ["answer", "素材列表如上。"]],
+    "assertions": [
+      {"type": "contains", "value": "素材列表如上"}
+    ]
+  },
+  {
+    "name": "two_tool_rounds",
+    "description": "两轮工具调用后收尾",
+    "input": "处理视频",
+    "llm_steps": [["tool", "load_media", {}], ["tool", "analyze_scene", {}], ["answer", "处理完成。"]],
+    "assertions": [
+      {"type": "contains", "value": "处理完成"},
+      {"type": "tool_calls", "min": 2}
+    ]
+  },
+  {
+    "name": "chinese_only",
+    "description": "答复必须是简体中文",
+    "input": "介绍一下你自己",
+    "llm_steps": [["answer", "我是智能创作助手，可以帮你剪辑视频、生成文案。"]],
+    "assertions": [
+      {"type": "regex", "value": "^[\\u4e00-\\u9fff，。！？、]+$"}
+    ]
+  }
+]

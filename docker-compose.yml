@@ -1,0 +1,61 @@
+# 上线存储层的本地依赖：PostgreSQL 16（元数据）+ MinIO（媒体字节）。
+# 起停：docker compose up -d / docker compose down
+# 凭证是本机开发用的默认值；.env 里可覆盖，生产请用部署平台的密钥注入。
+# name 必须显式给出：项目目录名含非 ASCII 字符时 compose 无法从路径推导项目名。
+name: creation-storage
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: creation-pg
+    environment:
+      POSTGRES_USER: ${PG_USER:-creation}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-creation_dev_pw}
+      POSTGRES_DB: ${PG_DB:-creation}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-creation} -d ${PG_DB:-creation}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    # quay.io 而非 docker.io：本机 Docker 的镜像加速源对 docker.io 库返回 403，
+    # Quay 上 minio/minio 是上游官方仓库。
+    image: quay.io/minio/minio:latest
+    container_name: creation-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-creationdev}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-creation_dev_pw_8chars}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # 可选：多副本回投广播的 Redis pub/sub。单副本不用起它。
+  # 起法：docker compose up -d redis；每个实例加 --broadcast-redis-url redis://localhost:6379/0
+  redis:
+    # 走 ECR 公共仓库：本机 docker.io 的加速源对 redis 库只回「Pulling fs layer」不放行，
+    # 与上面 minio 绕开 docker.io 是同一类问题。
+    image: public.ecr.aws/docker/library/redis:7-alpine
+    container_name: creation-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
+  miniodata:

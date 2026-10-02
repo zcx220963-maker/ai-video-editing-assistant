@@ -1,0 +1,34 @@
+# 主框架依赖（Storyline 真实节点的增量见 requirements-storyline.txt）
+# 安装：pip install -r requirements.txt
+
+# --- 模型与协议 ---
+openai>=2.38          # DeepSeek 走 OpenAI 兼容接口（agent_framework/llm_openai.py）
+mcp>=1.28             # MCP 客户端 + StreamableHttp 传输，连 Storyline server
+
+# --- Web 层 ---
+fastapi>=0.136        # agent_framework/server.py：/chat /upload /history /ws
+uvicorn>=0.47         # ASGI 服务器
+pydantic>=2.13        # 请求体模型
+websockets>=15.0      # WebSocket 回投（Connection Manager）
+aiohttp>=3.13         # 出站 HTTP（WebTool / MQ 消费端）
+
+# --- 上线存储层（spec 2026-09-20-pg-minio-storage-design）---
+# 元数据全进 PostgreSQL、媒体字节全进 MinIO；两者配置只从环境变量读。
+SQLAlchemy>=2.0.49    # async engine + asyncpg dialect（agent_framework/storage/db.py）
+greenlet>=3.5         # SQLAlchemy 异步上下文切换必需
+asyncpg>=0.30         # PG 异步驱动
+minio>=7.2            # 对象存储 SDK（同步 API，调用点一律包 asyncio.to_thread）
+# 系统依赖：docker compose up -d 起 postgres:16 + minio（见 docker-compose.yml）
+#           PATH 上需有 ffmpeg / ffprobe（渲染与 ffprobe 元数据）
+
+# --- 多副本回投广播（可选）---
+# 只有单副本时不需要：OutBound 帧在本进程直接推 WS。
+# 起多个实例/副本时用 --broadcast-redis-url 打开，帧经 Redis pub/sub 扇出到各实例的
+# Connection Manager（agent_framework/broadcast.py 里延迟 import，没开就不装也行）。
+redis>=5.0
+
+# --- 按链接取素材的第三条策略（站点播放器解析）---
+# 缺它只是少了兜底：直链与页面嗅探仍可用（media_fetch 里延迟 import）。
+# 站点解析器会随对方改版失效——2026-09-21 B 站取料报 HTTP 412，根因就是
+# 2026.3.17 过期，2026.8.19 已修好。遇到「解析失败」先 pip install -U yt-dlp。
+yt-dlp>=2026.8.19

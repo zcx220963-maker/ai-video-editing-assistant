@@ -1,0 +1,53 @@
+# ---- 密钥与本地配置：绝不入库 ----
+# .env 里有真实的 PG 密码与 MinIO secret key。曾经差点被提交——先排除再 add。
+.env
+.env.local
+.env.*.local
+# 历史遗留：明文 token（见审计报告）
+.runtime/legacy-credentials.txt
+*.pem
+*.key
+
+# ---- 运行时数据（4 GB 级，全部可再生）----
+# 剪辑产物缓存与工作区
+.storyline/
+# 审计脚本与中间产物（探针日志、下载回来的音视频、报告）
+.runtime/
+# 临时目录
+.tmp/
+# 本地日志
+*.log
+.main_server.log
+.storyline_server.log
+server.log
+storyline_err.log
+debug_confirm.log
+nul
+
+# 本地快照/状态文件
+.merkle-snapshot.json
+
+# ---- 依赖与构建产物 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+frontend/node_modules/
+frontend/dist/
+
+# ---- 离线依赖包（体积大，且 requirements*.txt 才是权威）----
+*.whl
+
+# ---- 编辑器/工具 ----
+.codeartsdoer/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- 测试与覆盖率 ----
+.pytest_cache/
+.coverage
+htmlcov/
