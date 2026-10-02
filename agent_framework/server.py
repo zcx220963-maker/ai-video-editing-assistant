@@ -278,6 +278,63 @@ class CatalogJSONResponse(JSONResponse):
                           indent=None, separators=(",", ":")).encode("utf-8")
 
 
+def reject_stale_answer(row: Mapping[str, Any], decision: str,
+                        answers: list[dict[str, Any]]) -> None:
+    """答案必须属于**当前这道题**，否则拒绝——这是「没选完就继续」的守口。
+
+    真机实测的坏情形（模型自己都发现了，原话「我这边一直只收到「治愈系慢节奏」
+    这一句，时长选项始终没被选中」）：客户端拿上一题的 key 去答下一题
+    ——问「成片时长想控制在多少」，回的却是风格题的 key。
+    服务端原先照单全收，于是同一道题被反复"答"了四次、run 原地打转。
+
+    判据（只在能判定时判，判不了就放行，避免误伤）：
+      · 当前挂起带结构化 ask 且列出了 options 时：
+          - decision 是 approve/reject（通用审批门的语义）→ 放行；
+          - decision 是某个 option 的 key → 放行；
+          - 否则 → 409，并明确告诉用户刷新（前端据此重新拉当前题）。
+      · 多题 answers 里每条 `key` 同理必须能对上；用户自己写的（custom 有值）
+        永远放行——那是人打的字，不可能是"陈旧 key"。
+      · 没有 ask / 没有 options（通用审批门、兜底选项）→ 放行，不猜。
+    """
+    ask = ((row.get("approval") or {}).get("ask") or {}) if row else {}
+    options = [o for o in (ask.get("options") or []) if isinstance(o, Mapping)]
+    if not options:
+        return
+    allowed = {str(o.get("key") or "") for o in options}
+    if not allowed or allowed == {""}:
+        return
+
+    d = str(decision or "")
+    if d in ("approve", "reject", ""):
+        return
+    if d not in allowed and not _is_custom_answer(answers, d):
+        raise HTTPException(
+            409, "你选的这一项不属于当前这道题（可能是页面还停在上一题）。"
+                 "请刷新页面，按当前弹出的问题重新选择。")
+
+    for a in answers or []:
+        if not isinstance(a, Mapping):
+            continue
+        if str(a.get("custom") or "").strip():
+            continue                     # 用户自己写的，放行
+        k = str(a.get("key") or a.get("answer") or "")
+        if k and k not in allowed:
+            raise HTTPException(
+                409, "选项不属于当前这道题（可能是页面还停在上一题）。"
+                     "请刷新页面，按当前弹出的问题重新选择。")
+
+
+def _is_custom_answer(answers: list[dict[str, Any]], decision: str) -> bool:
+    """decision 是不是用户在弹窗里自己写的那句（自由文本）。"""
+    for a in answers or []:
+        if not isinstance(a, Mapping):
+            continue
+        custom = str(a.get("custom") or "").strip()
+        if custom and (custom == decision or str(a.get("answer") or "") == decision):
+            return True
+    return False
+
+
 def readable_decision(row: Mapping[str, Any], decision: str, message: str,
                       answers: list[dict[str, Any]]
                       ) -> tuple[str, str, list[dict[str, Any]]]:
@@ -815,6 +872,18 @@ def create_app(
             raise HTTPException(
                 409, f"执行 {run_id} 当前不在待审批状态"
                      f"（可能已审批过或已结束），请刷新页面查看最新进展。")
+        # 硬校验：答案必须属于**当前这道题**。
+        #
+        # 真机实测的坏情形（模型自己都发现了，原话「我这边一直只收到「治愈系慢节奏」
+        # 这一句，时长选项始终没被选中」）：客户端拿上一题的 key 去答下一题
+        # ——问「成片时长想控制在多少」，回的却是风格题的 `healing_*`。
+        # 服务端原先照单全收，于是同一道题被反复"答"了四次、run 原地打转，
+        # 用户看到的就是「没选完就继续」「做完没反应」。
+        #
+        # 为什么把守口放在服务端，而不是只修客户端：客户端无论哪个版本、哪条路径
+        # （重连、陈旧状态、旧构建产物）出问题，这里都能把「不是这道题的答案」挡住，
+        # 并明确告诉用户刷新——而不是静默地让模型空转。
+        reject_stale_answer(row, req.decision, req.answers)
         sid = str(row["session_id"])
         _, conversation_id = sid.split(":", 1)
         decision, message, answers = readable_decision(

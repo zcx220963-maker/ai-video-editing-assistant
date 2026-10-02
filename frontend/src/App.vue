@@ -1230,10 +1230,25 @@ async function qSubmit() {
       await confirmPlan(card);
     } else {
       // ask / preview_gate / fallback：答案经审批续跑回喂给服务端
-      const answers = c.pages.map((p, i) => ({
-        page: i, title: p.title, answer: qAnswerOf(i),
-        key: c.answers[i] || "", custom: String(p.custom || "").trim(),
-      }));
+      //
+      // 关键守口：只提交**属于当前这道题**的 key。
+      // 真机事故：客户端拿上一题的 key 去答下一题（问时长、答的是风格），
+      // 服务端照单全收，于是同一道题被反复"答"、run 原地打转。这里逐页核对
+      // 选项清单，不属于本页的一律不提交（宁可让用户重新点，也不送脏答案）。
+      const answers = c.pages.map((p, i) => {
+        const raw = String(c.answers[i] || "");
+        const custom = String(p.custom || "").trim();
+        const belongs = (p.options || []).some((o) => String(o.key) === raw);
+        const key = belongs ? raw : "";
+        const ans = custom || (belongs ? qAnswerOf(i) : "");
+        return { page: i, title: p.title, answer: ans, key, custom };
+      });
+      const unanswered = answers.findIndex((a) => !a.answer);
+      if (unanswered >= 0) {
+        c.submitting = false;
+        c.error = `第 ${unanswered + 1} 题还没选（这题可能是刚弹出来的）——请点一个选项再提交。`;
+        return;
+      }
       const first = answers[0] || {};
       await decideApproval(c.approval, first.answer || "approve", answers);
     }
