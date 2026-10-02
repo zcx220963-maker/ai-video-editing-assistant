@@ -22,7 +22,7 @@ agent_framework/        主框架：Agent / MQ / 上下文 / 记忆 / 技能 / c
 storyline_server/       真实剪辑节点（FastMCP server，:8001）
 frontend/               Vue3 前端（构建产物 frontend/dist，由主服务直接托管）
 examples/               配置样例与技能样例
-prompts/                提示词库落盘的整段文案（系统提示 + 5 类纠错说明，改文案不必动代码，见 §3.18）
+prompts/                提示词库落盘的整段文案（系统提示 + 规划轮整段 + 子 Agent system + 5 类纠错说明，改文案不必动代码，见 §3.18）
 docs/superpowers/specs/ 设计与决策记录
 run_server.py           主服务装配（:8000）
 run_storyline.py        Storyline MCP Server 装配（:8001）
@@ -861,10 +861,10 @@ curl -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
 
 ### 3.18 提示词库（`PromptLibrary`）：整段提示文本搬出 .py
 
-`agent_framework/prompts.py`（`render_template` / `placeholders_in` / `PromptLibrary` /
-`build_prompt_library`）+ 仓库自带的 `prompts/*.md`（6 份：`system_prompt.md`、
-`step_nudge.md`、`step_note.md`、`no_card_nudge.md`、`no_card_note.md`、
-`no_card_structural_nudge.md`）。以前这些文案硬编码在 5 个 .py 里，改一句要动代码、走评审、
+`agent_framework/prompts.py`（`render_template` / `render_blocks` / `placeholders_in` /
+`PromptLibrary` / `build_prompt_library`）+ 仓库自带的 `prompts/*.md`（8 份：`system_prompt.md`、
+`planning_round.md`、`subagent_system.md`、`step_nudge.md`、`step_note.md`、`no_card_nudge.md`、
+`no_card_note.md`、`no_card_structural_nudge.md`）。以前这些文案硬编码在 5 个 .py 里，改一句要动代码、走评审、
 重新发布；`ContextBuilder` 的 `bootstrap_dir` 口子其实早就实现了，但生产装配从来没传过。
 
 * **语义**：`render_template` **只替换明确提供的键，其余原样保留**。提示词里天然写着
@@ -874,11 +874,26 @@ curl -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
 * **接线**：`build_runtime(prompts_dir=)`；`None`（默认）= 用仓库自带的 `prompts/`，
   `False` = 关闭全走内联。启动日志第 (e2) 行会明说「提示词库已接线：N 份来自 …」或
   「提示词库未接目录：使用内联默认值」——这一条是给「动态加载」做证的，以前没人能从日志判断提示词从哪来。
-* **有意不搬的**：规划轮那一段。它是几十行按条件拼装 + 中间插节点白名单与参数枚举，正确性依赖
-  代码同时维护的数据；把拼装一起搬进模板只会把「改文案」变成「改模板语言 + 调试渲染」。
-* **漂移守卫**：`tests/test_prompt_library.py`（28 项）钉 `prompts/system_prompt.md` 与
-  `DEFAULT_SYSTEM_PROMPT` 内容必须一致（只差空白）。两处各写一份文案，靠人眼比对一定会漂——
-  实测就漂过一次。
+* **规划轮整段也搬了**（2026-10-02，`prompts/planning_round.md`）。搬的边界是「措辞 + 哪一段
+  出现」，不是「谁来算数据」：模板按空行分块，块首独占一行的 `{?key}` 是**守卫**——这个键没值
+  就整块不出现；`render_blocks` 除了这条只有「渲染后为空的行不留空行」。节点白名单与可上卡开关
+  仍由代码现取（`gate.whitelist()` / `gate.knob_facts()`，与卡面校验同一份判据）插进
+  `{nodes}` / `{knobs}`。没有 if/for/嵌套——一旦要那些，就不是「改文案不必改代码」，
+  而是往仓库里塞一门模板语言。接线：`build_runtime` 把 `prompt_library` 传给 `PlanGate`，
+  `plan/prompt.py` 只备数据。
+* **子 Agent 的 system 提示词同样落盘**（`prompts/subagent_system.md`，2026-10-02）。两处坑记下来：
+  ① `SubAgentRunner.__init__` 的形参默认值原先直接写 `CHILD_SYSTEM_PROMPT`——**默认参数在 import
+  时定格**，启动期再怎么刷新模块全局都进不了构造，现在形参是 `None`、构造时现取全局；
+  ② `build_runtime` 里 `make_spawn_tool(...)` 很早就把 runner 连提示词一起构造好，所以提示词库
+  与两条 `refresh` 必须排在它之前（库的构造因此挪到了 `build_runtime` 开头）。两条都由用例钉住。
+* **漂移守卫**：`tests/test_prompt_library.py`（49 项）钉 `system_prompt.md` 与
+  `DEFAULT_SYSTEM_PROMPT`、`planning_round.md` 与内联回落模板必须一致（模板那份只允许行尾空白差）。
+  两处各写一份文案，靠人眼比对一定会漂——实测就漂过一次。
+* **逐字金样**：`tests/test_planning_prompt_golden.py`（29 项）拿**迁移之前**从旧代码逐字捕获的
+  9 条渲染结果（`tests/data/planning_round_golden.json`）比对现在的输出，内联回落与磁盘模板各跑
+  一遍、要求字符串相等——差一个空格模型行为就可能漂，这里不比「意思差不多」。另钉一条接线守卫：
+  `run_server.py` 构造 `PlanGate` 时必须真的带 `prompt_library`，防的正是「模板写了没人接」
+  这个本项目死过一次的模式。
 
 ### 3.19 装配期一致性检查：点名的工具必须真的存在
 
@@ -994,9 +1009,9 @@ python -m pytest -q                              # 全量：一条命令收完 t
 python tests/test_approval_gate.py               # 单文件直跑（exit code 判定，便于反复调一个用例）
 ```
 
-当前规模：`tests/test_*.py` **58 份脚本**，`python -m pytest` 收出 58 个用例
-（2026-10-02 全量复跑 58/58 绿；注意 `pytest.ini` 的 `addopts` 里已经有一个 `-q`，
-命令行再带 `-q` 会变成 `-qq`，末尾那行 `58 passed in …` 就不打印了，判据看 exit code 与点数）。
+当前规模：`tests/test_*.py` **59 份脚本**，`python -m pytest` 收出 59 个用例
+（2026-10-02 全量复跑 59/59 绿；注意 `pytest.ini` 的 `addopts` 里已经有一个 `-q`，
+命令行再带 `-q` 会变成 `-qq`，末尾那行 `59 passed in …` 就不打印了，判据看 exit code 与点数）。
 
 **`tests/` 里每份文件都是自带 `asyncio.run(main())` 的独立脚本，一个真 pytest 用例也没有**。
 `pytest.ini` 写着 `testpaths = tests`，直接收集会把脚本里的 `async def` 判成「缺异步插件」、
@@ -1064,6 +1079,12 @@ MCP `title`、技能 frontmatter `display`，以及规划轮那张独立注册�
 god file、依赖方向（底层不引上层、装配层不被任何运行期引用，只为形参标注引 PlanGate 不算环）、
 对外名字一个都不缺且仍只从 `agent_framework.plan` 取、`_drive` 保持骨架且六块具名助手在位、
 跨挂起的事实不再退回 `ctx.extras` 的约定键）、
+`test_prompt_library.py`（49 项，提示词库的读盘 / 占位符 / 块守卫 / 回落 / 热替换、
+「内联回落与磁盘文件必须一致」的漂移守卫（系统提示 + 规划轮模板 + 子 Agent），
+外加「库与 refresh 必须排在 `make_spawn_tool` 之前」那条接线守卫——两份文案各写一处迟早会漂）、
+`test_planning_prompt_golden.py`（29 项，规划轮段搬进模板**之前**逐字捕获的 9 条渲染金样，
+内联回落与磁盘模板各比对一遍并要求字符串相等，另钉「`run_server` 真的把 `prompt_library`
+传进了 `PlanGate`」——金样全绿也可能意味着磁盘那份从来没被读过）、
 `test_render_watchdog.py`（§3.10 的停滞看门狗：无进展收口、慢渲染不误杀、`stall_sec=0` 不建循环）、
 `test_hooks.py`（21 项，除生命周期接线外钉住「`result` 截到 600 字后帧上的 `render` 视图仍完整」）。
 
