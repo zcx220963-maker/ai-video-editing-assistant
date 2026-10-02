@@ -998,12 +998,14 @@ class JobsRepo(_Repo):
                         new_state: Mapping[str, Any],
                         enabled: bool = True) -> dict[str, Any] | None:
         """比较-交换领取：state 没被别人动过才写入新一轮时间，赢家独占这一轮执行。"""
-        rows = await self.db.claim(
+        # 与 memories.append 同理：CAS 要用条件 UPDATE。claim 的 SKIP LOCKED 会把
+        # 「行正被别人写」也报成「我没领到」，于是别人只是改了个无关字段（比如在页面
+        # 上勾掉 enabled）就能悄悄吃掉这一轮。
+        rows = await self.db.update(
             self.table,
             {"state": dict(new_state), "enabled": enabled, "updated_at": _now()},
             where=[Cond("id", "eq", job_id), Cond("enabled", "eq", True),
                    Cond("state", "eq", dict(expect_state))],
-            limit=1,
         )
         return rows[0] if rows else None
 
@@ -1020,12 +1022,17 @@ class MemoriesRepo(_Repo):
                                           "content": content, "updated_at": _now()})
 
     async def append(self, user_id: str, category: str, block: str, *,
-                     retries: int = 8) -> str:
+                     retries: int = 16) -> str:
         """比较-交换追加：只有旧内容没被别人改过才写入合并结果，改过就重读重试。
 
         曾经的写法是 read → 拼接 → 全量覆盖，两个进程同时追加时后者冲掉前者，
         即 spec 附带缺陷清单里的「记忆 append 丢更新」。追加不丢是本表的底线，
         所以宁可在重试耗尽后抛错，也不静默写回一份旧内容。
+
+        重试预算为什么按并发数而不是按运气算：CAS 失败**必然**意味着别人真的改了内容
+        （不是「行被人锁住」那种假失败），所以每一轮都在往前走，一个写者需要的轮数
+        约等于同 ``(user_id, category)`` 上的并发写者数。8 在十几个并发会话下会
+        真的耗尽，故给 16。
         """
         for _ in range(retries):
             row = await self.db.get_by_pk(self.table, {"user_id": user_id,
@@ -1038,11 +1045,17 @@ class MemoriesRepo(_Repo):
                     continue          # 并发里别人刚建了同一行：下一轮改走 CAS
                 return block
             merged = f"{row['content']}\n{block}".strip()
-            won = await self.db.claim(
+            # 比较-交换必须用**条件 UPDATE**，不能用 claim。
+            # 为什么：PG 的 claim 是 FOR UPDATE SKIP LOCKED——它专为「多个 worker
+            # 抢不同行」设计，遇到被别人锁住的行会**跳过**而不是等。用在 CAS 上就变成
+            # 「行只是被别人锁住」也被当成「我输了这一轮」，于是并发追加会互相跳过、
+            # 8 次重试全数白烧（真机复现：5 路并发 gather 抛 IntegrityConflict，约 2/3 次）。
+            # 条件 UPDATE 会先在行锁上等住，拿到锁后按新快照重算 WHERE：内容真被改过
+            # 才返回 0 行——这才是 CAS 要的判据。
+            won = await self.db.update(
                 self.table, {"content": merged, "updated_at": _now()},
                 where=[Cond("user_id", "eq", user_id), Cond("category", "eq", category),
-                       Cond("content", "eq", row["content"])],
-                limit=1)
+                       Cond("content", "eq", row["content"])])
             if won:
                 return merged
         raise IntegrityConflict(

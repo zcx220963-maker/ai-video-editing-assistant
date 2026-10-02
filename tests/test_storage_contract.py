@@ -334,11 +334,17 @@ async def case_checkpoint_and_memory(s, tmp: Path) -> None:
     check((await s.memories.read(uid, "user")) == "偏好短镜头\n爱用空镜", "记忆追加")
     check((await s.memories.read(uid, "tool")) == "", "未写过的分类读空串")
 
-    # 并发追加：首建行 + 后续比较-交换，一条都不许丢（spec 缺陷清单「记忆 append 丢更新」）
-    await asyncio.gather(*(s.memories.append(uid, "tool", f"第{i}条") for i in range(5)))
+    # 并发追加：首建行 + 后续比较-交换，一条都不许丢（spec 缺陷清单「记忆 append 丢更新」）。
+    # 12 路而不是 5 路：旧实现用 claim 做 CAS，而 PG 的 claim 是 SKIP LOCKED——
+    # 「行正被别人锁住」也被算成一次失败，并发一高就把重试预算全白烧掉（真机复现：
+    # 5 路里约 2/3 次直接抛 IntegrityConflict，12 路必炸）。
+    results = await asyncio.gather(*(s.memories.append(uid, "tool", f"第{i}条")
+                                     for i in range(12)), return_exceptions=True)
+    errs = [r for r in results if isinstance(r, BaseException)]
+    check(not errs, f"12 路并发追加没有一路抛错（抛了 {len(errs)} 路：{errs[:1]}）")
     tool_txt = await s.memories.read(uid, "tool")
-    check(all(f"第{i}条" in tool_txt for i in range(5)), "5 路并发追加一条不丢")
-    check(len(tool_txt.splitlines()) == 5, "并发追加没有重复也没有半条")
+    check(all(f"第{i}条" in tool_txt for i in range(12)), "12 路并发追加一条不丢")
+    check(len(tool_txt.splitlines()) == 12, "并发追加没有重复也没有半条")
 
     check(await s.memories.drop_category(uid, "user") == 1
           and set(await s.memories.entries(uid)) == {"tool"}, "按分类删除")
