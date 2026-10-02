@@ -921,15 +921,54 @@ def _build_original_timeline(clips_groups, rough, media_by_id, bgm_path, bgm_vol
             "start": float(r["start"]),
         })
     events: list[dict[str, Any]] = []
+    # 口播段在**墙壁时间**上的映射：(墙起, 墙止, 源起, 源止, 素材路径)。
+    #
+    # 为什么必须有它：出镜画面取哪个源时刻，**不能**由「第几个出镜片段」决定，
+    # 只能由「这个墙壁时刻声音正在播源片的哪一秒」决定。
+    # 真机事故（用户原话「回到邓紫棋的画面的时候音画不同步啊」）：
+    # 原实现 `c = speaker_clips[si % len(...)]` 后直接用它自己的 `start` 当 src_start，
+    # 而出镜段的序号 si 只在用到出镜时才自增，与口播段落序号根本不同步，
+    # 于是画面源时刻一路漂——实测同一墙壁窗 16.84~40.36 上，
+    # 声音播原片 201.99~225.51、画面却取 197.92~221.44，**错了 4.07 秒**（口型对不上）。
+    speech_spans: list[tuple[float, float, float, float, str]] = []
+    _w = 0.0
+    for r in rough:
+        m = media_by_id.get(r["clip"])
+        if m is None:
+            continue
+        _dur = max(0.2, float(r["end"]) - float(r["start"]))
+        speech_spans.append((_w, _w + _dur, float(r["start"]), float(r["end"]),
+                             m["path"]))
+        _w += _dur
+
+    def _speech_at(wall: float) -> tuple[float, float, str] | None:
+        """墙壁时刻 → （该刻正在播的源时刻, 本口播段的墙止, 素材路径）。"""
+        for w0, w1, s0, _s1, path in speech_spans:
+            if w0 <= wall < w1:
+                return s0 + (wall - w0), w1, path
+        return None
+
     t = 0.0
-    bi, si = 0, 0
+    bi = 0
     speaker_dur = 0.0
     while t < total - 0.05 and (broll or speaker_clips):
         use_speaker = bool(speaker_clips) and speaker_dur < speaker_ratio * (t + 0.5)
+        hit = _speech_at(t) if use_speaker else None
+        if hit is None:
+            use_speaker = False
         if use_speaker:
-            c = speaker_clips[si % len(speaker_clips)]
-            si += 1
-        elif broll:
+            # 出镜段：画面取自**与声音同一个源时刻**，并只播到本口播段结束
+            # （跨段就会把下一句的画面提前放出来，口型又对不上）。
+            src_s, span_end, src_path = hit
+            seg_end = min(total, span_end)
+            events.append({"path": src_path, "start": round(t, 3),
+                           "end": round(seg_end, 3),
+                           "src_start": round(src_s, 3),
+                           "src_end": round(src_s + max(0.0, seg_end - t), 3)})
+            speaker_dur += seg_end - t
+            t = seg_end
+            continue
+        if broll:
             c = broll[bi % len(broll)]
             bi += 1
         else:
@@ -938,8 +977,6 @@ def _build_original_timeline(clips_groups, rough, media_by_id, bgm_path, bgm_vol
         src_s = float(c.get("start", 0.0))
         events.append({"path": c["path"], "start": round(t, 3), "end": round(seg_end, 3),
                        "src_start": round(src_s, 3), "src_end": round(src_s + seg_end - t, 3)})
-        if use_speaker:
-            speaker_dur += seg_end - t
         t = seg_end
     ref = broll[0] if broll else (speaker_clips[0] if speaker_clips else {})
     return {
