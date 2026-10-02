@@ -298,6 +298,89 @@ async def case_g_ask_user_no_duplicate_result() -> None:
     await storage.close()
 
 
+async def case_h_ask_answer_enters_as_user() -> None:
+    """⑨ 主动提问续跑：用户那句答案必须以 **user 角色**进链。
+
+    为什么专门钉，且为什么⑧那样的断言不够：ask_user 的回执（「问题已发给用户，
+    本轮到此为止」）在挂起**之前**就写好了，续跑时 ``_settle_pending`` 发现
+    「这批调用都已有回执」，原先两条分支在这个前提下都不写入任何东西 ——
+    模型于是永远等不到答案，只能一遍遍重问同一道题（真机实测：连问 6 题，
+    第 6 题还在重问第 1 题）。⑧ 里那句「'60' 在链上」旧实现也能过，
+    因为回执文本自身就带着选项里的「60 秒」。所以这里按**角色**判：
+    要的是新出现的那条 role=user，不是 tool 回执里的字符串。
+    """
+    print("\n=== ⑨ 提问续跑：用户答案以 user 角色进链（旧实现丢答案 → 无限重问）===")
+    storage = build_storage("memory")
+    await storage.start()
+    reg = ToolRegistry()
+    reg.register(AskUserTool())
+    runner, mgr = _build(reg, [
+        ("tool", "ask_user", {"title": "要多长？", "options": [
+            {"key": "s60", "label": "60 秒", "recommended": True},
+            {"key": "s90", "label": "90 秒"}]}),
+        ("answer", "好，按 60 秒来做"),
+    ], storage)
+    sess = Session(user_id="u", conversation_id="c_appr_h")
+    out = await runner.run(sess, "帮我剪一条", run_id="run-h")
+    check(out == _APPROVAL_PAUSE_ANSWER, f"⑨ 提问后挂起：{out}")
+    cp = await mgr.pending_approval("run-h")
+    check(cp is not None, "⑨ 挂起 checkpoint 存在")
+
+    before = len((await mgr.load("run-h")).messages or [])
+    await runner.approve(cp, sess, decision="s60", note="60 秒左右")
+
+    # 续跑那一轮 LLM 真正看到的消息里必须有那句答案（模型侧生效，不只是落库）
+    seen = runner.llm.calls[-1]
+    got = [m for m in seen if m.get("role") == "user"
+           and "60 秒左右" in str(m.get("content") or "")]
+    check(len(got) == 1, f"⑨ 续跑时模型看到 user 角色的答案：{len(got)} 条")
+
+    done = await mgr.load("run-h")
+    saved = [m for m in (done.messages or []) if m.get("role") == "user"
+             and "60 秒左右" in str(m.get("content") or "")]
+    check(len(saved) == 1, f"⑨ 答案进了 checkpoint 消息链：{len(saved)} 条")
+    check(len(done.messages or []) == before + 2,
+          f"⑨ 只多了一条 user + 一条 assistant（没重复补回执）："
+          f"{before} → {len(done.messages or [])}")
+    await storage.close()
+
+
+async def case_i_no_false_nudge_on_resume() -> None:
+    """⑩ 从提问断点续跑后，不该再吃一条「你没有调用 ask_user」的假打回。
+
+    为什么专门钉：ask_gate 的判据是「本轮没调过 ask_user + 收尾文本像在提问」。
+    续跑开的是**新的** ``_drive``，``asked_this_run`` 从 False 起步，而这条 run
+    明明就是被 ask_user 弹出去的。真机的 checkpoint 链里每个偶数 seq 都是一条
+    这种 system 打回——模型确实调过工具，却被服务端反复指责「没用弹窗」。
+    """
+    print("\n=== ⑩ 提问续跑：不再注入「你没调用 ask_user」的假打回 ===")
+    storage = build_storage("memory")
+    await storage.start()
+    reg = ToolRegistry()
+    reg.register(AskUserTool())
+    runner, mgr = _build(reg, [
+        ("tool", "ask_user", {"title": "要多长？", "options": [
+            {"key": "s60", "label": "60 秒", "recommended": True},
+            {"key": "s90", "label": "90 秒"}]}),
+        # 续跑后模型先顺着答一句、但文本里带着提问措辞：这不该被判成「提问却没弹窗」
+        ("answer", "好，那你想用哪种风格？"),
+        ("answer", "高光金句版做完了"),
+    ], storage)
+    sess = Session(user_id="u", conversation_id="c_appr_i")
+    await runner.run(sess, "帮我剪一条", run_id="run-i")
+    cp = await mgr.pending_approval("run-i")
+    check(cp is not None, "⑩ 提问后确实挂起了")
+
+    out2 = await runner.approve(cp, sess, decision="s60", note="60 秒左右")
+    check(out2 == "好，那你想用哪种风格？", f"⑩ 续跑后的答复直接交付，没被打回：{out2}")
+    check(len(runner.llm.calls) == 2,
+          f"⑩ 续跑只问了一次 LLM（被打回会变成两次）：{len(runner.llm.calls)} 次")
+    nudges = [m for call in runner.llm.calls for m in call
+              if m.get("role") == "system" and "没有调用 ask_user" in str(m.get("content") or "")]
+    check(not nudges, f"⑩ 没有假打回注入：{len(nudges)} 条")
+    await storage.close()
+
+
 async def main() -> int:
     await case_a_approve_continues()
     await case_b_reject_skips()
@@ -306,6 +389,8 @@ async def main() -> int:
     await case_e_confirm_executes_pending()
     await case_f_repair_keeps_pending()
     await case_g_ask_user_no_duplicate_result()
+    await case_h_ask_answer_enters_as_user()
+    await case_i_no_false_nudge_on_resume()
     print("\n" + ("SMOKE PASSED" if not FAILS else f"SMOKE FAILED：{FAILS}"), flush=True)
     print(f"用例 {CHECKS} 条", flush=True)
     return 0 if not FAILS else 1

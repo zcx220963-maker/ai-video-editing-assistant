@@ -464,6 +464,9 @@ class AgentOnceRun:
         # 反例（真机实测）：模型调 ask_user 提问 → 循环挂起并把「已暂停等你选择」写成终答 →
         # 那句解释里带着「本轮不可用，你希望怎么处理」的措辞，会被判据认成「在提问却没调
         # ask_user」，于是又逼它问一遍，用户看到两张一模一样的卡。
+        # 从提问断点续跑时这里靠 _settle_pending 的返回值补回来：本轮确实是 ask_user
+        # 弹的卡，不能因为「这次 _drive 还没调过」就判它没用弹窗（真机实测：续跑的每一轮
+        # 都吃一条「但你没有调用 ask_user」的假打回）。
         asked_this_run = False
         qa_parts: list[dict] = []  # 本轮 think / tool call 片段（QA .jsonl 历史用）
         # 首条记 prompt 指纹：eval 回归据此把结果归到具体版本的 prompt。
@@ -475,8 +478,8 @@ class AgentOnceRun:
                 while iteration < self.config.max_iterations:
                     # HITL：从审批断点续跑——先把挂起的那批 tool_calls 按用户决策收口。
                     if approval_decision is not None:
-                        await self._settle_pending(ctx, cp, reg, approval_decision,
-                                                   approval_note)
+                        asked_this_run |= await self._settle_pending(
+                            ctx, cp, reg, approval_decision, approval_note)
                         approval_decision = None
                         approval_note = ""
                         iteration += 1
@@ -798,7 +801,7 @@ class AgentOnceRun:
     async def _settle_pending(
         self, ctx: AgentHookContext, cp: Checkpoint | None, reg: ToolRegistry,
         decision: str, note: str = "",
-    ) -> None:
+    ) -> bool:
         """把挂起的那批 tool_calls 按用户决策收口（批准=执行，拒绝=回喂拒绝结果）。
 
         恢复路径专用：挂起时 messages 末尾已是 assistant(tool_calls)，这里只补它的
@@ -813,7 +816,7 @@ class AgentOnceRun:
         正是这套弹窗必须留的一条路，所以必须传到底。
         """
         if cp is None:
-            return
+            return False
         approval = cp.approval or {}
         pending = list(approval.get("pending_calls") or [])
         fallback_options = approval.get("fallback_options") or []
@@ -830,6 +833,9 @@ class AgentOnceRun:
         # · 其余（要改 / 自定义 / 未识别）→ 回喂用户原话，让模型重做编排，
         #   绝不执行（render_video 就在这批里，跑掉就等于没确认就渲了）。
         if asked is not None and not fallback_options:
+            # 这批调用里有没有 ask_user。渲染确认门也走这一分支（它同样带 ask 结构），
+            # 但只有 ask_user 那一路才是「本轮已经问过」的证据。
+            asked_now = any(tc.name == "ask_user" for tc in calls)
             # 只给「还没有回执」的那几条补结果。
             #
             # 为什么必须查重：主动提问那一路（ask_user）在挂起**之前**就已经执行过了，
@@ -839,31 +845,42 @@ class AgentOnceRun:
             already = {m.get("tool_call_id") for m in ctx.messages
                        if isinstance(m, dict) and m.get("role") == "tool"}
             remaining = [tc for tc in calls if tc.id not in already]
+            if not remaining:
+                # 这批调用全都已经有回执了——主动提问那一路正是这样：ask_user 在挂起
+                # 之前就执行完，回执（「问题已发给用户，本轮到此为止」）已经在链里。
+                # 这时必须把用户点选/写的那句话以 user 角色补进去。原先两条分支在
+                # remaining 为空时都不写入任何东西（确认类只记一个渲染标记就 return，
+                # 非确认类的补写被 `if remaining:` 挡住），于是模型永远只看到
+                # 「问题已发给用户」而等不到答案，只能一遍遍重问同一道题
+                # （真机实测：连问 6 题，第 6 题还在重问第 1 题）。
+                text = note or decision_text(decision, "")
+                if text:
+                    ctx.messages.append(user(text))
+                return asked_now
             if decision_is_confirm(decision) and calls:
                 # 记下「这条 run 的渲染已确认」：之后再出现渲染调用不再拦。
                 self._render_confirmed.add(str(cp.run_id or ""))
-                if remaining:
-                    await self._execute_tool_calls(ctx, remaining, reg)
-                return
+                await self._execute_tool_calls(ctx, remaining, reg)
+                return asked_now
             text = note or decision_text(decision, "")
-            if remaining:
-                for tc in remaining:
-                    ctx.messages.append(tool_result(tc.id, tc.name, text))
-                await self.hooks.after_execute_tools(ctx)
-            return
+            for tc in remaining:
+                ctx.messages.append(tool_result(tc.id, tc.name, text))
+            await self.hooks.after_execute_tools(ctx)
+            return asked_now
         if fallback_options and decision in {o.get("key") for o in fallback_options}:
             calls = [ToolCall(id=tc.id, name=tc.name,
                               arguments={**tc.arguments, "render_mode": decision})
                      for tc in calls]
             await self._execute_tool_calls(ctx, calls, reg)
-            return
+            return False
         if decision == "approve":
             await self._execute_tool_calls(ctx, calls, reg)
-            return
+            return False
         for tc in calls:
             ctx.messages.append(tool_result(
                 tc.id, tc.name, ToolError(tc.name, _APPROVAL_DECISION_TEXT["reject"])))
         await self.hooks.after_execute_tools(ctx)
+        return False
 
     async def _execute_tool_calls(
         self, ctx: AgentHookContext, tool_calls: list[ToolCall],
