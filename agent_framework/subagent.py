@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from .agent import AgentConfig, AgentOnceRun
 from .context import ContextBuilder
@@ -22,7 +22,11 @@ from .tool import Tool, ToolRegistry
 # 子 Agent 工具装配器：往传入的 registry 里注册一批工具（不含 spawn）。
 ToolRegistrar = Callable[[ToolRegistry], None]
 
-CHILD_SYSTEM_PROMPT = (
+# 子 Agent 的 system 提示词也搬进了提示词库（2026-10-02，`prompts/subagent_system.md`）：
+# 这里是**逐字相同的内联回落**，两份漂了由 tests/test_prompt_library.py 守卫。
+SUBAGENT_PROMPT_FILE = "subagent_system.md"
+
+_CHILD_SYSTEM_PROMPT_DEFAULT = (
     "你是被主 Agent 派生出来的子 Agent，负责专注完成下面这个子任务并给出简洁结论。"
     "无论任何情况，你必须始终用简体中文思考和回复。"
     "你在调用工具前对步骤的任何说明文字，也必须是简体中文，绝不允许输出英文句子——"
@@ -31,6 +35,15 @@ CHILD_SYSTEM_PROMPT = (
     "不要盲目改参数反复重试同一工具。"
     "不要偏离任务、不要再派生子任务。"
 )
+CHILD_SYSTEM_PROMPT = _CHILD_SYSTEM_PROMPT_DEFAULT
+
+
+def refresh_subagent_prompt(library: Any) -> None:
+    """按提示词库刷新子 Agent 的 system 提示词（就地改模块全局）。"""
+    if library is None:
+        return
+    global CHILD_SYSTEM_PROMPT
+    CHILD_SYSTEM_PROMPT = library.text(SUBAGENT_PROMPT_FILE, CHILD_SYSTEM_PROMPT)
 
 
 class SubAgentRunner:
@@ -42,14 +55,18 @@ class SubAgentRunner:
         child_tool_registrars: list[ToolRegistrar],
         *,
         max_iterations: int = 6,
-        child_system_prompt: str = CHILD_SYSTEM_PROMPT,
+        child_system_prompt: str | None = None,
         hooks: AgentHook | None = None,
         trace_mq: MessageQueue | None = None,
     ) -> None:
         self.llm = llm
         self._registrars = list(child_tool_registrars)
         self.config = AgentConfig(max_iterations=max_iterations)
-        self.child_system_prompt = child_system_prompt
+        # None = 取模块全局（启动时 refresh_subagent_prompt 可能已换成磁盘版本）。
+        # 形参默认值不能直接写 CHILD_SYSTEM_PROMPT：那会在 import 时定格成内联那份，
+        # 磁盘上的版本永远读不到——正是本项目死过一次的那个「写了但没人接」。
+        self.child_system_prompt = (child_system_prompt if child_system_prompt is not None
+                                    else CHILD_SYSTEM_PROMPT)
         self._trace_hook = ToolTraceHook(trace_mq) if trace_mq else None
         if self._trace_hook:
             base = hooks or CompositeHook([])

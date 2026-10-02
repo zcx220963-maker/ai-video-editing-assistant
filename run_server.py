@@ -52,7 +52,7 @@ from agent_framework.agent import Agent, AgentConfig
 from agent_framework.broadcast import OUTBOUND_CHANNEL
 from agent_framework.checkpoint import CheckpointManager
 from agent_framework.compress import ContextCompressor, make_llm_summarizer
-from agent_framework.context import ContextBuilder, DEFAULT_SYSTEM_PROMPT
+from agent_framework.context import ContextBuilder
 from agent_framework.prompts import build_prompt_library
 from agent_framework.agent import _refresh_prompt_texts as refresh_prompt_texts
 from agent_framework.ask_user import AskUserTool
@@ -81,7 +81,7 @@ from agent_framework.skill import (
     SkillManifestContextSource,
     register_skill_tools,
 )
-from agent_framework.subagent import make_spawn_tool
+from agent_framework.subagent import make_spawn_tool, refresh_subagent_prompt
 from agent_framework.team_tools import Team, register_team_tools
 from agent_framework.tool import ToolRegistry
 from agent_framework.tools.cron import CronScheduler, register_cron_tools
@@ -289,6 +289,20 @@ def build_runtime(
 ) -> Runtime:
     llm = llm or get_default_llm()
     instance_id = instance_id or _default_instance_id()
+
+    # 提示词库：默认接仓库自带的 prompts/（存在就用），所以「提示词搬出 .py」
+    # 默认生效，而不是又一个要记得打开的开关——Bootstrap 机制当年就是死在
+    # 「写了但没人接」上（bootstrap_dir 一直没传）。System prompt、规划轮整段、
+    # 子 Agent 的 system、几条纠错说明都从这里读；文件缺失则逐段回落到内联默认值。
+    # **必须排在所有消费者之前**：下面的 make_spawn_tool 会把子 Agent 提示词
+    # 在构造时就固化进 SubAgentRunner，PlanGate 也要拿这份引用——晚一步就变成
+    # 「磁盘上有一份、跑的永远是内联那份」。
+    prompt_library = build_prompt_library(False if prompts_dir is False else prompts_dir)
+    # 让 agent.py 里的纠错提示也换成磁盘版本（内联那几段是回落值）
+    refresh_prompt_texts(prompt_library)
+    # 子 Agent 的 system 提示词同理（CHILD_SYSTEM_PROMPT 那份内联是回落值）
+    refresh_subagent_prompt(prompt_library)
+
     mq = build_message_queue(mq_backend, bootstrap_servers=bootstrap_servers)
     if storage is None:
         inject = {"cache_root": cache_root, "workspace_root": workspace_root}
@@ -346,6 +360,7 @@ def build_runtime(
         skills=plan_skill_source(skill_loader),
         extra_options=bgm_enum_source(storage),
         catalog=get_catalog(),
+        prompt_library=prompt_library,
     )
 
     # ---- 分级上下文压缩（默认开启：折叠工具结果 → 淘汰 → LLM 摘要；<=0 显式关闭）----
@@ -353,14 +368,6 @@ def build_runtime(
     budget = max_context_tokens if max_context_tokens is not None else DEFAULT_MAX_CONTEXT_TOKENS
     if budget > 0:
         compressor = ContextCompressor(budget, summarizer=make_llm_summarizer(llm))
-
-    # 提示词库：默认接仓库自带的 prompts/（存在就用），所以「提示词搬出 .py」
-    # 默认生效，而不是又一个要记得打开的开关——Bootstrap 机制当年就是死在
-    # 「写了但没人接」上（bootstrap_dir 一直没传）。System prompt 与几条纠错说明
-    # 都从这里读；文件缺失则逐段回落到内联默认值，行为不变。
-    prompt_library = build_prompt_library(False if prompts_dir is False else prompts_dir)
-    # 让 agent.py 里的纠错提示也换成磁盘版本（内联那几段是回落值）
-    refresh_prompt_texts(prompt_library)
 
     context_builder = ContextBuilder(
         None,                       # None = 按提示词库解析；显式字符串仍可覆盖
@@ -573,9 +580,9 @@ def build_runtime(
             if prompt_library is not None and prompt_library.loaded_from_disk():
                 files = prompt_library.loaded_from_disk()
                 _info(f"提示词库已接线：{len(files)} 份来自 {prompt_library.dir}"
-                      f"（系统提示 + 纠错说明，改文案不必动代码）")
+                      f"（系统提示 + 规划轮段 + 子 Agent + 纠错说明，改文案不必动代码）")
             else:
-                _warn("提示词库未接目录：系统提示与纠错说明使用内联默认值"
+                _warn("提示词库未接目录：系统提示、规划轮段、子 Agent 与纠错说明都用内联默认值"
                       "（把 prompts/*.md 放好即可生效）")
         except Exception as exc:  # noqa: BLE001
             _warn(f"提示词库状态未知（忽略）：{exc}")

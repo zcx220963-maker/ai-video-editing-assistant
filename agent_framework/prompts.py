@@ -6,12 +6,13 @@
 `ContextBuilder` 其实早就实现了读磁盘的 Bootstrap 机制（``bootstrap_dir``），
 但生产装配里那个参数从来没传过——那个口子一直空着。
 
-**这一层的边界（有意为之）。** 只搬「整段、可独立成文的自然语言」：
-系统提示词与几条纠错说明。**不搬**那些与代码结构强耦合的模板：
-规划轮段是几十行按条件拼装 + 中间插节点白名单与参数事实，
-它的正确性依赖代码同时维护的数据（白名单、开关枚举），
-把拼装逻辑一起搬到模板里只会把「改文案」变成「改模板语言 + 调试渲染」。
-先让「改一句话」这件事不再需要改代码，是这一步的目的。
+**这一层的边界（有意为之）。** 搬「整段、可独立成文的自然语言」：系统提示词、
+几条纠错说明、规划轮整段（``planning_round.md``，2026-10-02 落盘）。规划轮段里的
+条件也一起搬了，但只搬到**块级开关**这一层：模板用空行分块，块首单独一行的
+``{?key}`` 表示「这个键没值就整块不出现」。数据仍然由代码算（节点白名单、开关枚举
+都是服务端现取的判据），模板只管措辞与出现与否。
+不再多加 if/for/嵌套：一旦要那些，就不是「改文案不必改代码」，而是往仓库里塞一门
+模板语言、把调试成本从评审换到了渲染。
 
 替换语义（与 ``str.format_map`` 不同）：**只替换我明确提供的键，其余原样保留**。
 提示词里天然会写 ``{"plans": [...]}``、``{clip, start, end}`` 这类 JSON 片段，
@@ -25,6 +26,12 @@ from typing import Any, Mapping
 
 # 允许在提示词文件里写的占位符形态：{name} / {name:spec}，name 限定为标识符。
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)(?::[^{}]*)?\}")
+
+# 块守卫：单独成行的 {?name}——这个键没有值时**整块不出现**。
+_BLOCK_GUARD = re.compile(r"^\{\?([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+# 块分隔：一行空白（含只有空格的情况）。
+_BLOCK_SEP = re.compile(r"\n[ \t]*\n")
 
 # 仓库自带的提示词目录（随包分发，作为默认来源）
 DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -50,8 +57,55 @@ def render_template(text: str, values: Mapping[str, Any]) -> str:
 
 
 def placeholders_in(text: str) -> set[str]:
-    """列出文本里出现的占位符名（自检用：确认模板需要的键都提供了）。"""
-    return {m.group(1) for m in _PLACEHOLDER.finditer(text or "")}
+    """列出文本需要的键名（自检用：确认模板要的键都提供了）。
+
+    含两种形态：普通占位符 ``{key}`` 与块守卫 ``{?key}``——后者也是一次取值，
+    漏传了不会报错，只会让整段文案静默消失，所以更要能被列出来检查。
+    """
+    keys = {m.group(1) for m in _PLACEHOLDER.finditer(text or "")}
+    for line in (text or "").splitlines():
+        m = _BLOCK_GUARD.match(line.strip())
+        if m:
+            keys.add(m.group(1))
+    return keys
+
+
+def _present(value: Any) -> bool:
+    """守卫键的「有值」判据：空白串 / None / 空集合 / False 都算没有。
+
+    数字 0 也算没有——契约里守卫键只放文本或布尔，不放计数。
+    """
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
+def render_blocks(text: str, values: Mapping[str, Any]) -> str:
+    """按**空行分块**渲染带条件段的提示词。
+
+    两条规则，没有第三条：
+      1. 块首单独一行的 ``{?key}`` 是守卫——``values[key]`` 没有值时整块不出现；
+         有值时去掉这一行，其余照常渲染。
+      2. 块内某行渲染后为空（它本来只有 ``{data}`` 而这次没数据）→ 这一行丢掉，不留空行。
+
+    为什么只要这两条：规划轮那种「几十行按条件拼装」的文案，条件与数据是同一件事
+    （有旧卡才提旧卡，有反馈原话才提反馈）。搬进模板只需要**块级开关**，不需要 if/for/
+    嵌套——一旦要那些，就不是「改文案不必改代码」而是往仓库里塞一门模板语言了。
+
+    先按空行切块、再替换，因此值里自带的空行不会被重新解释成块边界。
+    """
+    out: list[str] = []
+    for block in _BLOCK_SEP.split(text or ""):
+        lines = block.split("\n")
+        guard = _BLOCK_GUARD.match(lines[0].strip()) if lines else None
+        if guard:
+            if not _present(values.get(guard.group(1))):
+                continue
+            lines = lines[1:]
+        kept = [r for r in (render_template(ln, values) for ln in lines) if r.strip()]
+        if kept:
+            out.append("\n".join(kept))
+    return "\n".join(out)
 
 
 class PromptLibrary:
@@ -103,6 +157,12 @@ class PromptLibrary:
         raw = self._read(name)
         body = raw if raw is not None and raw.strip() else fallback
         return render_template(body, values)
+
+    def blocks(self, name: str, fallback: str = "", **values: Any) -> str:
+        """同 ``text``，但按 ``render_blocks`` 的块规则渲染（条件段住在模板里）。"""
+        raw = self._read(name)
+        body = raw if raw is not None and raw.strip() else fallback
+        return render_blocks(body, values)
 
     def system_prompt(self, fallback: str) -> str:
         return self.text(self.main_filename, fallback)

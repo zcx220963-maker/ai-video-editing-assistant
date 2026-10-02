@@ -7,7 +7,8 @@
 * ``validate.PlanValidator`` —— ①~④ 四重校验（node / 拓扑与依赖 / skills_hint / param_options）
 * ``compile.PlanCompiler`` —— ⑤ 确认帧编译（选中版本 + 参数终值 + 跳过 + 自定义诉求）
 * ``tools`` —— 模型侧的 ``submit_plan`` / ``confirm_plan``
-* ``prompt`` —— 中文长文案（两段分离注入、规划轮 system 段、同会话历史段）
+* ``prompt`` —— 执行轮的两段分离注入与同会话历史段；规划轮 system 段的**措辞**在
+  ``prompts/planning_round.md``，这里只备它要插的数据
 * ``reconcile`` —— 事后对账与两个钩子
 * ``wording`` —— 假称判据的措辞正则
 * ``skills`` —— 技能预注入
@@ -17,7 +18,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Sequence
 
 from ..catalog import ToolCatalog
 from ..editing_contract import ContractSlot, EditingContract
@@ -27,6 +28,9 @@ from .support import PlanIssues
 from .validate import PlanValidator
 from .vocab import PlanVocabulary
 
+if TYPE_CHECKING:
+    from ..prompts import PromptLibrary
+
 
 class PlanGate:
     """计划的服务端四重校验 + execute 帧校验（纯代码，无 LLM）。
@@ -34,7 +38,9 @@ class PlanGate:
     本身不持任何判据，只做装配与转发。依赖全部**现取**（注册表与契约要到启动后才填齐，
     构造时只握引用）：``contract`` 给依赖边与下游集，``registry`` 给节点参数枚举源，
     ``skills`` 给技能可用性，``extra_options`` 给不在 schema 里的真实枚举
-    （生产里是 BGM 曲库的实际标签），``catalog`` 给词表以判「臆造别名」。
+    （生产里是 BGM 曲库的实际标签），``catalog`` 给词表以判「臆造别名」，
+    ``prompt_library`` 给规划轮文案的磁盘版本（``prompt.planning_section`` 是它唯一的消费者；
+    没接就用内联回落，提示词目录不在也不该让规划轮拼不出提示）。
     """
 
     def __init__(self, *,
@@ -42,11 +48,15 @@ class PlanGate:
                  contract: ContractSlot | EditingContract | None = None,
                  skills: Callable[[], Awaitable[Mapping[str, Any]]] | None = None,
                  extra_options: Callable[[str, str], Awaitable[Sequence[str]]] | None = None,
-                 catalog: ToolCatalog | None = None) -> None:
+                 catalog: ToolCatalog | None = None,
+                 prompt_library: "PromptLibrary | None" = None) -> None:
         self.vocab = PlanVocabulary(registry=registry, contract=contract,
                                     extra_options=extra_options, catalog=catalog)
         self.validator = PlanValidator(self.vocab, skills=skills)
         self.compiler = PlanCompiler()
+        # 只有一个消费者：``prompt.planning_section`` 从这里取规划轮文案的磁盘版本。
+        # 没接（None）就用内联回落——提示词目录不在也不该让规划轮拼不出提示。
+        self.prompt_library = prompt_library
 
     # ---- 事实层：转发 ----
 

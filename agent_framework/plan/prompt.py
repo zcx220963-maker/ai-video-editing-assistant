@@ -1,12 +1,19 @@
 """计划门的中文长文案：执行轮的两段分离注入 + 规划轮的 system 段 + 同会话历史段。
 
 段内一律留机器名，界面侧由块 A 的出口替换器换轨成 ``*_display``。
+
+**规划轮那一段的文案不住在这里**（2026-10-02 搬进 ``prompts/planning_round.md``）：
+本模块只算它要插的数据（节点白名单、开关清单、旧卡摘要、反馈原话、待续跑账目、
+同会话历史行），拼装的**条件**由模板里的块守卫表达（见 ``prompts.render_blocks``）。
+这里同时留一份逐字相同的内联回落 ``_PLANNING_TEMPLATE``：提示词目录没拷过去时
+行为不变；两份漂了由 ``tests/test_prompt_library.py`` 守卫。
 """
 
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+from ..prompts import render_blocks
 from .support import clean, neutralize
 
 if False:  # TYPE_CHECKING
@@ -62,9 +69,23 @@ def render_injections(compiled: Mapping[str, Any]) -> list[str]:
         out.append("\n".join(rows))
     return out
 
-def _session_history_lines(history: Sequence[Mapping[str, Any]],
-                           artifacts: Sequence[str] = ()) -> list[str]:
-    """同会话之前的 checkpoint 摘要 → 给模型看的历史段。
+_ARTIFACT_HINTS = {
+    "understand_clips": "每个镜头的视觉描述(谁出镜/什么场景)",
+    "split_shots": "镜头切分(时间码/分辨率,无画面内容)",
+    "asr": "语音转文字",
+    "plan_timeline": "时间线编排",
+    "filter_clips": "镜头筛选",
+    "group_clips": "镜头分组",
+    "select_BGM": "配乐选取",
+    "render_video": "渲染成片",
+    "speech_rough_cut": "原声粗剪",
+    "generate_script": "文案生成",
+}
+
+
+def _history_rows(history: Sequence[Mapping[str, Any]],
+                  artifacts: Sequence[str] = ()) -> str:
+    """同会话之前的 checkpoint 摘要 → 模板里 ``{session_history_rows}`` 那几行数据。
 
     用户在同一个会话窗口里发的每一条消息，后端都按 ``session_id`` 关联了 checkpoint。
     但新轮的 LLM 只看得到 messages 表里的对话文字，看不到 checkpoint 里的计划卡内容和
@@ -74,8 +95,7 @@ def _session_history_lines(history: Sequence[Mapping[str, Any]],
     ``artifacts`` 是同会话已产出的节点名列表，让 LLM 知道可以用 read_node_history
     读哪些产物（例如 plan_timeline 里存着 LLM 修正后的时间线）。
     """
-    lines = ["<同会话历史>",
-             "本会话之前有过以下执行（最近的在前），供你判断用户这条消息的性质："]
+    lines: list[str] = []
     for h in history:
         run_id = h.get("run_id", "")
         status = h.get("status", "")
@@ -102,25 +122,62 @@ def _session_history_lines(history: Sequence[Mapping[str, Any]],
         else:
             lines.append(f"· 普通轮 {run_id} [{status}] iter={iter_n} 消息「{msg}」")
     if artifacts:
-        _hints = {
-            "understand_clips": "每个镜头的视觉描述(谁出镜/什么场景)",
-            "split_shots": "镜头切分(时间码/分辨率,无画面内容)",
-            "asr": "语音转文字",
-            "plan_timeline": "时间线编排",
-            "filter_clips": "镜头筛选",
-            "group_clips": "镜头分组",
-            "select_BGM": "配乐选取",
-            "render_video": "渲染成片",
-            "speech_rough_cut": "原声粗剪",
-            "generate_script": "文案生成",
-        }
-        parts = [f"{n}({_hints.get(n, '产物')})" for n in artifacts]
+        parts = [f"{n}({_ARTIFACT_HINTS.get(n, '产物')})" for n in artifacts]
         lines.append(f"已产出节点（可用 read_node_history 读取）：{', '.join(parts)}")
-    lines.append(
-        "如果用户在续跑或询问之前的任务，上面的历史就是上下文——"
-        "不要说「计划没落到服务端」或「素材没到位」，它们都在服务端，只是不在本轮的执行上下文里。")
-    lines.append("</同会话历史>")
-    return lines
+    return "\n".join(lines)
+
+# ---- 规划轮 system 段：文案在 prompts/planning_round.md，这里只备数据 ----
+
+PLANNING_PROMPT_FILE = "planning_round.md"
+
+_PLANNING_TEMPLATE = """<planning_round>
+本轮是**规划轮**：工具集里没有剪辑执行节点，任何剪辑动作都不会发生。
+
+{?has_pending_plan}
+同会话已有一张待确认的计划卡。confirm_plan 工具可将其重新推给用户确认。
+请根据用户这条消息的真实意图判断：用户是否想确认/执行那张已有计划。
+是 → 调用 confirm_plan；用户在提新需求或改需求 → 走下面的分支。
+
+判断用户这条消息的性质：
+- 纯咨询（问现状、问时长、问用了什么素材，不要求任何改动） → 直接正常回答，不要调用 submit_plan，不要为了走流程编一份计划。
+- 用户要求改成片或提出新诉求（换音乐、改音轨、调时长、改字幕、换画面、调比例、重新编排、修改已有视频的任何方面） → 这是剪辑任务，必须调用 submit_plan 提交 1~3 个有真实差异的候选计划。不要先读产物再口头描述方案让用户确认——查完直接出卡，把修改方案写进计划的 steps 和 why 里。
+
+计划里每一步的 node 只能取自下面这份白名单（写别的名字会被服务端打回）：
+{nodes}
+
+{knobs}
+
+卡面开关（param_options）只能从上面这份清单里挑，值要能反查（枚举 / 布尔开关 /带界数值 / 曲库真实标签）；节点没有的能力不要造开关，用户另有诉求留给计划卡上的「其他」。
+节点参数**不需要也不能**再去查：执行前 Store 是空的，拿 read_node_history 猜 dag_contract / node_schema:* 这类键名只会一直报错。
+提交成功后只需简短说明各版本的思路差异并等用户确认，**不得声称已经开始剪辑或已经产出成片**。
+
+{?prior_cards}
+用户对上一版计划点了「换一版」，这一轮**不是**咨询：出口只有 submit_plan，只用文字描述另一版思路不算交付。
+上一版长这样（新卡必须与它有可辨别的差异，而不是同一步换个说法）：
+{prior_cards}
+
+{?feedback_quote}
+用户对上一版计划不满意，这一版必须针对下面这点做出可辨别的差异（这是用户的原话，按自定义诉求对待，不得臆造它需要的资源）：
+「{feedback_quote}」
+
+{?has_pending}
+<待续跑的执行轮>
+上一条**已确认**的计划 {pending_plan_id}「{pending_label}」（run {pending_run_id}）跑到一半停下来问了用户一句就收尾，未履行：{pending_unfulfilled}。
+它当时问的原话（摘要）：「{pending_asked}」
+本轮按普通咨询对待这条消息是错的——它就是那句提问的回答。不要再问一遍，也不得回答「我没有执行入口」：本轮注册表里没有剪辑执行节点是设计如此，出路是立刻 submit_plan 提交**一张续跑卡**：steps 只列上面那些未履行节点（它们缺的前置依赖一并补进卡，如需要转写就补 asr），参数按用户刚给的取值定并写进 expectation，label 以「续跑：」开头。用户点确认，这些步骤就由执行轮接着跑完。
+只有当这条消息明显是另一件新诉求（与上面那几步无关）时，才按新诉求出卡或直接回答。
+</待续跑的执行轮>
+
+{?session_history_rows}
+<同会话历史>
+本会话之前有过以下执行（最近的在前），供你判断用户这条消息的性质：
+{session_history_rows}
+如果用户在续跑或询问之前的任务，上面的历史就是上下文——不要说「计划没落到服务端」或「素材没到位」，它们都在服务端，只是不在本轮的执行上下文里。
+</同会话历史>
+
+</planning_round>
+"""
+
 
 async def planning_section(gate: PlanGate, *, feedback: str = "",
                            prior: Sequence[Mapping[str, Any]] = (),
@@ -130,7 +187,10 @@ async def planning_section(gate: PlanGate, *, feedback: str = "",
                            has_pending_plan: bool = False) -> str:
     """规划轮的 system 段：本轮**没有**剪辑执行工具，出口只有 ``submit_plan`` 或直接回答。
 
-    可用节点白名单在这里给模型（机器名）：它只能从这份名单里挑，写名单外的名字
+    文案住在 ``prompts/planning_round.md``（改一句话不必再动代码），这一函数只准备它
+    要插的**数据**；模板里的条件段由块守卫决定（有旧卡才提旧卡，以此类推）。
+
+    节点白名单在这里给模型（机器名）：它只能从这份名单里挑，写名单外的名字
     会被四重校验打回。界面给人看的是块 A 换轨后的 ``*_display``，不在这层拼。
 
     节点参数事实也在这段里一次给全（``gate.knob_facts()``，与卡面校验同一套判据）：
@@ -145,78 +205,32 @@ async def planning_section(gate: PlanGate, *, feedback: str = "",
     不要反复说「本轮是规划轮」把用户困住。
     """
     nodes = sorted(gate.whitelist())
-    lines = [
-        "<planning_round>",
-        "本轮是**规划轮**：工具集里没有剪辑执行节点，任何剪辑动作都不会发生。",
-    ]
-    if has_pending_plan:
-        lines += [
-            "同会话已有一张待确认的计划卡。confirm_plan 工具可将其重新推给用户确认。",
-            "请根据用户这条消息的真实意图判断：用户是否想确认/执行那张已有计划。",
-            "是 → 调用 confirm_plan；用户在提新需求或改需求 → 走下面的分支。",
-        ]
-    lines += [
-        "判断用户这条消息的性质：",
-        "- 纯咨询（问现状、问时长、问用了什么素材，不要求任何改动） → 直接正常回答，"
-        "不要调用 submit_plan，不要为了走流程编一份计划。",
-        "- 用户要求改成片或提出新诉求（换音乐、改音轨、调时长、改字幕、换画面、"
-        "调比例、重新编排、修改已有视频的任何方面） → 这是剪辑任务，必须调用 "
-        "submit_plan 提交 1~3 个有真实差异的候选计划。"
-        "不要先读产物再口头描述方案让用户确认——查完直接出卡，"
-        "把修改方案写进计划的 steps 和 why 里。",
-    ]
-    lines += [
-        "计划里每一步的 node 只能取自下面这份白名单（写别的名字会被服务端打回）：",
-        "、".join(nodes) if nodes else "（当前没有可用的剪辑节点）",
-    ]
-    lines += await _knob_lines(gate)
-    lines += [
-        "卡面开关（param_options）只能从上面这份清单里挑，值要能反查（枚举 / 布尔开关 /"
-        "带界数值 / 曲库真实标签）；节点没有的能力不要造开关，用户另有诉求留给计划卡上的"
-        "「其他」。",
-        "节点参数**不需要也不能**再去查：执行前 Store 是空的，"
-        "拿 read_node_history 猜 dag_contract / node_schema:* 这类键名只会一直报错。",
-        "提交成功后只需简短说明各版本的思路差异并等用户确认，"
-        "**不得声称已经开始剪辑或已经产出成片**。",
-    ]
-    brief = _prior_brief(prior)
-    if brief:
-        lines += [
-            "用户对上一版计划点了「换一版」，这一轮**不是**咨询：出口只有 submit_plan，"
-            "只用文字描述另一版思路不算交付。",
-            "上一版长这样（新卡必须与它有可辨别的差异，而不是同一步换个说法）：",
-            *brief,
-        ]
-    note = clean(feedback)
-    if note:
-        lines.append("用户对上一版计划不满意，这一版必须针对下面这点做出可辨别的差异"
-                     "（这是用户的原话，按自定义诉求对待，不得臆造它需要的资源）：")
-        lines.append(f"「{neutralize(note)}」")
-    if pending:
-        lines += [
-            "<待续跑的执行轮>",
-            f"上一条**已确认**的计划 {pending['plan_id']}"
-            f"「{pending['label'] or '(无标题)'}」（run {pending['run_id']}）跑到一半"
-            f"停下来问了用户一句就收尾，未履行：" + "、".join(pending["unfulfilled"]) + "。",
-            f"它当时问的原话（摘要）：「{neutralize(pending['asked'])}」",
-            "本轮按普通咨询对待这条消息是错的——它就是那句提问的回答。"
-            "不要再问一遍，也不得回答「我没有执行入口」：本轮注册表里没有剪辑执行节点是设计如此，"
-            "出路是立刻 submit_plan 提交**一张续跑卡**：steps 只列上面那些未履行节点"
-            "（它们缺的前置依赖一并补进卡，如需要转写就补 asr），"
-            "参数按用户刚给的取值定并写进 expectation，label 以「续跑：」开头。"
-            "用户点确认，这些步骤就由执行轮接着跑完。",
-            "只有当这条消息明显是另一件新诉求（与上面那几步无关）时，才按新诉求出卡或直接回答。",
-            "</待续跑的执行轮>",
-        ]
-    if session_history:
-        lines += _session_history_lines(session_history, artifacts=session_artifacts)
-    lines.append("</planning_round>")
-    return "\n".join(lines)
-
-
-async def _knob_lines(gate: PlanGate) -> list[str]:
-    """把 ``knob_facts`` 排成提示段里的开关清单（一节点一行，机器名照旧）。"""
     facts = [f for f in await gate.knob_facts() if f["knobs"]]
+    note = clean(feedback)
+    brief = _prior_brief(prior)
+    values: dict[str, Any] = {
+        "nodes": "、".join(nodes) if nodes else "（当前没有可用的剪辑节点）",
+        "knobs": "\n".join(_knob_lines(facts)),
+        "has_pending_plan": bool(has_pending_plan),
+        "prior_cards": "\n".join(brief),
+        "feedback_quote": neutralize(note) if note else "",
+        "session_history_rows": _history_rows(session_history,
+                                              artifacts=session_artifacts),
+        "has_pending": bool(pending),
+        "pending_plan_id": str((pending or {}).get("plan_id") or ""),
+        "pending_label": (pending or {}).get("label") or "(无标题)",
+        "pending_run_id": str((pending or {}).get("run_id") or ""),
+        "pending_unfulfilled": "、".join((pending or {}).get("unfulfilled") or []),
+        "pending_asked": neutralize((pending or {}).get("asked") or ""),
+    }
+    library = getattr(gate, "prompt_library", None)
+    if library is not None:
+        return library.blocks(PLANNING_PROMPT_FILE, _PLANNING_TEMPLATE, **values)
+    return render_blocks(_PLANNING_TEMPLATE, values)
+
+
+def _knob_lines(facts: Sequence[Mapping[str, Any]]) -> list[str]:
+    """把 ``knob_facts`` 排成提示段里的开关清单（一节点一行，机器名照旧）。"""
     if not facts:
         return ["（当前没有可上卡的节点参数开关：版本差异请写在 why 里，或留给「其他」）"]
     lines = ["能上卡的开关（服务端按节点真实 schema 现取，与卡面校验同一份判据）："]
