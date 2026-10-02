@@ -16,7 +16,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +192,100 @@ def _answers_text(answers: Sequence[Mapping[str, Any]]) -> str:
     if len(lines) < 2:
         return ""
     return "用户在弹窗里逐题做的选择：\n" + "\n".join(lines)
+
+
+def _annotate_requires(compiled: dict[str, Any], gate: Any) -> None:
+    """把每个计划步骤的直接前置补进编译结果（原地改 ``compiled``）。
+
+    依赖只有契约知道，编译层拿不到，所以在 execute_plan 这一层补一次。
+    契约不可用时留空——下游据此退化成"不自动并批"，不会出错，只是慢。
+    """
+    try:
+        contract = getattr(gate, "contract", None)
+        rmap = contract.required_map() if contract is not None else {}
+    except Exception:  # noqa: BLE001 - 取不到就不标注，退化成串行
+        rmap = {}
+    for step in compiled.get("steps") or []:
+        if isinstance(step, dict):
+            step.setdefault("requires", list(rmap.get(str(step.get("node") or ""), ())))
+
+
+def _with_ready_siblings(
+    calls: list[Any], completed: set[str], required_map: Mapping[str, Sequence[str]],
+    nodes: Sequence[str], *, resolve: Any, make_call: Any,
+) -> list[Any]:
+    """把「同层就绪、且与本次调用互不依赖」的兄弟节点补进同一批。
+
+    为什么要有这个：``plan_batches`` 只能对**同一条回复里的调用**并批，
+    于是能不能并行取决于模型是否恰好把两个独立节点写在一起——真机实测它就
+    分开写了（先 asr、拿到结果才 split_shots），本可并行的链路退化成一前一后。
+    并行与否是**图的性质**，不该由模型的输出习惯决定，所以在这里按图补全。
+
+    严格条件（宁可不补，也不补错）：
+      · 候选必须在**这次的执行计划里**（``nodes``）——不碰计划外的节点；
+      · 候选的前置必须**全部已完成**（``completed``）——否则会跑出错误结果；
+      · 候选与本次调用、以及候选彼此之间**依赖互不包含**——有先后就不能同批；
+      · 候选尚未执行过。
+    任何一条不满足就跳过它，最终仍由 ``plan_batches`` 按读写集切成安全的批。
+    """
+    if not calls or not nodes:
+        return calls
+    # 同层判定：前置集合完全相同（都只依赖已完成的那批）
+    def reqs(n: str) -> frozenset[str]:
+        return frozenset(str(x) for x in required_map.get(n, ()))
+
+    called_names = {str(getattr(c, "name", "")) for c in calls}
+    have = {n for n in applied_names(called_names) if n in nodes}
+
+    def depends(a: str, b: str) -> bool:
+        """a 是否（直接或间接）依赖 b。"""
+        seen: set[str] = set()
+        stack = list(reqs(a))
+        while stack:
+            x = stack.pop()
+            if x == b:
+                return True
+            if x in seen:
+                continue
+            seen.add(x)
+            stack.extend(reqs(x))
+        return False
+
+    added: list[Any] = []
+    for cand in nodes:
+        if cand in have or cand in completed:
+            continue
+        cand_reqs = reqs(cand)
+        if not cand_reqs or not cand_reqs <= completed:
+            continue                      # 前置没做完：绝不能提前跑
+        # 与本次已调用的每一个、以及已加入的候选，都不能有依赖关系
+        peers = [n for n in have] + [str(getattr(c, "name", "")) for c in added]
+        if any(depends(cand, p) or depends(p, cand) for p in peers if p):
+            continue
+        # 同层：前置集合与本次调用的某个节点一致（同一批上游的兄弟）
+        if not any(reqs(cand) == reqs(p) for p in peers if p):
+            continue
+        tool = resolve(cand) if resolve else None
+        if tool is None or not getattr(tool, "concurrency_safe", False):
+            continue
+        call = make_call(cand) if make_call else None
+        if call is None:
+            continue
+        added.append(call)
+    return [*calls, *added]
+
+
+def applied_names(names: Iterable[str]) -> set[str]:
+    """调用名 → 契约里的节点名（MCP 工具名可能带 ``storyline_`` 前缀）。"""
+    out: set[str] = set()
+    for n in names:
+        s = str(n or "")
+        if not s:
+            continue
+        out.add(s)
+        if "_" in s:
+            out.add(s.split("_", 1)[1])
+    return out
 
 
 def _detect_fallback_options(messages: list, tool_calls: list) -> dict | None:
@@ -1012,11 +1106,60 @@ class AgentOnceRun:
         registry: ToolRegistry | None = None,
     ) -> None:
         results = await self._run_tool_round(ctx, tool_calls, registry)
+        # 结构性并批补进来的调用（id 前缀 ``auto-``）**不能**写工具结果消息：
+        # 它们不在模型那条 assistant(tool_calls) 里，凭空插一条 tool 消息会被
+        # LLM API 拒掉（400：tool 消息必须是某条 tool_calls 的回应）。
+        # 它们的产物已经落在产物表里，下一轮模型需要时自己读得到——不回填无损失。
+        origin = [tc for tc in tool_calls if not str(tc.id).startswith("auto-")]
         # 分叉交接（rerun_from）已经把本轮搬到新 run 上，旧作用域的在途渲染不该再由
         # 这条循环追着查——新 run 的上下文里会有它自己的渲染。
         if ctx.extras.get("handover") is None:
             await self._follow_inflight_renders(
-                ctx, [(tc.name, results.get(tc.id)) for tc in tool_calls], registry)
+                ctx, [(tc.name, results.get(tc.id)) for tc in origin], registry)
+
+    async def _expand_ready_siblings(
+        self, ctx: AgentHookContext, tool_calls: list[ToolCall], reg: ToolRegistry,
+    ) -> list[ToolCall]:
+        """按计划依赖图，把同层就绪的独立兄弟节点补进本批（结构性地并行）。
+
+        只在**有执行计划**时生效（规划轮/闲聊没有图，原样返回）。
+        补进来的调用与模型自己发起的走完全同一条执行路径——同样的
+        before/after 钩子、同样的结果回填，只是并行跑。
+        """
+        nodes = list(getattr(self, "_exec_plan_nodes", None) or ())
+        if not nodes or not tool_calls:
+            return tool_calls
+        contract = getattr(getattr(self, "plan_gate", None), "contract", None)
+        try:
+            required_map = contract.required_map() if contract is not None else {}
+        except Exception:  # noqa: BLE001 - 取不到图就退化成原样（只是不并批）
+            return tool_calls
+        # 已完成的节点：从产物表按当前作用域取值（与 read_node_history 同一处口径），
+        # 再加上本 run 这一轮之前已经执行过的调用名。
+        completed: set[str] = applied_names(ctx.extras.get("_executed_nodes") or ())
+        try:
+            if self.storage is not None:
+                ident = current_identity()
+                sid = storyline_session_id(
+                    ctx.session.user_id, ctx.session.conversation_id)
+                art = (ident.artifact_id if ident is not None else "") or ""
+                completed |= applied_names(await self.storage.artifacts(sid, art).executed())
+        except Exception:  # noqa: BLE001 - 读不到就当没有已完成节点，退化成不并批
+            pass
+
+        def _resolve(name: str) -> Any:
+            # 只有既安全又可并发的才补：写工具若没声明读写集，concurrency_safe=False
+            return reg.get(name)
+
+        def _make(name: str) -> ToolCall | None:
+            # 参数留空：剪辑节点的公共入参（session_id/artifact_id/…）由拦截器
+            # 在请求前统一补齐（见 orchestration 的 before_request），
+            # 与模型自己调用时的路径完全一致。
+            return ToolCall(id=f"auto-{name}", name=name, arguments={})
+
+        return _with_ready_siblings(
+            list(tool_calls), completed, required_map, nodes,
+            resolve=_resolve, make_call=_make)
 
     async def _run_tool_round(
         self, ctx: AgentHookContext, tool_calls: list[ToolCall],
@@ -1030,6 +1173,15 @@ class AgentOnceRun:
         """
         reg = registry if registry is not None else self.registry
         fail_counts: dict[str, int] = ctx.extras.setdefault("_fail_counts", {})
+
+        # 结构性并批：把**同层就绪、互不依赖**的兄弟节点自动补进本批。
+        #
+        # 为什么要做在这一层：``plan_batches`` 只能对同一条回复里的调用并批，
+        # 于是并行与否取决于模型的输出习惯——真机实测它把 asr 与 split_shots
+        # 分成两轮（拿到 ASR 结果才切镜），本可并行的链路退化成一前一后，
+        # 白等一整段 ASR（237 秒）。**并行是图的性质，不该由模型自觉决定。**
+        # 判据全在图里：前置已完成 + 与本次调用无依赖 + 同层 + 在计划内。
+        tool_calls = await self._expand_ready_siblings(ctx, tool_calls, reg)
 
         def _refused(tc: ToolCall, times: int) -> ToolError:
             return ToolError(
@@ -1074,6 +1226,10 @@ class AgentOnceRun:
         for batch in plan_batches(tool_calls, reg.get):
             gathered = await asyncio.gather(*(_exec_one(tc) for tc in batch))
             results.update({tc.id: r for tc, r in zip(batch, gathered)})
+        # 记下本 run 已执行过的节点：下一轮的 _expand_ready_siblings 据此判断
+        # 「谁的产物已经有了」，从而决定还能并谁。
+        done = ctx.extras.setdefault("_executed_nodes", set())
+        done.update(tc.name for tc in tool_calls)
 
         # 按 LLM 给出的原始顺序回填，保证上下文一致性。
         # 守卫提示必须排在本批**全部**回执之后：assistant(tool_calls) 与它的逐条
@@ -1087,6 +1243,11 @@ class AgentOnceRun:
                     nagging.append((tc.name, fail_counts[tc.name]))
             else:
                 fail_counts[tc.name] = 0
+            # 结构性并批补进来的调用不回填：它们不在模型的 assistant(tool_calls) 里，
+            # 插一条 tool 消息会让 API 报 400。失败计数照记（上面已记），
+            # 只是不往消息链里写——产物已在产物表里。
+            if str(tc.id).startswith("auto-"):
+                continue
             ctx.messages.append(tool_result(tc.id, tc.name, r))
         for name, times in nagging:
             ctx.messages.append(system(
@@ -1474,6 +1635,16 @@ class Agent:
         compiled, issues = gate.validate_execute(plan, frame)
         if not issues.ok:
             raise ValueError("确认帧未通过校验：" + "；".join(issues.errors))
+        # 富化依赖图：把每个计划步骤的直接前置（契约里的 requires）补进编译结果。
+        # 为什么要有它：执行器要据此**自动**把同一层里互不依赖的节点并成一批并发跑
+        # （见 _with_ready_siblings），而不是指望模型自己把两次调用放进同一条回复。
+        # 依赖只有契约知道（编译层拿不到），所以在这一层补——一处富化、下游只管用。
+        _annotate_requires(compiled, gate)
+        # 把依赖图交给执行器：它据此自动把同层就绪的独立节点并成一批并发跑，
+        # 不再依赖模型是否把它们写进同一条回复（见 _with_ready_siblings）。
+        self._exec_plan_nodes = [str(s.get("node") or "")
+                                 for s in (compiled.get("steps") or [])
+                                 if isinstance(s, Mapping)]
         sections = list(render_injections(compiled))
         sections += await preload_skills(self.skill_loader, compiled.get("skills_hint") or ())
         session = await self.session_manager.get_or_create(user_id, conversation_id)
