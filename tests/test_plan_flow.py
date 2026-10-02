@@ -50,7 +50,7 @@ from agent_framework.context import ContextBuilder                 # noqa: E402
 from agent_framework.consumer import CHAT_TOPIC, SessionConsumer    # noqa: E402
 from agent_framework.hooks import CompositeHook                   # noqa: E402
 from agent_framework.llm import ScriptedLLM                        # noqa: E402
-from agent_framework.plan_gate import (PlanCardHook, PlanGate,      # noqa: E402
+from agent_framework.plan import (PlanCardHook, PlanGate,      # noqa: E402
                                        PlanReconcileHook, drain_plan_cards)
 from agent_framework.storage import build_storage                  # noqa: E402
 

@@ -2,7 +2,7 @@
 
 **这一层在防什么。** 这个项目的 LLM 面向层有四份独立清单：
 
-1. 生产提示词里手写的工具名（``plan_gate`` 的规划段与历史段、``agent`` 的纠错 nudge、
+1. 生产提示词里手写的工具名（``plan/prompt.py`` 的规划段与历史段、``agent`` 的纠错 nudge、
    ``editing_agent`` 的角色提示）；
 2. 真实注册的工具名（本地 Tool 子类 + MCP ``tools/list``）；
 3. 计划门白名单（剪辑节点 ∩ 已注册）；
@@ -83,7 +83,7 @@ def schema_property_names(tools: Iterable[Any]) -> set[str]:
     """把所有工具 JSON Schema 里出现过的 **properties 键名**全收出来（含嵌套层）。
 
     为什么必须递归：判据要能认出「技能正文里提到的字段名不是工具名」。
-    ``plan_gate.param_keys()`` 只覆盖计划门那批节点的参数，而模型在技能正文里
+    ``PlanGate.param_keys()`` 只覆盖计划门那批节点的参数，而模型在技能正文里
     顺口提到的字段可能来自任何工具的嵌套结构——例如 ``submit_plan`` 的
     ``plans[].steps[].param_options``。只取顶层就会把 ``param_options`` 判成
     「臆造工具」，启动时挂一条假告警；假告警比不报更坏，它教人忽略这个检查。

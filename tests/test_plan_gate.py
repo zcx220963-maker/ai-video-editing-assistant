@@ -24,7 +24,7 @@ from agent_framework.catalog import ToolCatalog, get_catalog, set_catalog  # noq
 from agent_framework.checkpoint import Checkpoint  # noqa: E402
 from agent_framework.editing_contract import EditingContract, NodeContract  # noqa: E402
 from agent_framework.hooks import AgentHookContext, _current_hook_ctx  # noqa: E402
-from agent_framework.plan_gate import (  # noqa: E402
+from agent_framework.plan import (  # noqa: E402
     CUSTOM_MAX_CHARS, CUSTOM_MAX_ITEMS, ConfirmPlanTool, PlanCardHook, PlanGate, PlanReconcileHook,
     SubmitPlanTool, claims_plan_card, claims_step_executed, drain_plan_cards,
     neutralize, pending_continuation,

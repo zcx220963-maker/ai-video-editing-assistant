@@ -139,7 +139,7 @@ def case_real_sources() -> None:
     """
     print("\n=== ②b 真实 submit_plan schema → 字段名来源 ===")
     from agent_framework.catalog import get_catalog
-    from agent_framework.plan_gate import ConfirmPlanTool, SubmitPlanTool
+    from agent_framework.plan import ConfirmPlanTool, SubmitPlanTool
 
     # SubmitPlanTool 的 schema 是静态的，只有 execute 才用 gate，这里不调它
     planning_tools = [SubmitPlanTool(None), ConfirmPlanTool()]

@@ -36,7 +36,7 @@ from agent_framework.checkpoint import CheckpointManager  # noqa: E402
 from agent_framework.context import ContextBuilder  # noqa: E402
 from agent_framework.hooks import CompositeHook  # noqa: E402
 from agent_framework.llm import ScriptedLLM  # noqa: E402
-from agent_framework.plan_gate import PlanReconcileHook  # noqa: E402
+from agent_framework.plan import PlanReconcileHook  # noqa: E402
 from agent_framework.run_state import STATE_FIELD, RunState, tool_names_in  # noqa: E402
 from agent_framework.session import Session  # noqa: E402
 from agent_framework.storage import build_storage  # noqa: E402

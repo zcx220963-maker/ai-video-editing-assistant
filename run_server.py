@@ -93,7 +93,7 @@ from agent_framework.tools.mcp import (
     register_mcp_tools,
 )
 from agent_framework.editing_contract import ContractSlot, load_contract
-from agent_framework.plan_gate import PlanCardHook, PlanGate, PlanReconcileHook
+from agent_framework.plan import PlanCardHook, PlanGate, PlanReconcileHook
 from agent_framework.catalog import get_catalog
 from agent_framework.media_fetch import FetchPolicy
 from agent_framework import uploads
@@ -589,7 +589,7 @@ def build_runtime(
             from agent_framework.agent import (NO_CARD_NUDGE_TEXT, NO_CARD_NOTE_TEXT,
                                                NO_CARD_STRUCTURAL_TEXT, STEP_NUDGE_TEXT,
                                                STEP_NOTE_TEXT)
-            from agent_framework.plan_gate import planning_section as _planning_section
+            from agent_framework.plan import planning_section as _planning_section
             # known 必须是**模型真能调到的**工具全集。规划轮的工具（submit_plan /
             # confirm_plan）只在规划注册表里，不在主注册表——漏了它们就会把
             # 提示词里正确的 submit_plan 误报成假工具（第一次跑就是这么误报的）。
@@ -619,7 +619,7 @@ def build_runtime(
             # 于是 plans[].steps[].param_options 这个字段名被判成「臆造工具」，
             # 启动日志挂了一条假告警——假告警比不报更坏，它教人忽略这个检查本身。
             try:
-                from agent_framework.plan_gate import ConfirmPlanTool, SubmitPlanTool
+                from agent_framework.plan import ConfirmPlanTool, SubmitPlanTool
                 param_keys = _cons.skill_field_names(
                     node_param_keys=plan_gate.param_keys(),
                     tools=[registry.all_tools(),

@@ -6,7 +6,7 @@
 **还没确认**的那张计划卡原样重放出来——确认入口不能只活在那一帧 WS 里。
 
 与成片卡同样刻意只放 contextvar 与纯函数：既不 import storage 也不 import hooks，
-供两侧各自**单向**依赖（``plan_gate`` 从这里 re-export，调用方无需知道本模块存在）。
+供两侧各自**单向**依赖（``agent_framework.plan`` 从这里 re-export，调用方无需知道本模块存在）。
 """
 
 from __future__ import annotations

@@ -30,7 +30,7 @@ from .identity import (current_identity, rebind_artifact_scope,
                        storyline_session_id, use_identity_or_inherit)
 from .llm import LLMClient, LLMResponse
 from .messages import ToolCall, assistant, system, tool_result, user
-from .plan_gate import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_step_executed,
+from .plan import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_step_executed,
                         pending_continuation, planning_section, preload_skills,
                         reconcile, render_injections)
 from .render_gate import (ADJUST_OPTION, CONFIRM_OPTION, KEEP_FULL_OPTION,
@@ -261,6 +261,40 @@ class _Request:
     run_id: str | None = None
 
 
+@dataclass
+class _Round:
+    """一次 ``_drive`` 的循环账：原先散在三百行里的局部量收敛成一份有名字的状态。
+
+    ``state`` 是**跨挂起仍成立**的那份可恢复状态（``RunState``，随指针行落盘）；
+    这里其余字段都是本轮调用私有的（打回预算、终答、当轮注册表），落盘反而失真。
+    """
+
+    ctx: AgentHookContext
+    state: RunState
+    reg: ToolRegistry
+    messages: list
+    iteration: int
+    cp: Checkpoint | None
+    run_id: str | None = None
+    planning: bool = False
+    interactive: bool = True
+    approval_decision: str | None = None
+    approval_note: str = ""
+    card_nudges: int = 0
+    step_nudges: int = 0
+    popup_nudges: int = 0
+    # 本轮**是否已经用过 ask_user**：必须按「整轮」而不是「当前这一批」算。
+    # 反例（真机实测）：模型调 ask_user 提问 → 循环挂起并把「已暂停等你选择」写成终答 →
+    # 那句解释里带着「本轮不可用，你希望怎么处理」的措辞，会被判据认成「在提问却没调
+    # ask_user」，于是又逼它问一遍，用户看到两张一模一样的卡。
+    # 从提问断点续跑时靠 ``_settle_pending`` 的返回值补回来：本轮确实是 ask_user 弹的卡，
+    # 不能因为「这次 _drive 还没调过」就判它没用弹窗（真机实测：续跑的每一轮都吃一条
+    # 「但你没有调用 ask_user」的假打回）。
+    asked_this_run: bool = False
+    final: str | None = None
+    reached_limit: bool = True
+
+
 class AgentOnceRun:
     """处理单个用户请求的内层 ReAct 循环。"""
 
@@ -436,6 +470,74 @@ class AgentOnceRun:
         approval_note: str = "",
         interactive: bool = True,
     ) -> str:
+        """一次执行的骨架：开账 → 循环 → 交付。
+
+        循环本身只做三件事：在一致点落盘、叫 LLM、把切出去的三块串起来——
+        ``_tool_round``（这一轮要调工具：审批/渲染/提问三类挂起与分叉交接）、
+        ``_nudge_back``（收尾前的四条硬保证）、``_deliver``（终答的兜底核对与落库）。
+        """
+        r = self._open_run(
+            session, messages, start_iteration, cp, run_id=run_id, registry=registry,
+            approved_plan=approved_plan, planning=planning,
+            approval_decision=approval_decision, approval_note=approval_note,
+            interactive=interactive)
+        # 暴露当前 ctx 与 hooks 给工具（如 SpawnTool）触发子 Agent 生命周期节点。
+        hooks_token = _current_hooks.set(self.hooks)
+        ctx_token = _current_hook_ctx.set(r.ctx)
+        try:
+            try:
+                while r.iteration < self.config.max_iterations:
+                    # HITL：从审批断点续跑——先把挂起的那批 tool_calls 按用户决策收口。
+                    if r.approval_decision is not None:
+                        r.asked_this_run |= await self._settle_pending(
+                            r.ctx, r.cp, r.reg, r.approval_decision, r.approval_note)
+                        r.approval_decision = None
+                        r.approval_note = ""
+                        r.iteration += 1
+                        continue
+                    # 一致点：即将调用 LLM 之前落盘，恢复从这里续跑即可避免重放工具。
+                    # 状态与消息一起落：崩溃恢复取到的调用清单/候选计划/q 片段
+                    # 必须和这一条一致点上的 messages 同批，否则对账会多算或漏算。
+                    if r.cp is not None:
+                        r.state.persist(r.cp)
+                        await self.checkpoint.save_progress(
+                            r.cp, iteration=r.iteration, messages=r.messages)
+                    r.ctx.iteration = r.iteration
+                    await self.hooks.before_iteration(r.ctx)
+
+                    resp = await self._invoke(r.ctx, r.messages, r.reg.get_definitions(),
+                                              stream, resuming)
+                    if resp.wants_tools:
+                        pause = await self._tool_round(r, resp)
+                        if pause is not None:
+                            return pause
+                        continue
+
+                    if await self._nudge_back(r, resp):
+                        continue
+                    r.final = resp.content
+                    r.reached_limit = False
+                    break
+            except BaseException:
+                # 真实进程被 kill 时此处不执行，但上一致点已落盘，仍可恢复。
+                if r.cp is not None:
+                    r.state.persist(r.cp)
+                    await self.checkpoint.mark_failed(
+                        r.cp, iteration=r.iteration, messages=r.messages)
+                raise
+
+            return await self._deliver(r, message)
+        finally:
+            _current_hooks.reset(hooks_token)
+            _current_hook_ctx.reset(ctx_token)
+
+    def _open_run(self, session: Session, messages: list, start_iteration: int,
+                  cp: Checkpoint | None, *, run_id: str | None,
+                  registry: ToolRegistry | None,
+                  approved_plan: dict[str, Any] | None, planning: bool,
+                  approval_decision: str | None, approval_note: str,
+                  interactive: bool) -> "_Round":
+        """开一本循环账：恢复可恢复状态、装配本轮 ctx、发三道打回预算。"""
         reg = registry if registry is not None else self.registry
         # 跨挂起仍然成立的事实从指针行恢复（没有 checkpoint 时就是全新的）：执行轮在渲染
         # 确认门/弹窗上停过一次之后，批准的计划、已经跑过的调用、攒下的 qa 片段都还在，
@@ -452,298 +554,264 @@ class AgentOnceRun:
         # 调用方显式给的优先——同一 run 不会带着两份承诺跑，但 fork 出来的子 run 要认新的。
         if approved_plan is not None:
             state.approved_plan = dict(approved_plan)
-        # 暴露当前 ctx 与 hooks 给工具（如 SpawnTool）触发子 Agent 生命周期节点。
-        hooks_token = _current_hooks.set(self.hooks)
-        ctx_token = _current_hook_ctx.set(ctx)
-
-        final: str | None = None
-        iteration = start_iteration
-        reached_limit = True
-        card_nudges = max(0, self.config.plan_claim_nudges)
-        step_nudges = max(0, self.config.step_claim_nudges)
-        # 「向用户提问必须走弹窗」的打回预算（见 ask_gate）。默认 1 次。
-        popup_nudges = max(0, self.config.popup_question_nudges)
-        # 本轮**是否已经用过 ask_user**：必须按「整轮」而不是「当前这一批」算。
-        # 反例（真机实测）：模型调 ask_user 提问 → 循环挂起并把「已暂停等你选择」写成终答 →
-        # 那句解释里带着「本轮不可用，你希望怎么处理」的措辞，会被判据认成「在提问却没调
-        # ask_user」，于是又逼它问一遍，用户看到两张一模一样的卡。
-        # 从提问断点续跑时这里靠 _settle_pending 的返回值补回来：本轮确实是 ask_user
-        # 弹的卡，不能因为「这次 _drive 还没调过」就判它没用弹窗（真机实测：续跑的每一轮
-        # 都吃一条「但你没有调用 ask_user」的假打回）。
-        asked_this_run = False
         # 首条记 prompt 指纹：eval 回归据此把结果归到具体版本的 prompt。
         # 只在全新的 state 上记——续跑那半截不再补一条，否则历史里同一次执行有两个指纹。
         if not state.qa_parts:
             state.qa_parts.append(
                 {"type": "prompt_fingerprint",
                  "fingerprint": self.context_builder.fingerprint()})
-        qa_parts = state.qa_parts
+        r = _Round(
+            ctx=ctx, state=state, reg=reg, messages=messages, iteration=start_iteration,
+            cp=cp, run_id=run_id, planning=planning, interactive=interactive,
+            approval_decision=approval_decision, approval_note=approval_note,
+            card_nudges=max(0, self.config.plan_claim_nudges),
+            step_nudges=max(0, self.config.step_claim_nudges),
+            # 「向用户提问必须走弹窗」的打回预算（见 ask_gate）。默认 1 次。
+            popup_nudges=max(0, self.config.popup_question_nudges))
         state.persist(cp)
-        try:
-            try:
-                while iteration < self.config.max_iterations:
-                    # HITL：从审批断点续跑——先把挂起的那批 tool_calls 按用户决策收口。
-                    if approval_decision is not None:
-                        asked_this_run |= await self._settle_pending(
-                            ctx, cp, reg, approval_decision, approval_note)
-                        approval_decision = None
-                        approval_note = ""
-                        iteration += 1
-                        continue
-                    # 一致点：即将调用 LLM 之前落盘，恢复从这里续跑即可避免重放工具。
-                    # 状态与消息一起落：崩溃恢复取到的调用清单/候选计划/q 片段
-                    # 必须和这一条一致点上的 messages 同批，否则对账会多算或漏算。
-                    if cp is not None:
-                        state.persist(cp)
-                        await self.checkpoint.save_progress(cp, iteration=iteration, messages=messages)
-                    ctx.iteration = iteration
-                    await self.hooks.before_iteration(ctx)
+        return r
 
-                    resp = await self._invoke(ctx, messages, reg.get_definitions(), stream, resuming)
+    async def _tool_round(self, r: "_Round", resp: LLMResponse) -> str | None:
+        """模型这一轮要调工具：记账 → 三类挂起 → 真执行 → 分叉交接或推进迭代。
 
-                    if resp.wants_tools:
-                        if resp.content:
-                            qa_parts.append({"type": "think", "content": resp.content})
-                        for tc in resp.tool_calls:
-                            qa_parts.append({
-                                "type": "tool call",
-                                "name": tc.name,
-                                "arguments": tc.arguments,
-                            })
-                            state.note_attempted(tc.name)
-                        messages.append(assistant(resp.content, resp.tool_calls))
-                        if cp is not None:
-                            # 确认过渲染之后，模型若又发起一次渲染：如实告诉它「已经在渲了」，
-                            # 不重复提交。真机里模型收尾时不会这么干，但一次误判就是白烧几分钟
-                            # 算力，而且两次渲染写同一个 artifact 作用域，代价不对称。
-                            repeat = [tc for tc in resp.tool_calls
-                                      if tc.name == RENDER_NODE
-                                      and run_id in self._render_confirmed]
-                            if repeat:
-                                for tc in resp.tool_calls:
-                                    if tc.name == RENDER_NODE:
-                                        messages.append(tool_result(
-                                            tc.id, tc.name,
-                                            "本次编排已经确认并提交渲染，无需再次提交。"
-                                            "请直接向用户汇报渲染已开始。"))
-                                    else:
-                                        messages.append(tool_result(
-                                            tc.id, tc.name,
-                                            "本次渲染已提交，这一条随渲染一并跳过。"))
-                                await self.hooks.after_execute_tools(ctx)
-                                iteration += 1
-                                continue
-                            # 通用审批门（--approve-tools / 工具自声明 requires_approval）。
-                            #
-                            # 排在这里、并且在命中时**直接返回**，所以它天然优先于下面的渲染确认门。
-                            # 这是有意的：谁显式配了 `--approve-tools render_video`，
-                            # 谁就该拿到那道门的语义（逐条列出待批工具、批准/拒绝），
-                            # 而不是被渲染门的编排预览卡取代。
-                            # 反过来，默认配置下没有任何工具需要审批，于是渲染一律走下面那道
-                            # 带编排预览的门——「渲染前让用户看到编排结果」这个需求不受影响。
-                            gated = [tc for tc in resp.tool_calls
-                                     if reg.needs_approval(tc.name)]
-                            if gated:
-                                pending = [{"id": tc.id, "name": tc.name,
-                                            "arguments": tc.arguments}
-                                           for tc in resp.tool_calls]
-                                state.persist(cp)
-                                await self.checkpoint.await_approval(
-                                    cp, iteration=iteration, messages=messages,
-                                    pending_calls=pending,
-                                    reason="以下操作需要你确认后才会执行")
-                                await self.hooks.on_approval_required(
-                                    ctx, pending, "以下操作需要你确认后才会执行")
-                                return _APPROVAL_PAUSE_ANSWER
-                            # 渲染确认门：编排已就绪、马上要渲染时，先把编排结果给用户看，
-                            # 等确认再渲。用户明确要求「不确认绝不渲染」。
-                            # 确认过一次就整条 run 不再拦：同一个 run 里再拦一次只是重复打扰
-                            # （模型收尾时偶尔会再调一次渲染）。
-                            #
-                            # 但 `interactive=False`（到点自动跑的定时任务）必须放行：
-                            # 那条 run 的 user_id 是 "cron"，浏览器身份永远过不了归属校验，
-                            # 而 awaiting_approval 刻意不在 _UNFINISHED 里、自动续跑也捞不到——
-                            # 拦下来就是**永久挂起**。它的投递方本来就已显式声明"直接执行"。
-                            if (interactive
-                                    and should_gate_render(resp.tool_calls,
-                                                           enabled=self.config.gate_render)
-                                    and run_id not in self._render_confirmed):
-                                preview = await self._load_preview(session)
-                                ask = build_render_ask(preview)
-                                pending = [{"id": tc.id, "name": tc.name,
-                                            "arguments": tc.arguments}
-                                           for tc in resp.tool_calls]
-                                state.persist(cp)
-                                await self.checkpoint.await_approval(
-                                    cp, iteration=iteration, messages=messages,
-                                    pending_calls=pending, reason=ask["title"], ask=ask)
-                                await self.hooks.on_approval_required(
-                                    ctx, pending, ask["title"], ask=ask)
-                                return _APPROVAL_PAUSE_ANSWER
-                        await self._execute_tool_calls(ctx, resp.tool_calls, reg)
-                        # 主动提问：模型调了 ask_user 就把本轮停在这里，等问题卡片
-                        # 上用户点选之后从同一断点续跑（与审批共用挂起/续跑机制）。
-                        # 为什么在这里拦而不是在工具里抛：工具只负责把问题整理成形，
-                        # 「停下来」是循环的职责——工具不该自己决定一整个轮次的生命周期。
-                        asked = self._take_asked_question(reg, resp.tool_calls)
-                        if asked is not None:
-                            asked_this_run = True
-                        if asked is not None and cp is not None:
-                            pending = [{"id": tc.id, "name": tc.name,
-                                        "arguments": tc.arguments}
-                                       for tc in resp.tool_calls]
-                            reason = asked["title"]
-                            state.persist(cp)
-                            await self.checkpoint.await_approval(
-                                cp, iteration=iteration, messages=messages,
-                                pending_calls=pending, reason=reason, ask=asked)
-                            await self.hooks.on_approval_required(
-                                ctx, pending, reason, ask=asked)
-                            return _APPROVAL_PAUSE_ANSWER
-                        fb = _detect_fallback_options(ctx.messages, resp.tool_calls)
-                        if fb is not None and cp is not None:
-                            pending = [{"id": tc.id, "name": tc.name,
-                                        "arguments": tc.arguments} for tc in resp.tool_calls]
-                            state.persist(cp)
-                            await self.checkpoint.await_approval(
-                                cp, iteration=iteration, messages=messages,
-                                pending_calls=pending,
-                                reason=fb.get("error", "渲染需要你选择方案"),
-                                fallback_options=fb.get("options", []))
-                            await self.hooks.on_approval_required(
-                                ctx, pending, fb.get("error", "渲染需要你选择方案"),
-                                fallback_options=fb.get("options", []))
-                            return _APPROVAL_PAUSE_ANSWER
-                        handover = ctx.extras.pop("handover", None)
-                        if handover is not None:
-                            cp, messages, iteration = await self._adopt_fork(ctx, handover)
-                            reg = self.registry   # 交接后是正常执行轮，用回全量注册表
-                        else:
-                            iteration += 1
-                        continue
+        返回非 ``None`` 就是本轮的终答（那句「已暂停」过渡话术），循环直接交付；
+        返回 ``None`` 表示接着跑下一轮（迭代计数已在里面推进）。
+        """
+        qa_parts = r.state.qa_parts
+        if resp.content:
+            qa_parts.append({"type": "think", "content": resp.content})
+        for tc in resp.tool_calls:
+            qa_parts.append({
+                "type": "tool call",
+                "name": tc.name,
+                "arguments": tc.arguments,
+            })
+            r.state.note_attempted(tc.name)
+        r.messages.append(assistant(resp.content, resp.tool_calls))
 
-                    if (planning and not state.plan_candidates
-                            and claims_plan_card(resp.content) and card_nudges > 0):
-                        # 规划轮里「卡已提交」而没有 submit_plan 成功记录＝界面上没有卡：
-                        # 用户点不到确认，这一轮是死胡同。先给它一次真出卡或改口的机会。
-                        card_nudges -= 1
-                        messages.append(assistant(resp.content))
-                        messages.append(system(NO_CARD_NUDGE_TEXT))
-                        iteration += 1
-                        continue
+        if r.cp is not None:
+            # 确认过渲染之后，模型若又发起一次渲染：如实告诉它「已经在渲了」，
+            # 不重复提交。真机里模型收尾时不会这么干，但一次误判就是白烧几分钟
+            # 算力，而且两次渲染写同一个 artifact 作用域，代价不对称。
+            if await self._suppress_repeat_render(r, resp):
+                return None
+            # 通用审批门（--approve-tools / 工具自声明 requires_approval）。
+            #
+            # 排在这里、并且在命中时**直接返回**，所以它天然优先于下面的渲染确认门。
+            # 这是有意的：谁显式配了 `--approve-tools render_video`，
+            # 谁就该拿到那道门的语义（逐条列出待批工具、批准/拒绝），
+            # 而不是被渲染门的编排预览卡取代。
+            # 反过来，默认配置下没有任何工具需要审批，于是渲染一律走下面那道
+            # 带编排预览的门——「渲染前让用户看到编排结果」这个需求不受影响。
+            if any(r.reg.needs_approval(tc.name) for tc in resp.tool_calls):
+                return await self._pause(r, resp.tool_calls,
+                                         reason="以下操作需要你确认后才会执行")
+            # 渲染确认门：编排已就绪、马上要渲染时，先把编排结果给用户看，
+            # 等确认再渲。用户明确要求「不确认绝不渲染」。
+            # 确认过一次就整条 run 不再拦：同一个 run 里再拦一次只是重复打扰
+            # （模型收尾时偶尔会再调一次渲染）。
+            #
+            # 但 `interactive=False`（到点自动跑的定时任务）必须放行：
+            # 那条 run 的 user_id 是 "cron"，浏览器身份永远过不了归属校验，
+            # 而 awaiting_approval 刻意不在 _UNFINISHED 里、自动续跑也捞不到——
+            # 拦下来就是**永久挂起**。它的投递方本来就已显式声明"直接执行"。
+            if (r.interactive
+                    and should_gate_render(resp.tool_calls, enabled=self.config.gate_render)
+                    and r.run_id not in self._render_confirmed):
+                ask = build_render_ask(await self._load_preview(r.ctx.session))
+                return await self._pause(r, resp.tool_calls, reason=ask["title"], ask=ask)
 
-                    if (planning and not state.plan_candidates
-                            and looks_like_plan_card(resp.content)
-                            and not declines_plan(resp.content) and card_nudges > 0):
-                        # 上面那条措辞守卫按**文本**判「假称已出卡」，而真机上模型换一种说法
-                        # 就绕过去了：实测「已为你准备好 3 个候选方案……你在计划卡上选一版
-                        # 确认即可」两种变体都判不中 → 守卫不触发 → 规划轮以一句口头方案收尾、
-                        # 服务端零张卡、用户永远点不到确认。这就是「剪辑流程跑不起来」的断点。
-                        # 这条按**卡面形状**判（≥2 个方案标号 + 让用户挑），与具体措辞无关；
-                        # 纯咨询回答（问素材能不能用、要不要出卡）不具这个形状，不会误伤。
-                        # 候选清单挂在可恢复状态上：规划轮弹过问题再续跑，卡确实在界面上，
-                        # 不能因为「这次 _drive 没跑过 submit_plan」就再打回一次。
-                        card_nudges -= 1
-                        messages.append(assistant(resp.content))
-                        messages.append(system(NO_CARD_STRUCTURAL_TEXT))
-                        iteration += 1
-                        continue
+        await self._execute_tool_calls(r.ctx, resp.tool_calls, r.reg)
 
-                    approved = state.approved_plan
-                    if (approved and _no_step_called(approved, state.calls_attempted)
-                            and claims_step_executed(resp.content)
-                            and step_nudges > 0):
-                        # 执行轮里「某步已跑完」而这条 run 零步骤调用＝Storyline 没收到请求，
-                        # 界面上不会多出任何新产物：那句「已完成」是从历史里复述的旧结果。
-                        # 调用清单按整条 run 算（跨挂起仍成立），否则在渲染确认门之前真跑过
-                        # 步骤、续跑后收尾的那句会被判成假称——与 asked_this_run 同一个病灶。
-                        # 先退回去要一次真调用（或一次如实说明），别把旧产物当本轮产出交出去。
-                        step_nudges -= 1
-                        first = (approved.get("steps") or [{}])[0].get("node") or "?"
-                        messages.append(assistant(resp.content))
-                        # 用 replace 而不是 str.format：提示词是磁盘文件，里面可能
-                        # 出现 JSON 示例（{"plans": …}），format 会拿它当占位符炸掉。
-                        messages.append(system(STEP_NUDGE_TEXT.replace(
-                            "{first}", str(first))))
-                        iteration += 1
-                        continue
-                    if (self.config.require_popup_questions and popup_nudges > 0
-                            and not asked_this_run
-                            and looks_like_asking_user(resp.content)):
-                        # 硬保证：向用户提问必须走弹窗。判据与守卫都在 ask_gate，
-                        # 只打回一次（用尽后如实交付并在末尾附服务端核对）。
-                        # 为什么放在最后一道（收尾前）而不是每轮都查：只有「准备收尾」
-                        # 才是真的把问题交给用户；中途文字里带个问号只是思考过程。
-                        popup_nudges -= 1
-                        messages.append(assistant(resp.content))
-                        messages.append(system(popup_nudge(planning)))
-                        iteration += 1
-                        continue
-                    final = resp.content
-                    reached_limit = False
-                    break
-            except BaseException:
-                # 真实进程被 kill 时此处不执行，但上一致点已落盘，仍可恢复。
-                if cp is not None:
-                    state.persist(cp)
-                    await self.checkpoint.mark_failed(cp, iteration=iteration, messages=messages)
-                raise
+        # 主动提问：模型调了 ask_user 就把本轮停在这里，等问题卡片
+        # 上用户点选之后从同一断点续跑（与审批共用挂起/续跑机制）。
+        # 为什么在这里拦而不是在工具里抛：工具只负责把问题整理成形，
+        # 「停下来」是循环的职责——工具不该自己决定一整个轮次的生命周期。
+        asked = self._take_asked_question(r.reg, resp.tool_calls)
+        if asked is not None:
+            r.asked_this_run = True
+            if r.cp is not None:
+                return await self._pause(r, resp.tool_calls, reason=asked["title"],
+                                         ask=asked)
+        fb = _detect_fallback_options(r.messages, resp.tool_calls)
+        if fb is not None and r.cp is not None:
+            return await self._pause(
+                r, resp.tool_calls,
+                reason=fb.get("error", "渲染需要你选择方案"),
+                fallback_options=fb.get("options", []))
 
-            if reached_limit:
-                final = f"[已达最大迭代次数 {self.config.max_iterations}，提前结束]"
+        handover = r.ctx.extras.pop("handover", None)
+        if handover is not None:
+            r.cp, r.messages, r.iteration = await self._adopt_fork(r.ctx, handover)
+            r.reg = self.registry       # 交接后是正常执行轮，用回全量注册表
+        else:
+            r.iteration += 1
+        return None
 
-            final = self.hooks.finalize_content(ctx, final)
+    async def _suppress_repeat_render(self, r: "_Round", resp: LLMResponse) -> bool:
+        """本轮里的重复渲染：逐条回填「已经在渲了」，不再走任何一道门。"""
+        repeat = [tc for tc in resp.tool_calls
+                  if tc.name == RENDER_NODE and r.run_id in self._render_confirmed]
+        if not repeat:
+            return False
+        for tc in resp.tool_calls:
+            if tc.name == RENDER_NODE:
+                r.messages.append(tool_result(
+                    tc.id, tc.name,
+                    "本次编排已经确认并提交渲染，无需再次提交。"
+                    "请直接向用户汇报渲染已开始。"))
+            else:
+                r.messages.append(tool_result(
+                    tc.id, tc.name,
+                    "本次渲染已提交，这一条随渲染一并跳过。"))
+        await self.hooks.after_execute_tools(r.ctx)
+        r.iteration += 1
+        return True
 
-            # 「提问必须是弹窗」的打回机会用尽仍在提问：如实交付，但补一句服务端核对到的事实，
-            # 让用户知道这句本该是个弹窗（与 NO_CARD_NOTE_TEXT 同一套兜底思路）。
-            if (self.config.require_popup_questions and not asked_this_run
-                    and looks_like_asking_user(final)):
-                final = (final or "") + NO_POPUP_NOTE
+    async def _pause(self, r: "_Round", calls: list, *, reason: str,
+                     ask: dict | None = None,
+                     fallback_options: list | None = None) -> str:
+        """四个挂起点的同一种收口：状态先落盘 → 指针行落 awaiting_approval →
+        发审批帧 → 本轮以过渡话术结束（终答与落库留给续跑那一次）。
 
-            if (planning and not state.plan_candidates
-                    and (claims_plan_card(final) or looks_like_plan_card(final))):
-                # 核对机会用尽还在声称/还在把卡面内容当交付：界面上不会多出卡，这句不能
-                # 原样进历史——末尾补一条服务端核到的事实，让用户知道该重新发起。
-                # 判据与循环里那条守卫同源：纯咨询回答（问素材能不能用）不具卡面形状，
-                # 原样交付，不被这句多余的事实更正污染。
-                final = (final or "") + NO_CARD_NOTE_TEXT
+        ``state.persist`` 必须在 ``await_approval`` 之前：审批帧发出去、用户可能几天后才点，
+        其间进程随时会重启，恢复取的指针行得带上这一轮真发生过的调用与候选计划。
+        """
+        pending = [{"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                   for tc in calls]
+        r.state.persist(r.cp)
+        await self.checkpoint.await_approval(
+            r.cp, iteration=r.iteration, messages=r.messages,
+            pending_calls=pending, reason=reason, ask=ask,
+            fallback_options=fallback_options)
+        await self.hooks.on_approval_required(r.ctx, pending, reason, ask=ask,
+                                              fallback_options=fallback_options)
+        return _APPROVAL_PAUSE_ANSWER
 
-            approved = state.approved_plan
-            if (approved and _no_step_called(approved, state.calls_attempted)
-                    and claims_step_executed(final)):
-                # 同一件事在执行轮的版本：核对机会用尽还在声称某步跑完了，就把「这条 run
-                # 零步骤调用、界面上不会多出任何新产物」这条事实补在答复末尾——留原样进历史，
-                # 用户读到的是上一轮的旧时长冒充这一轮的产出。
-                final = (final or "") + STEP_NOTE_TEXT
+    async def _nudge_back(self, r: "_Round", resp: LLMResponse) -> bool:
+        """收尾前的四条硬保证：把「说得出但没发生」的终答退回一次，并吃掉那道预算。
 
-            # 终答进收尾一致点：回看/分叉取这条 run 时，缺最后一句就不是一轮的终态。
-            if cp is not None:
-                if reached_limit:
-                    # 撞迭代上限是**被打断**，不是成功收尾。原先这里照样 complete()，
-                    # 于是 checkpoint 落成 completed、_UNFINISHED={running,failed} 把它排除，
-                    # /runs/active 查不到、consumer 的自动续跑也捞不回来——用户看到
-                    # 「[已达最大迭代次数 N，提前结束]」，刷新后这条 run 再也接不上。
-                    # 真机会话里已经有一批这样收尾的记录。标记成 failed 让「继续」能接。
-                    state.persist(cp)
-                    await self.checkpoint.mark_failed(
-                        cp, iteration=iteration,
-                        messages=[*messages, assistant(final or "")])
-                else:
-                    # 完成的 run 不再被恢复：指针行只留「认过的承诺」（分叉要继承它），
-                    # transcript 与调用清单撤下——前者已经在 assistant 行的 qa 字段里。
-                    RunState.retain_residue(cp, state)
-                    await self.checkpoint.complete(cp, messages=[*messages, assistant(final or "")])
+        每条都是**先退回、预算用尽再如实交付**（末尾补服务端核到的事实，见 ``_deliver``），
+        而不是把模型的话砍掉：界面上到底有没有那张卡、这条 run 到底有没有跑过步骤，
+        服务端说了算，可这句话该由模型自己收回去。
+        """
+        if (r.planning and not r.state.plan_candidates
+                and claims_plan_card(resp.content) and r.card_nudges > 0):
+            # 规划轮里「卡已提交」而没有 submit_plan 成功记录＝界面上没有卡：
+            # 用户点不到确认，这一轮是死胡同。先给它一次真出卡或改口的机会。
+            r.card_nudges -= 1
+            r.messages.append(assistant(resp.content))
+            r.messages.append(system(NO_CARD_NUDGE_TEXT))
+            r.iteration += 1
+            return True
 
-            # 落回会话历史：流式模式下这也是把攒出的完整答复写进会话的最简单情形。
-            qa_parts.append({"type": "answer", "content": final or ""})
-            session.add(user(message))
-            session.add(assistant(final))
-            session.add_qa(message, qa_parts)
-            await self._persist_answer_message(session, final or "", qa_parts)
-            return final or ""
-        finally:
-            _current_hooks.reset(hooks_token)
-            _current_hook_ctx.reset(ctx_token)
+        if (r.planning and not r.state.plan_candidates
+                and looks_like_plan_card(resp.content)
+                and not declines_plan(resp.content) and r.card_nudges > 0):
+            # 上面那条措辞守卫按**文本**判「假称已出卡」，而真机上模型换一种说法
+            # 就绕过去了：实测「已为你准备好 3 个候选方案……你在计划卡上选一版
+            # 确认即可」两种变体都判不中 → 守卫不触发 → 规划轮以一句口头方案收尾、
+            # 服务端零张卡、用户永远点不到确认。这就是「剪辑流程跑不起来」的断点。
+            # 这条按**卡面形状**判（≥2 个方案标号 + 让用户挑），与具体措辞无关；
+            # 纯咨询回答（问素材能不能用、要不要出卡）不具这个形状，不会误伤。
+            # 候选清单挂在可恢复状态上：规划轮弹过问题再续跑，卡确实在界面上，
+            # 不能因为「这次 _drive 没跑过 submit_plan」就再打回一次。
+            r.card_nudges -= 1
+            r.messages.append(assistant(resp.content))
+            r.messages.append(system(NO_CARD_STRUCTURAL_TEXT))
+            r.iteration += 1
+            return True
+
+        approved = r.state.approved_plan
+        if (approved and _no_step_called(approved, r.state.calls_attempted)
+                and claims_step_executed(resp.content) and r.step_nudges > 0):
+            # 执行轮里「某步已跑完」而这条 run 零步骤调用＝Storyline 没收到请求，
+            # 界面上不会多出任何新产物：那句「已完成」是从历史里复述的旧结果。
+            # 调用清单按整条 run 算（跨挂起仍成立），否则在渲染确认门之前真跑过
+            # 步骤、续跑后收尾的那句会被判成假称——与 asked_this_run 同一个病灶。
+            # 先退回去要一次真调用（或一次如实说明），别把旧产物当本轮产出交出去。
+            r.step_nudges -= 1
+            first = (approved.get("steps") or [{}])[0].get("node") or "?"
+            r.messages.append(assistant(resp.content))
+            # 用 replace 而不是 str.format：提示词是磁盘文件，里面可能
+            # 出现 JSON 示例（{"plans": …}），format 会拿它当占位符炸掉。
+            r.messages.append(system(STEP_NUDGE_TEXT.replace("{first}", str(first))))
+            r.iteration += 1
+            return True
+
+        if (self.config.require_popup_questions and r.popup_nudges > 0
+                and not r.asked_this_run
+                and looks_like_asking_user(resp.content)):
+            # 硬保证：向用户提问必须走弹窗。判据与守卫都在 ask_gate，
+            # 只打回一次（用尽后如实交付并在末尾附服务端核对）。
+            # 为什么放在最后一道（收尾前）而不是每轮都查：只有「准备收尾」
+            # 才是真的把问题交给用户；中途文字里带个问号只是思考过程。
+            r.popup_nudges -= 1
+            r.messages.append(assistant(resp.content))
+            r.messages.append(system(popup_nudge(r.planning)))
+            r.iteration += 1
+            return True
+        return False
+
+    async def _deliver(self, r: "_Round", message: str) -> str:
+        """收尾：终答定形 → 三条「核对用尽后补事实」→ 指针行落终态 → 回会话历史落库。"""
+        session = r.ctx.session
+        qa_parts = r.state.qa_parts
+        final = r.final
+        if r.reached_limit:
+            final = f"[已达最大迭代次数 {self.config.max_iterations}，提前结束]"
+
+        final = self.hooks.finalize_content(r.ctx, final)
+
+        # 「提问必须是弹窗」的打回机会用尽仍在提问：如实交付，但补一句服务端核对到的事实，
+        # 让用户知道这句本该是个弹窗（与 NO_CARD_NOTE_TEXT 同一套兜底思路）。
+        if (self.config.require_popup_questions and not r.asked_this_run
+                and looks_like_asking_user(final)):
+            final = (final or "") + NO_POPUP_NOTE
+
+        if (r.planning and not r.state.plan_candidates
+                and (claims_plan_card(final) or looks_like_plan_card(final))):
+            # 核对机会用尽还在声称/还在把卡面内容当交付：界面上不会多出卡，这句不能
+            # 原样进历史——末尾补一条服务端核到的事实，让用户知道该重新发起。
+            # 判据与循环里那条守卫同源：纯咨询回答（问素材能不能用）不具卡面形状，
+            # 原样交付，不被这句多余的事实更正污染。
+            final = (final or "") + NO_CARD_NOTE_TEXT
+
+        approved = r.state.approved_plan
+        if (approved and _no_step_called(approved, r.state.calls_attempted)
+                and claims_step_executed(final)):
+            # 同一件事在执行轮的版本：核对机会用尽还在声称某步跑完了，就把「这条 run
+            # 零步骤调用、界面上不会多出任何新产物」这条事实补在答复末尾——留原样进历史，
+            # 用户读到的是上一轮的旧时长冒充这一轮的产出。
+            final = (final or "") + STEP_NOTE_TEXT
+
+        # 终答进收尾一致点：回看/分叉取这条 run 时，缺最后一句就不是一轮的终态。
+        if r.cp is not None:
+            if r.reached_limit:
+                # 撞迭代上限是**被打断**，不是成功收尾。原先这里照样 complete()，
+                # 于是 checkpoint 落成 completed、_UNFINISHED={running,failed} 把它排除，
+                # /runs/active 查不到、consumer 的自动续跑也捞不回来——用户看到
+                # 「[已达最大迭代次数 N，提前结束]」，刷新后这条 run 再也接不上。
+                # 真机会话里已经有一批这样收尾的记录。标记成 failed 让「继续」能接。
+                r.state.persist(r.cp)
+                await self.checkpoint.mark_failed(
+                    r.cp, iteration=r.iteration,
+                    messages=[*r.messages, assistant(final or "")])
+            else:
+                # 完成的 run 不再被恢复：指针行只留「认过的承诺」（分叉要继承它），
+                # transcript 与调用清单撤下——前者已经在 assistant 行的 qa 字段里。
+                RunState.retain_residue(r.cp, r.state)
+                await self.checkpoint.complete(
+                    r.cp, messages=[*r.messages, assistant(final or "")])
+
+        # 落回会话历史：流式模式下这也是把攒出的完整答复写进会话的最简单情形。
+        qa_parts.append({"type": "answer", "content": final or ""})
+        session.add(user(message))
+        session.add(assistant(final))
+        session.add_qa(message, qa_parts)
+        await self._persist_answer_message(session, final or "", qa_parts)
+        return final or ""
+
 
     async def _adopt_fork(self, ctx: AgentHookContext,
                           child: Checkpoint) -> tuple[Checkpoint, list, int]:
