@@ -208,8 +208,9 @@ async function checkActiveRun(cid) {
       // 卡片就被重建、已选全丢——真机反馈正是
       // 「用户还没选完就跳另一个卡片，还要用户去找」。
       //
-      // 新题不会因此漏弹：新题由 WS 的 type=approval 帧弹出（那条路径不去重），
-      // 这里只是冷启动兜底。
+      // 新题不会因此漏弹：新题是一条**新的**签名，WS 与这条路径都会放行；
+      // 两条路径共用同一套签名（run_id + 标题），所以谁先弹都不会互相打架。
+      // 用户答完时 `decideApproval` 会清掉这个集合，换一版后被重新问到仍弹得出。
       const seen = askedCards[cid] || new Set();
       const same = questionCard.value
         && String(questionCard.value.run_id || "") === rid
@@ -1818,6 +1819,23 @@ function onFrame(cid, p) {
   } else if (p.type === "approval") {
     // HITL 审批：撞上需人工确认的工具，弹审批卡等用户批准/拒绝
     if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
+    // **按题去重**——这就是「同一道题弹好几次」的成因。
+    //
+    // 服务端每次挂起只发一帧审批（已核对库里的链：每道题只问一次），
+    // 但这条帧会进会话缓冲，**每次重连都带 ``replayed: true`` 重放一次**
+    // （见 connection_manager 的缓冲说明）。上面只对 ``answer`` 帧做了去重，
+    // 审批帧漏了，于是重连一次就再弹一次同一道题。
+    //
+    // 判据是「这个 run + 这道题」的签名。**不看 replayed 也去重**：
+    // 后端每道题只问一次，所以同一签名再进来必然是重放——统一拦掉更稳，
+    // 也顺带挡住任何重复投递。用户答完时 `decideApproval` 会清这个集合，
+    // 所以「换一版后同一道题被重新问到」仍然弹得出来。
+    const apSig = `${String(p.run_id || "")}\u0000${
+      String((p.ask && p.ask.title) || p.reason || "")}`;
+    const seenAp = askedCards[cid] || new Set();
+    if (seenAp.has(apSig)) return;
+    seenAp.add(apSig);
+    askedCards[cid] = seenAp;
     approvalBubble(cid, p);
   } else if (p.type === "plan") {
     // 候选计划：一张卡一条消息，等待用户在卡上点确认（服务端把这一份也存进了指针行）
