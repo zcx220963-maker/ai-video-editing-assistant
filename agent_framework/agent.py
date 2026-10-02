@@ -423,6 +423,12 @@ class AgentOnceRun:
         # 放内存即可——它只影响「同一进程、同一条 run 内要不要再弹一次」，
         # 跨重启后重弹一次无害（用户顶多再看一眼同一份编排），不值得为它加一列。
         self._render_confirmed: set[str] = set()
+        # 已经**问过**渲染确认门的 run：同一道门题对同一条 run 只问一次。
+        # 与 _render_confirmed 同理只放内存（跨重启重弹一次无害）。
+        # 为什么必须有它：``decision_is_confirm`` 只认 ``confirm_render``，
+        # 用户选「保内容完整」时门会认为"你没确认"→ 模型重渲 → 再拦 → 再问，
+        # 真机实测同一道题被问了几十遍。见 _tool_round 里的完整说明。
+        self._render_gate_asked: set[str] = set()
 
     async def run(
         self, session: Session, message: str, *, run_id: str | None = None,
@@ -723,7 +729,20 @@ class AgentOnceRun:
             # 拦下来就是**永久挂起**。它的投递方本来就已显式声明"直接执行"。
             if (r.interactive
                     and should_gate_render(resp.tool_calls, enabled=self.config.gate_render)
-                    and r.run_id not in self._render_confirmed):
+                    and r.run_id not in self._render_confirmed
+                    and r.run_id not in self._render_gate_asked):
+                # 这道门题**对同一条 run 只问一次**。
+                #
+                # 真机事故：用户看到同一道题被问了几十遍。机制是这样的——
+                # ``decision_is_confirm`` 只认 ``confirm_render`` 这一个 key，
+                # 用户选「保内容完整」不是它，于是门认为"你没确认"→ 模型重渲 →
+                # 再拦 → 再问同一道题，无限循环。而模型其实是对的：
+                # 它把时长放到了 234 秒、句子也没截断，用户的要求确实已满足。
+                #
+                # 用户的原则说得很清楚：「应该是用户没有选选项就不应该继续啊，
+                # 等待用户选择完成后才继续啊」——**答了就是答了**。
+                # 所以记下"这条 run 已问过"，之后按用户的选择继续，不再重复问。
+                self._render_gate_asked.add(r.run_id)
                 ask = build_render_ask(await self._load_preview(r.ctx.session))
                 return await self._pause(r, resp.tool_calls, reason=ask["title"], ask=ask)
 

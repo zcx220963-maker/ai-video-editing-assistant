@@ -127,6 +127,50 @@ async def main() -> int:
                   "不再是「纯用户文本」那种冒充回执的写法")
 
         print()
+        # 关键回归：**同一道门题只能问一次**。
+        #
+        # 真机事故：`decision_is_confirm` 只认 `confirm_render`，用户选「保内容完整」
+        # 不是它 → 门认为"没确认" → 模型重渲 → 再拦 → 再问同一道题，问了几十遍。
+        # 用户的原则：「答了就是答了」。所以第二次渲染必须**放行**（不再拦、不再问）。
+        print("=== ② 同一道门题不能问第二次 ===")
+        # 模拟模型「没改参数就重渲」（真机就是这样）
+        llm2 = ScriptedLLM([("tool", "render_video", {}),
+                            ("tool", "render_video", {}),
+                            ("answer", "完成")])
+        storage2 = build_storage("memory")
+        await storage2.start()
+        try:
+            tool2 = RenderTool()
+            reg2 = ToolRegistry()
+            reg2.register(tool2)      # type: ignore[arg-type]
+            mgr2 = CheckpointManager(storage2)
+            runner2 = AgentOnceRun(
+                llm2, reg2, ContextBuilder("BASE"), hooks=CompositeHook([]),
+                config=AgentConfig(max_iterations=6), checkpoint=mgr2,
+                storage=storage2,
+            )
+            sess2 = Session(user_id="u", conversation_id="c_gate_once")
+            await runner2.run(sess2, "渲染成片", run_id="run-go")
+            cp_a = await mgr2.load("run-go")
+            check(cp_a is not None and cp_a.status == "awaiting_approval",
+                  "第一次渲染被拦下（该问就问）")
+            check(tool2.calls == 0, f"第一次没渲染（实际 {tool2.calls}）")
+
+            # 用户选了「保完整」（非 confirm_render）
+            await runner2.approve(cp_a, sess2, decision="keep_full_sentence",
+                                 note="按音乐时长内,不要截断句子即可")
+            # 关键断言：第二次渲染**不该再被拦**
+            cp_b = await mgr2.load("run-go")
+            status_b = getattr(cp_b, "status", "?")
+            check(tool2.calls >= 1,
+                  f"第二次渲染**放行了**（渲染真的执行了 {tool2.calls} 次）")
+            check(status_b != "awaiting_approval",
+                  f"没有再次停在等待确认上（status={status_b}）——"
+                  f"这就是「问几十遍」的反面")
+        finally:
+            await storage2.close()
+
+        print()
         print("全部通过" if not _fails else f"有 {_fails} 项未通过")
         print(f"用例 {_checks} 条")
         return 0 if not _fails else 1
