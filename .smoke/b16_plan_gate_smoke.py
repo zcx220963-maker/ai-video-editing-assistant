@@ -47,7 +47,8 @@ from agent_framework.storage import build_storage  # noqa: E402
 from agent_framework.tools.mcp import MCPServerConfig, connect_server  # noqa: E402
 from agent_framework.video_editing import (  # noqa: E402
     load_storyline_config, storyline_server_url)
-from b6_fork_smoke import Service, bearer, borrow_key, free_port  # noqa: E402
+from b6_fork_smoke import (Service, bearer, borrow_key, credit_gate,  # noqa: E402
+                           free_port)
 from b7_bgm_rerun_smoke import make_clip, make_tone  # noqa: E402
 from storyline_server import mediaops  # noqa: E402
 
@@ -94,6 +95,10 @@ def frames_of(frames: list[dict], typ: str, run_id: str = "") -> list[dict]:
 
 
 async def main() -> int:
+    # 模型额度是这些断言的前提：没额度时 run 会在 iteration=0 就 failed，
+    # 十几条断言一起 FAIL，那是环境不是缺陷——先闸掉再说。
+    if (code := await credit_gate()):
+        return code
     tmp = Path(tempfile.mkdtemp(prefix="b16_plan_"))
     port_main, port_story = free_port(), free_port()
     base = f"http://127.0.0.1:{port_main}"

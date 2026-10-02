@@ -35,7 +35,8 @@ import websockets
 from agent_framework.checkpoint import rebuild  # noqa: E402
 from agent_framework.secrets import API_KEY_NAME  # noqa: E402
 from agent_framework.storage import build_storage  # noqa: E402
-from b6_fork_smoke import Service, bearer, borrow_key, free_port  # noqa: E402
+from b6_fork_smoke import (Service, bearer, borrow_key, credit_gate,  # noqa: E402
+                           free_port)
 from b7_bgm_rerun_smoke import BGM_USER, make_clip, make_tone, put_bgm  # noqa: E402
 from storyline_server import mediaops  # noqa: E402
 
@@ -113,6 +114,10 @@ async def wait_turn_idle(c, tok, timeout=RUN_WAIT) -> bool:
 
 
 async def main() -> int:
+    # 模型额度是这些断言的前提：没额度时 run 会在 iteration=0 就 failed，
+    # 十几条断言一起 FAIL，那是环境不是缺陷——先闸掉再说。
+    if (code := await credit_gate()):
+        return code
     tmp = Path(tempfile.mkdtemp(prefix="b9_poll_"))
     port_main, port_story = free_port(), free_port()
     base = f"http://127.0.0.1:{port_main}"

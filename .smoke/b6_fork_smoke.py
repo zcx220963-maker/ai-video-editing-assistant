@@ -34,6 +34,8 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent_framework.editing_contract import load_contract  # noqa: E402
+from agent_framework.llm_openai import (  # noqa: E402
+    DEFAULT_BASE_URL, DEFAULT_MODEL, MY_BASE_URL, MY_MODEL)
 from agent_framework.secrets import API_KEY_NAME  # noqa: E402
 from agent_framework.storage import build_storage  # noqa: E402
 from agent_framework.tools.mcp import MCPServerConfig, connect_server  # noqa: E402
@@ -74,6 +76,49 @@ async def borrow_key(st) -> str:
         if v.strip():
             return v.strip()
     return ""
+
+
+async def preflight_credit() -> str:
+    """真机冒烟的前置闸：先花 4 个 token 问模型「还调用得通吗」。
+
+    这些冒烟的判据全建立在「那一轮真跑到 completed」上。密钥没余额时 run 会在
+    iteration=0 直接 failed，于是十几条断言一起 FAIL——看着像代码坏了，其实是账户空了。
+    返回 ""（可以继续）或一句中文原因。
+    """
+    st = build_storage("pg_minio")
+    await st.start()
+    try:
+        key = await borrow_key(st)
+    finally:
+        await st.close()
+    if not key:
+        return "库里没有已配置的模型密钥（app_secrets 无值），真机冒烟跑不了。"
+    model = MY_MODEL or os.getenv("OPENAI_MODEL") or DEFAULT_MODEL
+    base_url = MY_BASE_URL or os.getenv("OPENAI_BASE_URL") or DEFAULT_BASE_URL
+    try:
+        from openai import AsyncOpenAI  # noqa: PLC0415 - 只在真要出网时才依赖它
+
+        async with AsyncOpenAI(api_key=key, base_url=base_url) as client:
+            await client.chat.completions.create(
+                model=model, max_tokens=4,
+                messages=[{"role": "user", "content": "回一个「在」字"}], timeout=60)
+    except Exception as exc:  # noqa: BLE001 - 冒烟只分类不重试
+        code = getattr(exc, "status_code", None)
+        tip = {401: "密钥无效", 402: "账户余额不足", 403: "访问被拒",
+               429: "请求过于频繁"}.get(int(code or 0), "调用失败")
+        return (f"模型{tip}（{code or type(exc).__name__}）——真机冒烟需要先解决它，"
+                f"否则 run 会在 iteration=0 就 failed，一堆断言 FAIL 是环境不是缺陷。"
+                f"原始错误：{str(exc)[:160]}")
+    return ""
+
+
+async def credit_gate() -> int:
+    """冒烟开场用：额度没问题返 0，否则把原因打印出来、返退出码 2。"""
+    reason = await preflight_credit()
+    if not reason:
+        return 0
+    print(f"SKIP  {reason}", flush=True)
+    return 2
 
 
 class Service:
@@ -354,6 +399,10 @@ async def part_runsurface() -> None:
 
 
 async def main() -> None:
+    # 模型额度是这些断言的前提：没额度时 run 会在 iteration=0 就 failed，
+    # 十几条断言一起 FAIL，那是环境不是缺陷——先闸掉再说。
+    if await credit_gate():
+        return
     await part_contract()
     await part_runsurface()
     print("\n" + ("全部通过" if not FAILS else f"{len(FAILS)} 项失败："))

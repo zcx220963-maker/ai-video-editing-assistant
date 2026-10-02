@@ -40,7 +40,8 @@ import httpx
 
 from agent_framework.secrets import API_KEY_NAME  # noqa: E402
 from agent_framework.storage import build_storage  # noqa: E402
-from b6_fork_smoke import Service, bearer, borrow_key, free_port  # noqa: E402
+from b6_fork_smoke import (Service, bearer, borrow_key, credit_gate,  # noqa: E402
+                           free_port)
 
 STAMP = int(time.time())
 CONV = f"c_b12_{STAMP}"
@@ -86,6 +87,10 @@ def jloads(text: str) -> Any:
 
 
 async def main() -> int:
+    # 模型额度是这些断言的前提：没额度时 run 会在 iteration=0 就 failed，
+    # 十几条断言一起 FAIL，那是环境不是缺陷——先闸掉再说。
+    if (code := await credit_gate()):
+        return code
     st = build_storage("pg_minio")
     await st.start()
     port = free_port()

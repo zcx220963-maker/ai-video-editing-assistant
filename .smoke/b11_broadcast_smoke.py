@@ -42,7 +42,8 @@ import websockets
 
 from agent_framework.secrets import API_KEY_NAME  # noqa: E402
 from agent_framework.storage import build_storage  # noqa: E402
-from b6_fork_smoke import Service, bearer, borrow_key, free_port  # noqa: E402
+from b6_fork_smoke import (Service, bearer, borrow_key, credit_gate,  # noqa: E402
+                           free_port)
 
 STAMP = int(time.time())
 REDIS_URL = os.getenv("BROADCAST_REDIS_URL", "redis://localhost:6379/0")
@@ -224,6 +225,8 @@ async def main() -> int:
     if not await redis_alive():
         print(f"Redis 不可达（{REDIS_URL}）：多副本广播没法真机验，先 docker compose up -d redis。")
         return 2
+    if (code := await credit_gate()):
+        return code
     st = build_storage("pg_minio")
     await st.start()
     runs: list[dict[str, Any]] = []
