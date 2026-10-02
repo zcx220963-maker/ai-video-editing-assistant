@@ -40,7 +40,7 @@ tests/                   离线验证（每个模块一份，`python tests/test_
 | Python 3.12+ | `pip install -r requirements.txt -r requirements-storyline.txt` |
 | ffmpeg / ffprobe | 在 `PATH` 上；渲染与素材元数据都靠它，**留在本地不进存储层** |
 | Docker Desktop | 起 PostgreSQL + MinIO（`docker-compose.yml`）；也可换原生实例或云实例，只改 `.env` |
-| 模型密钥 | **一把就够**：文案/对话与画面理解走同一个服务商的同一个多模态模型（`deepseek-flash`）。填在页面「设置」里（写进 PG `app_secrets`，两个服务热读，不用重启）；`OPENAI_API_KEY` 是回落位，见 §3.7。**代码与配置里不写死、不打印** |
+| 模型密钥 | **一把就够**：文案/对话与画面理解走同一个服务商的同一个多模态模型（`deepseek-flash`）。填在页面「设置」里（写进 PG `app_secrets`，两个服务热读，不用重启）；`OPENAI_API_KEY` 是回落位（同层还认 `DEEPSEEK_API_KEY` / `SILICONFLOW_API_KEY` 两个历史名字，按顺序取第一把非空的），见 §3.7。**代码与配置里不写死、不打印** |
 
 `requirements.txt` 里的 `yt-dlp` 是「按链接取素材」的第三条策略（站点播放器解析）。
 它的站点解析器会随对方改版失效——遇到 `yt-dlp 解析失败` 先 `pip install -U yt-dlp`
@@ -76,6 +76,11 @@ copy .env.example .env      # Windows；*nix 用 cp
 `.env` 里必须齐的五项：`PG_DSN`、`MINIO_ENDPOINT`、`MINIO_ACCESS_KEY`、
 `MINIO_SECRET_KEY`、`MINIO_BUCKET`（默认值与本机容器一致，上线改成自己的实例）。
 `docker compose` 另读 `PG_USER` / `PG_PASSWORD` / `PG_DB`，改了要同步改 `PG_DSN`。
+
+PG 连接池除 `PG_POOL_SIZE` 外还有三条**可选**参数（都有默认值，不改也能跑）：
+`PG_POOL_MAX_OVERFLOW`（10，长任务与 HTTP handler 共用这一池，池满时溢出几条比排队等超时好）、
+`PG_POOL_PRE_PING`（开，取连接前先 ping——容器重启或 PG 侧掐掉空闲连接后，池里那条是死的，
+不 ping 就是一次 `StorageUnavailable`）、`PG_POOL_RECYCLE_SEC`（1800，连接活够久就换新）。
 
 剪辑参数与能力在 `examples/storyline/config.toml`：`[storage]`（后端、临时工作区与
 内容缓存根、LRU 上限）、`[capabilities]`（ASR/TTS/VL、超时、字幕字体目录
@@ -220,7 +225,9 @@ curl -X POST http://127.0.0.1:8000/chat -H "Authorization: Bearer $TOKEN" \
 主服务与 Storyline 各自在**每次请求前**按当前身份回源：
 
 ```
-前端配置（app_secrets，按 user_id）→ 环境变量 OPENAI_API_KEY → 进程内回落位
+前端配置（app_secrets，按 user_id）
+  → 环境变量（按 OPENAI_API_KEY → DEEPSEEK_API_KEY → SILICONFLOW_API_KEY 的顺序，取第一把非空的）
+  → 进程内回落位
 ```
 
 `agent_framework/secrets.py` 是这条优先级的唯一实现，`Storage.start()` 把存储句柄绑进去
@@ -242,7 +249,10 @@ curl -X POST http://127.0.0.1:8000/chat -H "Authorization: Bearer $TOKEN" \
   所以它验的是「稍后真跑一条片子会怎么走」，不是另一个平行实现。
 
 `.env` / `OPENAI_API_KEY` 仍然是有效回落层（容器化部署、CI、还没打开过页面的用户）；
-`llm_openai.py` 顶部那个 `MY_API_KEY` 常量只剩「本机开发最后一级」的定位，留空即可。
+同一层现在还认 `DEEPSEEK_API_KEY` 与 `SILICONFLOW_API_KEY` 这两个历史名字——原先**没有任何代码读它们**，
+用户在 `.env` 里填了、静默无效（审计第 7 条）。顺序即优先级，且三者是同一层的三个名字、不是三把
+不同的 key；来源名报的是**实际命中的那一个变量名**（`环境变量 DEEPSEEK_API_KEY`），诊断据此说得清
+读到的是哪一把。`llm_openai.py` 顶部那个 `MY_API_KEY` 常量只剩「本机开发最后一级」的定位，留空即可。
 
 ### 3.8 思考模式：默认关，两条通道各留开关
 
