@@ -125,35 +125,30 @@ def case_skills_hygiene() -> None:
 
 
 def case_real_sources() -> None:
-    """②b 用**真实来源**再跑一遍：假 schema 全绿不代表装配处不漏来源。
+    """②b 字段名来源要读**真实的 submit_plan schema**，不是手写替身。
 
-    为什么专门钉：上一版这个用例喂的是手写的 SUBMIT_PLAN_LIKE 替身 schema，
+    为什么专门钉：这个用例的上一版喂的是手写的 SUBMIT_PLAN_LIKE 替身 schema，
     而真机装配处只扫主注册表（submit_plan 只在规划注册表里），
     于是启动日志挂着「引用了不存在的工具：param_options」，测试却依然全绿。
-    现在两边都走同一个 skill_field_names，并且直接读真实的 submit_plan schema
-    与磁盘上真实的技能正文——来源少一个、字段改个名，这里就会红。
+    现在这里直接取真实工具的 schema：字段改名、或来源没并进 skill_field_names，都会红。
+
+    「真实技能正文 × 真实工具集 → 零误报」这半条**不放在离线用例里**：
+    工具集要等装配时从 MCP ``tools/list`` 灌进 ToolCatalog，离线那份 ``catalog.names``
+    近乎空表，拿它当 known 会把技能正文里每一个真名都报成假工具。
+    这一半由带服务跑的标定脚本核（``.runtime/audit/calibrate_consistency.py``）。
     """
-    print("\n=== ②b 真实来源：规划工具 schema + 磁盘上的技能正文 ===")
+    print("\n=== ②b 真实 submit_plan schema → 字段名来源 ===")
     from agent_framework.catalog import get_catalog
     from agent_framework.plan_gate import ConfirmPlanTool, SubmitPlanTool
 
     # SubmitPlanTool 的 schema 是静态的，只有 execute 才用 gate，这里不调它
     planning_tools = [SubmitPlanTool(None), ConfirmPlanTool()]
-    catalog = get_catalog()
-    fields = C.skill_field_names(node_param_keys=catalog.params_display().keys(),
+    fields = C.skill_field_names(node_param_keys=get_catalog().params_display().keys(),
                                  tools=[planning_tools])
     check("param_options" in fields,
           "真实 submit_plan schema 里能反查出 param_options（不是靠手写替身）")
-
-    known = set(catalog.names) | {"submit_plan", "confirm_plan"}
-    bodies: dict[str, str] = {}
-    for md in sorted((Path(__file__).resolve().parents[1]
-                      / "examples" / "skills").glob("*/SKILL.md")):
-        bodies[md.parent.name] = md.read_text(encoding="utf-8")
-    check(len(bodies) >= 4, f"读到磁盘上的技能正文 {len(bodies)} 份")
-
-    bad = C.unknown_tools_in_skills(bodies, known, param_keys=fields)
-    check(bad == [], f"真实技能正文 × 真实工具集：零误报（误报会教人忽略这个检查）：{bad}")
+    for want in ("plans", "plan_id", "steps", "seq", "node", "why", "skippable"):
+        check(want in fields, f"真实 schema 的嵌套字段「{want}」也在来源里")
 
 
 def case_watched() -> None:
