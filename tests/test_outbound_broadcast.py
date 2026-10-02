@@ -8,6 +8,9 @@
   - 反向对照：不开广播时 B 一条也收不到——差距是真的，广播是补上它的那块
   - 频道里跑的仍是同一份 payload：字段不增不减，跨会话不串台
   - 收到帧的那个实例照样写环形缓冲，新连接重连能补看错过的进度
+  - **没挂 WS 的那个实例也攒一份**（只攒不投）：浏览器被它接管后重连，补得回接管之前的进度
+  - 这一份「影子缓冲」与两个观测计数都有**常数上界**（条数 / 合计帧数 / 最近 N 条），
+    不随「会话数 × 副本数」或累计帧数无界涨
   - create_app 开广播时 OutBound 订阅者只有一个（同一 topic+group 两处都订阅会在
     消费组里随机分掉一帧，另一处永远看不到）
   - 频道读失败不拖垮服务：监听任务吞掉异常继续，后续帧照常投递
@@ -26,6 +29,7 @@ import asyncio
 import sys
 import tempfile
 import time
+from collections import deque
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -35,7 +39,11 @@ from fastapi.testclient import TestClient
 
 from agent_framework.agent import Agent, AgentConfig
 from agent_framework.broadcast import OUTBOUND_CHANNEL, OutboundBroadcaster
-from agent_framework.connection_manager import OUTBOUND_TOPIC, ConnectionManager
+from agent_framework.connection_manager import (
+    OUTBOUND_TOPIC,
+    ConnectionManager,
+    _DEFAULT_OBS_LIMIT as _OBS_LIMIT,
+)
 from agent_framework.context import ContextBuilder, DEFAULT_SYSTEM_PROMPT
 from agent_framework.hooks import CompositeHook, OutboundStreamHook
 from agent_framework.llm import ScriptedLLM
@@ -172,8 +180,10 @@ async def part1_cross_instance() -> None:
     ok = await wait_for(lambda: len(ws_b.received) == 1)
     check(ok and ws_b.received[0]["text"] == "跨实例的一句话",
           "帧产生在 A、WS 挂在 B → B 的这条连接收到")
-    check(cm_a.sockets_of("u1:c1") == 0 and cm_a.sent == [],
+    check(cm_a.sockets_of("u1:c1") == 0 and list(cm_a.sent) == [],
           "A 本地没有该 session 的连接：不就地投递，只广播出去")
+    check(cm_a.get_buffer("u1:c1") and cm_a.shadow_of() == ["u1:c1"],
+          "但 A 攒下了这一帧（有界影子预算）——接管后重连补得回接管前的进度")
     check(len(bus.publishes) == 1, "一帧只上频道一次（消费入口被广播接管，不与本地直连叠加）")
 
     await bc_a.stop(); await bc_b.stop(); await mq_a.stop(); await mq_b.stop()
@@ -224,8 +234,17 @@ async def part2_payload_shape_and_buffer() -> None:
     n = await cm_b.replay_to("u1:c1", ws_late)
     check(n == 1 and ws_late.received[0]["type"] == "media",
           "收到帧的实例写了环形缓冲：重连能补看断连期间的进度")
-    check(cm_b.get_buffer("u1:c1") and cm_a.get_buffer("u1:c1") == [],
-          "缓冲落在挂着连接的那个实例上，A 侧不攒无用的帧")
+    check(cm_b.get_buffer("u1:c1") and cm_a.get_buffer("u1:c1"),
+          "投递侧（B）照旧攒帧，没挂连接的 A 也攒一份：审计第 5 条的那句「A 侧不攒无用的帧」已作废")
+    # 接管：浏览器从 B 换到 A（轮询/断线重连），A 上重连必须补得到接管之前的那一帧
+    ws_on_a = FakeWS()
+    cm_a.connect("u1:c1", ws_on_a)
+    n_a = await cm_a.replay_to("u1:c1", ws_on_a)
+    check(n_a == 1 and ws_on_a.received[0]["type"] == "media"
+          and ws_on_a.received[0].get("replayed") is True,
+          "被别的副本接管后重连：接管之前的进度补得回来（原来只能是空手）")
+    check(cm_a.shadow_of() == [],
+          "本地挂上连接之后不再占跨副本预算（上界回到每会话那条 deque）")
 
     await bc_a.stop(); await bc_b.stop(); await mq_a.stop(); await mq_b.stop()
 
@@ -326,11 +345,61 @@ async def part4_broker_outage() -> None:
     await bc_a.stop(); await bc_b.stop(); await mq_a.stop(); await mq_b.stop()
 
 
+def part5_shadow_budget() -> None:
+    """有界性单独测：攒是目的，不封顶是事故。"""
+    def frame(sid: str, i: int, kind: str = "delta") -> dict:
+        return {"type": kind, "session_id": sid, "run_id": f"r-{i}", "text": f"{sid}#{i}"}
+
+    cm = ConnectionManager(InMemoryMessageQueue(), shadow_sessions=2, shadow_frames=6)
+    for i in range(3):
+        cm.buffer_only(frame("u1:c1", i))
+    for i in range(3):
+        cm.buffer_only(frame("u1:c2", i))
+    check(cm.buffer_only(frame("u1:c3", 0)) is True, "第三条会话先进来（占名额）")
+    check(cm.shadow_of() == ["u1:c2", "u1:c3"],
+          f"会话条数上界生效：最久没人碰的整条淘汰（实际 {cm.shadow_of()}）")
+    check(cm.get_buffer("u1:c1") == [] and len(cm.get_buffer("u1:c2")) == 3,
+          "淘汰是整条丢，不留半截进度")
+
+    for i in range(3, 6):                       # c2 再灌 3 帧 → 合计 6+1 > 6
+        cm.buffer_only(frame("u1:c2", i))
+    check(cm.shadow_of() == ["u1:c2"],
+          f"总帧数上界生效：淘汰的是最久没人碰的那条（c3 又没被写过），实际 {cm.shadow_of()}")
+    check([f["text"] for f in cm.get_buffer("u1:c2")] == [f"u1:c2#{i}" for i in range(6)],
+          "留下的是最近碰过的那条，内容原样且按序（跨副本攒的就是同一份 payload）")
+    check(cm.get_buffer("u1:c3") == [], "被淘汰那条整条清空，不留半截")
+
+    ws = FakeWS()
+    cm.connect("u1:c2", ws)
+    check(cm.shadow_of() == [], "本地挂上连接 → 退出预算，改由每会话 deque 兜底")
+    check(cm.buffer_only(frame("u1:c2", 9)) is False,
+          "有本地连接时 buffer_only 不插手（那条路要走 route，得真投递）")
+    cm.disconnect("u1:c2", ws)
+    check(cm.shadow_of() == ["u1:c2"],
+          "最后一条本地连接断开 → 并入同一预算（否则每来过一个会话永久留一条 deque）")
+
+    off = ConnectionManager(InMemoryMessageQueue(), shadow_sessions=0)
+    check(off.buffer_only({"type": "delta", "session_id": "u1:cX", "text": "x"}) is False
+          and off.get_buffer("u1:cX") == [],
+          "shadow_sessions=0 显式关掉：回到「整条跳过」的老口径，不当默认改掉")
+    check(off.buffer_only({"type": "delta", "text": "没有 session_id"}) is False,
+          "没有 session_id 的帧不攒（攒了也永远找不到归属）")
+
+    cm.sent.extend(frame("u1:c1", i) for i in range(_OBS_LIMIT + 100))
+    check(isinstance(cm.sent, deque) and cm.sent.maxlen == _OBS_LIMIT
+          and len(cm.sent) == _OBS_LIMIT,
+          f"观测计数有界（{len(cm.sent)} 条，上限 {_OBS_LIMIT}）：以前每帧永久留一份，长跑必漏")
+    bc = OutboundBroadcaster(InMemoryMessageQueue(), ConnectionManager(InMemoryMessageQueue()),
+                             url="redis://fake", obs_limit=3)
+    check(bc.published.maxlen == 3, "广播器的 published 同样有界")
+
+
 def main() -> int:
     for title, fn in [("① 跨实例投递 + 反向对照", part1_cross_instance),
                       ("② 同形 payload / 不串台 / 缓冲重放", part2_payload_shape_and_buffer),
                       ("③ create_app 装配与容错", part3_app_wiring),
-                      ("④ broker 不可达时的退化范围", part4_broker_outage)]:
+                      ("④ broker 不可达时的退化范围", part4_broker_outage),
+                      ("⑤ 跨副本影子预算的有界性", part5_shadow_budget)]:
         print(f"\n[{title}]")
         if asyncio.iscoroutinefunction(fn):
             asyncio.run(fn())
