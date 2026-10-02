@@ -22,6 +22,7 @@ agent_framework/        主框架：Agent / MQ / 上下文 / 记忆 / 技能 / c
 storyline_server/       真实剪辑节点（FastMCP server，:8001）
 frontend/               Vue3 前端（构建产物 frontend/dist，由主服务直接托管）
 examples/               配置样例与技能样例
+prompts/                提示词库落盘的整段文案（系统提示 + 5 类纠错说明，改文案不必动代码，见 §3.18）
 docs/superpowers/specs/ 设计与决策记录
 run_server.py           主服务装配（:8000）
 run_storyline.py        Storyline MCP Server 装配（:8001）
@@ -179,6 +180,8 @@ cd frontend && npm install && npm run build        # 产物 frontend/dist
 ```
 
 `run_server.py` 默认托管 `frontend/dist`（`--static-dir ""` 可关掉只提供 API）。
+`frontend/dist/` 在 `.gitignore` 里（构建产物不入库），所以**新克隆的仓库必须先跑上面那条
+`npm run build` 才打得出页面**——只起服务不 build，浏览器拿到的是 404 而 API 照常工作。
 浏览器只需知道一件事：**`localStorage` 里只有 `ca.token`**，会话列表与历史全部由
 服务端按 token 反查回来——换浏览器、换机器、清缓存都不丢历史。
 
@@ -757,15 +760,179 @@ curl -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
 + 真机 `.smoke/b16_plan_gate_smoke.py`（六段，含伪造确认帧
 拒收于跑模型之前、`<approved_plan>` 探针注入、revise 出新卡，跑完自建数据零残留）。
 
+### 3.16 HITL：弹窗提问与渲染前确认（同一条 run 内挂起）
+
+三条触发路径共用同一套挂起 / 回投 / 续跑 / 落盘机制——**同一条 run 停在中间等人工**。
+这与 §3.15 计划门是两回事：计划门是「规划 run 出卡 + 执行 run 开工」两条 run，这里只有一条。
+
+* **触发**：① `ask_user` 工具（模型主动提问，`agent_framework/ask_user.py`）；
+  ② 渲染前确认门 `render_gate`（默认开，`--no-render-gate` 关）；
+  ③ 工具自声明 `requires_approval=True`，或 `--approve-tools=render_video,delete_clip` 按名覆盖
+  （**默认全关**，不擅自改变既有流程）。
+* **挂起态 `awaiting_approval`**：`checkpoints.status` 新增的一格。`approval` 列同时存
+  `pending_calls`（待批的工具调用描述）与结构化 `ask`（题面 / 选项 / `recommended` 徽标 /
+  `custom_hint` / `allow_custom`；选项硬边界是「至少 1 个、至多 `MAX_OPTIONS=6` 个、key 不得重复」，
+  打回文案里对模型的要求是「给 2~6 个有真实差异的选项」）+ `fallback_options`。
+  挂起态刻意**不在** `_UNFINISHED` 里——
+  人工挂着就是等人工，崩溃恢复不该把它当残留捞起来重跑。
+* **刷新后重弹**：`GET /convs/{id}/runs/active` 的 `approval` 字段就是数据源（挂起态不在
+  `running` 里，所以这个只读口要单独再看一眼 `awaiting_approval_for_session`）。
+  2026-10-02 真机复验：挂在 :8000 的浏览器里刷新，「你手上的素材是什么情况？」那张卡原样回来，
+  多题分页（`第 1 / 1 题`）、推荐徽标、✎ 自定义输入都在，WS 状态 `回投已连接`。
+* **作答**：`POST /runs/{run_id}/approve`，体 `{decision, message, answers}`。
+  `answers` 是「第几题选了哪个 key」的结构化回执，执行侧不必去解析前端拼的那句中文散文。
+  与 `resume` 同构：这里只核归属与状态，投一帧 `action.op="approve"` 进 MQ，真正续跑在
+  `Agent.approve`。非本人 404；状态不是 `awaiting_approval`（已批过 / 已结束 / 从未挂起）409。
+* **答案怎么进模型上下文（两条硬纪律，都是真机踩出来的）**。`ask_user` 在挂起**之前**就执行完了，
+  那条 tool 回执已经在链上，于是续跑时：
+  ① **不得再补第二条同 `call_id` 的回执**（打真接口直接 400），用户的回话改以 `role=user` 追加。
+  旧写法在「这批调用都已有回执」时什么都不写，模型只看到「问题已发给用户」而等不到答案，
+  只能一遍遍重问同一道题——真机一条 run 连问 6 题、第 6 题还在重问第 1 题。
+  ② `asked_this_run` 是每次 `_drive` 的局部量，续跑那一轮必须由 `_settle_pending` 把它**恢复回来**，
+  否则那一轮正撞上 §3.17 的弹窗硬保证，续跑的每一轮都吃一条「但你没有调用 ask_user」的假打回。
+  回归各钉一条判据：`tests/test_approval_gate.py` 用例 H（链上「答案」恰好一条 `role=user`、
+  且不多第二条回执）、用例 I（续跑只多一次 LLM 调用、零条假打回）。
+  修好后的真机形状（同一条 run 第 32–39 条消息）：`user "highlight"` →
+  `assistant "你选了高光精选，方向定下来了"` → `tool ask_user(下一题)` → `user "…一次补齐…"` →
+  不再重复提问，收尾给出方案，run 停在 `completed`（不是烧穿迭代预算）。
+  **这条链上仍留下的边界**：修复之前落进链的那几题没有 `role=user` 答案（旧代码写的），
+  模型看得到「问题已发给用户」却看不到回答，所以那条历史被污染的 run 会继续重问旧题——
+  新答的会答一次少一次，老账只能靠重新发起会话。
+* **渲染前确认**：`agent_framework/render_gate.py`。`RENDER_NODE="render_video"` 做成常量；
+  `should_gate_render` 决定拦不拦，`build_render_ask` 把编排摘要写进题面（时长冲突会升级成一道
+  专门的题），选项固定 `confirm_render` / `adjust_plan`，`decision_is_confirm` 才放行执行。
+  复用 `ask` 那一套的好处是「刷新后重弹 / 多题分页 / 自定义输入」一次对两条路径都生效。
+* **编排预览读模型**：`agent_framework/preview.py` + `GET /preview/{conversation_id}`。
+  只读整理 Store 里已有的节点产物（`plan_timeline*` 时间线 / `group_clips` 分组 /
+  `understand_clips` 画面 / `asr` 逐句 / `generate_voiceover`、`select_BGM` 声音），
+  不触发剪辑、不调 LLM。`artifact_id` 留空时**不盲取 `_default`**——`rerun_from` 分叉给子 run
+  换了 `art-xxxx` 作用域，盲取会让预览显示父 run 的旧编排而用户以为看的是这一次的；
+  口径改成「本会话最近写过产物的那个作用域」。
+* **离线 46 项**：`tests/test_approval_gate.py`（A approve 续跑 / B reject 跳过 / C 未标注不挂起 /
+  D 按名覆盖 / E confirm 真执行挂起调用 / F `_repair_orphans` 不剥待批调用 /
+  G ask_user 不补第二条回执 / H 答案以 `role=user` 进链 / I 续跑无假打回）。
+
+### 3.17 弹窗硬保证：要用户拿主意就必须是弹窗
+
+原先「弹不弹窗」完全由模型自觉：它调 `ask_user` 就弹，把问题写进正文就只是普通答复，代码不检查。
+真机实测到过后者——正文里列「1. 风格：… 2. 时长：…」让用户自己打字挑。现在由
+`agent_framework/ask_gate.py` 在**准备收尾那一刻**拦：
+
+* **判据 `looks_like_asking_user`** 两级：强索取措辞（请你选 / 麻烦你 / 需要你上传 / 把链接发我 /
+  素材在哪…）**不带问号也算**——用户点名的「要素材、贴链接」本来就是祈使句；
+  弱索取（你想 / 要不要我 / 是否）必须**配问号**才算，否则「用户的诉求是…」这类叙述被误伤；
+  以「你来定 / 听你的」结尾也算。正反例在 `.runtime/audit/calibrate_ask_gate.py` 上标定过。
+* **打回**：本轮没有 `ask_user` 调用而文字在提问 → 追加一条服务端核对（`popup_nudge(planning)`，
+  规划轮那版多一条正路「直接 submit_plan」）并要求重来。默认**只打回一次**
+  （`popup_question_nudges=1`）——无上限会烧穿迭代预算。
+* **用尽后如实交付**：不再打回，在正文末尾附一句 `NO_POPUP_NOTE`，让用户知道「这句本该是个弹窗」。
+* **开关**：`AgentConfig.require_popup_questions`，默认 **True**。
+* **离线 26 项**：`tests/test_ask_gate.py`（两级判据各自的正反例——含「需要你**知道**」这类
+  告知不挨打、「请把链接发我」这种不带问号祈使句要挨打；打回恰好一次；预算用尽改附说明）。
+* 与 §3.15 的 `claims_plan_card` 同族——都是「声称做了 X 就必须拿得出 X 的证据」。
+  边界同样是词面判据：认得完成态说法，认不出一句刻意绕开的措辞；宁可漏纠也不误伤正常回答。
+
+### 3.18 提示词库（`PromptLibrary`）：整段提示文本搬出 .py
+
+`agent_framework/prompts.py`（`render_template` / `placeholders_in` / `PromptLibrary` /
+`build_prompt_library`）+ 仓库自带的 `prompts/*.md`（6 份：`system_prompt.md`、
+`step_nudge.md`、`step_note.md`、`no_card_nudge.md`、`no_card_note.md`、
+`no_card_structural_nudge.md`）。以前这些文案硬编码在 5 个 .py 里，改一句要动代码、走评审、
+重新发布；`ContextBuilder` 的 `bootstrap_dir` 口子其实早就实现了，但生产装配从来没传过。
+
+* **语义**：`render_template` **只替换明确提供的键，其余原样保留**。提示词里天然写着
+  `{"plans": [...]}` 这类 JSON 片段，按 `format_map` 会 KeyError 或静默吃字符。
+* **兜底**：目录不存在或某个文件缺失时落到内联默认值——提示词是核心资产，不能因为一个目录
+  没拷过去就让模型收到空 system prompt。
+* **接线**：`build_runtime(prompts_dir=)`；`None`（默认）= 用仓库自带的 `prompts/`，
+  `False` = 关闭全走内联。启动日志第 (e2) 行会明说「提示词库已接线：N 份来自 …」或
+  「提示词库未接目录：使用内联默认值」——这一条是给「动态加载」做证的，以前没人能从日志判断提示词从哪来。
+* **有意不搬的**：规划轮那一段。它是几十行按条件拼装 + 中间插节点白名单与参数枚举，正确性依赖
+  代码同时维护的数据；把拼装一起搬进模板只会把「改文案」变成「改模板语言 + 调试渲染」。
+* **漂移守卫**：`tests/test_prompt_library.py`（28 项）钉 `prompts/system_prompt.md` 与
+  `DEFAULT_SYSTEM_PROMPT` 内容必须一致（只差空白）。两处各写一份文案，靠人眼比对一定会漂——
+  实测就漂过一次。
+
+### 3.19 装配期一致性检查：点名的工具必须真的存在
+
+`agent_framework/consistency.py`，启动时跑一次（§3 启动日志的第 (f) 步），非空只**显式告警**、
+不拦启动。防的是四份互不校验的清单漂移：手写进提示词的工具名 / 真实注册的工具名 / 计划门白名单 /
+技能正文里让模型调用的工具名。真机事故：提示词写 `read_node_artifact`、真实工具叫
+`read_node_history` → 模型照提示词调 → `UnknownToolError` → 调用从未发生 → 白烧一轮迭代预算，
+表现成「流程走到一半莫名其妙断了」。
+
+* **方向 A（精确、零假阳性）**：`WATCHED` 清单——只收「曾经写错过 / 极易写错」的名字，
+  每个名字要么在真实工具集合里，要么就是漂移。扫到就是真错。
+* **方向 B（跨来源）**：`SKILL.md` 正文里 `xxx_yyy` 形态的标识符与真实工具集合求差集。
+  技能正文是给人看的自然语言，那里的下划线名基本就是工具名，判据可以激进些；
+  再排掉参数键、技能名、模板 id、样例 id 这些确定不是工具的东西（形态规则 + 词表，宁漏不误报）。
+* **字段名来源收在一处**：`skill_field_names(node_param_keys=, tools=[…])` = 剪辑节点参数键
+  ∪ 各批工具 schema 里出现过的**全部层级**字段名（`schema_property_names` 递归进
+  `items / additionalProperties / oneOf / anyOf`）。为什么必须收全：计划门的 `param_keys()` 只覆盖
+  剪辑节点参数，而 `submit_plan` 的 `plans[].steps[].param_options` 只在**规划注册表**里——
+  装配处第一版只扫主注册表，于是启动日志挂着一条假告警「引用了不存在的工具：param_options」，
+  而离线测试因为喂的是手写替身 schema 依然全绿。假告警的代价是教人忽略这个检查本身。
+* **离线 37 项**：`tests/test_consistency_check.py`，含用例⑤专钉「漏传规划那批来源 → 正好复现
+  那条假告警」。**真机精度校准**（拿真注册表 + 真技能正文跑零误报）在
+  `.runtime/audit/calibrate_consistency.py`——离线跑不了，因为 `ToolCatalog` 只在装配时填充，
+  离线拿到的 `catalog.names` 是近空的替身。
+
+### 3.20 配额闸（用量落库 + 超限拦截）
+
+每次 LLM 调用的 token 用量落 `token_usage` 表，按用户 + 时间窗聚合；超限不再调 LLM。
+
+* **用量接出**：`LLMResponse.usage` / `StreamChunk.usage`（`{prompt_tokens, completion_tokens, total_tokens}`）。
+  `llm_openai` 非流式从 `resp.usage` 取，流式靠 `stream_options={"include_usage": True}` 从末块取。
+* **落库**：`UsageHook` 写 `token_usage`（`user_id, session_id, run_id, model, *_tokens, created_at`）。
+* **拦截**：`QuotaHook` 在 `before_iteration` 查近 `window` 秒合计，超 `limit` 抛 `QuotaExceeded`。
+  `--quota-limit` 默认 **0**、`--quota-window` 默认 86400。**`limit=0` 是「不拦截但仍记录用量」的
+  刻意默认，不是缺陷**——上线先观察一周用量再定阈值。
+* **离线 9 项**：`tests/test_quota_gate.py`（落库 / 未超限不拦截 / 超限抛 / limit=0 不拦截）。
+
+### 3.21 eval 回归通道：钉 prompt 路径的形状
+
+* **prompt 指纹**：`context.prompt_fingerprint(text)` = `"{version}:{sha256[:8]}"`
+  （当前 `2026-10-01.v2:cbf36a96`）。改了提示词文本，指纹自动变；每轮 `qa.parts` 首条记
+  `{"type": "prompt_fingerprint", "fingerprint": "…"}`，于是「换过文案之后的结果」能归到具体版本。
+* **golden 基线**：`tests/golden/baseline.json`（4 条用例：纯答复 / 一轮工具 / 两轮工具 / 中文断言）。
+  每条声明 `input` + `llm_steps`（ScriptedLLM 脚本）+ `assertions`（equals / contains / regex / tool_calls）。
+* **入口**：`PYTHONPATH=. python scripts/run_eval.py`，不联网不接真 LLM——用 ScriptedLLM 按
+  golden 脚本逐轮返回。**它钉的是路径形状，不是模型质量**；真机评测走 `--live` 另接真 LLM + 真素材。
+
+### 3.22 多副本执行语义
+
+多个 `run_server.py` 实例共用同一套 PG，崩溃恢复按 `(status, lease)` 原子认领，
+跨实例同一条 run 只被一个实例接手。
+
+* **认领**：`CheckpointManager.claim_recoverable(instance_id)` 两步纯 AND claim——先认领无主的
+  （`owner_instance_id IS NULL`），再认领租约过期的（`lease_expires_at < now()`）。
+  PG 用 `FOR UPDATE SKIP LOCKED`，内存引擎在锁内比较-改写。
+* **租约续期**：`save_progress` 每次落盘顺带续租（迭代边界 = 心跳点）；`complete` / `mark_failed`
+  归还认领。
+* **装配**：`--instance-id=web-1`（默认 `hostname-pid`）。单副本下 `owner/lease` 恒为 NULL，
+  既有行为不变。§3.11 的 Redis 广播解决的是**回投**跨实例，这一节解决的是**执行权**跨实例，两件事。
+* **离线 17 项**：`tests/test_replica_claim.py`（认领无主 / 租约过期 / 续租 / 归还 / 跨实例互斥）。
 
 ## 4. 测试
 
 ```bash
-for f in test_*.py; do python "$f" || echo "FAIL $f"; done     # 全量回归，按 exit code 判定
+python -m pytest -q                              # 全量：一条命令收完 tests/ 下所有脚本
+python tests/test_approval_gate.py               # 单文件直跑（exit code 判定，便于反复调一个用例）
 ```
 
-**别用 pytest 收集 `tests/`**：这些文件是自带 `asyncio.main` 的独立脚本，pytest 会把每个
-`async def` 判成"缺异步插件"而全线 FAILED——看着像大回归，其实是跑错了门。
+当前规模：`tests/test_*.py` **56 份脚本**，`python -m pytest` 收出 56 个用例
+（2026-10-02 全量复跑 56/56 绿，约 130s；注意 `pytest.ini` 的 `addopts` 里已经有一个 `-q`，
+命令行再带 `-q` 会变成 `-qq`，末尾那行 `56 passed in …` 就不打印了，判据看 exit code 与点数）。
+
+**`tests/` 里每份文件都是自带 `asyncio.run(main())` 的独立脚本，一个真 pytest 用例也没有**。
+`pytest.ini` 写着 `testpaths = tests`，直接收集会把脚本里的 `async def` 判成「缺异步插件」、
+把 `tmp` 参数判成「fixture 不存在」——**命令能跑、结论全是假故障**，既掩盖真实回归也让人不敢用标准入口。
+`tests/conftest.py` 因此把每份脚本包成一个用子进程执行的用例（同样按 exit code 判定），
+退出码非 0 时在报告里带上该脚本的输出尾部，全量输出落 `.tmp/reg_pytest/`。
+实现上有个坑别改回去：`pytest_collect_file` **不是** firstresult hook，内置收集器同时会收出
+`Module`，同一文件于是既出现 5 个 async 用例、又出现 1 个脚本用例；在
+`pytest_pycollect_makemodule` 里返回 `None` 也挡不掉（那个 hook 经 `hookproxy(file_path)` 调用，
+子目录 conftest 不参与）。所以做法是收集完成之后**筛掉**非 `ScriptItem` 的那些。
 
 离线套件不联网、不起容器（存储层用内存替身，外部能力用注入的假实现）。
 `test_fork_time_travel.py`（49 项）钉的是增量链形态（指针行里没有 `messages`、`head_seq` 等于链长减一）、
@@ -922,16 +1089,23 @@ faster-whisper 权重（几百 MB～GB，镜像预置）；系统字体（`font_
   另两点如实：① 小文件（<2MB）走单请求路径，没有分片会话可作废，因此不显示「取消上传」，
   要中止只能等那一个请求自己结束；② init 声明整文件 `sha256` 的强校验只有脚本/CLI 客户端会发，
   浏览器换成交逐片摘要列（形态差异，非缺口）。
-- **两台常驻服务已是当前代码**（:8001 与 :8000 于 2026-09-30 19:03 各起重，启动时间晚于本轮全部
-  源码改动（渲染侧 11:15、`hooks.py` 12:34、`plan_gate.py`/`agent.py` 12:42、`frontend/dist` 12:37），
-  `GET :8000/health` 200、:8001 在听）。两行的命令行**都没带 flag**，走的是内置默认值：
-  `--port 8000`、`--storage pg_minio`、`--config examples/storyline/config.toml` 与文档一致，
-  唯一差别是 `--max-iterations` 取内置 **20**（本轮真机跑的是 24）——整链剪辑十余次工具调用，
-  20 够用但没有余量，遇到长链偏航早停时按 §3.15 的口径看 `iteration` 上限，别当成门失效。
-  六行启动日志（`storage=pg_minio` / 内部身份 `default+cron` / 技能库 3 个 /
-  `Storyline 已接入 21 个剪辑节点（DAG 契约 19 节点，rerun_from 可用）` /
-  `中文名词表已装载：47 条…参数标签 79 个` / `计划门已就位：19 个可规划节点`）
-  是 12:44 那一次逐行核过的；19:03 这次没把 stdout 接进可读文件，**未复核**。
+- **两台常驻服务的当前状态（2026-10-02 核过）**：:8001 `python -u run_storyline.py` 起于 10:21:07，
+  :8000 `python -u run_server.py` 起于 11:10:52，两行命令行**都不带 flag**，走内置默认值
+  （`--port 8000`、`--storage pg_minio`、`--config examples/storyline/config.toml`）。
+  `GET :8000/health` 200、`GET :8001` 在听。
+  * :8000 那次重启**晚于** §3.16 的两条 HITL 修复（`agent.py` 10:59 / 提交 `730e519` 11:09），
+    所以「答案以 `role=user` 进链」与「续跑不吃假打回」是**在当前进程上真机验过的**（浏览器点完
+    一整串提问 → 挂起 → 作答 → 续跑 → `completed`）。
+  * 但它**早于** §3.19 一致性检查的装配修复（`run_server.py` 11:14 / `consistency.py` 11:14）。
+    那一条只影响启动日志里的一行告警，不改变运行期行为；本轮**没有再重启**，因为同一台机器上有
+    另一个会话正在用这套服务，kill 会打断别人。下一次重启 :8000 后它自然生效。
+  * `--max-iterations` 的内置默认值现在是 **40**（旧文档写的 20 已改：整链剪辑十几步工具调用、
+    每步一轮 LLM，20 轮必然半路耗尽，用户看到「已达最大迭代次数 20，提前结束」）。
+  * 本轮两次重启都**没把 stdout 接进可读文件**，所以那几行启动日志（`storage=pg_minio` /
+    内部身份 / 技能库 / `Storyline 已接入 21 个剪辑节点…` / `中文名词表已装载…` /
+    `计划门已就位…` / 新增的 `提示词库已接线…`）**未逐行复核**。要复核就重启时带
+    `>> .main_server.log 2>&1`（注意 uvicorn 的访问日志会把 WS 查询串里的 token 原样写进文件——
+    该文件已在 `.gitignore` 里，但别贴进 issue）。
   主服务只在启动时建 MCP 连接，所以**改 Storyline 侧或 `config.toml` 白名单后必须重启 :8000**，
   否则它拿的还是旧工具表；只改主服务侧（如本轮的 `agent.py`）时 :8001 可以不动。
 - **块 A/B/C（§3.14、§3.15、§3.10）落地后仍存在的边界**，逐条如实：
@@ -1027,51 +1201,3 @@ faster-whisper 权重（几百 MB～GB，镜像预置）；系统字体（`font_
 - `generate_script` 会把标题截断（观察过：「换乐冒烟」→「换乐冒」），只影响文案标题字段，不影响产物。
 - 本机 `.runtime/checkpoints/` 的 11 个遗留 JSON **已实迁进库**（见 §3.4）；盘上文件按迁移器口径
   保留不删，要清盘得人工确认。
----
-
-### 3.16 HITL 审批断点（2026-09-30 新增）
-
-执行轮撞上标注「需人工审批」的工具时，整批 tool_calls 挂起，前端弹审批卡，用户批准后才续跑。
-这是真正的 interrupt 状态机——不是计划门那种两条 run 的做法，而是在同一条 run 内暂停。
-
-* **挂起态 `awaiting_approval`**：`checkpoints.status` 新增这一格。挂起时 `approval` 列记下
-  `pending_calls`（待批的工具调用描述），`messages` 末尾已是 `assistant(tool_calls)` 但工具结果未回填。
-  挂起态不在 `running/failed` 里，崩溃恢复候选天然看不到它——人工挂了就是等人工，不是等重启。
-* **批准 / �拒绝**：`POST /runs/{run_id}/approve`（`{decision: "approve"|"reject"}`）。
-  批准 → 从同一一致点续跑，工具真执行；拒绝 → 回喂拒绝结果，run 继续到下一轮 LLM。
-* **装配**：工具自声明 `requires_approval=True`，或 `run_server.py --approve-tools=render_video,delete_clip`
-  按名覆盖。默认全关，不擅自改变既有流程。
-* **离线 22 项**：`tests/test_approval_gate.py`（挂起 → approve 续跑 / reject 跳过 / 未标注不挂起 / 按名覆盖）。
-
-### 3.17 配额闸（2026-09-30 新增）
-
-每次 LLM 调用的 token 用量落 `token_usage` 表，按用户 + 时间窗聚合；超限拦截不再调 LLM。
-
-* **用量接出**：`LLMResponse.usage` / `StreamChunk.usage`（`{prompt_tokens, completion_tokens, total_tokens}`）。
-  `llm_openai` 非流式从 `resp.usage` 取，流式靠 `stream_options={"include_usage": True}` 从末块取。
-* **落库**：`UsageHook` 把每条用量写 `token_usage` 表（`user_id, session_id, run_id, model, *_tokens, created_at`）。
-* **拦截**：`QuotaHook` 在 `before_iteration` 查近 `window` 秒的合计，超 `limit` 抛 `QuotaExceeded`。
-  `run_server.py --quota-limit=100000 --quota-window=86400`（每用户每天 10 万 token）；`limit=0` 不拦截（默认）。
-* **离线 9 项**：`tests/test_quota_gate.py`（落库 / 未超限不拦截 / 超限抛 QuotaExceeded / limit=0 不拦截）。
-
-### 3.18 eval 回归通道（2026-09-30 新增）
-
-prompt 版本标注 + golden 基线 + 离线评测入口，钉 prompt 路径的形状不钉模型质量。
-
-* **prompt 指纹**：`context.prompt_fingerprint(text)` = `"{version}:{sha256[:8]}"`。改了 prompt 文本，指纹自动变。
-  每轮 `qa_parts` 首条记 `{"type": "prompt_fingerprint", "fingerprint": "..."}`，eval 据此把结果归到具体版本。
-* **golden 基线**：`tests/golden/baseline.json`（4 条用例：纯答复 / 一轮工具 / 两轮工具 / 中文断言）。
-  每条声明 `input` + `llm_steps`（ScriptedLLM 脚本）+ `assertions`（equals / contains / regex / tool_calls）。
-* **评测入口**：`scripts/run_eval.py`（`PYTHONPATH=. python scripts/run_eval.py`）。
-  不联网不依赖真实 LLM——用 ScriptedLLM 按 golden 脚本逐轮返回，结果只钉路径形状。
-  真机评测（模型质量）走 `--live` 另接真实 LLM + 真实素材。
-
-### 3.19 多副本执行语义（2026-09-30 新增）
-
-多个 `run_server.py` 实例共用同一套 PG，崩溃恢复按 `(status, lease)` 原子认领，跨实例同一 run 只被一个实例接手。
-
-* **认领**：`checkpoint.claim_recoverable(instance_id)` 两步纯 AND claim——先认领无主的（`owner_instance_id IS NULL`），
-  再认领租约过期的（`lease_expires_at < now()`）。PG 用 `FOR UPDATE SKIP LOCKED`，内存引擎锁内比较-改写。
-* **租约续期**：`save_progress` 每次落盘顺带续租（迭代边界 = 心跳点）；`complete` / `mark_failed` 归还认领。
-* **装配**：`run_server.py --instance-id=web-1`（默认 `hostname-pid`）。单副本下 `owner/lease` 恒为 NULL，既有行为不变。
-* **离线 17 项**：`tests/test_replica_claim.py`（认领无主 / 租约过期 / 续租 / 归还 / 跨实例互斥）。
