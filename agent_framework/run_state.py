@@ -47,6 +47,15 @@ class RunState:
     plan_candidates: list[dict[str, Any]] = field(default_factory=list)
     plan_warnings: list[str] = field(default_factory=list)
     plan_card_pushed: bool = False
+    # 渲染确认门：这条 run **已经问过**那道门题没有。
+    #
+    # 为什么必须持久化（放内存不够）：真机实测同一道题被问了几十遍——
+    # 用户在弹窗里答了「保内容完整 / 音乐时长内」这类选项，但
+    # ``decision_is_confirm`` 只认 ``confirm_render`` 一个 key，于是门判定
+    # "你没确认" → 模型重渲 → 再拦 → 再问，无限循环。
+    # 放内存的版本还会被两件事打穿：进程重启（内存清零）、续跑换 run 身份。
+    # 落进 state 就跟着指针行走，重启与续跑都记得「这道题问过了」。
+    render_gate_asked: bool = False
     # 对账：上一次推给前端的偏差（据此去重），以及终答时算出的完整结论
     audit_pushed: dict[str, Any] | None = None
     plan_audit: dict[str, Any] | None = None
@@ -62,6 +71,7 @@ class RunState:
             "calls_attempted": list(self.calls_attempted),
             "calls_executed": list(self.calls_executed),
             "plan_card_pushed": bool(self.plan_card_pushed),
+            "render_gate_asked": bool(self.render_gate_asked),
             "audit_pushed": (dict(self.audit_pushed)
                              if isinstance(self.audit_pushed, Mapping) else None),
             "plan_audit": (dict(self.plan_audit)
@@ -78,6 +88,7 @@ class RunState:
             calls_attempted=[str(x) for x in (d.get("calls_attempted") or [])],
             calls_executed=[str(x) for x in (d.get("calls_executed") or [])],
             plan_card_pushed=bool(d.get("plan_card_pushed")),
+            render_gate_asked=bool(d.get("render_gate_asked")),
             audit_pushed=(dict(d["audit_pushed"])
                           if isinstance(d.get("audit_pushed"), Mapping) else None),
             plan_audit=(dict(d["plan_audit"])

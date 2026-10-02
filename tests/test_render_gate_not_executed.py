@@ -171,6 +171,61 @@ async def main() -> int:
             await storage2.close()
 
         print()
+        print("=== ③ 这个标记必须**落盘**（重启/换实例后仍记得）===")
+        # 上一版把标记放内存，真机被两件事打穿：进程重启、续跑换代——
+        # 于是同一道题又问了两遍。这里直接验它进了可恢复状态。
+        storage3 = build_storage("memory")
+        await storage3.start()
+        try:
+            tool3 = RenderTool()
+            reg3 = ToolRegistry()
+            reg3.register(tool3)      # type: ignore[arg-type]
+            mgr3 = CheckpointManager(storage3)
+            llm3 = ScriptedLLM([("tool", "render_video", {}), ("answer", "先停")])
+            runner3 = AgentOnceRun(
+                llm3, reg3, ContextBuilder("BASE"), hooks=CompositeHook([]),
+                config=AgentConfig(max_iterations=4), checkpoint=mgr3,
+                storage=storage3,
+            )
+            sess3 = Session(user_id="u", conversation_id="c_persist")
+            await runner3.run(sess3, "渲染", run_id="run-persist")
+            cp3 = await mgr3.load("run-persist")
+            # RunState 落在 cp.plan["state"]（见 RunState.persist），不是 cp.state
+            def _flag(cp) -> object:
+                plan = getattr(cp, "plan", None) or {}
+                return (plan.get("state") or {}).get("render_gate_asked")
+
+            got = _flag(cp3)
+            check(got is True,
+                  f"挂起时 render_gate_asked 已落进 cp.plan['state']（实际 {got!r}）")
+            # 关键：从盘上重新读一遍（模拟进程重启后恢复），标记仍在
+            cp3b = await mgr3.load("run-persist")
+            got2 = _flag(cp3b)
+            check(got2 is True,
+                  f"重新载入后仍然记得（实际 {got2!r}）——重启不会再问一遍")
+
+            # 换一个全新的运行器实例（模拟新进程），用同一份 checkpoint 续跑
+            tool4 = RenderTool()
+            reg4 = ToolRegistry()
+            reg4.register(tool4)      # type: ignore[arg-type]
+            runner4 = AgentOnceRun(
+                ScriptedLLM([("tool", "render_video", {}), ("answer", "完成")]),
+                reg4, ContextBuilder("BASE"), hooks=CompositeHook([]),
+                config=AgentConfig(max_iterations=4), checkpoint=mgr3,
+                storage=storage3,
+            )
+            await runner4.approve(cp3b, sess3, decision="keep_full_sentence",
+                                  note="音乐时长内")
+            cp4 = await mgr3.load("run-persist")
+            check(tool4.calls >= 1,
+                  f"**新实例**续跑后渲染放行了（执行 {tool4.calls} 次）——"
+                  f"换进程也不会再问一遍")
+            check(getattr(cp4, "status", "?") != "awaiting_approval",
+                  f"没有再次停在等待确认（status={getattr(cp4, 'status', '?')}）")
+        finally:
+            await storage3.close()
+
+        print()
         print("全部通过" if not _fails else f"有 {_fails} 项未通过")
         print(f"用例 {_checks} 条")
         return 0 if not _fails else 1
