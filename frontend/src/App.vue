@@ -1099,6 +1099,10 @@ function openQuestionCard(pages, meta = {}) {
     answers: {},                        // pageIndex -> 选中的 key
     customAnswers: {},                  // pageIndex -> 自定义文本
     previewSummary: meta.previewSummary || null,
+    // 审批类弹窗（ask_user / 渲染确认 / 兜底选项）要把服务端那份 approval 带在身上：
+    // qSubmit 提交时取的就是它，缺了这个字段，点「确认」会抛
+    // 「Cannot set properties of undefined」，审批请求根本发不出去。
+    approval: meta.approval || null,
     card: meta.card || null,            // plan_confirm 时挂回原计划卡
   };
   return questionCard.value;
@@ -1263,7 +1267,10 @@ function approvalBubble(cid, src) {
     error: "",
   };
   const list = msgs(cid);
-  list.push({ role: "assistant", kind: "approval", card, state: "waiting" });
+  // text 不能省：消息列表的模板没有 kind==='approval' 的专门分支，这条会落到默认
+  // 的富文本分支，而那个解析器读 undefined.length 会抛 TypeError，
+  // 一抛就把整条消息流的这次更新中断掉（表现：挂起气泡根本不出现）。
+  list.push({ role: "assistant", kind: "approval", text: card.reason, card, state: "waiting" });
   scrollDown();
   // 走统一提问卡：结构化 ask 优先，没有就退化成「批准 / 拒绝」，同一个弹窗组件
   askQuestionCard(src, card.run_id);
