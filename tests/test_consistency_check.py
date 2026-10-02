@@ -15,6 +15,10 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# ✓/✗ 这些符号在 GBK 控制台上直接 print 会 UnicodeEncodeError（pytest 里被捕获才没暴露）
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 from agent_framework import consistency as C  # noqa: E402
 
 FAIL: list[str] = []
@@ -120,6 +124,38 @@ def case_skills_hygiene() -> None:
     check(bad3 == [], f"顶层参数名放行：{bad3}")
 
 
+def case_real_sources() -> None:
+    """②b 用**真实来源**再跑一遍：假 schema 全绿不代表装配处不漏来源。
+
+    为什么专门钉：上一版这个用例喂的是手写的 SUBMIT_PLAN_LIKE 替身 schema，
+    而真机装配处只扫主注册表（submit_plan 只在规划注册表里），
+    于是启动日志挂着「引用了不存在的工具：param_options」，测试却依然全绿。
+    现在两边都走同一个 skill_field_names，并且直接读真实的 submit_plan schema
+    与磁盘上真实的技能正文——来源少一个、字段改个名，这里就会红。
+    """
+    print("\n=== ②b 真实来源：规划工具 schema + 磁盘上的技能正文 ===")
+    from agent_framework.catalog import get_catalog
+    from agent_framework.plan_gate import ConfirmPlanTool, SubmitPlanTool
+
+    # SubmitPlanTool 的 schema 是静态的，只有 execute 才用 gate，这里不调它
+    planning_tools = [SubmitPlanTool(None), ConfirmPlanTool()]
+    catalog = get_catalog()
+    fields = C.skill_field_names(node_param_keys=catalog.params_display().keys(),
+                                 tools=[planning_tools])
+    check("param_options" in fields,
+          "真实 submit_plan schema 里能反查出 param_options（不是靠手写替身）")
+
+    known = set(catalog.names) | {"submit_plan", "confirm_plan"}
+    bodies: dict[str, str] = {}
+    for md in sorted((Path(__file__).resolve().parents[1]
+                      / "examples" / "skills").glob("*/SKILL.md")):
+        bodies[md.parent.name] = md.read_text(encoding="utf-8")
+    check(len(bodies) >= 4, f"读到磁盘上的技能正文 {len(bodies)} 份")
+
+    bad = C.unknown_tools_in_skills(bodies, known, param_keys=fields)
+    check(bad == [], f"真实技能正文 × 真实工具集：零误报（误报会教人忽略这个检查）：{bad}")
+
+
 def case_watched() -> None:
     print("\n=== ③ 方向 A：点名了不存在的工具 ===")
     known = {"load_media", "filter_clips"}
@@ -137,11 +173,54 @@ def case_report_text() -> None:
           "有技能问题时给出可读告警并点名")
 
 
+def case_skill_field_names() -> None:
+    """skill_field_names 是装配处真正调用的那个入口。
+
+    它比 schema_property_names 多一层：把「多批工具」合并起来。
+    为什么这个函数非测不可：真机那次假告警的根因正是**只扫了主注册表**，
+    漏掉「submit_plan / confirm_plan 只活在规划注册表里」这一事实；
+    而当时的离线用例用的是手写假 schema，生产与测试各算各的来源，照样全绿。
+    所以这里专门钉住「来源必须都传进来」这件事。
+    """
+    print("\n=== ⑤ skill_field_names：多批来源必须都算上 ===")
+    main_batch = [_FakeTool("load_media", {"type": "object", "properties": {
+        "material_ids": {"type": "array"}}})]
+    # 规划注册表那批：只在这里才有的 submit_plan
+    plan_batch = [_FakeTool("submit_plan", SUBMIT_PLAN_LIKE)]
+
+    names = C.skill_field_names(node_param_keys={"keep_clips"},
+                               tools=[main_batch, plan_batch])
+    for want in ("keep_clips", "material_ids", "param_options", "steps"):
+        check(want in names, f"合并后含「{want}」")
+
+    # 少传规划注册表那批 → param_options 就收不到。这正是真机 bug 的形状，
+    # 用例必须能复现它（否则测试就失去意义）。
+    missing = C.skill_field_names(node_param_keys=set(), tools=[main_batch])
+    check("param_options" not in missing,
+          "只扫主注册表时收不到 param_options（复现真机 bug 的形状）")
+
+    # 而且这种缺失会真的产生假告警——证明这个用例测的是有意义的东西
+    body = "在规划轮用 param_options 做成开关。"
+    ok_names = C.skill_field_names(node_param_keys=set(),
+                                  tools=[main_batch, plan_batch])
+    bad_names = C.skill_field_names(node_param_keys=set(), tools=[main_batch])
+    check(C.unknown_tools_in_skills({"s": body}, {"load_media"},
+                                    param_keys=ok_names) == [],
+          "来源传全 → 不报假告警")
+    check(C.unknown_tools_in_skills({"s": body}, {"load_media"},
+                                    param_keys=bad_names) == ["param_options"],
+          "来源漏传 → 正是那条假告警（用例确实守得住）")
+
+    check(C.skill_field_names() == set(), "都不传时返回空集（不崩）")
+
+
 def main() -> None:
     case_schema_property_names()
     case_skills_hygiene()
+    case_real_sources()
     case_watched()
     case_report_text()
+    case_skill_field_names()
     print()
     if FAIL:
         print(f"有 {len(FAIL)} 项未通过：")

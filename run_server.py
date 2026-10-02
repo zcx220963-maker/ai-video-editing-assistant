@@ -613,30 +613,20 @@ def build_runtime(
                 _warn(f"一致性检查：技能正文取不到（跳过这段）：{exc}")
 
             watched = _cons.missing_watched(prompt_texts, known)
-            # 技能正文里的参数键（keep_clips/custom_groups/…）不是工具名，按真实 schema 排掉
-            try:
-                param_keys = set(plan_gate.param_keys())
-            except Exception:  # noqa: BLE001 - 契约没接上时退成空集
-                param_keys = set()
-            # 再补上所有工具 schema 里出现过的字段名（含嵌套层）。
-            # 计划门的 param_keys 只覆盖剪辑节点参数，而技能正文会提到别处的字段
-            # （如 submit_plan 的 plans[].steps[].param_options）。不收全就会把字段名
-            # 判成臆造工具，挂一条假告警——假告警会教人忽略这个检查本身。
-            #
-            # 规划轮的两个工具必须单独补：submit_plan / confirm_plan 只活在**规划注册表**
-            # 里（按调用懒建），主注册表里没有它们，只扫 registry 就会漏掉
-            # plans[].steps[].param_options，启动期挂一条「引用了不存在的工具：param_options」
-            # 的假告警（真机启动日志实测到过）。
+            # 技能正文里的参数键（keep_clips/custom_groups/…）不是工具名，按真实 schema 排掉。
+            # 来源必须收在 consistency.skill_field_names 这一处：装配处曾经只扫主注册表，
+            # 而 submit_plan / confirm_plan 只活在**规划注册表**里（按调用懒建），
+            # 于是 plans[].steps[].param_options 这个字段名被判成「臆造工具」，
+            # 启动日志挂了一条假告警——假告警比不报更坏，它教人忽略这个检查本身。
             try:
                 from agent_framework.plan_gate import ConfirmPlanTool, SubmitPlanTool
-                param_keys |= _cons.schema_property_names(
-                    [SubmitPlanTool(plan_gate), ConfirmPlanTool()])
-            except Exception:  # noqa: BLE001 - 取不到就按原样检查
-                pass
-            try:
-                param_keys |= _cons.schema_property_names(registry.all_tools())
-            except Exception:  # noqa: BLE001 - 取不到就按原样检查
-                pass
+                param_keys = _cons.skill_field_names(
+                    node_param_keys=plan_gate.param_keys(),
+                    tools=[registry.all_tools(),
+                           [SubmitPlanTool(plan_gate), ConfirmPlanTool()]])
+            except Exception as exc:  # noqa: BLE001 - 取不到就按原样检查
+                _warn(f"一致性检查：字段名来源取不全（可能误报字段名为假工具）：{exc}")
+                param_keys = set()
             skills_bad = _cons.unknown_tools_in_skills(
                 skill_bodies, known, param_keys=param_keys)
             report = _cons.format_report(watched, skills_bad, known)
