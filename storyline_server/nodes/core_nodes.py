@@ -1504,6 +1504,66 @@ async def validate_timeline_objects(timeline: Any, storage: Any) -> None:
             + "\n请用上面的真实键（素材入库/曲库返回的就是它），不要按当前会话前缀拼。")
 
 
+def resync_original_audio_timeline(tl: Any) -> int:
+    """原声混剪时间线：把出镜画面的源时刻**重新钉到声音的源时刻**上。返回改了几段。
+
+    为什么渲染前必须做这一道（真机事故，用户报了两次「音画不同步」）：
+    模型可以**自己手写整个 timeline** 再直接交给 render_video（走 ``inputs["timeline"]``），
+    那条路径逐字使用、不经过 ``_build_original_timeline``。而模型是按「句子的原始镜头
+    时间码」切画面、按「ASR 段落的音频时间码」排声音——**两套时间轴并不重合**，
+    于是每个出镜段的偏移各不相同（实测 −4.07 / +1.90 / −33.97 / +6.41 / −14.01 秒…），
+    嘴型必然对不上。修 builder 修不了手写路径，所以这道校准放在**渲染前**，
+    两条路径都覆盖。
+
+    判据只用时间线自身：画面段与声音段同源（同一 path）时，
+    该画面的 ``src_start`` 必须等于「该墙壁时刻声音正在播的源时刻」。
+    不满足就按声音改画面（声音是口播的时间基准，画面跟着它才对得上嘴）。
+    """
+    if not isinstance(tl, Mapping):
+        return 0
+    events = tl.get("events")
+    audios = tl.get("audio_events")
+    if not isinstance(events, list) or not isinstance(audios, list):
+        return 0
+    # 声音段：与画面同源的才参与（同一素材才有"嘴型"可言）
+    spans = []
+    for a in audios:
+        if not isinstance(a, Mapping):
+            continue
+        s, e = a.get("start"), a.get("end")
+        ss = a.get("src_start")
+        if s is None or e is None or ss is None:
+            continue
+        spans.append((float(s), float(e), float(ss), str(a.get("path") or "")))
+    if not spans:
+        return 0
+
+    def voice_at(wall: float, path: str):
+        for s, e, ss, p in spans:
+            if p == path and s <= wall < e:
+                return ss + (wall - s)
+        return None
+
+    changed = 0
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        path = str(ev.get("path") or "")
+        s, e = ev.get("start"), ev.get("end")
+        if s is None or e is None:
+            continue
+        want = voice_at(float(s), path)
+        if want is None:
+            continue                     # 这一段的画面不来自口播素材（空镜），不动它
+        cur = ev.get("src_start")
+        if cur is not None and abs(float(cur) - want) < 0.01:
+            continue                     # 已经对齐
+        ev["src_start"] = round(want, 3)
+        ev["src_end"] = round(want + max(0.0, float(e) - float(s)), 3)
+        changed += 1
+    return changed
+
+
 class RenderVideoNode(StoryNode):
     name = "render_video"
     display_name = "成片渲染"
@@ -1572,6 +1632,13 @@ class RenderVideoNode(StoryNode):
         # 而键写错原先要等渲染器深处才炸——真机实测跑了十分钟才失败，报错只说
         # 「对象不存在：…/mat-0fe987.mp3」，不说正确的是哪个键。
         # 现在一次 HEAD 就拦下，并把**真实的对象键**告诉它（见 validate_timeline_objects）。
+        # 渲染前校准音画同步：模型手写的 timeline 走的是另一条路（见
+        # resync_original_audio_timeline 的说明），它的出镜画面按"句子的镜头时间码"
+        # 切、声音按"ASR 音频时间码"排，两套轴不重合 → 嘴型对不上。
+        # 这里按声音把画面钉回去，两条路径（builder / 手写）都覆盖。
+        fixed = resync_original_audio_timeline(tl)
+        # 校验对象键真的存在：一次 HEAD 就能拦下写错的键，并告诉模型正确的键
+        # （见 validate_timeline_objects；这里放在 open 之后，失败才会留下 failed 记录）
         try:
             await validate_timeline_objects(tl, self.storage)
         except ValueError as exc:

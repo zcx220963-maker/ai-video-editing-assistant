@@ -125,6 +125,52 @@ def main() -> int:
     check(abs(t_prev - tl["duration"]) < 0.06,
           f"画面轨铺到总时长（{t_prev:.3f} vs {tl['duration']}）")
 
+    print("\n=== ⑤ 渲染前校准：模型手写的 timeline 也要被掰回来 ===")
+    # 真机事故：模型手写整个 timeline 直接交给 render_video（绕过 builder），
+    # 它按「句子的镜头时间码」切画面、按「ASR 音频时间码」排声音，两套轴不重合，
+    # 每个出镜段偏移各不相同（实测 −4.07 / +1.90 / −33.97 / +6.41 / −14.01 秒…）。
+    # 修 builder 修不了这条路，所以渲染前必须再校准一次。
+    from storyline_server.nodes.core_nodes import (  # noqa: PLC0415
+        resync_original_audio_timeline,
+    )
+
+    hand = {
+        "mode": "original_audio",
+        "events": [
+            # 画面按"镜头时间码" 197.92，声音其实是 201.99 起
+            {"path": ONCAM, "start": 16.84, "end": 26.07,
+             "src_start": 197.92, "src_end": 207.15},
+            {"path": BROLL, "start": 26.07, "end": 27.0,
+             "src_start": 0.0, "src_end": 0.93},
+            # 偏得最狠的一段：−33.97
+            {"path": ONCAM, "start": 40.36, "end": 43.52,
+             "src_start": 311.24, "src_end": 314.4},
+            # 已对齐的不该被动
+            {"path": ONCAM, "start": 0.0, "end": 7.72,
+             "src_start": 0.0, "src_end": 7.72},
+        ],
+        "audio_events": [
+            {"path": ONCAM, "start": 0.0, "end": 7.72,
+             "src_start": 0.0, "src_end": 7.72},
+            {"path": ONCAM, "start": 16.84, "end": 40.36,
+             "src_start": 201.99, "src_end": 225.51},
+            {"path": ONCAM, "start": 40.36, "end": 63.06,
+             "src_start": 311.26, "src_end": 333.96},
+        ],
+    }
+    n = resync_original_audio_timeline(hand)
+    check(n == 2, f"校准了 2 段错位的（实际 {n}）")
+    by_start = {e["start"]: e for e in hand["events"]}
+    check(abs(by_start[16.84]["src_start"] - 201.99) < 0.01,
+          f"197.92 → {by_start[16.84]['src_start']}（按声音钉回来）")
+    check(abs(by_start[40.36]["src_start"] - 311.26) < 0.01,
+          f"311.24 → {by_start[40.36]['src_start']}（修掉那 −33.97 秒）")
+    check(by_start[26.07]["src_start"] == 0.0,
+          "空镜段不动（它不是口播素材，没有嘴型可言）")
+    check(by_start[0.0]["src_start"] == 0.0, "本来就对齐的不动")
+    # 幂等：再跑一遍不该继续改
+    check(resync_original_audio_timeline(hand) == 0, "再校准一次是幂等的（0 改动）")
+
     print()
     print("全部通过" if not _fails else f"有 {_fails} 项未通过")
     print(f"用例 {_checks} 条")
