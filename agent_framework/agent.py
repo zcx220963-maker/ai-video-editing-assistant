@@ -1081,9 +1081,23 @@ class AgentOnceRun:
                 self._render_confirmed.add(str(cp.run_id or ""))
                 await self._execute_tool_calls(ctx, remaining, reg)
                 return asked_now
+            # ⚠️ 关键：这个 tool 结果**不是**工具的返回值，而是「本轮没执行、先把用户
+            # 的话交给你」。真机事故：用户对渲染确认门选了「要改」并写了自由文本，
+            # 这里直接把那句话当成 ``render_video`` 的结果写回，模型于是看到
+            # 「render_video 返回了『和音乐长度一致…』」——以为渲染已受理，回话
+            # 「渲染已提交，正在跑」，而服务端从未创建渲染任务，整条链路就断在最后一步。
+            # 所以文本必须以 ToolError 的形态说明「没跑」，而不是冒充成功回执。
             text = note or decision_text(decision, "")
             for tc in remaining:
-                ctx.messages.append(tool_result(tc.id, tc.name, text))
+                ctx.messages.append(tool_result(
+                    tc.id, tc.name,
+                    ToolError(tc.name,
+                              f"【本轮未执行】用户没有确认这一步，而是给出了新的要求："
+                              f"{text}\n"
+                              f"「{tc.name}」**没有运行、没有产生任何产物**"
+                              f"（服务端没有登记任务）。"
+                              f"请先按上面的要求完成该做的事，再重新调用它；"
+                              f"不要声称它已经提交或完成。")))
             await self.hooks.after_execute_tools(ctx)
             return asked_now
         if fallback_options and decision in {o.get("key") for o in fallback_options}:
