@@ -166,12 +166,35 @@ async function checkActiveRun(cid) {
     const r = await fetch(`/convs/${cid}/runs/active`, { headers: authHeaders() });
     if (!r.ok) return;
     const j = await r.json();
-    if (j.run && j.run.status === "running") {
+    if (!j.run) return;
+    if (j.run.status === "running") {
       busy[cid] = j.run.run_id;
       msgs(cid).push({
         role: "assistant", text: "⏳ 任务正在后台运行中，正在接续进度…", state: "streaming",
       });
       scrollDown();
+      return;
+    }
+    // 挂起态：刷新/重连后要把选项卡**重新弹出来**。
+    //
+    // 服务端 /convs/{id}/runs/active 一直在回 approval（含结构化 ask），
+    // 但前端原先只判 status === "running"，approval 一个字都没读——
+    // 于是用户在等确认时一刷新，后端永久挂起、界面上没有任何可点的东西，
+    // 只能整页重开。这里把服务端那份 approval 还原成 WS 帧的同一形状
+    // （approvalBubble 就吃这个形状），复用同一条渲染路径。
+    //
+    // 不需要去重：同一会话串行，一条会话最多只有一个挂起的 run；
+    // 重复调用只是把同一张卡再设一次（弹窗是单例 questionCard）。
+    if (j.run.status === "awaiting_approval" && j.run.approval) {
+      const ap = j.run.approval;
+      busy[cid] = j.run.run_id;
+      approvalBubble(cid, {
+        run_id: ap.run_id || j.run.run_id,
+        reason: ap.reason || "",
+        calls: ap.calls || [],
+        fallback_options: ap.fallback_options || [],
+        ask: ap.ask || undefined,
+      });
     }
   } catch (_) { /* 查不到不影响正常使用 */ }
 }

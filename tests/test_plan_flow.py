@@ -303,8 +303,10 @@ class _StubAgent:
         return "规划答复"
 
     async def handle(self, user_id, conversation_id, message, *, run_id=None,
-                     stream=False, attachments=(), resume=False):
-        self.calls.append(("handle", message, run_id, resume))
+                     stream=False, attachments=(), resume=False, interactive=True):
+        # interactive 是「有没有活人在等」：cron 投递（op=execute）会带 False，
+        # 用来跳过所有「拦下来问用户」的确认门。记进调用元组便于断言。
+        self.calls.append(("handle", message, run_id, resume, interactive))
         return "直接答复"
 
     async def execute_plan(self, user_id, conversation_id, plan_run_id, frame, *,

@@ -102,7 +102,8 @@ class SessionConsumer:
                 answer = await self.agent.approve(
                     action["run_id"], user_id, conversation_id,
                     decision=str(action.get("decision") or "approve"), stream=True,
-                    note=str(message or ""))
+                    note=str(message or ""),
+                    answers=list(action.get("answers") or []))
             elif action.get("op") == "execute_plan":
                 # 计划卡上的点击帧。计划本体不从浏览器来：agent 按 plan_run_id 取回
                 # 服务端自己校验过的那一份，本帧只回答「选了哪张卡、动了哪些开关」。
@@ -113,9 +114,12 @@ class SessionConsumer:
             elif action.get("op") == "execute":
                 # 明确跳过计划门的投递：只有「到点自动跑」的定时任务走这条——
                 # 那条消息没有坐在屏幕前的用户来点确认，拦在规划轮里等于任务永不落地。
+                # interactive=False 把同一件事贯彻到**所有**确认门（含渲染前确认）：
+                # 只跳计划门是不够的——渲染门照样会拦，任务还是永久挂在等确认上
+                # （user_id 是 "cron"，浏览器过不了归属校验，没人能来点）。
                 answer = await self.agent.handle(
                     user_id, conversation_id, message, run_id=run_id, stream=True,
-                    attachments=attachments, resume=resume
+                    attachments=attachments, resume=resume, interactive=False
                 )
             elif action.get("op") == "plan":
                 answer = await self.agent.plan(

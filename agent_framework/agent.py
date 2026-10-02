@@ -26,8 +26,8 @@ from .catalog import get_catalog
 from .compress import _repair_orphans
 from .context import ContextBuilder
 from .hooks import AgentHook, AgentHookContext, CompositeHook, _current_hook_ctx, _current_hooks
-from .identity import (rebind_artifact_scope, storyline_session_id,
-                         use_identity_or_inherit)
+from .identity import (current_identity, rebind_artifact_scope,
+                       storyline_session_id, use_identity_or_inherit)
 from .llm import LLMClient, LLMResponse
 from .messages import ToolCall, assistant, system, tool_result, user
 from .plan_gate import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_step_executed,
@@ -35,7 +35,7 @@ from .plan_gate import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claim
                         reconcile, render_injections)
 from .render_gate import (ADJUST_OPTION, CONFIRM_OPTION, KEEP_FULL_OPTION,
                           RENDER_NODE, TRUNCATE_OPTION, build_render_ask,
-                          decision_is_confirm, should_gate_render)
+                          decision_is_confirm, decision_text, should_gate_render)
 from .session import Session, SessionManager
 from .tool import ToolError, ToolRegistry, is_tool_error, plan_batches
 
@@ -169,6 +169,29 @@ _APPROVAL_DECISION_TEXT.update({
 })
 
 
+def _answers_text(answers: Sequence[Mapping[str, Any]]) -> str:
+    """多题弹窗的结构化答案 → 给模型看的一句话（每题一行）。
+
+    为什么优先用它而不是前端拼的 ``message``：结构化答案里带着**选项 key**，
+    服务端与模型都能确定「第 2 题选的是 keep_original_audio 那支」；
+    而前端拼出来的中文散文是不可反查的，换个措辞就丢了对应关系。
+    单题时返回空串，让调用方回退到 note（保持原有行为）。
+    """
+    rows = [a for a in (answers or ()) if isinstance(a, Mapping)]
+    if len(rows) < 2:
+        return ""
+    lines = []
+    for i, a in enumerate(rows, start=1):
+        ans = str(a.get("answer") or a.get("custom") or "").strip()
+        if not ans:
+            continue
+        title = str(a.get("title") or "").strip()
+        lines.append(f"{i}. {title} → {ans}" if title else f"{i}. {ans}")
+    if len(lines) < 2:
+        return ""
+    return "用户在弹窗里逐题做的选择：\n" + "\n".join(lines)
+
+
 def _detect_fallback_options(messages: list, tool_calls: list) -> dict | None:
     """检查最近一批工具结果里有没有 __fallback_options__ 标记。"""
     import json
@@ -271,6 +294,7 @@ class AgentOnceRun:
         approved_plan: dict[str, Any] | None = None,
         plan_run_id: str | None = None,
         planning: bool = False,
+        interactive: bool = True,
     ) -> str:
         """正常发起一次执行；配置了 checkpoint 时先落一个初始快照。
 
@@ -279,6 +303,9 @@ class AgentOnceRun:
         ``extra_sections`` 带进 ``<planning_round>`` 或 ``<approved_plan>`` 等本轮专属段、
         ``approved_plan`` 让对账钩子有本、``plan_run_id`` 记执行轮从哪次规划来、
         ``planning`` 让循环认领规划轮的那条硬保证（没出卡就不许声称已出卡）。
+
+        ``interactive=False``（到点自动跑的定时任务）：所有「拦下来问用户」的门
+        一概跳过，否则没人能来点确认，run 会永久挂起。
         """
         ids = [str(m) for m in attachments if str(m).strip()]
         rows, rejected = await self._resolve_attachments(session, ids)
@@ -301,6 +328,7 @@ class AgentOnceRun:
             return await self._drive(
                 session, message, messages, 0, cp, stream, resuming=False, run_id=run_id,
                 registry=registry, approved_plan=approved_plan, planning=planning,
+                interactive=interactive,
             )
 
     async def _resolve_attachments(
@@ -365,12 +393,14 @@ class AgentOnceRun:
 
     async def approve(
         self, cp: Checkpoint, session: Session, *, decision: str, stream: bool = False,
-        note: str = "",
+        note: str = "", answers: Sequence[Mapping[str, Any]] = (),
     ) -> str:
         """从审批断点续跑：按用户决策把挂起的那批工具收口，再继续正常循环。
 
         ``decision`` 是 "approve"/"reject"、兜底方案的 key、或弹窗选项的 key。
         ``note`` 是用户在弹窗里选/写的原话（多题汇总或自定义文本），一并带进上下文。
+        ``answers`` 是多题弹窗的**结构化**答案（``[{page,title,answer,key,custom}]``）：
+        有了它就不必依赖前端拼的那句中文散文——服务端自己知道每题选了什么。
 
         注意这里**不能**用 ``_repair_orphans`` 裸修：挂起点上待批的 tool_calls 本来
         就没有 tool 结果，会被当成孤儿剥掉，续跑时 ``_settle_pending`` 再补一条 tool
@@ -385,7 +415,7 @@ class AgentOnceRun:
                 _repair_orphans(list(cp.messages), keep_ids=pending_ids),
                 cp.iteration, cp, stream,
                 resuming=True, run_id=cp.run_id, approval_decision=decision,
-                approval_note=note,
+                approval_note=_answers_text(answers) or note,
             )
 
     async def _drive(
@@ -403,6 +433,7 @@ class AgentOnceRun:
         planning: bool = False,
         approval_decision: str | None = None,
         approval_note: str = "",
+        interactive: bool = True,
     ) -> str:
         reg = registry if registry is not None else self.registry
         ctx = AgentHookContext(session=session, messages=messages)
@@ -490,12 +521,20 @@ class AgentOnceRun:
                                 await self.hooks.after_execute_tools(ctx)
                                 iteration += 1
                                 continue
-                            gated = [tc for tc in resp.tool_calls if reg.needs_approval(tc.name)]
+                            # 通用审批门（--approve-tools / 工具自声明 requires_approval）。
+                            #
+                            # 排在这里、并且在命中时**直接返回**，所以它天然优先于下面的渲染确认门。
+                            # 这是有意的：谁显式配了 `--approve-tools render_video`，
+                            # 谁就该拿到那道门的语义（逐条列出待批工具、批准/拒绝），
+                            # 而不是被渲染门的编排预览卡取代。
+                            # 反过来，默认配置下没有任何工具需要审批，于是渲染一律走下面那道
+                            # 带编排预览的门——「渲染前让用户看到编排结果」这个需求不受影响。
+                            gated = [tc for tc in resp.tool_calls
+                                     if reg.needs_approval(tc.name)]
                             if gated:
-                                # 撞上需人工审批的工具：整批挂起（挂起时 assistant(tool_calls)
-                                # 已入 messages、工具结果未回填；批准后从同一候选点续跑）。
                                 pending = [{"id": tc.id, "name": tc.name,
-                                            "arguments": tc.arguments} for tc in resp.tool_calls]
+                                            "arguments": tc.arguments}
+                                           for tc in resp.tool_calls]
                                 await self.checkpoint.await_approval(
                                     cp, iteration=iteration, messages=messages,
                                     pending_calls=pending,
@@ -504,25 +543,24 @@ class AgentOnceRun:
                                     ctx, pending, "以下操作需要你确认后才会执行")
                                 ctx.extras["approval_paused"] = True
                                 return _APPROVAL_PAUSE_ANSWER
-                            # 渲染前确认门：编排已就绪、马上要渲染时，先把编排结果给用户看，
+                            # 渲染确认门：编排已就绪、马上要渲染时，先把编排结果给用户看，
                             # 等确认再渲。用户明确要求「不确认绝不渲染」。
                             # 确认过一次就整条 run 不再拦：同一个 run 里再拦一次只是重复打扰
                             # （模型收尾时偶尔会再调一次渲染）。
-                            if (should_gate_render(resp.tool_calls,
-                                                   enabled=self.config.gate_render)
+                            #
+                            # 但 `interactive=False`（到点自动跑的定时任务）必须放行：
+                            # 那条 run 的 user_id 是 "cron"，浏览器身份永远过不了归属校验，
+                            # 而 awaiting_approval 刻意不在 _UNFINISHED 里、自动续跑也捞不到——
+                            # 拦下来就是**永久挂起**。它的投递方本来就已显式声明"直接执行"。
+                            if (interactive
+                                    and should_gate_render(resp.tool_calls,
+                                                           enabled=self.config.gate_render)
                                     and run_id not in self._render_confirmed):
                                 preview = await self._load_preview(session)
                                 ask = build_render_ask(preview)
                                 pending = [{"id": tc.id, "name": tc.name,
                                             "arguments": tc.arguments}
                                            for tc in resp.tool_calls]
-                                logger.info(
-                                    "渲染确认门：挂起 iteration=%s，待批 %s，"
-                                    "messages 末条 role=%s 有 tool_calls=%s，ask.preview=%s",
-                                    iteration, [c["name"] for c in pending],
-                                    (messages[-1] or {}).get("role") if messages else None,
-                                    bool((messages[-1] or {}).get("tool_calls")) if messages else None,
-                                    bool(ask.get("preview")))
                                 await self.checkpoint.await_approval(
                                     cp, iteration=iteration, messages=messages,
                                     pending_calls=pending, reason=ask["title"], ask=ask)
@@ -927,13 +965,20 @@ class AgentOnceRun:
         作用域键必须用 ``storyline_session_id``（``u:{user}:c:{conv}``）：
         剪辑产物存在 Storyline 那一侧，键由那个函数统一拼装。用 ``session.session_id``
         （``{user}:{conv}``）会查不到任何产物，表现是「预览永远为空」而没有任何报错。
+
+        artifact_id 必须取**当前生效的作用域**而不是固定的 ``_default``：
+        ``rerun_from`` 分叉会给子 run 生成 ``art-xxxx`` 作用域（checkpoint.fork），
+        子 run 的产物写在自己的作用域里。写死 ``_default`` 的话，分叉后那张渲染确认卡
+        显示的是父 run 的旧编排（或直接空），而用户以为看到的是这次的编排。
         """
         if self.storage is None:
             return None
         try:
             from .preview import build_preview
+            ident = current_identity()
             sid = storyline_session_id(session.user_id, session.conversation_id)
-            arts = await self.storage.artifacts(sid).snapshot()
+            art = (ident.artifact_id if ident is not None else "") or ""
+            arts = await self.storage.artifacts(sid, art).snapshot()
             return build_preview(arts)
         except Exception:  # noqa: BLE001 - 预览是增强信息，读失败不该阻断确认流程
             logger.exception("读取编排预览失败（渲染确认门继续，只是少一块摘要）")
@@ -1136,12 +1181,17 @@ class Agent:
     async def handle(
         self, user_id: str, conversation_id: str, message: str, *, run_id: str | None = None,
         stream: bool = False, attachments: Sequence[str] = (), resume: bool = False,
+        interactive: bool = True,
     ) -> str:
         """直接处理一条消息并返回结果（同步语义，便于调用与测试）。
 
         ``resume=True`` 才续跑该会话最近一个未完成的 run；默认不劫持——带进来的
         是一条新消息，就按新消息开新 run。「这条消息是不是『继续』」是入口处的
         意图判断（consumer / server），不是一个未落盘的快照该替用户决定的事。
+
+        ``interactive=False`` 表示**没有活人在等**（到点自动跑的定时任务）。
+        凡是「拦下来问用户」的门都必须跳过：否则这条 run 会永久挂在等确认上——
+        没有人来点，而浏览器身份也过不了它的归属校验（{user_id} 是 "cron"）。
         """
         session = await self.session_manager.get_or_create(user_id, conversation_id)
         async with self._lock_for(session.session_id):
@@ -1150,7 +1200,8 @@ class Agent:
                 if cp is not None:
                     return await self.runner.resume(cp, session, stream=stream)
             return await self.runner.run(
-                session, message, run_id=run_id, stream=stream, attachments=attachments
+                session, message, run_id=run_id, stream=stream,
+                attachments=attachments, interactive=interactive,
             )
 
     async def plan(
@@ -1325,6 +1376,7 @@ class Agent:
     async def approve(
         self, run_id: str, user_id: str, conversation_id: str, *, decision: str,
         stream: bool = False, note: str = "",
+        answers: Sequence[Mapping[str, Any]] = (),
     ) -> str:
         """用户对一条挂起审批的执行做出批准/拒绝，从断点续跑。
 
@@ -1341,7 +1393,7 @@ class Agent:
             if cp is None:
                 raise KeyError(f"没有待审批的 checkpoint: {run_id}")
             return await self.runner.approve(cp, session, decision=decision,
-                                            stream=stream, note=note)
+                                            stream=stream, note=note, answers=answers)
 
     async def fork(
         self, run_id: str, at_seq: int, user_id: str, conversation_id: str, *,

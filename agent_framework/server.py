@@ -98,6 +98,11 @@ class RunApproveRequest(BaseModel):
     """HITL 审批帧：用户对挂起的工具调用做出批准或拒绝。"""
     decision: str = "approve"     # "approve" 放行续跑；"reject" 跳过该批工具继续
     message: str = ""             # 随审批带进去的一句话（可空，仅留痕）
+    # 多题弹窗的结构化答案：``[{page, title, answer, key, custom}, …]``。
+    # 原先只声明 decision/message，前端发的 answers 被 pydantic 静默忽略——
+    # 靠前端把它拼成中文句子塞进 message 才没丢信息。那等于把结构化数据降级成
+    # 一段散文：服务端再也无法知道「用户在第 2 题选了哪个 key」。
+    answers: list[dict[str, Any]] = []
 
 
 class PlanConfirmRequest(BaseModel):
@@ -225,6 +230,11 @@ class ChatQueuedResponse(BaseModel):
 class ChatSyncResponse(BaseModel):
     run_id: str
     answer: str
+    # 挂起待确认时一并回这两项：非 WS 客户端（CLI/脚本/自动化）拿不到实时帧，
+    # 只从 answer 里读那句「已暂停」是没法把选项卡渲染出来的。
+    # 形状与 WS 的 approval 帧一致，也与 /convs/{id}/runs/active 的 approval 一致。
+    status: str = ""
+    approval: dict[str, Any] | None = None
 
 
 _TOOL_CATEGORIES = {
@@ -482,7 +492,11 @@ def create_app(
             user_id, req.conversation_id, req.message, run_id=run_id,
             attachments=req.attachments, resume=req.resume
         )
-        return ChatSyncResponse(run_id=run_id, answer=answer)
+        # 挂起态如实回给非 WS 客户端：answer 仍然保留（旧客户端照旧能读），
+        # 但把结构化提问一并给出，脚本/CLI 才拿得到选项。
+        status, approval = await _approval_view_for(agent, user_id, req.conversation_id)
+        return ChatSyncResponse(run_id=run_id, answer=answer,
+                                status=status, approval=approval)
 
     async def _resumed_run_id(user_id: str, conversation_id: str) -> str | None:
         """resume 语义下真正在跑的是那条在途 run：回给前端的 run_id 必须是它，
@@ -536,17 +550,77 @@ def create_app(
 
         只读、不触发任何剪辑、不调 LLM。前端在渲染前展示它，让用户先看编排结果
         （提取内容 / 切分 / 分镜 / 画面 / 声音）再决定是改还是渲。
-        ``artifact_id`` 留空则用 ``_default``（与渲染默认作用域一致）。
+
+        ``artifact_id`` 留空时**不要**盲取 ``_default``：``rerun_from`` 分叉会给子 run
+        生成 ``art-xxxx`` 作用域（checkpoint.fork），子 run 的产物写在自己那份里。
+        盲取 ``_default`` 的后果是分叉后预览显示父 run 的旧编排（或直接空），
+        而用户以为看的是这一次的编排——正是「不许偷偷替用户定事」要防的那种误导。
+
+        所以留空时的口径是「本会话**最近写过产物**的那个作用域」：
+        按 artifacts.updated_at 找出最新的一份，就是当前正在生效的编排。
+        显式给了 artifact_id 就照它读，不做猜测。
         """
         from .preview import build_preview
         sid = storyline_session_id(user_id, conversation_id)
+
+        async def _snapshot(art: str) -> dict[str, Any]:
+            return await storage.artifacts(sid, art).snapshot()
+
         try:
-            arts = await storage.artifacts(sid, artifact_id or "_default").snapshot()
+            if artifact_id:
+                arts = await _snapshot(artifact_id)
+            else:
+                arts = await _snapshot("_default")
+                if not arts:
+                    # 回退：找本会话里最近被写过的那个作用域
+                    rows = await storage.db.select(
+                        "artifacts", where=[Cond("session_id", "eq", sid)],
+                        order_by=["-updated_at"], limit=1)
+                    latest = str(rows[0].get("artifact_id") or "") if rows else ""
+                    if latest and latest != "_default":
+                        arts = await _snapshot(latest)
         except Exception as exc:  # noqa: BLE001 - 读不到就当还没编排
             return {"ready": False, "warnings": [f"读取产物失败：{exc}"],
                     "summary": {}, "material": {}, "shots": {}, "story": [],
                     "timeline": {}, "audio": {}}
         return build_preview(arts)
+
+    def _approval_payload(cp: Any) -> dict[str, Any] | None:
+        """挂起态 → 审批视图。**一处拼装**，三个出口共用，形状不会漂。
+
+        为什么要抽出来：这套结构原先只在 `/convs/{id}/runs/active` 里拼一次，
+        而 `/chat/sync`（CLI/脚本用）和前端重连都需要同一份。各写一遍必然漂移，
+        漂了以后「界面上弹得出来、脚本里拿不到」这种问题很难查。
+        形状与 WS 的 ``type=approval`` 帧一致，前端可以拿同一段代码渲染。
+        """
+        approval = getattr(cp, "approval", None) or {}
+        if not approval:
+            return None
+        return {
+            "run_id": cp.run_id,
+            "reason": approval.get("reason") or "",
+            "calls": approval.get("pending_calls") or [],
+            "fallback_options": approval.get("fallback_options") or [],
+            "ask": approval.get("ask") or None,
+        }
+
+    async def _approval_view_for(ag: Any, user_id: str,
+                                 conversation_id: str) -> tuple[str, dict[str, Any] | None]:
+        """会话当前的 (status, approval)；没有在途 run 回 ("", None)。
+
+        `/chat/sync` 用它把挂起态回给非 WS 客户端——answer 里那句「已暂停」不够，
+        脚本拿不到选项就等于没法答。
+        """
+        cp_mgr = ag.runner.checkpoint
+        if cp_mgr is None:
+            return "", None
+        sid = session_key(user_id, conversation_id)
+        cp = await cp_mgr.pending_for_session(sid)
+        if cp is None:
+            cp = await _awaiting_approval_for_session(cp_mgr, sid)
+        if cp is None:
+            return "", None
+        return str(cp.status or ""), _approval_payload(cp)
 
     @app.get("/convs/{conversation_id}/runs/active")
     async def conv_active_run(conversation_id: str,
@@ -569,15 +643,9 @@ def create_app(
             return {"run": None}
         view: dict[str, Any] = {"run_id": cp.run_id, "status": cp.status,
                                 "iteration": cp.iteration, "message": cp.message}
-        approval = getattr(cp, "approval", None) or {}
-        if approval:
-            view["approval"] = {
-                "run_id": cp.run_id,
-                "reason": approval.get("reason") or "",
-                "calls": approval.get("pending_calls") or [],
-                "fallback_options": approval.get("fallback_options") or [],
-                "ask": approval.get("ask") or None,
-            }
+        payload = _approval_payload(cp)
+        if payload is not None:
+            view["approval"] = payload
         return {"run": view}
 
     async def _awaiting_approval_for_session(cp_mgr: Any, sid: str) -> Any:
@@ -707,7 +775,10 @@ def create_app(
             "message": req.message,
             "run_id": run_id,
             "action": {"op": "approve", "run_id": run_id,
-                       "decision": req.decision},
+                       "decision": req.decision,
+                       # 结构化答案原样带上：执行侧据此知道「第几题选了哪个 key」，
+                       # 不必再去猜前端拼的那句中文散文。
+                       "answers": req.answers},
         })
         return ChatQueuedResponse(run_id=run_id, status="queued")
 
