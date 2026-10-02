@@ -171,6 +171,25 @@ _APPROVAL_DECISION_TEXT.update({
 })
 
 
+def _iteration_limit(max_iterations: int, start_iteration: int, resuming: bool) -> int:
+    """本轮迭代上限：**续跑时是「再给一轮」，不是「接着数」**。
+
+    真机事故（用户原话「[已达最大迭代次数 40，提前结束]…还是不行啊」）：
+    撞上限那条 run 的 ``iteration`` 就等于 ``max_iterations``，用户点「继续」时
+    从 ``cp.iteration`` 续跑，而循环条件写的是 ``while iteration < max_iterations``
+    → **一进循环就为假**，一个字都没干又打印一次同样的话，用户永远无法前进。
+
+    「继续」是用户的明确指令，意思是"再做点事"——预算应当按续跑点**往后延**，
+    而不是继承一个已经用光的计数。
+
+    做成模块级函数而不是写在 ``_drive`` 里：``_drive`` 有"只剩骨架"的结构守卫
+    （见 tests/test_plan_layout.py），逻辑该切出去就切出去，不该靠放宽阈值绕过。
+    """
+    if resuming and start_iteration >= max_iterations:
+        return start_iteration + max(1, max_iterations)
+    return max_iterations
+
+
 def _answers_text(answers: Sequence[Mapping[str, Any]]) -> str:
     """多题弹窗的结构化答案 → 给模型看的一句话（每题一行）。
 
@@ -394,6 +413,9 @@ class _Round:
     # ``state.plan_candidates``——那才是「submit_plan 真成功过」的权威记录，
     # 另加一个字段只会多一处可能与它不同步的状态。
     plan_nudges: int = 0
+    # 本轮的**有效**迭代上限：续跑时会往后延（见 _drive 里的说明），
+    # 收尾那句提示要按它写，否则会说一个与实际不符的数字。
+    iter_limit: int = 0
     final: str | None = None
     reached_limit: bool = True
 
@@ -590,9 +612,11 @@ class AgentOnceRun:
         # 暴露当前 ctx 与 hooks 给工具（如 SpawnTool）触发子 Agent 生命周期节点。
         hooks_token = _current_hooks.set(self.hooks)
         ctx_token = _current_hook_ctx.set(r.ctx)
+        limit = _iteration_limit(self.config.max_iterations, start_iteration, resuming)
+        r.iter_limit = limit
         try:
             try:
-                while r.iteration < self.config.max_iterations:
+                while r.iteration < limit:
                     # HITL：从审批断点续跑——先把挂起的那批 tool_calls 按用户决策收口。
                     if r.approval_decision is not None:
                         r.asked_this_run |= await self._settle_pending(
@@ -899,7 +923,8 @@ class AgentOnceRun:
         qa_parts = r.state.qa_parts
         final = r.final
         if r.reached_limit:
-            final = f"[已达最大迭代次数 {self.config.max_iterations}，提前结束]"
+            final = (f"[已达最大迭代次数 {r.iter_limit or self.config.max_iterations}"
+                     f"，提前结束]")
 
         final = self.hooks.finalize_content(r.ctx, final)
 
