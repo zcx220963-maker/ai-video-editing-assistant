@@ -17,7 +17,11 @@ from .identity import current_identity
 from .storage.repositories import mask
 
 API_KEY_NAME = "model_api_key"          # app_secrets 里唯一的键名（一把 key 用到底）
-ENV_KEY_NAME = "OPENAI_API_KEY"         # 前端没配时的回落环境变量
+ENV_KEY_NAME = "OPENAI_API_KEY"         # 前端没配时的回落环境变量（首选）
+# .env 里还留着 DEEPSEEK_API_KEY / SILICONFLOW_API_KEY 这两把历史名字。原先没有任何代码
+# 读它们——用户填了、静默无效，还以为「填了就生效」。现在把它们接成同一层的回落位，
+# 顺序即优先级（OPENAI_API_KEY 仍是首选，页面配置永远压过环境变量）。
+ENV_KEY_NAMES = (ENV_KEY_NAME, "DEEPSEEK_API_KEY", "SILICONFLOW_API_KEY")
 CACHE_TTL_SEC = 5.0                     # 另一个进程的生效延迟上限
 
 SOURCE_PG = "前端配置"
@@ -76,25 +80,39 @@ async def _from_storage(user_id: str) -> str:
     return value or ""
 
 
+def env_api_key() -> tuple[str, str]:
+    """环境变量层的回落：按 ``ENV_KEY_NAMES`` 的顺序取第一把非空的，返回 (值, 来源名)。
+
+    来源名写的是**变量名本身**而不是笼统的「环境变量」——用户填了三处之一，报错时得看得
+    出程序实际读到了哪一把。值本身只在这个函数与调用方的返回值里出现，展示一律先过掩码。
+    """
+    for name in ENV_KEY_NAMES:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value, f"环境变量 {name}"
+    return "", ""
+
+
 async def resolve_api_key(user_id: str = "", *, fallback: str = "") -> tuple[str, str]:
     """取本次调用真正该用的 key，返回 (值, 来源名)。
 
-    优先级：前端配置（app_secrets，按当前身份）→ 环境变量 → 调用方给的回落位。
-    来源名只用于诊断文案，任何情况下都不带出值本身。
+    优先级：前端配置（app_secrets，按当前身份）→ 环境变量（按 ``ENV_KEY_NAMES`` 的顺序）
+    → 调用方给的回落位。来源名只用于诊断文案，任何情况下都不带出值本身。
     """
     uid = user_id or current_user_id()
     value = (await _from_storage(uid)).strip()
     if value:
         return value, SOURCE_PG
-    env = os.environ.get(ENV_KEY_NAME, "").strip()
+    env, source = env_api_key()
     if env:
-        return env, SOURCE_ENV
+        return env, source
     v = (fallback or "").strip()
     if v:
         return v, SOURCE_FALLBACK
     return "", SOURCE_NONE
 
 
-__all__ = ["API_KEY_NAME", "CACHE_TTL_SEC", "ENV_KEY_NAME", "SOURCE_PG", "SOURCE_ENV",
-           "SOURCE_FALLBACK", "SOURCE_NONE", "bind_storage", "unbind_storage",
-           "bound_storage", "current_user_id", "invalidate", "resolve_api_key", "mask"]
+__all__ = ["API_KEY_NAME", "CACHE_TTL_SEC", "ENV_KEY_NAME", "ENV_KEY_NAMES", "SOURCE_PG",
+           "SOURCE_ENV", "SOURCE_FALLBACK", "SOURCE_NONE", "bind_storage", "unbind_storage",
+           "bound_storage", "current_user_id", "env_api_key", "invalidate",
+           "resolve_api_key", "mask"]

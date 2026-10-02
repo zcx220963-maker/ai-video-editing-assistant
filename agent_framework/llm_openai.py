@@ -8,7 +8,8 @@ Ollama 等）改三个参数即可复用本适配器。
 因此可注入假客户端做无网络单测。
 
 密钥解析在**每次请求前**发生（见 `_client_for_request`），优先级：
-前端「设置」写入的 app_secrets → 环境变量 OPENAI_API_KEY → 下面这个回落常量。
+前端「设置」写入的 app_secrets → 环境变量（按 `OPENAI_API_KEY` → `DEEPSEEK_API_KEY` →
+`SILICONFLOW_API_KEY` 的顺序取第一把非空的）→ 下面这个回落常量。
 所以页面上改一次 key 就立刻生效，不用重启，也不用两个进程各配一遍。
 """
 
@@ -146,7 +147,7 @@ class OpenAICompatClient:
         thinking: bool | None = None,
     ) -> None:
         self.model = model or MY_MODEL or os.getenv("OPENAI_MODEL") or DEFAULT_MODEL
-        self.api_key = api_key or MY_API_KEY or os.getenv("OPENAI_API_KEY") or ""
+        self.api_key = api_key or MY_API_KEY or runtime_secrets.env_api_key()[0] or ""
         self.base_url = base_url or MY_BASE_URL or os.getenv("OPENAI_BASE_URL") or DEFAULT_BASE_URL
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -172,7 +173,8 @@ class OpenAICompatClient:
         if not key:
             raise RuntimeError(
                 "未配置模型密钥：在页面「设置」里填 API Key（或设环境变量 "
-                f"{runtime_secrets.ENV_KEY_NAME}）。已尝试的来源：{source}。")
+                f"{' / '.join(runtime_secrets.ENV_KEY_NAMES)} 之一，按此优先级）。"
+                f"已尝试的来源：{source}。")
         if key == self.api_key:
             return self._client
         return self._client.with_options(api_key=key)

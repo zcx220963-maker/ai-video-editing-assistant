@@ -51,6 +51,23 @@ _checks = 0
 _fails = 0
 
 
+def clear_env_keys() -> dict[str, str | None]:
+    """把环境变量层的**所有**名字摘干净，返回原值供还原。
+
+    这一层现在认三个名字（OPENAI_API_KEY → DEEPSEEK_API_KEY → SILICONFLOW_API_KEY）。
+    凡是判「环境变量没配时落到哪一层」的用例都必须一起 pop 掉——只 pop 首选那把，
+    机器上残留的别名会让判据看环境脸色（改之前不存在这个问题，因为只认一个名字）。
+    """
+    return {n: os.environ.pop(n, None) for n in SEC.ENV_KEY_NAMES}
+
+
+def restore_env_keys(saved: dict[str, str | None]) -> None:
+    for name, value in saved.items():
+        os.environ.pop(name, None)
+        if value is not None:
+            os.environ[name] = value
+
+
 def check(cond: bool, label: str) -> None:
     global _checks, _fails
     _checks += 1
@@ -132,7 +149,7 @@ def case_mask_shape() -> None:
 # ---------------------------------------------------------------------------
 
 def case_resolve_priority() -> None:
-    saved = os.environ.pop(ENV, None)
+    saved = clear_env_keys()
     st = CountingStorage(fresh_storage())
     run(st.inner.users.provision("u-a"))
     SEC.bind_storage(st)
@@ -154,9 +171,54 @@ def case_resolve_priority() -> None:
         key, src = run(SEC.resolve_api_key("u-none"))
         check(key == "" and src == SEC.SOURCE_NONE, "三层都空时明确报「未配置」而不是硬凑")
     finally:
+        restore_env_keys(saved)
+        SEC.unbind_storage()
+
+
+def case_env_alias_names() -> None:
+    """环境变量层认三个名字（审计第 7 条）：原先 DEEPSEEK/SILICONFLOW 没人读，
+    用户在 .env 里填了、静默无效，还以为「填了就生效」。
+
+    钉四件事：① 顺序即优先级；② 来源名报出**实际命中的那一个**（诊断据此说得清读到了哪把）；
+    ③ 空白串不算填了；④ 客户端构造期与请求期走同一套判据（不能一处认三把、另一处只认一把）。
+    """
+    aliases = ("DEEPSEEK_API_KEY", "SILICONFLOW_API_KEY")
+    ALIAS_DS = "sk-from-deepseek-alias-D0005"
+    ALIAS_SF = "sk-from-siliconflow-alias-S0006"
+    saved = clear_env_keys()
+    st = CountingStorage(fresh_storage())
+    SEC.bind_storage(st)
+    try:
+        check(SEC.ENV_KEY_NAMES[0] == ENV and SEC.ENV_KEY_NAMES[1:] == aliases,
+              f"环境变量层的名字与顺序：{SEC.ENV_KEY_NAMES}")
+        os.environ[aliases[0]] = ALIAS_DS
+        key, src = run(SEC.resolve_api_key("u-none"))
+        check(key == ALIAS_DS and src == f"环境变量 {aliases[0]}",
+              "只有 DEEPSEEK_API_KEY 时它生效（改之前这一把压根没人读）")
+        os.environ[ENV] = ENV_KEY
+        key, src = run(SEC.resolve_api_key("u-none"))
+        check(key == ENV_KEY and src == SEC.SOURCE_ENV,
+              "OPENAI_API_KEY 有值时压过后两把（首选地位不变）")
         os.environ.pop(ENV, None)
-        if saved is not None:
-            os.environ[ENV] = saved
+        os.environ[ENV] = "   "
+        key, src = run(SEC.resolve_api_key("u-none"))
+        check(key == ALIAS_DS and src == f"环境变量 {aliases[0]}",
+              "空白串不算填了，跳过它取下一把")
+        os.environ.pop(ENV, None)
+        os.environ.pop(aliases[0], None)
+        os.environ[aliases[1]] = ALIAS_SF
+        key, src = run(SEC.resolve_api_key("u-none"))
+        check(key == ALIAS_SF and src == f"环境变量 {aliases[1]}",
+              "第三把也只在前两把都空时才用")
+        check(OpenAICompatClient(client=object()).api_key == ALIAS_SF,
+              "构造期读同一套判据（不会一处认三把、另一处只认 OPENAI_API_KEY）")
+        check(ALIAS_SF not in src and ALIAS_DS not in src,
+              "来源名只带变量名，不带任何一把 key 的值")
+        masked = SEC.mask(ALIAS_SF)
+        check(masked.endswith(ALIAS_SF[-4:]) and "siliconflow" not in masked,
+              "值要出门仍必须先过掩码（中间正文抄不回）")
+    finally:
+        restore_env_keys(saved)
         SEC.unbind_storage()
 
 
@@ -241,6 +303,7 @@ def case_llm_uses_pg_key() -> None:
     SEC.bind_storage(st)
     sink: list = []
     saved_parse = OpenAICompatClient.__dict__["_parse"]
+    saved_env: dict[str, str | None] = {}
     OpenAICompatClient._parse = staticmethod(lambda _r: Resp())
     try:
         c = OpenAICompatClient(api_key=FALLBACK_KEY, client=FakeClient(FALLBACK_KEY, sink))
@@ -252,7 +315,7 @@ def case_llm_uses_pg_key() -> None:
         with use_identity("u-none", "c-1"):
             used = run(c._client_for_request())
         check(used.api_key == FALLBACK_KEY, "没配置时原样复用实例 key，不多做一次 with_options")
-        os.environ.pop(ENV, None)
+        saved_env = clear_env_keys()
         bare = OpenAICompatClient(api_key="", client=FakeClient("", sink))
         bare.api_key = ""                    # 构造期会被回落位补齐；这里模拟回落位本身为空
         bare._injected = False
@@ -266,12 +329,13 @@ def case_llm_uses_pg_key() -> None:
         check(any(k == "create" for k, _ in sink), "complete() 走的是解析后的 client")
     finally:
         OpenAICompatClient._parse = saved_parse
+        restore_env_keys(saved_env)
         SEC.unbind_storage()
 
 
 def case_build_without_key() -> None:
     """构造期不再拦空 key：用户可能就是先在页面上配好才启动的。"""
-    saved = os.environ.pop(ENV, None)
+    saved = clear_env_keys()
     try:
         c = OpenAICompatClient(api_key=FALLBACK_KEY, client=object())
         c.api_key = ""                      # 模拟三层都没有的启动时刻
@@ -279,8 +343,7 @@ def case_build_without_key() -> None:
         check(getattr(built, "api_key", None) == "pending-frontend-settings",
               "空 key 也能构造出真 client（占位串，绝不出网）")
     finally:
-        if saved is not None:
-            os.environ[ENV] = saved
+        restore_env_keys(saved)
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +368,7 @@ def register(client: TestClient) -> tuple[str, dict[str, str]]:
 
 
 def case_settings_endpoints() -> None:
-    saved = os.environ.pop(ENV, None)
+    saved = clear_env_keys()
     st = fresh_storage()
     SEC.bind_storage(st)      # 生产里这行由 Storage.start() 做；TestClient 不跑 run_server 的装配
     app, agent = make_app(st)
@@ -349,9 +412,7 @@ def case_settings_endpoints() -> None:
             check(cleared.json()["api_key"]["source"] == SEC.SOURCE_ENV,
                   "清除后回落环境变量（不是回落成无）")
     finally:
-        os.environ.pop(ENV, None)
-        if saved is not None:
-            os.environ[ENV] = saved
+        restore_env_keys(saved)
         SEC.unbind_storage()
 
 
@@ -428,9 +489,12 @@ def case_self_check_reports_breakage() -> None:
         MP._post_chat = saved
 
     SEC.unbind_storage()
-    os.environ.pop(ENV, None)
-    out = run(MP.self_check(st, "u-a", type("NoKey", (), {"model": "m", "base_url": "b"})()))
-    check(out["ok"] is False and "设置" in out["detail"], "没配 key 时直接教用户去「设置」填")
+    saved_env = clear_env_keys()
+    try:
+        out = run(MP.self_check(st, "u-a", type("NoKey", (), {"model": "m", "base_url": "b"})()))
+        check(out["ok"] is False and "设置" in out["detail"], "没配 key 时直接教用户去「设置」填")
+    finally:
+        restore_env_keys(saved_env)
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +502,7 @@ def case_self_check_reports_breakage() -> None:
 # ---------------------------------------------------------------------------
 
 def case_storyline_resolves_pg_key() -> None:
-    saved = os.environ.pop(ENV, None)
+    saved = clear_env_keys()
     # 生产代码不再硬编码回落 key：这里显式给回落位定值并重置单例，
     # 使 get_default_llm().api_key 与动态解析的 _fallback_key() 一致。
     import agent_framework.llm_openai as _L
@@ -463,14 +527,13 @@ def case_storyline_resolves_pg_key() -> None:
             check(PG_KEY not in str(e), "降级文案不带密钥值")
     finally:
         _L.MY_API_KEY, _L._default_llm = saved_key, saved_llm
-        os.environ.pop(ENV, None)
-        if saved is not None:
-            os.environ[ENV] = saved
+        restore_env_keys(saved)
         SEC.unbind_storage()
 
 
 def main() -> None:
     for fn in (case_repo_roundtrip, case_mask_shape, case_resolve_priority,
+               case_env_alias_names,
                case_hot_reload_and_ttl, case_start_binds_storage, case_llm_uses_pg_key,
                case_build_without_key, case_settings_endpoints, case_self_check_green,
                case_self_check_reports_breakage, case_storyline_resolves_pg_key):

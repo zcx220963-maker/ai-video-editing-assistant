@@ -93,7 +93,9 @@ async def test_factory(tmp: Path) -> None:
           "artifacts 按 (会话,产物) 现取")
     raises(lambda: build_storage("sqlite"), ValueError, "未知 backend 抛 ValueError")
 
-    saved = {k: os.environ.pop(k, None) for k in st_mod.ENV_KEYS}
+    saved = {k: os.environ.pop(k, None) for k in
+             (*st_mod.ENV_KEYS, "PG_POOL_SIZE", "PG_POOL_MAX_OVERFLOW",
+              "PG_POOL_PRE_PING", "PG_POOL_RECYCLE_SEC")}
     real_loader = st_mod._load_env_file
     st_mod._load_env_file = lambda *a, **k: None   # 本用例要考察「环境变量缺失」，不能被 .env 补上
     try:
@@ -102,11 +104,28 @@ async def test_factory(tmp: Path) -> None:
         os.environ["PG_DSN"] = "postgresql://u:p@127.0.0.1:1/none"
         for k in ("MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY"):
             os.environ[k] = "x"
+        # 三条池参数都设成**非默认值**：用默认值判等于什么都没判（结构性改造 6）
+        os.environ["PG_POOL_MAX_OVERFLOW"] = "3"
+        os.environ["PG_POOL_PRE_PING"] = "0"
+        os.environ["PG_POOL_RECYCLE_SEC"] = "60"
         try:
             pg = build_storage("pg_minio")
         except Exception:                 # 未装 SDK 或引擎不可用：构造阶段就失败
             check(True, "引擎不可用（未装 SDK / 连不上）时构造即抛，不静默降级")
         else:
+            pool = pg.db._engine.pool
+            got = (getattr(pool, "_max_overflow", None), getattr(pool, "_pre_ping", None),
+                   getattr(pool, "_recycle", None))
+            check(got == (3, False, 60),
+                  f"三条池参数从环境透传到池：overflow/pre_ping/recycle = {got}")
+            # 默认值就是生产里跑的那一套，所以默认也得判（PG 侧掐空闲连接时靠它兜住）
+            plain = st_mod.db.PgDatastore("postgresql://u:p@127.0.0.1:1/none")
+            d = plain._engine.pool
+            check(getattr(d, "_max_overflow", None) == 10
+                  and getattr(d, "_pre_ping", None) is True
+                  and getattr(d, "_recycle", None) == 1800,
+                  f"不传参数时用的是默认值 10 / 开 / 1800：{getattr(d, '_max_overflow', None)}, "
+                  f"{getattr(d, '_pre_ping', None)}, {getattr(d, '_recycle', None)}")
             await araises(pg.start, StorageUnavailable, "PG/MinIO 不可达时 start() 抛错")
     finally:
         st_mod._load_env_file = real_loader

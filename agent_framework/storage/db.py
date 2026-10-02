@@ -546,7 +546,9 @@ class PgDatastore(Datastore):
     只有真的构造 pg_minio 后端才需要它们（同 KafkaMessageQueue 对 aiokafka 的处理）。
     """
 
-    def __init__(self, dsn: str, *, pool_size: int = 5, echo: bool = False) -> None:
+    def __init__(self, dsn: str, *, pool_size: int = 5, pool_max_overflow: int = 10,
+                 pool_pre_ping: bool = True, pool_recycle_sec: int = 1800,
+                 echo: bool = False) -> None:
         super().__init__()
         if not dsn.startswith("postgresql"):
             dsn = "postgresql+asyncpg://" + dsn.split("://", 1)[-1]
@@ -555,7 +557,15 @@ class PgDatastore(Datastore):
         from sqlalchemy.ext.asyncio import create_async_engine  # 延迟导入
 
         self.dsn = dsn
-        self._engine = create_async_engine(dsn, pool_size=pool_size, echo=echo)
+        # 三条池参数各防一件事（原先只有 pool_size，另两条是审计里那条「池固定 5」）：
+        # · max_overflow —— 长任务（渲染代查、批量转写）与 HTTP handler 共用这一池，
+        #   池满时溢出几条比让请求卡在队列上等下一轮超时好；
+        # · pre_ping —— 容器重启或 PG 侧掐掉空闲连接后，池里那条是死的，取出来直接
+        #   一次 StorageUnavailable；pre_ping 先 ping 一下，坏连接就地丢弃重开；
+        # · recycle —— 比 ping 更省事的一刀：连接活够久就换新，别等它被中间层掐了才发现。
+        self._engine = create_async_engine(
+            dsn, pool_size=pool_size, max_overflow=pool_max_overflow,
+            pool_pre_ping=pool_pre_ping, pool_recycle=pool_recycle_sec, echo=echo)
         self._Text = __import__("sqlalchemy").text
 
     async def _run(self, sql: str, params: Mapping[str, Any] | None = None,

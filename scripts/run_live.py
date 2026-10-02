@@ -1,6 +1,8 @@
 """用真实 LLM（默认 DeepSeek）跑通 Search→Fetch 联网 ReAct 链路。
 
-密钥只配置一处、全项目共用：设置环境变量 OPENAI_API_KEY（推荐）。
+密钥只配置一处、全项目共用：页面「设置」里填的那把优先（按用户存 PG）；命令行跑本脚本
+时没有页面可填，就设环境变量 `OPENAI_API_KEY`（也认 `DEEPSEEK_API_KEY` /
+`SILICONFLOW_API_KEY`，按此顺序取第一把非空的）。
 run_live.py 与剪辑链路都通过 get_default_llm() 拿同一个共享客户端。
 
   export OPENAI_API_KEY=sk-xxxx

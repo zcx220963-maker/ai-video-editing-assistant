@@ -251,7 +251,15 @@ def build_storage(backend: str = "pg_minio", **kwargs: Any) -> Storage:
             secure=_env("MINIO_SECURE", "0") in ("1", "true", "yes"),
             cache_max_bytes=max_bytes,
         )
-        db = PgDatastore(cfg["PG_DSN"], pool_size=int(_env("PG_POOL_SIZE", "5")))
+        db = PgDatastore(
+            cfg["PG_DSN"],
+            pool_size=int(_env("PG_POOL_SIZE", "5")),
+            # 三条都是可选、有默认值（不进 ENV_KEYS 那份必填清单）：池的固定上限之外
+            # 允许溢出几条、取连接前先 ping、连接活够久就换新。判据见 db.PgDatastore。
+            pool_max_overflow=int(_env("PG_POOL_MAX_OVERFLOW", "10")),
+            pool_pre_ping=_env("PG_POOL_PRE_PING", "1") in ("1", "true", "yes"),
+            pool_recycle_sec=int(_env("PG_POOL_RECYCLE_SEC", "1800")),
+        )
         return Storage(
             "pg_minio", db, objects,
             Workspace(root=workspace_root, objects=objects),

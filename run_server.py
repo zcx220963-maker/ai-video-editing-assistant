@@ -16,7 +16,8 @@
 
 运行时状态落点：会话历史/收件箱/任务板/子 Agent/checkpoint/定时任务与心跳/长期记忆/技能库
 （正文 + 附件）全在 PG 与 MinIO（spec §8），本地目录只作为可弃工作区和技能导入源。
-密钥只配置一处：get_default_llm() 读环境变量 OPENAI_API_KEY（全项目共用）；
+密钥只配置一处：日常在页面「设置」里填（按用户存 PG，压过环境）；没配时按环境变量
+`OPENAI_API_KEY` → `DEEPSEEK_API_KEY` → `SILICONFLOW_API_KEY` 取第一把非空的（全项目共用）。
 PG_DSN / MINIO_* 五项只从环境变量或 .env 读，代码不落盘也不打印值。
 
 用法：
