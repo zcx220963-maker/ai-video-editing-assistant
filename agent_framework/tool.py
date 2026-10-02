@@ -208,6 +208,10 @@ class ToolRegistry:
     def tool_names(self) -> list[str]:
         return list(self._tools.keys())
 
+    def all_tools(self) -> list[Tool]:
+        """已注册的全部工具（只读遍历用；别拿它改注册表）。"""
+        return list(self._tools.values())
+
     def _unknown_tool_error(self, name: str) -> str:
         """调了一个不存在的工具时的报错；能给出「它为什么不在」就说清楚。
 

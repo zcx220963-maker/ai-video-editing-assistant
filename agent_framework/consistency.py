@@ -79,6 +79,60 @@ _SKILL_NOT_TOOL_PATTERNS = (
 )
 
 
+def schema_property_names(tools: Iterable[Any]) -> set[str]:
+    """把所有工具 JSON Schema 里出现过的 **properties 键名**全收出来（含嵌套层）。
+
+    为什么必须递归：判据要能认出「技能正文里提到的字段名不是工具名」。
+    ``plan_gate.param_keys()`` 只覆盖计划门那批节点的参数，而模型在技能正文里
+    顺口提到的字段可能来自任何工具的嵌套结构——例如 ``submit_plan`` 的
+    ``plans[].steps[].param_options``。只取顶层就会把 ``param_options`` 判成
+    「臆造工具」，启动时挂一条假告警；假告警比不报更坏，它教人忽略这个检查。
+
+    只放宽文案检查，不影响任何执行判定。
+    """
+    out: set[str] = set()
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if depth > 8 or not isinstance(node, Mapping):
+            return
+        props = node.get("properties")
+        if isinstance(props, Mapping):
+            for key, sub in props.items():
+                out.add(str(key))
+                walk(sub, depth + 1)
+        for key in ("items", "additionalProperties", "oneOf", "anyOf", "allOf"):
+            sub = node.get(key)
+            if isinstance(sub, Mapping):
+                walk(sub, depth + 1)
+            elif isinstance(sub, (list, tuple)):
+                for item in sub:
+                    walk(item, depth + 1)
+
+    for tool in tools or ():
+        schema = getattr(tool, "parameters", None)
+        walk(schema if isinstance(schema, Mapping) else {})
+    return out
+
+
+def skill_field_names(*, node_param_keys: Iterable[str] = (),
+                      tools: Iterable[Iterable[Any]] = ()) -> set[str]:
+    """技能正文里可能出现的**字段名**总集（这些都不是工具名，不能报成臆造工具）。
+
+    为什么要一个函数而不是让调用方自己拼：装配处曾经只扫了主注册表，漏掉「submit_plan
+    只活在规划注册表里」这一事实，于是启动期挂出一条假告警
+    （「引用了不存在的工具：param_options」）；而离线测试当时用的是手写的假 schema，
+    照样全绿——**测试与生产各算各的来源**就是这次漏判的形状。现在两边都走这里，
+    来源少一个就会在测试里红。
+
+    ``tools`` 是「一批批工具对象」（每批一个可迭代的 Tool），不是工具名的可迭代——
+    所以调用方传列表，别传生成器。
+    """
+    out = {str(k) for k in node_param_keys}
+    for batch in tools:
+        out |= schema_property_names(batch)
+    return out
+
+
 def _looks_like_non_tool(token: str, param_keys: Iterable[str]) -> bool:
     if token in _SKILL_NOT_TOOLS:
         return True

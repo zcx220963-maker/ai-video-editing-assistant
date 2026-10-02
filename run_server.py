@@ -618,6 +618,25 @@ def build_runtime(
                 param_keys = set(plan_gate.param_keys())
             except Exception:  # noqa: BLE001 - 契约没接上时退成空集
                 param_keys = set()
+            # 再补上所有工具 schema 里出现过的字段名（含嵌套层）。
+            # 计划门的 param_keys 只覆盖剪辑节点参数，而技能正文会提到别处的字段
+            # （如 submit_plan 的 plans[].steps[].param_options）。不收全就会把字段名
+            # 判成臆造工具，挂一条假告警——假告警会教人忽略这个检查本身。
+            #
+            # 规划轮的两个工具必须单独补：submit_plan / confirm_plan 只活在**规划注册表**
+            # 里（按调用懒建），主注册表里没有它们，只扫 registry 就会漏掉
+            # plans[].steps[].param_options，启动期挂一条「引用了不存在的工具：param_options」
+            # 的假告警（真机启动日志实测到过）。
+            try:
+                from agent_framework.plan_gate import ConfirmPlanTool, SubmitPlanTool
+                param_keys |= _cons.schema_property_names(
+                    [SubmitPlanTool(plan_gate), ConfirmPlanTool()])
+            except Exception:  # noqa: BLE001 - 取不到就按原样检查
+                pass
+            try:
+                param_keys |= _cons.schema_property_names(registry.all_tools())
+            except Exception:  # noqa: BLE001 - 取不到就按原样检查
+                pass
             skills_bad = _cons.unknown_tools_in_skills(
                 skill_bodies, known, param_keys=param_keys)
             report = _cons.format_report(watched, skills_bad, known)
