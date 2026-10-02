@@ -23,7 +23,9 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 from agent_framework.agent import AgentConfig, AgentOnceRun, _APPROVAL_PAUSE_ANSWER  # noqa: E402
-from agent_framework.ask_gate import NO_POPUP_NOTE, looks_like_asking_user  # noqa: E402
+from agent_framework.ask_gate import (  # noqa: E402
+    NO_POPUP_NOTE, looks_like_asking_user, looks_like_plan_invite,
+)
 from agent_framework.ask_user import AskUserTool  # noqa: E402
 from agent_framework.checkpoint import (  # noqa: E402
     CheckpointManager, STATUS_AWAITING_APPROVAL,
@@ -179,11 +181,57 @@ async def case_flag_off() -> None:
         await storage.close()
 
 
+async def case_plan_must_be_card() -> None:
+    """计划必须出卡：不能把方案写成正文再要用户"回复确认"。
+
+    真机实测的形状（用户原话「为什么这步没有弹窗??我不想打字」）：
+    模型弹窗问了时长、又问出镜分布，用户都点完，最后模型把整套方案写成
+    正文，结尾「确认这个方案就回复我，我立刻开始跑」——既没有计划卡可点，
+    又明确要用户打字。这条用例钉住：这种收尾会被打回，并喂一条要求出卡的核对。
+    """
+    print("\n=== ⑥ 方案写成正文 + 要用户回复确认 → 打回要求出卡 ===")
+    prose = ("这一版会怎么做（3 分钟 · 金句出镜版）\n"
+             "1. 加载素材…\n2. 采访转写…\n"
+             "确认这个方案就回复我，我立刻开始跑。")
+    storage = build_storage("memory")
+    await storage.start()
+    try:
+        reg = ToolRegistry()
+        reg.register(AskUserTool())
+        mgr = CheckpointManager(storage)
+        # 第一轮给散文方案，第二轮（被打回后）才交卡——用真实 SubmitPlanTool 太重，
+        # 这里只验「打回发生过」，所以第二轮给一个普通收尾即可。
+        runner = AgentOnceRun(
+            ScriptedLLM([("answer", prose), ("answer", "方案已交。")]),
+            reg, ContextBuilder("BASE"), hooks=CompositeHook([]),
+            config=AgentConfig(max_iterations=6), checkpoint=mgr, storage=storage,
+        )
+        sess = Session(user_id="u", conversation_id="c_plan_card")
+        # planning=True 才会认这条保证（规划轮才是该出卡的轮次）
+        out = await runner.run(sess, "剪一条", run_id="run-pc", planning=True)
+        # 证据从一致点链里取（真实来源，不猜内部属性）
+        cp = await mgr.load("run-pc")
+        msgs = list(getattr(cp, "messages", None) or []) if cp else []
+        joined = "\n".join(str((m or {}).get("content") or "") for m in msgs)
+        hit = ("submit_plan" in joined) or ("计划卡" in joined)
+        check(hit, f"⑥ 打回时要求改用 submit_plan 出卡（链上消息 {len(msgs)} 条，"
+                   f"末答：{out[:36]}）")
+    finally:
+        await storage.close()
+
+    print("\n=== ⑦ 正常收尾不该被打回 ===")
+    for text, tag in [("已按你的要求渲完了，成片在这里。", "交付说明"),
+                      ("这条素材能用，1080p/25fps。", "纯咨询"),
+                      ("我建议先切镜头再理解画面。", "普通叙述")]:
+        check(not looks_like_plan_invite(text), f"⑦ 不误伤：{tag}")
+
+
 async def main() -> int:
     case_detector()
     await case_prose_question_is_bounced()
     await case_budget_exhausted_appends_note()
     await case_flag_off()
+    await case_plan_must_be_card()
     print("\n" + ("全部通过" if not _fails else f"有 {_fails} 项未通过"), flush=True)
     print(f"用例 {_checks} 条", flush=True)
     return 0 if not _fails else 1

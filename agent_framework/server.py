@@ -44,7 +44,7 @@ import uuid
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -276,6 +276,54 @@ class CatalogJSONResponse(JSONResponse):
             content = catalog.rewrite_obj(content)
         return json.dumps(content, ensure_ascii=False, allow_nan=False,
                           indent=None, separators=(",", ":")).encode("utf-8")
+
+
+def readable_decision(row: Mapping[str, Any], decision: str, message: str,
+                      answers: list[dict[str, Any]]
+                      ) -> tuple[str, str, list[dict[str, Any]]]:
+    """把弹窗选项的**机器 key** 换成人话，填进**给用户看**的那条消息。
+
+    为什么必须在这一层换：前端点选后回传的是 ``o.key``（``d180`` / ``key_only``），
+    它会作为 ``message`` 原样进消息链，用户就在对话里看到一串 ``d180``。
+    真机实测用户的原话：「之前的弹窗按钮点击后显示的那些 d180、key_only 等
+    能不能不要在前端显示」——他要的是自己点过的那句中文。
+
+    为什么在服务端换而不是只改前端：CLI / 脚本 / 老前端也一并受益，一处修三处一致。
+
+    **``decision`` 必须保持原样不动**：它是语义键，下游靠它判分支
+    （``decision_is_confirm`` 认的是 ``confirm_render`` 这个 key，换成中文标签就
+    判不出来了，渲染确认会失效）。所以这里只改 ``message`` 与 ``answers`` 里的
+    ``answer``——那两样是写进对话、给模型和用户看的。
+
+    放在**模块级**而不是 create_app 内：这样用例可以直接 import 它。
+    埋在闭包里就只能靠 exec 抠源码来测，那正是「测试与生产各写一份」的来源。
+    """
+    ask = ((row.get("approval") or {}).get("ask") or {}) if row else {}
+    by_key = {str(o.get("key") or ""): str(o.get("label") or "")
+              for o in (ask.get("options") or []) if isinstance(o, Mapping)}
+
+    out: list[dict[str, Any]] = []
+    for a in answers or []:
+        if not isinstance(a, Mapping):
+            continue
+        item = dict(a)
+        key = str(item.get("key") or item.get("answer") or "")
+        label = by_key.get(key) or ""
+        custom = str(item.get("custom") or "").strip()
+        # custom 优先：用户自己写的那句比任何预设标签都更贴切
+        if custom:
+            item["answer"] = custom
+        elif label:
+            item["answer"] = label
+        out.append(item)
+
+    # 只把 message 换成人话。换不出来就保留原文，不编造。
+    new_message = message
+    if message:
+        new_message = by_key.get(str(message).strip()) or message
+    elif out:
+        new_message = str(out[0].get("answer") or "")
+    return decision, new_message, out
 
 
 def create_app(
@@ -769,16 +817,18 @@ def create_app(
                      f"（可能已审批过或已结束），请刷新页面查看最新进展。")
         sid = str(row["session_id"])
         _, conversation_id = sid.split(":", 1)
+        decision, message, answers = readable_decision(
+            row, req.decision, req.message, req.answers)
         await mq.publish(topic, sid, {
             "user_id": user_id,
             "conversation_id": conversation_id,
-            "message": req.message,
+            "message": message,
             "run_id": run_id,
             "action": {"op": "approve", "run_id": run_id,
-                       "decision": req.decision,
+                       "decision": decision,
                        # 结构化答案原样带上：执行侧据此知道「第几题选了哪个 key」，
                        # 不必再去猜前端拼的那句中文散文。
-                       "answers": req.answers},
+                       "answers": answers},
         })
         return ChatQueuedResponse(run_id=run_id, status="queued")
 

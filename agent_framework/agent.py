@@ -20,7 +20,8 @@ from typing import Any, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
-from .ask_gate import NO_POPUP_NOTE, looks_like_asking_user, popup_nudge
+from .ask_gate import (NO_POPUP_NOTE, PLAN_CARD_NUDGE, looks_like_asking_user,
+                       looks_like_plan_invite, popup_nudge)
 from .checkpoint import Checkpoint, CheckpointManager
 from .catalog import get_catalog
 from .compress import _repair_orphans
@@ -251,6 +252,10 @@ class AgentConfig:
     # 置 False 即关闭这道保证（回到「模型自觉决定要不要弹窗」的老行为）。
     require_popup_questions: bool = True
     popup_question_nudges: int = 1
+    # 「计划必须出卡」的硬保证：模型把整套方案写成正文、末尾要用户"回复确认"
+    # 时打回一次，要求改用 submit_plan 出卡（见 ask_gate.looks_like_plan_invite）。
+    # 置 False 即关闭这道保证。
+    plan_card_nudges: int = 1
 
 
 @dataclass
@@ -291,6 +296,10 @@ class _Round:
     # 不能因为「这次 _drive 还没调过」就判它没用弹窗（真机实测：续跑的每一轮都吃一条
     # 「但你没有调用 ask_user」的假打回）。
     asked_this_run: bool = False
+    # 「计划必须出卡」的打回预算。是否**已经**交过计划不看这里，看
+    # ``state.plan_candidates``——那才是「submit_plan 真成功过」的权威记录，
+    # 另加一个字段只会多一处可能与它不同步的状态。
+    plan_nudges: int = 0
     final: str | None = None
     reached_limit: bool = True
 
@@ -567,7 +576,10 @@ class AgentOnceRun:
             card_nudges=max(0, self.config.plan_claim_nudges),
             step_nudges=max(0, self.config.step_claim_nudges),
             # 「向用户提问必须走弹窗」的打回预算（见 ask_gate）。默认 1 次。
-            popup_nudges=max(0, self.config.popup_question_nudges))
+            popup_nudges=max(0, self.config.popup_question_nudges),
+            # 「计划必须出卡」的打回预算：模型把方案写成正文再要用户"回复确认"
+            # 时打回一次，要求改用 submit_plan 出卡。
+            plan_nudges=max(0, self.config.plan_card_nudges))
         state.persist(cp)
         return r
 
@@ -749,6 +761,23 @@ class AgentOnceRun:
             r.popup_nudges -= 1
             r.messages.append(assistant(resp.content))
             r.messages.append(system(popup_nudge(r.planning)))
+            r.iteration += 1
+            return True
+        # 计划必须出卡，不能写成正文要用户「回复确认」。
+        #
+        # 为什么要有这条硬保证：原先只靠提示词说「用 submit_plan 交候选计划」，
+        # 模型完全可以把整套方案写成散文、末尾来一句「确认这个方案就回复我」——
+        # 用户既没卡可点（看不到也可改不了那些开关），还被告知要打字。
+        # 真机实测就是这样：弹窗问了时长和出镜分布，最后却用正文收尾要人打字确认。
+        #
+        # 为什么排在上面那条之后、而且出路是「出卡」不是「再弹窗」：
+        # 用户要的是**能改参数的计划卡**，不是一个"要不要继续"的窗。
+        # 所以认出这类收尾时，正确动作是把方案改写成 submit_plan。
+        if (r.plan_nudges > 0 and not r.state.plan_candidates
+                and looks_like_plan_invite(resp.content)):
+            r.plan_nudges -= 1
+            r.messages.append(assistant(resp.content))
+            r.messages.append(system(PLAN_CARD_NUDGE))
             r.iteration += 1
             return True
         return False
