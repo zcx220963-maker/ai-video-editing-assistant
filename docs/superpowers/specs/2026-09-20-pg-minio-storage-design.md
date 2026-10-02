@@ -533,8 +533,9 @@ python -u run_migrate.py              # 幂等，可重跑
 
 - 实时回投的会话亲和：本批次交付时仍是单实例内存路由（§7 写明「本次不做半套」）。
   该边界已由后续子项目补上——OutBound 帧经 Redis pub/sub 扇出到每个实例
-  （`agent_framework/broadcast.py`，用法与剩余边界见 README §3.11）：环形缓冲不跨副本补全，
-  浏览器被另一个副本接走时补不回接管之前的进度。
+  （`agent_framework/broadcast.py`，用法与剩余边界见 README §3.11）：没挂 WS 的副本如今也攒一份
+  **有界**影子缓冲（2026-10-02），接管后重连补得回接管之前的进度；仍补不回的是这个副本订阅频道
+  之前的帧、被预算整条淘汰的会话，以及跨重启（缓冲本身还在进程内）。
 - `minio` SDK 与 `asyncpg` 需新装；未装时 `--storage memory` 仍可跑全部离线测试，
   但生产路径不可用。
 - faster-whisper / edge-tts / 画面理解**已各自真机冒烟过**（`.smoke/b8_tts_smoke.py` 真网络合成、
