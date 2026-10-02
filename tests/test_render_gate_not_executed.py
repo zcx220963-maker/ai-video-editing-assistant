@@ -226,6 +226,31 @@ async def main() -> int:
             await storage3.close()
 
         print()
+        print("=== ④ 收尾（retain_residue）不能把这一位清掉 ===")
+        # 真机事故（用户原话「为什么老是问我这个问题，我回答无数遍了」）：
+        # run 撞迭代上限 → 收尾时 retain_residue 只保留 approved_plan、把这位置清掉
+        # → 用户点「继续」→ 门认为"没问过" → 又把同一道题问一遍，如此往复。
+        from agent_framework.run_state import RunState  # noqa: PLC0415
+
+        st = RunState()
+        st.render_gate_asked = True
+        cp_fake = type("CP", (), {"plan": {"state": {"render_gate_asked": True,
+                                                    "calls_attempted": ["x"]}}})()
+        RunState.retain_residue(cp_fake, st)
+        kept = (cp_fake.plan.get("state") or {}).get("render_gate_asked")
+        check(kept is True,
+              f"收尾后 render_gate_asked 仍在（实际 {kept!r}）——「继续」不会再问一遍")
+        check("calls_attempted" not in (cp_fake.plan.get("state") or {}),
+              "中间过程（调用清单）仍然被精简掉（收尾该瘦身的部分没变胖）")
+
+        # 没问过时不该凭空写进去
+        st2 = RunState()
+        cp_fake2 = type("CP", (), {"plan": {"state": {"render_gate_asked": False}}})()
+        RunState.retain_residue(cp_fake2, st2)
+        check((cp_fake2.plan.get("state") or {}).get("render_gate_asked") is None,
+              "没问过时不留这一位（state 该空就空）")
+
+        print()
         print("全部通过" if not _fails else f"有 {_fails} 项未通过")
         print(f"用例 {_checks} 条")
         return 0 if not _fails else 1

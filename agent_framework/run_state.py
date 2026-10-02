@@ -129,15 +129,27 @@ class RunState:
 
         完成的 run 不会被恢复，调用清单与 transcript 不必再存（transcript 已经在
         assistant 行的 ``qa.parts`` 里，对账结论另有 ``cp.plan["audit"]``）。
-        唯独 ``approved_plan`` 要留着：它是「编译后的那一份计划」在库里唯一的落点，
-        从这条 run 的某个一致点分叉时，子 run 得继承同一个承诺，而不是退回
-        「没有批准计划」——那道执行轮的硬保证和对账都会因此失效。
+
+        要留的只有两类：
+          · ``approved_plan`` —— 「编译后的那一份计划」在库里唯一的落点。
+            从这条 run 的某个一致点分叉时，子 run 得继承同一个承诺，而不是退回
+            「没有批准计划」——那道执行轮的硬保证和对账都会因此失效。
+          · ``render_gate_asked`` —— **「渲染确认门已经问过」这一位必须活过收尾**。
+            真机事故（用户原话「为什么老是问我这个问题，我回答无数遍了」）：
+            run 撞迭代上限 → 收尾把这位置清掉 → 用户点「继续」→ 门认为"没问过"
+            → 又把同一道题问一遍，如此往复。它记的是"这条 run 已经问过用户"，
+            与 approved_plan 同属「已认过的事实」，不是可丢的中间过程。
         """
         plan = getattr(cp, "plan", None) if cp is not None else None
         if not isinstance(plan, dict):
             return
+        keep: dict[str, Any] = {}
         if isinstance(state.approved_plan, Mapping):
-            plan[STATE_FIELD] = {"approved_plan": dict(state.approved_plan)}
+            keep["approved_plan"] = dict(state.approved_plan)
+        if state.render_gate_asked:
+            keep["render_gate_asked"] = True
+        if keep:
+            plan[STATE_FIELD] = keep
         else:
             plan.pop(STATE_FIELD, None)
 
