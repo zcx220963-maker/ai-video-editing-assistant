@@ -183,11 +183,40 @@ async function checkActiveRun(cid) {
     // 只能整页重开。这里把服务端那份 approval 还原成 WS 帧的同一形状
     // （approvalBubble 就吃这个形状），复用同一条渲染路径。
     //
-    // 不需要去重：同一会话串行，一条会话最多只有一个挂起的 run；
-    // 重复调用只是把同一张卡再设一次（弹窗是单例 questionCard）。
+    // **必须去重**：questionCard 是单例，而 openQuestionCard 每次都整体重建
+    // （answers/customAnswers 全清空）。这条路径在 **WS 每次重连**时都会跑
+    // （reloadAfterReconnect → checkActiveRun），于是用户选到一半、
+    // 连接一断一重，卡片就被重建、已选全丢——真机反馈正是
+    // 「用户还没选完就跳另一个卡片，还要用户去找」。
+    // 所以这里只认「这个 run + 这道题」还没弹过才弹：
+    // 同一 run 的同一个 ask 再进来一律跳过，把选择留在用户手上。
     if (j.run.status === "awaiting_approval" && j.run.approval) {
       const ap = j.run.approval;
+      const rid = String(ap.run_id || j.run.run_id || "");
+      const title = String((ap.ask && ap.ask.title) || ap.reason || "");
+      const sig = `${rid}\u0000${title}`;
       busy[cid] = j.run.run_id;
+
+      // 这条路径**只负责"冷启动时把卡补回来"**（首次进会话 / 整页刷新）。
+      // 去重规则两条：
+      //  · 这道题已经补弹过 → 不再补（否则 WS 每次重连都会重建一次卡）；
+      //  · 或者正开着一张同签名的卡（用户还没提交）→ 更不能重建。
+      //
+      // 为什么不去重会出事：questionCard 是单例，openQuestionCard 每次都整体重建
+      // （answers/customAnswers 清空）。这条路径在 **WS 每次重连**时都跑
+      // （reloadAfterReconnect → checkActiveRun），于是用户选到一半、连接一断一重，
+      // 卡片就被重建、已选全丢——真机反馈正是
+      // 「用户还没选完就跳另一个卡片，还要用户去找」。
+      //
+      // 新题不会因此漏弹：新题由 WS 的 type=approval 帧弹出（那条路径不去重），
+      // 这里只是冷启动兜底。
+      const seen = askedCards[cid] || new Set();
+      const same = questionCard.value
+        && String(questionCard.value.run_id || "") === rid
+        && String(questionCard.value.pages?.[0]?.title || "") === title;
+      if (same || seen.has(sig)) return;
+      seen.add(sig);
+      askedCards[cid] = seen;
       approvalBubble(cid, {
         run_id: ap.run_id || j.run.run_id,
         reason: ap.reason || "",
@@ -219,6 +248,9 @@ const histories = reactive({});
 const socks = {};
 const busy = reactive({});   // convId -> 等待中的 run_id
 const streamCur = {};        // convId -> 当前流式气泡
+// convId -> 已经弹过的那道题签名。见 checkActiveRun 的说明：
+// 它是「不要因为一次重连就把用户选到一半的卡片重建掉」的那道闸。
+const askedCards = reactive({});
 const connected = reactive({});
 const draft = ref("");
 const scroller = ref(null);
@@ -1308,6 +1340,9 @@ async function decideApproval(card, decision, answers) {
     card.decision_label = label;
     if (approvalModal.value === card) approvalModal.value = null;
     if (questionCard.value && questionCard.value.approval === card) questionCard.value = null;
+    // 清掉这个会话的「已补弹」标记：答完之后同一道题若被重新问到（换一版/重试），
+    // 冷启动兜底还要能把它补出来，不能被上面的去重挡住。
+    delete askedCards[cid];
     msgs(cid).push({ role: "user", text: detail || label, state: "done", attachments: [] });
     busy[cid] = j.run_id || card.run_id || null;
     scrollDown();

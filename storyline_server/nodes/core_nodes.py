@@ -15,6 +15,7 @@ import random
 import re
 from pathlib import Path
 from typing import Any
+from collections.abc import Mapping
 
 from agent_framework.orchestration import (
     BaseNode,
@@ -659,6 +660,62 @@ _SCRIPT_PROMPT = """你是短视频文案作者。根据素材分组与脚本模
 {{"title": "12字内标题", "groups": [{{"group_id": "…", "raw_text": "该组旁白文案，60-120字口语化"}}]}}"""
 
 
+def normalize_custom_script(raw_custom: Any) -> str:
+    """把模型给的 ``custom_script`` 归一成「每行一句」的干净文本。
+
+    四种输入都要认（模型实际给过这四种）：
+      · ``None`` / 空           → 空串（调用方据空串回落到 LLM 生成）
+      · 字符串                  → 原样（按空行分段的手写文本）
+      · 字符串数组              → 换行拼接
+      · **对象数组**            → 取每项的 text/raw_text/sentence
+
+    最后一种曾经出过真机事故：模型传
+    ``[{"group": "group_0001", "text": "小白兔…"}]``，而当时用 ``str(x)`` 硬转，
+    于是每项变成 Python 字面量串 ``"{'group': 'group_0001', 'text': '小白兔…'}"``
+    （单引号 + 花括号），脏字符一路进字幕，用户看到一屏 ``{'group': ...}``，
+    渲染反复失败、模型报「文案生成节点坏了」。
+
+    另外做一层兜底：整串文本里若仍残留这种字面量，把 ``text`` 的值抠出来
+    （模型也可能把它当**一个字符串**传进来）。
+
+    做成模块级函数而不是写在 ``process`` 里：这样用例可以直接 import 它。
+    埋在方法里就只能靠 exec 抠源码来测——那正是「测试与生产各写一份」的来源。
+    """
+    raw = raw_custom
+    if isinstance(raw, Mapping):
+        return ""          # 已是最终结构对象，由调用方另走一条路
+    if isinstance(raw, (list, tuple)):
+        parts: list[str] = []
+        for x in raw:
+            if isinstance(x, Mapping):
+                txt = x.get("text") or x.get("raw_text") or x.get("sentence") or ""
+                if isinstance(txt, (list, tuple)):
+                    txt = " ".join(str(v) for v in txt)
+                txt = str(txt).strip()
+                if txt:
+                    parts.append(txt)
+            else:
+                s = str(x).strip()
+                if s:
+                    parts.append(s)
+        text = "\n".join(parts).strip()
+    else:
+        text = str(raw or "").strip()
+
+    # 兜底：清掉残留的 Python 字面量外壳
+    if text and "{" in text and "'" in text and ("'text'" in text or "'group'" in text):
+        salvaged: list[str] = []
+        for line in text.splitlines():
+            found = re.findall(r"['\"]text['\"]\s*:\s*['\"]([^'\"]+)['\"]", line)
+            if found:
+                salvaged.extend(found)
+            elif line.strip() and not line.strip().startswith("{"):
+                salvaged.append(line.strip())
+        if salvaged:
+            text = "\n".join(salvaged).strip()
+    return text
+
+
 class GenerateScriptNode(StoryNode):
     name = "generate_script"
     display_name = "文案生成"
@@ -680,14 +737,10 @@ class GenerateScriptNode(StoryNode):
         if isinstance(raw_custom, dict):
             custom_obj = raw_custom
             custom = ""
-        elif isinstance(raw_custom, (list, tuple)):
-            # 「每段一句的字符串数组」与「按空行分段的手写文本」是同一件事的两种写法。
-            # 原先只认字符串，模型给数组时在 .strip() 上炸（'list' object has no attribute
-            # 'strip'）——报错还看不出是参数形状问题，白烧一轮重试。
-            # 直接归一成换行文本，后面的分段逻辑一行都不用改。
-            custom = "\n".join(str(x) for x in raw_custom if str(x).strip()).strip()
         else:
-            custom = str(raw_custom or "").strip()
+            # 归一逻辑抽成模块级 normalize_custom_script（见它的 docstring）：
+            # 这样用例能直接 import 测，不必用 exec 抠源码。
+            custom = normalize_custom_script(raw_custom)
         parsed: dict[str, Any] | None = None
         if custom_obj is not None:
             parsed = custom_obj
