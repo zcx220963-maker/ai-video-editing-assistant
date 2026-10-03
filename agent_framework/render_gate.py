@@ -31,15 +31,33 @@ KEEP_FULL_OPTION = "keep_full_sentence"
 TRUNCATE_OPTION = "truncate_as_planned"
 
 
+def _dry_run_call(tc: Any) -> bool:
+    """这一次 render_video 调用是不是 dry_run（只要账、不出片）。
+
+    参数可能是真布尔，也可能是模型写出的字符串 "true"/"false"，所以逐字判一下：
+    ``bool("false")`` 为真，照原样判会把「不 dry」读成「dry」。
+    """
+    args = getattr(tc, "arguments", None) or {}
+    if not isinstance(args, Mapping):
+        return False
+    value = args.get("dry_run")
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no", "off", "否", "不")
+    return bool(value)
+
+
 def should_gate_render(tool_calls: Any, *, enabled: bool) -> bool:
     """这一批工具调用里有没有「要渲染」，且门是开着的。
 
-    只看名字，不看参数：只要能渲就得先给用户看编排结果。
+    看名字也看参数：``dry_run`` 的那一次不出片，它本身就是给用户看的那一眼编排
+    结果——再拦一道「确认渲染吗」是把同一道题问两遍。
     """
     if not enabled:
         return False
     for tc in tool_calls or ():
-        if getattr(tc, "name", None) == RENDER_NODE:
+        if getattr(tc, "name", None) != RENDER_NODE:
+            continue
+        if not _dry_run_call(tc):
             return True
     return False
 
@@ -109,6 +127,8 @@ def preview_summary(preview: Mapping[str, Any] | None) -> dict[str, str]:
         out["配乐"] = str((audio["bgm"] or {}).get("filename") or "已选")[:18]
     if tl.get("subtitles"):
         out["字幕"] = f"{tl['subtitles']} 条"
+    if tl.get("overlay_events"):
+        out["覆盖画面"] = f"{tl['overlay_events']} 层"
     return out
 
 

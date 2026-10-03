@@ -59,13 +59,21 @@ def check(cond: bool, label: str) -> None:
 
 
 class _StubGate:
-    """只给 planning_section 用到的三张口：白名单、开关事实、提示词库引用。"""
+    """只给 planning_section 用到的四张口：白名单、开关事实、提示词库、显式上卡节点。
+
+    ``explicit_call_nodes`` 按白名单取交集（真实契约里这个集合本就 ⊆ 白名单）：
+    白名单里没有那几张卡时它就是空集，``{?must_include}`` 整段不出现——守卫的
+    「有条件才说话」这一支也一并被金样盖住。
+    """
 
     def __init__(self, whitelist, knob_facts, library=None) -> None:
         self._wl, self._facts, self.prompt_library = whitelist, knob_facts, library
 
     def whitelist(self) -> list:
         return list(self._wl)
+
+    def explicit_call_nodes(self) -> set:
+        return set(self._wl) & {"filter_clips", "group_clips"}
 
     async def knob_facts(self) -> list:
         return json.loads(json.dumps(self._facts))  # 防被渲染过程就地改
@@ -106,7 +114,7 @@ def case_on_disk() -> None:
 def case_no_leftover_placeholder() -> None:
     print("③ 渲染结果里不留守卫行与未替换的数据占位符")
     everything = next(c for c in GOLDEN["cases"] if c["name"] == "everything")
-    data_keys = ("nodes", "knobs", "prior_cards", "feedback_quote",
+    data_keys = ("nodes", "knobs", "must_include", "prior_cards", "feedback_quote",
                  "session_history_rows", "pending_plan_id", "pending_label",
                  "pending_run_id", "pending_unfulfilled", "pending_asked")
     for label, library in (("内联", None), ("磁盘", build_prompt_library(None))):
@@ -120,16 +128,17 @@ def case_guard_key_contract() -> None:
     print("④ 模板要的键 == 代码给的键（少一个键就整段静默消失）")
     keys = placeholders_in(_PLANNING_TEMPLATE)
     wanted = {"has_pending_plan", "prior_cards", "feedback_quote", "has_pending",
-              "session_history_rows", "nodes", "knobs", "pending_plan_id",
-              "pending_label", "pending_run_id", "pending_unfulfilled", "pending_asked"}
+              "session_history_rows", "nodes", "must_include", "knobs",
+              "pending_plan_id", "pending_label", "pending_run_id",
+              "pending_unfulfilled", "pending_asked"}
     check(keys == wanted, f"内联模板的键名/守卫名固定：{sorted(keys)}")
     file_keys = placeholders_in(
         (DEFAULT_PROMPTS_DIR / PLANNING_PROMPT_FILE).read_text(encoding="utf-8"))
     check(file_keys == wanted, f"磁盘模板的键名与内联一致：{sorted(file_keys)}")
 
-    given = {"nodes", "knobs", "has_pending_plan", "prior_cards", "feedback_quote",
-             "session_history_rows", "has_pending", "pending_plan_id", "pending_label",
-             "pending_run_id", "pending_unfulfilled", "pending_asked"}
+    given = {"nodes", "must_include", "knobs", "has_pending_plan", "prior_cards",
+             "feedback_quote", "session_history_rows", "has_pending", "pending_plan_id",
+             "pending_label", "pending_run_id", "pending_unfulfilled", "pending_asked"}
     check(wanted <= given, "planning_section 的 values 覆盖了模板要的每个键")
 
 

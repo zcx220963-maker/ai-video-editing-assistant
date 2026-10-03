@@ -29,6 +29,7 @@ from agent_framework.orchestration import (
 from agent_framework.storage import Storage, build_storage
 
 from .nodes.core_nodes import build_real_registry
+from .nodes.core_nodes import _flag_on
 from .providers import build_providers
 from .render_jobs import (STALL_CHECK_SEC, TERMINAL, RenderDispatcher, tool_view)
 from .settings import Settings
@@ -174,6 +175,13 @@ class StorylineServer:
             state.mode = str(args.pop("mode", "auto") or "auto")
             if node.name in LONG_RUNNING_NODES:
                 wait_sec = args.pop("wait_sec", None)
+                # dry-run 不走「提交 + 轮询」：submit 会先落一条 queued 任务行，而 dry-run
+                # 的节点体刻意不开任务行、也不推进度——那一行于是永远停在 queued（界面显示
+                # 「正在出片」、看门狗按停滞判死），而它真正该回的出片计划账被进度视图盖掉。
+                dry = args.get("dry_run")
+                if _flag_on(state.flags.get("dry_run") if dry is None else dry):
+                    result = await server.interceptor.invoke(node.name, state, **args)
+                    return json.dumps(result, ensure_ascii=False)
                 return await server._invoke_long(node, state, args, wait_sec)
             result = await server.interceptor.invoke(node.name, state, **args)
             return json.dumps(result, ensure_ascii=False)

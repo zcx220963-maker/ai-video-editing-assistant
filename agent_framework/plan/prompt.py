@@ -136,6 +136,7 @@ _ARTIFACT_HINTS = {
     "understand_clips": "每个镜头的视觉描述(谁出镜/什么场景)",
     "split_shots": "镜头切分(时间码/分辨率,无画面内容)",
     "asr": "语音转文字",
+    "correct_transcript": "修字后的转写（时间戳/id 未动，附修字表）",
     "plan_timeline": "时间线编排",
     "filter_clips": "镜头筛选",
     "group_clips": "镜头分组",
@@ -208,11 +209,15 @@ _PLANNING_TEMPLATE = """<planning_round>
 计划里每一步的 node 只能取自下面这份白名单（写别的名字会被服务端打回）：
 {nodes}
 
+{?must_include}
+其中 {must_include} 必须**显式写进这张计划的 steps**：它们要用你传的创意决策参数，执行期不会被自动补齐——漏了这张卡会被服务端打回。
+
 {knobs}
 
 卡面开关（param_options）只能从上面这份清单里挑，值要能反查（枚举 / 布尔开关 /带界数值 / 曲库真实标签）；节点没有的能力不要造开关，用户另有诉求留给计划卡上的「其他」。
 节点参数**不需要也不能**再去查：执行前 Store 是空的，拿 read_node_history 猜 dag_contract / node_schema:* 这类键名只会一直报错。
 提交成功后只需简短说明各版本的思路差异并等用户确认，**不得声称已经开始剪辑或已经产出成片**。
+选哪一版、卡面开关取什么值，都由**卡上的点击**完成：不要用 ask_user 重问卡面已经在问的事（弹窗是单例，会把用户正填着的计划卡顶掉、选了一半的答案全丢），也不必写「你点选确认后我再开始」这类话——把卡交出去、等用户点即可。
 
 {?prior_cards}
 用户对上一版计划点了「换一版」，这一轮**不是**咨询：出口只有 submit_plan，只用文字描述另一版思路不算交付。
@@ -268,11 +273,13 @@ async def planning_section(gate: PlanGate, *, feedback: str = "",
     不要反复说「本轮是规划轮」把用户困住。
     """
     nodes = sorted(gate.whitelist())
+    must_include = _explicit_nodes(gate)
     facts = [f for f in await gate.knob_facts() if f["knobs"]]
     note = clean(feedback)
     brief = _prior_brief(prior)
     values: dict[str, Any] = {
         "nodes": "、".join(nodes) if nodes else "（当前没有可用的剪辑节点）",
+        "must_include": "、".join(must_include),
         "knobs": "\n".join(_knob_lines(facts)),
         "has_pending_plan": bool(has_pending_plan),
         "prior_cards": "\n".join(brief),
@@ -290,6 +297,21 @@ async def planning_section(gate: PlanGate, *, feedback: str = "",
     if library is not None:
         return library.blocks(PLANNING_PROMPT_FILE, _PLANNING_TEMPLATE, **values)
     return render_blocks(_PLANNING_TEMPLATE, values)
+
+
+def _explicit_nodes(gate: Any) -> list[str]:
+    """必须显式写进 steps 的节点名（执行期不会自动补齐的那几个）。
+
+    取不到就回空表：模板用 ``{?must_include}`` 守卫，空表整段不出现——没接契约的
+    进程（离线替身、旧装配）不该凭空多出一句「其中 必须显式写进 steps」。
+    """
+    getter = getattr(gate, "explicit_call_nodes", None)
+    if getter is None:
+        return []
+    try:
+        return sorted(str(n) for n in getter() if n)
+    except Exception:  # noqa: BLE001 - 契约读不到只是少一句提示，不该让规划轮拼不出提示
+        return []
 
 
 def _knob_lines(facts: Sequence[Mapping[str, Any]]) -> list[str]:

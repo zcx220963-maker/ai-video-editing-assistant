@@ -69,10 +69,10 @@ async def main() -> None:
     by_name = {t.name: t for t in tools}
     mock_names = [n.name for n in ALL_NODE_CLASSES]
     check(all(n in by_name for n in mock_names),
-          "19 个真实节点全部注册为 MCP 工具（与 mock 同名同 DAG）")
+          f"{len(mock_names)} 个真实节点全部注册为 MCP 工具（与 mock 同名同 DAG）")
     check("read_node_history" in by_name, "服务端 read_node_history 工具在册")
     check(len(tools) == len(mock_names) + 3,
-          f"工具总数 = 19 节点 + read_node_history + render_status + dag_contract"
+          f"工具总数 = {len(mock_names)} 节点 + read_node_history + render_status + dag_contract"
           f"（实际 {len(tools)}）")
 
     gs = by_name["generate_script"].inputSchema["properties"]

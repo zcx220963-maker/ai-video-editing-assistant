@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import zlib
 from abc import ABC, abstractmethod
 from typing import Any, Awaitable, Callable
 
 # handler(payload) -> None | awaitable
 Handler = Callable[[dict[str, Any]], "Awaitable[None] | None"]
+
+log = logging.getLogger("mq")
 
 
 class MessageQueue(ABC):
@@ -91,7 +94,10 @@ class InMemoryMessageQueue(MessageQueue):
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001  单条失败不应中断该分区
-                pass
+                # 但必须留下痕迹：run 失败的真正原因只有这里知道，而 OutBound 的
+                # error 帧只推给挂了 WS 的会话——没挂就整条形同消失。
+                log.exception("handler 失败（topic=%s group=%s partition=%s）：run_id=%s",
+                              sub[0], sub[1], p, payload.get("run_id"))
             finally:
                 async with self._lock:
                     self._inflight -= 1

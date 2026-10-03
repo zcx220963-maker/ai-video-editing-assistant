@@ -13,6 +13,9 @@ from ..hooks import _current_hook_ctx
 from ..tool import Tool, ToolError
 from .support import PLAN_MAX_CANDIDATES
 
+# 一次回喂最多列出几条校验意见。截断本身不可怕，不说明截断了才可怕（见 ``_listed``）。
+_MAX_LISTED_ISSUES = 12
+
 if False:  # TYPE_CHECKING：构造参数只做标注，运行期不需要（避免与 gate 形成环）
     from .gate import PlanGate
 
@@ -20,8 +23,13 @@ if False:  # TYPE_CHECKING：构造参数只做标注，运行期不需要（避
 class SubmitPlanTool(Tool):
     """规划轮唯一的产出通道：把候选计划交给服务端四重校验。
 
-    校验不过返回 ``ToolError``——失败文本原样回喂，模型据此重提一次；
-    第二次仍不过就不再磨它：明确要求它向用户如实说明，而不是无限打回。
+    校验不过返回 ``ToolError``——失败文本原样回喂，模型据此重提。这条错误的性质是
+    **可执行的反馈**（``counts_as_failure=False``），由本工具自己数着次数：``max_retries``
+    次之内让它改好再交，到顶了才明确要求它把卡点交回用户（走 ask_user 弹窗），
+    而不是无限打回、也不是让 agent 的失败守卫来插手。
+
+    为什么自己数：守卫那位管的是「同一个坏工具原地重试」，把「计划还没写对」算进去，
+    两次就叫停，于是模型手上的正路（照清单改一版再交）被当场掐断——真机实测的岔路。
     """
 
     def __init__(self, gate: PlanGate, *, max_retries: int = 1) -> None:
@@ -122,11 +130,58 @@ class SubmitPlanTool(Tool):
     def read_only(self) -> bool:
         return True
 
+    def _tries(self, ctx: Any) -> int:
+        """本轮（同一条 run）第几次提交。**不落盘**：用户中途答了一句话就重新计数。
+
+        为什么不落盘：次数管的是「这一口气里连着被打回几次」。用户作答之后模型拿到的
+        信息变了，再给它一次「改好再交」的余量是合理的。
+        拿不到 ctx（离线直调工具）时按第一次算，于是不会因为数不清次数而误判到顶。
+        """
+        if ctx is None:
+            return 1
+        tries = int(ctx.extras.get("_submit_plan_tries") or 0) + 1
+        ctx.extras["_submit_plan_tries"] = tries
+        return tries
+
+    @staticmethod
+    def _listed(errors: list[str]) -> str:
+        """校验意见 → 回喂清单。**超过上限要如实说明还有多少没列**。
+
+        截断而不说，模型会以为「清单就这些」，改完再交又撞上没列出来的那几条——
+        一轮迭代就是这么白烧的（真机实测：两次提交才把规则一层层试出来）。
+        """
+        shown = errors[:_MAX_LISTED_ISSUES]
+        text = "\n- ".join(shown)
+        rest = len(errors) - len(shown)
+        if rest > 0:
+            text += (f"\n- （另有 {rest} 条问题未逐条列出——上面每一条都给了判据，"
+                     f"请按同一套判据把整份计划从头过一遍，别只改列出来的这几条。）")
+        return text
+
     async def execute(self, plans: Any) -> str:
+        ctx = _current_hook_ctx.get()
+        tries = self._tries(ctx)
         normalized, issues = await self._gate.validate({"plans": plans})
         if issues.errors:
-            return ToolError(self.name, "计划校验未通过，修正后重新提交一次：\n- "
-                             + "\n- ".join(issues.errors[:8]))
+            listed = self._listed(issues.errors)
+            if tries > self._max_retries:
+                # 到顶了：再审下去只是让模型换着说法重交。出路是把卡点交回用户
+                # ——但**必须走 ask_user**（弹窗），而且要说清是哪一步写不出来。
+                return ToolError(
+                    self.name,
+                    f"计划已经连着被打回 {tries - 1} 次，不再改着重交了——"
+                    f"这多半说明这份编排与可用节点对不上，不是措辞问题。\n"
+                    f"请停止提交，改用 ask_user 把卡点交回用户：说清哪个节点/哪个参数的"
+                    f"取值你定不了，给 2~6 个有真实差异的出路（如换一种编排思路、"
+                    f"减少候选计划数、由用户指定缺失的取值），把你建议的那条标 "
+                    f"recommended=true，然后停下等用户选。\n"
+                    f"最后一次的校验意见：\n- {listed}")
+            # 反馈类失败：模型照着清单改输入再交一次是**正路**，所以不计入
+            # 「连续失败」守卫（那一位管的是原地重试坏工具）。见 ToolError 的说明。
+            return ToolError(self.name,
+                             "计划校验未通过，把所有问题一次性修正后再交一次：\n- "
+                             + listed,
+                             counts_as_failure=False)
         ctx = _current_hook_ctx.get()
         if ctx is not None:
             ctx.state.plan_candidates = normalized

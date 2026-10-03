@@ -73,6 +73,36 @@ from .tool import is_tool_error
 from .checkpoint import STATUS_AWAITING_APPROVAL
 
 
+def _mask_credentials_in_access_logs() -> None:
+    """访问日志里的 ``?token=`` 打码：那是身份凭证，不该躺在日志文件里。
+
+    WS 只能把凭证放在查询串上（浏览器不让 WS 握手带自定义头），于是 uvicorn 的访问日志
+    每接一条连接就写一行明文 token——本机 ``.tmp/*.log`` 翻一翻就能冒名开会话。
+    装在 lifespan 里而不是导入时：uvicorn 启动会 ``dictConfig`` 一遍日志，那一步清掉
+    logger 上已有的 filter，导入时装等于白装。
+    """
+    import logging
+    import re
+
+    pat = re.compile(r"(token=)[A-Za-z0-9+/_\-\.]{8,}")
+
+    class _Mask(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+            except Exception:  # noqa: BLE001 - 格式化不了就别改它
+                return True
+            masked = pat.sub(r"\1***", msg)
+            if masked != msg:
+                record.msg, record.args = masked, ()
+            return True
+
+    for name in ("uvicorn.access", "uvicorn.error"):
+        lg = logging.getLogger(name)
+        if not any(isinstance(f, _Mask) for f in lg.filters):
+            lg.addFilter(_Mask())
+
+
 class RegisterRequest(BaseModel):
     device_name: str = ""         # spec §7 的可选字段；users 表无对应列，只透传不落地
 
@@ -185,6 +215,8 @@ async def _render_media_views(storage: Storage, qa: Any) -> list[dict[str, Any]]
             "title": p.get("title") or "",
             "duration": p.get("duration"),
             "artifact_id": p.get("artifact_id"),
+            # 证据分级随卡片一起持久在片段里：刷新后这张卡仍然说得出「哪几条验过」
+            "evidence": list(p.get("evidence") or []),
         })
     return out
 
@@ -240,7 +272,8 @@ class ChatSyncResponse(BaseModel):
 _TOOL_CATEGORIES = {
     "load_media": "剪辑工具", "search_media": "剪辑工具", "split_shots": "剪辑工具",
     "understand_clips": "剪辑工具", "filter_clips": "剪辑工具", "group_clips": "剪辑工具",
-    "asr": "剪辑工具", "speech_rough_cut": "剪辑工具", "script_template_rec": "剪辑工具",
+    "asr": "剪辑工具", "correct_transcript": "剪辑工具",
+    "speech_rough_cut": "剪辑工具", "script_template_rec": "剪辑工具",
     "generate_script": "剪辑工具", "generate_ai_transition": "剪辑工具",
     "transition_rec": "剪辑工具", "text_rec": "剪辑工具", "generate_voiceover": "剪辑工具",
     "select_BGM": "剪辑工具", "plan_timeline": "剪辑工具", "plan_timeline_pro": "剪辑工具",
@@ -435,6 +468,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        _mask_credentials_in_access_logs()   # uvicorn 已配好日志，此刻装才不会被 dictConfig 冲掉
         consumer.start()          # 先注册回调
         if broadcaster is not None:
             await broadcaster.start()   # OutBound → Redis 频道 → 各实例本地注册表

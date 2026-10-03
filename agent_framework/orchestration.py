@@ -289,11 +289,15 @@ class BaseNode(ABC):
         inputs = self.load_inputs_from_client(state, dict(params))
         parsed = await self._parse_input(state, inputs)
         outputs = await self.process(state, parsed)
+        # 显式不落库的返回（render_video 的 dry_run：那是「将要渲成什么样」的答复，
+        # 不是一次渲染产物；落进 artifacts 就成了「这步已经有产出」的假象）。
+        no_store = bool(outputs.pop("__no_store__", None))
         packed = self.pack_outputs_to_client(state, outputs)
-        # 入库的那份剔掉 ephemeral：会过期的直链写进共享库，就是一条注定失效的引用
-        stored = ({k: v for k, v in outputs.items() if k not in self.ephemeral}
-                  if self.ephemeral else outputs)
-        await state.store.put(self.name, stored, reducer=self.reducer)  # 入库，供下游读取
+        if not no_store:
+            # 入库的那份剔掉 ephemeral：会过期的直链写进共享库，就是一条注定失效的引用
+            stored = ({k: v for k, v in outputs.items() if k not in self.ephemeral}
+                      if self.ephemeral else outputs)
+            await state.store.put(self.name, stored, reducer=self.reducer)  # 入库，供下游读取
         state.summary.calls += 1
         return packed
 

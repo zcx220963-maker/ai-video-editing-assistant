@@ -79,12 +79,29 @@ class MemoryContextSource:
     30489 字符，且只增不减——每轮 prompt 稳定膨胀，最后必然打爆上下文。
     超限时按分类截断并明确写出「已省略多少字」，让模型知道自己看到的不是全部
     （而不是静默丢内容、让它以为记忆就这么多）。
+
+    为什么连「怎么用这份记忆」也一起注入（``USAGE_NOTE``）：只有工具清单里真有
+    update_memory/read_memory 时才谈得上写，而这两件工具与这段注入同开同关
+    （``--no-memory`` 时两者都不存在）。写在系统提示词里就成了永久陈述句，
+    关着记忆时反而教模型去调一个不存在的工具。
     """
 
     name = "memory"
     # 单条分类的上限与全量上限：按「中文字≈1 token」估，约合 1.5k~2k token。
     per_category_chars = 2000
     total_chars = 4000
+
+    USAGE_NOTE = (
+        "用法：前缀是「计划卡：」「换一版计划的理由」「成片退回重做」的行由服务端从用户"
+        "在计划卡上的实际操作**自动生成**，是事实不是转述——出下一版计划时照它们办："
+        "被跳过的那步默认不再排、被改过的参数直接摆成那个值、「手写诉求」当明确指令、"
+        "看到退回记录就先定位上一版哪一条证据没过，而不是原样再渲一次。"
+        "这些行记的是**动作**，同一类反复出现才算稳定偏好，与本轮诉求冲突时以本轮为准。"
+        "用户当面说出的新偏好要立刻用 update_memory 追加（偏好进 user、工具教训进 tool），"
+        "不要等他再说第二遍；重复啰嗦的行用 mode=replace 合并精简。"
+        "上面若出现「更早的记忆已省略 N 字」，那是超过注入上限，**不等于用户没说过**——"
+        "必要时先 read_memory 核对再动手。"
+    )
 
     def __init__(self, store: MemoryStore, categories: list[str] | None = None,
                  *, per_category_chars: int | None = None,
@@ -120,7 +137,8 @@ class MemoryContextSource:
             used += len(body)
             sections.append(
                 f"### {CATEGORIES[cat]}（memories.category='{cat}'）\n{body}")
-        return "\n\n".join(sections)
+        # 用法段在预算之外：它是固定长度的说明，不参与「记忆内容截到哪」的计算。
+        return "\n\n".join(sections) + "\n\n" + self.USAGE_NOTE
 
 
 # --------------------------------------------------------------------------

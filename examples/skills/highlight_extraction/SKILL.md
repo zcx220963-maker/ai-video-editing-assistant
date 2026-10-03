@@ -19,10 +19,12 @@ description: 【CAPABILITY SKILL】从视频的语音转写（ASR）中按用户
 ## 第一步：获取 ASR 转写
 1. 确认 `asr` 节点已执行（若未执行，先调用 `asr`）。
 2. 调用 `read_node_history(key="asr")` 读取完整转写结果。
-3. 转写结果包含 `asr_segments`，每段有 `{clip, start, end, text}`——这是全文的逐字记录。
+3. 转写结果包含 `asr_segments`，每段有 `{id, clip, start, end, text}`——这是全文的逐字记录。
 
 ## 第二步：语义分析与选段
 1. **通读全文**：把所有 `asr_segments` 的 text 串起来读一遍，理解整体内容脉络。
+   读的过程中发现同音错字、人名/产品名写错，可以先调 `correct_transcript` 把字修对
+   （只传 `{id, text}`，时间戳与 id 由系统原样保留）；**没有错字就别调**，它不做自动纠错。
 2. **理解用户意图**：从用户的原始请求中提取筛选标准。用户说什么就找什么——
    不预设固定类别（不只限于"励志/金句/高光"），用户的描述就是唯一标准。
 3. **挑选段落**：从 `asr_segments` 中选出最符合用户标准的段落，记录每段的 `{start, end, clip}`。

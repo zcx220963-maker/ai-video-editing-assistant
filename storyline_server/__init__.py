@@ -3,7 +3,7 @@
 - settings: TOML → 强类型配置
 - mediaops: ffmpeg/ffprobe 原子操作（阻塞）
 - providers: 视觉理解 / ASR / 文案 LLM / TTS 外部能力（可注入 fake 全离线测试）
-- nodes:    与主 Agent mock 契约逐字对齐的 19 个真实节点
+- nodes:    与主 Agent mock 契约逐字对齐的 20 个真实节点
 - server:   FastMCP 装配 + 服务端 Interceptor（复用 agent_framework.orchestration）
 """
 

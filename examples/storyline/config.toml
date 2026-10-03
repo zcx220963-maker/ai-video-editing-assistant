@@ -19,7 +19,7 @@ timeout = 600
 available_nodes = [
     "search_media", "load_media",
     "split_shots", "understand_clips", "filter_clips", "group_clips",
-    "asr", "speech_rough_cut",
+    "asr", "correct_transcript", "speech_rough_cut",
     "script_template_rec", "generate_script", "generate_ai_transition",
     "transition_rec", "text_rec", "generate_voiceover", "select_BGM",
     "plan_timeline", "plan_timeline_pro", "plan_timeline_ai_transition",

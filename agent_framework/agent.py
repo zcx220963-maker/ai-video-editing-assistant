@@ -28,12 +28,14 @@ from .compress import _repair_orphans
 from .context import ContextBuilder
 from .hooks import AgentHook, AgentHookContext, CompositeHook, _current_hook_ctx, _current_hooks
 from .identity import (current_identity, rebind_artifact_scope,
-                       storyline_session_id, use_identity_or_inherit)
+                       storyline_session_id, use_identity, use_identity_or_inherit)
 from .llm import LLMClient, LLMResponse
 from .messages import ToolCall, assistant, system, tool_result, user
 from .plan import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_step_executed,
                         pending_continuation, planning_section, preload_skills,
                         reconcile, render_injections)
+from .plan_retro import (PlanRetrospective, plan_card_lines, rework_line,
+                         revise_line)
 from .render_gate import (ADJUST_OPTION, CONFIRM_OPTION, KEEP_FULL_OPTION,
                           RENDER_NODE, TRUNCATE_OPTION, build_render_ask,
                           decision_is_confirm, decision_text, should_gate_render)
@@ -169,6 +171,20 @@ _APPROVAL_DECISION_TEXT.update({
     TRUNCATE_OPTION: ("用户接受按原定时长截断末尾。按原时长重做/确认时间线即可；"
                       "末尾少一句话这件事用户已拍板，不必再问。"),
 })
+
+
+def _planning_run(cp: Any) -> bool:
+    """这条 run 开的时候是不是**规划轮**——续跑要接着用同一张注册表、同一套硬保证。
+
+    真机事故：规划轮里主动提问（问 group_clips 该怎么分组）→ 用户答一句 → 从断点
+    续跑。轮次身份原先只活在 ``run(planning=…)`` 这个形参里，没人落盘，续跑时它已经
+    丢了，于是回退到全量注册表——``submit_plan`` 消失、剪辑节点回来，而 checkpoint 里
+    的 system 段还写着「本轮是规划轮」。模型两头都不认，只能回「执行轮但剪辑节点未
+    注册」，把锅原样抛回给用户：一张确认过的计划就此续不上。
+
+    所以身份跟着快照走（``Checkpoint.scope["planning"]``，由 ``run`` 落盘）。
+    """
+    return bool((getattr(cp, "scope", None) or {}).get("planning"))
 
 
 def _iteration_limit(max_iterations: int, start_iteration: int, resuming: bool) -> int:
@@ -483,7 +499,10 @@ class AgentOnceRun:
             cp = await self.checkpoint.begin(
                 session.session_id, message, messages, run_id,
                 scope={"storyline_session": storyline_session_id(
-                    session.user_id, session.conversation_id), "artifact_id": ""},
+                    session.user_id, session.conversation_id), "artifact_id": "",
+                    # 轮次身份必须**落盘**：续跑（提问作答 / 审批 / 崩溃恢复）时没人再传
+                    # ``planning`` 这个形参，只能从快照里读（见 ``_planning_run``）。
+                    "planning": bool(planning)},
                 plan_run_id=plan_run_id,
             )
         # 身份对整条 await 链生效：素材按 owner 过滤要靠它，不能让模型自报
@@ -534,7 +553,8 @@ class AgentOnceRun:
             session.user_id, session.conversation_id, "user", content=message,
             attachments=ids)
 
-    async def resume(self, cp: Checkpoint, session: Session, *, stream: bool = False) -> str:
+    async def resume(self, cp: Checkpoint, session: Session, *, stream: bool = False,
+                     registry: ToolRegistry | None = None) -> str:
         """续跑一个快照：只重新发起 LLM 调用，不重放已提交工具。
 
         快照从哪来不在这里管——崩溃恢复取最新一致点，分叉重跑取历史某一界且已带着
@@ -542,6 +562,9 @@ class AgentOnceRun:
 
         待批的 tool_calls 要作为 keep 传进 ``_repair_orphans``：resume 也可能落到一个
         「等确认」的快照上，那时它们同样没有 tool 结果（详见 ``approve`` 的说明）。
+
+        ``registry`` 由调用方按快照里的轮次身份给（见 ``_planning_run``）：续跑必须
+        接着用**同一张**工具表，否则规划轮会在半路上换成执行轮的表。
         """
         pending_ids = [str(c.get("id") or "")
                        for c in ((cp.approval or {}).get("pending_calls") or [])]
@@ -551,12 +574,14 @@ class AgentOnceRun:
                 session, cp.message,
                 _repair_orphans(list(cp.messages), keep_ids=pending_ids),
                 cp.iteration, cp, stream,
-                resuming=True, run_id=cp.run_id,
+                resuming=True, run_id=cp.run_id, registry=registry,
+                planning=_planning_run(cp),
             )
 
     async def approve(
         self, cp: Checkpoint, session: Session, *, decision: str, stream: bool = False,
         note: str = "", answers: Sequence[Mapping[str, Any]] = (),
+        registry: ToolRegistry | None = None,
     ) -> str:
         """从审批断点续跑：按用户决策把挂起的那批工具收口，再继续正常循环。
 
@@ -568,6 +593,9 @@ class AgentOnceRun:
         注意这里**不能**用 ``_repair_orphans`` 裸修：挂起点上待批的 tool_calls 本来
         就没有 tool 结果，会被当成孤儿剥掉，续跑时 ``_settle_pending`` 再补一条 tool
         回执就成了孤儿 tool 消息，LLM API 直接 400。所以把待批 id 作为 keep 传进去。
+
+        ``registry`` 与 ``_planning_run`` 的理由同 ``resume``：**规划轮里主动提问、
+        用户答一句**走的正是这条入口，换了工具表就等于把这一轮的性质换掉了。
         """
         pending_ids = [str(c.get("id") or "")
                        for c in ((cp.approval or {}).get("pending_calls") or [])]
@@ -577,7 +605,9 @@ class AgentOnceRun:
                 session, cp.message,
                 _repair_orphans(list(cp.messages), keep_ids=pending_ids),
                 cp.iteration, cp, stream,
-                resuming=True, run_id=cp.run_id, approval_decision=decision,
+                resuming=True, run_id=cp.run_id, registry=registry,
+                planning=_planning_run(cp),
+                approval_decision=decision,
                 approval_note=_answers_text(answers) or note,
             )
 
@@ -1293,10 +1323,16 @@ class AgentOnceRun:
         nagging: list[tuple[str, int]] = []
         for tc in tool_calls:
             r = results[tc.id]
+            # 「可执行的反馈」不算故障：submit_plan 被校验打回是让模型改输入，重交是
+            # 正路。算进来的话，守卫两次就叫停，把「计划还没写对」升级成「工具坏了，
+            # 去问用户怎么办」——真机实测的岔路就在这里。
             if is_tool_error(r):
-                fail_counts[tc.name] = fail_counts.get(tc.name, 0) + 1
-                if fail_counts[tc.name] >= 2 and tc.name not in {n for n, _ in nagging}:
-                    nagging.append((tc.name, fail_counts[tc.name]))
+                if r.counts_as_failure:
+                    fail_counts[tc.name] = fail_counts.get(tc.name, 0) + 1
+                    if fail_counts[tc.name] >= 2 and tc.name not in {n for n, _ in nagging}:
+                        nagging.append((tc.name, fail_counts[tc.name]))
+                # 反馈类错误（counts_as_failure=False）既不加一也不清零：它说明的是
+                # 「输入还没写对」，与这个工具先前有没有真跑坏无关。
             else:
                 fail_counts[tc.name] = 0
             # 结构性并批补进来的调用不回填：它们不在模型的 assistant(tool_calls) 里，
@@ -1498,6 +1534,7 @@ class Agent:
         storage: Any | None = None,
         plan_gate: Any | None = None,
         skill_loader: Any | None = None,
+        memory_store: Any | None = None,
     ) -> None:
         # 注意：SessionManager 定义了 __len__，空实例是 falsy，必须用 is None 判断。
         self.session_manager = (
@@ -1510,6 +1547,9 @@ class Agent:
         # 计划门（块 B）：没接上就是普通服务，plan() 如实退回 handle()。
         self.plan_gate = plan_gate
         self.skill_loader = skill_loader
+        # 复盘进记忆（E）：没接记忆存储就没有落点，本功能如实不启用。
+        self.retro = (PlanRetrospective(memory_store)
+                      if memory_store is not None else None)
         self._planning: ToolRegistry | None = None
         self._planning_sig: tuple[str, ...] | None = None
         self._queue: asyncio.Queue[_Request] = asyncio.Queue()
@@ -1534,6 +1574,20 @@ class Agent:
             get_catalog().update(self._planning.displays())
         return self._planning
 
+    def _resume_registry(self, cp: Any) -> ToolRegistry | None:
+        """续跑这条快照时该用哪张注册表：规划轮续跑还是规划轮那张。
+
+        ``None`` = 用全量注册表（执行轮、普通轮、以及没接计划门时的所有轮次）。
+        为什么要在**这里**，而不是让 ``Runner`` 自己判：注册表是从计划门现建的，
+        Runner 手里没有门；轮次身份在快照里，Agent 两边都够得着。
+        """
+        gate = self.plan_gate
+        if not _planning_run(cp) or gate is None or not gate.whitelist():
+            # 没有可规划的节点 = ``plan()`` 当初直接退回 ``handle`` 的那种进程状态：
+            # 这轮本来就不是规划轮，别硬塞一张没有剪辑节点的表。
+            return None
+        return self._planning_registry(gate)
+
     def _lock_for(self, session_id: str) -> asyncio.Lock:
         return self._locks.setdefault(session_id, asyncio.Lock())
 
@@ -1557,7 +1611,9 @@ class Agent:
             if resume and self.runner.checkpoint is not None:
                 cp = await self.runner.checkpoint.pending_for_session(session.session_id)
                 if cp is not None:
-                    return await self.runner.resume(cp, session, stream=stream)
+                    return await self.runner.resume(
+                        cp, session, stream=stream,
+                        registry=self._resume_registry(cp))
             return await self.runner.run(
                 session, message, run_id=run_id, stream=stream,
                 attachments=attachments, interactive=interactive,
@@ -1578,6 +1634,9 @@ class Agent:
         （会话历史中只有那一轮的文字摘要），不带上它，新一轮既无从做出「与旧卡可辨别的
         差异」，也往往干脆口头描述另一版而不再出卡。
         """
+        # 「换一版」的原话是一句直接偏好，先落进记忆再重出卡（无计划门时也一样落）。
+        await self._record_retro([revise_line(feedback)],
+                                 user_id=user_id, conversation_id=conversation_id)
         gate = self.plan_gate
         if gate is None or not gate.whitelist():
             return await self.handle(user_id, conversation_id, message, run_id=run_id,
@@ -1663,6 +1722,44 @@ class Agent:
         except Exception:
             return []
 
+    async def _record_retro(self, entries: Sequence[tuple[str, str] | None], *,
+                            user_id: str, conversation_id: str) -> list[str]:
+        """把复盘行写进记忆；写失败只告警，不拖垮这条 run。
+
+        为什么不向上抛：记忆是旁路（下一轮的输入之一），它坏了不该让用户此刻的
+        渲染失败。但也不能静默——丢一句「写记忆失败」的告警，界面上看不出来
+        偏好为什么没攒下。
+
+        为什么要在这里显式绑身份：``MemoryStore`` 是进程级单例、按执行身份解析 user_id，
+        而这两处调用都在 ``runner.run`` **之前**——那时上下文里还没有身份，不绑就会
+        把 A 用户的偏好写进 "default" 名下（记忆跟着身份走是这张表的底线）。
+        """
+        if self.retro is None or not entries:
+            return []
+        try:
+            with use_identity(user_id, conversation_id):
+                return await self.retro.record(entries)
+        except Exception as exc:
+            logger.warning("复盘记忆写入失败（不影响本轮执行）：%s", exc)
+            return []
+
+    async def _last_user_text(self, user_id: str, conversation_id: str) -> str:
+        """最近一条用户消息的原话：退回重做时，它就是「上一版哪里不行」的证据。"""
+        if self.storage is None:
+            return ""
+        try:
+            history = await self.storage.messages.history(
+                user_id, conversation_id, limit=20)
+        except Exception:
+            return ""
+        for msg in reversed(history):
+            if msg.get("role") != "user":
+                continue
+            text = str(msg.get("message") or "").strip()
+            if text:
+                return text
+        return ""
+
     async def execute_plan(
         self, user_id: str, conversation_id: str, plan_run_id: str,
         frame: Mapping[str, Any], *, run_id: str | None = None,
@@ -1701,6 +1798,16 @@ class Agent:
         self._exec_plan_nodes = [str(s.get("node") or "")
                                  for s in (compiled.get("steps") or [])
                                  if isinstance(s, Mapping)]
+        # 复盘进记忆（E）：用户在这张卡上动过的地方 + 「本会话已有成片还要再渲」的退回信号。
+        # 为什么写在跑之前而不是跑完：确认帧是既成事实，与本轮跑不跑得动无关；
+        # 跑到渲染中途崩了，用户「跳过 BGM」的偏好也不该跟着丢。
+        prior_nodes = await self._session_artifacts_brief(user_id, conversation_id)
+        await self._record_retro(
+            plan_card_lines(plan, frame)
+            + [rework_line(prior_nodes, self._exec_plan_nodes,
+                           message or await self._last_user_text(
+                               user_id, conversation_id))],
+            user_id=user_id, conversation_id=conversation_id)
         sections = list(render_injections(compiled))
         sections += await preload_skills(self.skill_loader, compiled.get("skills_hint") or ())
         session = await self.session_manager.get_or_create(user_id, conversation_id)
@@ -1740,7 +1847,8 @@ class Agent:
             cp = await self.runner.checkpoint.resume(run_id, at_seq)
             if cp is None:
                 raise KeyError(f"没有可恢复的 checkpoint: {run_id}")
-            return await self.runner.resume(cp, session, stream=stream)
+            return await self.runner.resume(cp, session, stream=stream,
+                                            registry=self._resume_registry(cp))
 
     async def approve(
         self, run_id: str, user_id: str, conversation_id: str, *, decision: str,
@@ -1762,7 +1870,9 @@ class Agent:
             if cp is None:
                 raise KeyError(f"没有待审批的 checkpoint: {run_id}")
             return await self.runner.approve(cp, session, decision=decision,
-                                            stream=stream, note=note, answers=answers)
+                                            stream=stream, note=note,
+                                            answers=answers,
+                                            registry=self._resume_registry(cp))
 
     async def fork(
         self, run_id: str, at_seq: int, user_id: str, conversation_id: str, *,
@@ -1783,7 +1893,10 @@ class Agent:
             child = await self.runner.checkpoint.fork(
                 run_id, at_seq, run_id_new=run_id_new, invalidate=invalidate,
                 message=message)
-            return await self.runner.resume(child, session, stream=stream)
+            # fork 复制父快照的 scope，所以「是不是规划轮」跟着过来——分叉重跑
+            # 不该把一轮规划变成执行轮。
+            return await self.runner.resume(child, session, stream=stream,
+                                            registry=self._resume_registry(child))
 
     async def pending_runs(self) -> list[Checkpoint]:
         """所有未正常结束的执行（服务启动时补跑或对账用）。"""

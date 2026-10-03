@@ -72,10 +72,10 @@ async def part1_team_tools(tmp: Path) -> None:
     check(need.issubset(set(reg.tool_names)), f"团队 8 工具全部注册：{sorted(need)}")
 
     plan = json.loads(await reg.execute("plan_editing_team", {}))
-    check(len(plan["created_tasks"]) == 19, f"DAG 自动组队 → 19 个任务（实际 {len(plan['created_tasks'])}）")
-    check(await st1.db.count("tasks") == 19, "19 行任务进了 PG tasks 表（不落本地目录）")
+    check(len(plan["created_tasks"]) == 20, f"DAG 自动组队 → 20 个任务（实际 {len(plan['created_tasks'])}）")
+    check(await st1.db.count("tasks") == 20, "20 行任务进了 PG tasks 表（不落本地目录）")
     tasks = json.loads(await reg.execute("list_tasks", {}))
-    check(len(tasks) == 19 and all(t["status"] == PENDING for t in tasks), "任务板 19 个 pending")
+    check(len(tasks) == 20 and all(t["status"] == PENDING for t in tasks), "任务板 20 个 pending")
     check(all(t["scope"] == "default:default" for t in tasks),
           "离线直调落在缺省作用域，任务板按 用户:会话 分块")
 
@@ -88,7 +88,7 @@ async def part1_team_tools(tmp: Path) -> None:
     downstream_ready = [t["id"] for t in await team.task_manager.ready()]
     check(first not in downstream_ready, "已完成任务不再出现在可认领列表")
     status = json.loads(await reg.execute("team_status", {}))
-    check(len(status["tasks"]) == 19, "team_status 能看到任务板")
+    check(len(status["tasks"]) == 20, "team_status 能看到任务板")
     edges = await st1.db.select("task_edges")
     check(len(edges) == sum(len(t["blockedBy"]) for t in tasks),
           f"依赖边一Edge一行落在 task_edges：{len(edges)} 行")
@@ -143,6 +143,16 @@ async def part2_defaults(tmp: Path) -> None:
     check({"create_cron_job", "list_cron_jobs"}.issubset(names), "Cron 工具在位")
     check("render_video" not in names,
           "Storyline 关闭时无剪辑节点工具：剪辑链路唯一来源是 Storyline MCP")
+
+    # 执行轮也要能解释「本轮为什么没有这个工具」（与规划轮那条对称）。
+    # 真机事故：执行轮里模型调了 submit_plan，只拿到 tool 'submit_plan' not found，
+    # 看不出这是按设计不提供，于是弹窗问用户「本会话没有 submit_plan 工具，你希望怎么处理？」。
+    hint = rt.registry.unknown_tool_hint or ""
+    check("submit_plan" in hint and "规划轮" in hint and "ask_user" in hint,
+          f"执行轮注册表带说明（规划轮专属工具 + 不许为此问用户）：{hint[:36]}…")
+    err = str(await rt.registry.execute("submit_plan", {"plans": []}))
+    check("本轮不提供" in err and "not found" not in err,
+          f"调规划轮专属工具回原因与正路，不回裸 not found：{err[:60]}")
 
     # 回归（B4-10）：定时任务与心跳同表、同一个调度循环，到点各自分流。
     # 曾经 run_server 从不启动 cron 循环，而心跳自建的调度器会把到期的用户任务领走

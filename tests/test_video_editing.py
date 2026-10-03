@@ -58,13 +58,14 @@ async def main() -> None:
 
     # ---- 1b. 流程图节点全集落地（含 plan_timeline_pro；select_BGM 来自文档文字版）----
     doc_nodes = {
-        "load_media", "search_media", "split_shots", "asr", "speech_rough_cut",
+        "load_media", "search_media", "split_shots", "asr", "correct_transcript",
+        "speech_rough_cut",
         "generate_ai_transition", "understand_clips", "filter_clips", "group_clips",
         "generate_script", "script_template_rec", "generate_voiceover",
         "select_BGM", "transition_rec", "text_rec", "plan_timeline",
         "plan_timeline_pro", "plan_timeline_ai_transition", "render_video",
     }
-    check(len(doc_nodes) == 19, "流程图白名单共 19 个节点")
+    check(len(doc_nodes) == 20, "流程图白名单共 20 个节点")
     check(set(reg.names()) == doc_nodes, f"节点全集已注册（缺 {doc_nodes - set(reg.names())}）")
 
     # ---- 1c. 新节点也受拦截器 DAG 约束 ----

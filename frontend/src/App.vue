@@ -126,6 +126,7 @@ async function loadHistory(cid, force) {
         list.push({
           role: "assistant", kind: "media", state: "done",
           text: card.title || "成片已渲染", url: card.media_url, duration: card.duration,
+          evidence: card.evidence || [],
         });
       }
       // 刷新后重放的计划卡：待确认的那一份存在 assistant 行的 qa.parts 里，
@@ -151,6 +152,8 @@ async function loadHistory(cid, force) {
 }
 
 async function openConv(cid) {
+  // 让位排队只在会话内有效：切走就清（挂起态在服务端，`checkActiveRun` 进会话时补弹）
+  parkedCards.value = [];
   active.value = cid;
   await loadHistory(cid);
   await checkActiveRun(cid);
@@ -1042,7 +1045,9 @@ function planAskCard(card) {
   }
   return openQuestionCard(pages, {
     origin: "plan_confirm", card, submitLabel: "按此执行",
-    run_id: card.plan_run_id,
+    // 签名用**规划轮的 run**（帧上的那个）：冷启动补弹 / 重连补弹拿它跟服务端比，
+    // 用 plan_run_id 只有服务端跑同一条 run 时才碰得上。
+    run_id: card.frame_run_id || card.plan_run_id,
   });
 }
 
@@ -1096,6 +1101,28 @@ const approvalModal = ref(null);
 // （用户明确要求「弹窗问决策，侧边栏看详情」）。
 const questionCard = ref(null);
 
+// 让位排队的卡：同一时刻只渲染一张提问卡，但服务端可能**已经**在问另一件事。
+//
+// 真机事故（用户原话「怎么我第一个弹窗的问题还没选完，就继续了然后跳第二次弹窗，
+// 第一次都没提交啊」）：规划轮交卡后自动弹的是计划确认卡（origin=plan_confirm），
+// 模型那边又被 ask_gate 误判、追加了一条 ask_user 提问帧；两条消息各弹一次，
+// 后一张卡把前一张整体覆盖（answers/customAnswers 全没了），用户选到一半的计划卡
+// 就这么消失，接着点「确认」续跑的是那条提问，流程整个对不上。
+//
+// 所以：新卡不让它白白吃掉旧卡——旧卡整份（含已选答案）进队列，等当前这张提交或关掉
+// 之后再弹回来。队列只在会话内有效，切会话时清空（挂起态在服务端，`checkActiveRun`
+// 在进会话时会把该弹的卡补回来，不会漏）。
+const parkedCards = ref([]);
+
+// 当前卡走完了（提交成功 / 用户主动关掉）→ 把让位的那张还回来。
+// 只在前一张真的提交了之后才还：`decideApproval` / `confirmPlan` 里都是先确认
+// 「这张就是我刚提交的那张」再清空，所以不会把用户还没提交的卡挤走。
+function restoreParkedCard() {
+  if (questionCard.value) return;
+  const next = parkedCards.value.shift();
+  if (next) questionCard.value = next;
+}
+
 const RECOMMEND_LABEL = "推荐";
 
 // 把一道题整理成一页：选项统一成 {index, key, label, description, recommended}
@@ -1122,6 +1149,23 @@ function questionPage(title, options, extra = {}) {
 function openQuestionCard(pages, meta = {}) {
   const list = (pages || []).filter(Boolean);
   if (!list.length) return null;
+  const cur = questionCard.value;
+  const origin = meta.origin || "ask";
+  // 同一道题被再问一次（重连补弹、同一条帧重放）不重开：重建会把已选的答案洗掉。
+  // 签名与 WS 帧 / checkActiveRun 那两处一致：同一个 run + 同一道题。
+  // 计划卡例外——同一张卡重开是用户主动要刷新题面（侧边栏改了版本再点「查看并确认」），
+  // 题面必须跟着 card.chosen 重算，所以照旧重建。
+  const sig = (c) => c ? `${String(c.run_id || "")}\u0000${
+    String(c.pages?.[0]?.title || "")}` : "";
+  const mine = `${String(meta.run_id || "")}\u0000${String(list[0]?.title || "")}`;
+  if (cur && !(meta.card && cur.card === meta.card)
+      && cur.origin === origin && sig(cur) === mine) {
+    return cur;
+  }
+  // 还有别的卡开着 → 让位排队（整份留着，含用户已经选好的答案）。
+  // `submitting` 的那张不能动：它的提交回调认的是自己那张对象的身份，
+  // 换掉之后回调就清不掉了（卡会一直挂着）。
+  if (cur && !cur.submitting) parkedCards.value.push(cur);
   questionCard.value = {
     pages: list, page: 0,
     origin: meta.origin || "ask",      // ask_user / plan_confirm / preview_gate / fallback
@@ -1203,6 +1247,8 @@ function qPrev() {
 function qClose() {
   // 收起弹窗不等于放弃：挂起状态在服务端，刷新或重连后会重新弹出来
   questionCard.value = null;
+  // 这张是被别的卡顶掉后一直等着的？用户主动关掉当前这张，就把它还回来。
+  restoreParkedCard();
 }
 
 function qFullscreen() {
@@ -1261,7 +1307,8 @@ async function qSubmit() {
 }
 
 // ask 帧 → 统一提问卡。服务端可以一帧带多道题（questions[]），也可以只带一道。
-function askQuestionCard(src, runId) {
+// `frameRunId` 是帧上那条 run（挂起的就是它）；`runId` 是审批卡自己的记录，缺了才回落。
+function askQuestionCard(src, runId, frameRunId) {
   const pages = [];
   const a = src.ask || {};
   const rawQuestions = Array.isArray(a.questions) && a.questions.length
@@ -1290,7 +1337,10 @@ function askQuestionCard(src, runId) {
     }
   }
   return openQuestionCard(pages, {
-    origin: src.origin || "ask", run_id: runId || src.run_id || "",
+    origin: src.origin || "ask",
+    // 优先用审批卡自己那份 run_id：`plan_run_id` 是计划卡上的指针，
+    // 提问卡要跟服务端挂起的那条 run 对齐才能配上签名（否则重连时被当新题重弹）。
+    run_id: runId || frameRunId || src.plan_run_id || src.run_id || "",
     reason: src.reason || "", approval: src,
     submitLabel: pages.length > 1 ? "全部确认" : "确认",
   });
@@ -1320,8 +1370,9 @@ function approvalBubble(cid, src) {
   // 一抛就把整条消息流的这次更新中断掉（表现：挂起气泡根本不出现）。
   list.push({ role: "assistant", kind: "approval", text: card.reason, card, state: "waiting" });
   scrollDown();
-  // 走统一提问卡：结构化 ask 优先，没有就退化成「批准 / 拒绝」，同一个弹窗组件
-  askQuestionCard(src, card.run_id);
+  // 走统一提问卡：结构化 ask 优先，没有就退化成「批准 / 拒绝」，同一个弹窗组件。
+  // 第二参用**帧上的 run_id**，跟 WS 去重、冷启动补弹那两处的签名对齐。
+  askQuestionCard(src, card.run_id, src.run_id);
   card.state = "asking";
 }
 
@@ -1355,7 +1406,10 @@ async function decideApproval(card, decision, answers) {
     card.decision = decision;
     card.decision_label = label;
     if (approvalModal.value === card) approvalModal.value = null;
-    if (questionCard.value && questionCard.value.approval === card) questionCard.value = null;
+    if (questionCard.value && questionCard.value.approval === card) {
+      questionCard.value = null;
+      restoreParkedCard();     // 这张交掉了，把先前让位排队的那张还回来
+    }
     // 清掉这个会话的「已补弹」标记：答完之后同一道题若被重新问到（换一版/重试），
     // 冷启动兜底还要能把它补出来，不能被上面的去重挡住。
     delete askedCards[cid];
@@ -1400,6 +1454,8 @@ function planCardOf(src) {
   const card = {
     role: "assistant", kind: "plan", state: "waiting",
     plan_run_id: src.plan_run_id || src.run_id || "",
+    // 帧上的 run_id（= 规划轮的 run）：提问卡的签名、冷启动补弹都按它对齐
+    frame_run_id: src.run_id || "",
     plans, warnings: src.warnings || [],
     chosen: plans[0].plan_id,
     final: {}, custom: {}, skip: {}, general: "",
@@ -1490,6 +1546,7 @@ async function confirmPlan(card) {
     // 两个都清：哪条路径渲染的就关哪一个。
     if (questionCard.value && questionCard.value.card === card) {
       questionCard.value = null;
+      restoreParkedCard();     // 同上：交掉了就把让位的卡还回来
     }
     msgs(cid).push({ role: "user", text: message, state: "done", attachments: [] });
     busy[cid] = j.run_id || null;
@@ -1730,7 +1787,7 @@ function onFrame(cid, p) {
     msgs(cid).push({
       role: "assistant", kind: "media", state: "done",
       text: p.title || "成片已渲染",
-      url: p.media_url, duration: p.duration,
+      url: p.media_url, duration: p.duration, evidence: p.evidence || [],
     });
     scrollDown();
   } else if (p.type === "tool_call") {
@@ -1930,6 +1987,7 @@ const TOOL_LABELS = {
   filter_clips: "筛选镜头",
   group_clips: "编排镜头分组",
   asr: "识别语音文字",
+  correct_transcript: "修正转写错字",
   speech_rough_cut: "去除口播停顿",
   script_template_rec: "匹配文案模板",
   generate_script: "撰写文案",
@@ -2019,6 +2077,7 @@ function summarizeArgs(m) {
     bgm: "配乐",
     voiceover: "配音",
     timeline: "时间线",
+    corrections: "修字表",
     conversation_id: "会话",
     session_id: "服务端会话",
     artifact_id: "产物",
@@ -2064,7 +2123,7 @@ function shortResult(result) {
 // 只是展示层排序参考：agent 实际走哪些步骤由它自己决定，没走的不会出现。
 const PIPE_ORDER = [
   "search_media", "load_media", "fetch_media",
-  "split_shots", "asr", "understand_clips", "speech_rough_cut",
+  "split_shots", "asr", "understand_clips", "correct_transcript", "speech_rough_cut",
   "filter_clips", "group_clips",
   "script_template_rec", "text_rec", "generate_script",
   "generate_voiceover", "select_BGM", "transition_rec", "generate_ai_transition",
@@ -2652,6 +2711,23 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                   <span v-if="m.duration">时长 {{ Math.round(m.duration) }}s</span>
                   <a :href="m.url" download>下载成片</a>
                 </div>
+                <!-- 证据分级：渲染完成不等于每条都验过，这里把「有证据 / 没验」摊开 -->
+                <details v-if="(m.evidence || []).length" class="mc-ev">
+                  <summary>
+                    这条片子验到什么程度：
+                    <i class="ok">{{ m.evidence.filter((e) => e.verified).length }} 项有证据</i> ·
+                    <i class="no">{{ m.evidence.filter((e) => !e.verified).length }} 项没验</i>
+                  </summary>
+                  <div v-for="(e, k) in m.evidence" :key="k"
+                       class="mc-evrow" :class="{ un: !e.verified }">
+                    <span class="mc-evlv">{{ e.verified ? "✓" : "?" }} {{ e.label }}</span>
+                    <span class="mc-evcl">{{ e.claim }}</span>
+                  </div>
+                  <div class="mc-evnote">
+                    「没验」不是漏做，是机器验不了的那几条（听感、字幕好不好看、画面对不对题）——
+                    要你这一眼或这一耳朵。
+                  </div>
+                </details>
               </div>
             </template>
             <template v-else-if="m.kind === 'tool'">
@@ -2869,6 +2945,14 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                 </div>
                 <span class="pv-tv">{{ Math.round(preview.timeline.video_seconds) }}s
                   / {{ preview.timeline.video_events }} 段</span>
+              </div>
+              <div v-if="preview.timeline.overlay_events" class="pv-trk">
+                <span class="pv-tl">覆盖</span>
+                <div class="pv-bar">
+                  <i class="pv-fill o"
+                     :style="{ width: pctOf(preview.timeline.duration) }"></i>
+                </div>
+                <span class="pv-tv">{{ preview.timeline.overlay_events }} 层</span>
               </div>
               <div class="pv-trk">
                 <span class="pv-tl">人声</span>
@@ -3677,6 +3761,25 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .media-card .meta a:hover { color: var(--vermilion); }
 
+/* 证据分级：一条主张一行，验过的实、没验的淡 —— 用户要看的正是这个区分 */
+.mc-ev { font-size: 12.5px; color: var(--ink-soft); }
+.mc-ev summary { cursor: pointer; letter-spacing: 1px; }
+.mc-ev summary i { font-style: normal; }
+.mc-ev summary i.ok { color: var(--pine-deep, #2f6b46); }
+.mc-ev summary i.no { color: var(--vermilion-deep); }
+.mc-evrow {
+  display: flex; gap: 8px; align-items: baseline;
+  padding: 3px 0; border-bottom: 1px dashed var(--line);
+}
+.mc-evrow.un { opacity: .62; }
+.mc-evlv {
+  flex: none; font-family: ui-monospace, monospace; font-size: 11.5px;
+  letter-spacing: 1px; color: var(--ink);
+}
+.mc-evrow.un .mc-evlv { color: var(--vermilion-deep); }
+.mc-evcl { min-width: 0; }
+.mc-evnote { padding-top: 6px; font-size: 11.5px; opacity: .8; }
+
 /* 工具调用追踪卡片 */
 .tool-trace {
   font-family: ui-monospace, monospace; font-size: 12.5px; line-height: 1.7;
@@ -4358,6 +4461,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 .pv-fill.a { background: var(--vermilion); }
 .pv-fill.s { background: var(--gold); }
 .pv-fill.b { background: #8a7fbf; }
+.pv-fill.o { background: #4aa564; }
 .pv-tv { flex: 0 0 auto; font-size: 10.5px; color: var(--ink-soft); }
 .pv-sub {
   font-family: var(--serif); font-size: 12px; letter-spacing: 1px;

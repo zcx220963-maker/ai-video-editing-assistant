@@ -334,6 +334,19 @@ def build_runtime(
     ask_tool = AskUserTool()
     registry.register(ask_tool)
 
+    # 执行轮（与闲聊轮）的「本轮为什么没有这个工具」说明，与规划轮那条对称
+    # （见 agent_framework/plan/vocab.py 的 planning_registry）。
+    # 真机事故：执行轮里模型调了 submit_plan，只拿到一句 tool 'submit_plan' not found，
+    # 看不出这是「按设计不提供」，于是弹窗问用户「本会话没有 submit_plan 工具，
+    # 你希望怎么处理？」——用户被问了一个他答不了的问题，而正确答案是「这轮不用再提计划」。
+    registry.unknown_tool_hint = (
+        "提交/确认计划的两只工具（submit_plan、confirm_plan）只在**规划轮**"
+        "（用户提新剪辑诉求、系统弹出计划卡那一轮）注册，执行轮按设计不再提交候选计划——"
+        "要确认的计划已经在卡上确认过了。请直接用本轮真实的剪辑节点把剩余步骤跑完，"
+        "或如实收尾本轮；**不要**为了一个本轮不存在的工具调用 ask_user 把锅抛给用户。\n"
+        "如果这个名字不属于上面两只，那它就是臆造的（拼错、或把技能正文里的说法当成了"
+        "工具名）：请从本轮的工具清单里选一个真实存在的工具，不要换个拼法重试。")
+
     # ---- Cron（到点投递到 MQ）：任务行在 PG scheduled_jobs，scheduler 的 runner 需要 mq ----
 
     # ---- Context sources（记忆与技能都在 PG，本地目录仅是技能的导入源）----
@@ -345,10 +358,11 @@ def build_runtime(
         skill_loader = SkillLoader(storage)
         register_skill_tools(registry, skill_loader)
         context_sources.append(SkillManifestContextSource(skill_loader))
+    memory_store: MemoryStore | None = None
     if use_memory:
-        store = MemoryStore(storage)
-        register_memory_tools(registry, store)
-        context_sources.append(MemoryContextSource(store))
+        memory_store = MemoryStore(storage)
+        register_memory_tools(registry, memory_store)
+        context_sources.append(MemoryContextSource(memory_store))
 
     # ---- 计划门（块 B）：规划轮的唯一出口 + 执行帧的服务端校验 ----
     # 依赖全是引用（注册表与契约要到 _startup 才填齐），所以在这里构造就够了：
@@ -405,6 +419,7 @@ def build_runtime(
         storage=storage,
         plan_gate=plan_gate,
         skill_loader=skill_loader,
+        memory_store=memory_store,
     )
 
     # ---- Agent Team：消息中心 / 任务板 / 常驻子 Agent 池（状态在 PG 协作三表）----

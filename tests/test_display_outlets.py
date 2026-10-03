@@ -128,10 +128,16 @@ def case_frontend() -> None:
           "界面上不再常驻英文原名（工具卡片与工具库抽屉的 tt-raw/td-name 已撤）")
     check("copyMachine(" in text and "navigator.clipboard" in text,
           "豁免口径的另一半：代码位不翻译，但配了复制钮取回原文")
+    check("evidence: p.evidence || []" in text and "evidence: card.evidence || []" in text,
+          "成片卡的证据分级两条路都接上：实时 media 帧 + 刷新重放的 media 视图")
+    check('class="mc-evlv"' in text and "项没验" in text,
+          "证据账在卡片上有落点（逐条级别 + 「几项有证据 / 几项没验」的标题）")
     dist = list((ROOT / "frontend" / "dist" / "assets").glob("index-*.js"))
     built = any("tt-copy" in p.read_text(encoding="utf-8")
                 and "arg_labels" in p.read_text(encoding="utf-8") for p in dist)
     check(built, "frontend/dist 已按新源码重新构建（含 arg_labels 接线，不是只改了 src）")
+    check(any("mc-evlv" in p.read_text(encoding="utf-8") for p in dist),
+          "dist 里也有证据分级那块（改了 src 却没 build 的话这条会红）")
 
 
 def main() -> None:

@@ -2,7 +2,7 @@
 
 面向内容创作者的 Agent：一句话驱动「查资料 → 写文案 → 剪视频 → 出片」。
 外层是常驻 Agent 主循环（Message Queue → Session → AgentLoop → 工具），
-剪辑能力由独立的 Storyline MCP Server 提供 19 个真实节点（切镜、画面理解、ASR、
+剪辑能力由独立的 Storyline MCP Server 提供 20 个真实节点（切镜、画面理解、ASR、修字、
 文案、配音、BGM、三套时间线、渲染出片）。运行态全部落在 **PostgreSQL（元数据）+
 MinIO（媒体字节）**，本机磁盘只留可丢弃的缓存与临时工作区。
 
@@ -523,7 +523,7 @@ Redis 挂了不带走整帧：`OutboundBroadcaster.handle` 里 PUBLISH 抛异常
 |---|---|
 | 写（节点产出字节） | `Workspace.publish` / `publish_derived` 先把字节放进 MinIO，payload 里只留 `to_ref(object_key)`，即 `"obj:users/u_x/c_c_y/mat-50998b.mp4"` |
 | 读（下游取字节） | `Workspace.localize_ref(value, dst_dir)` 是**唯一**的取字节入口：按引用从对象存储落到本次调用的目录，同名不互盖（sha1 槽位 + 安全名）、命中即直返、同目标并发有锁 |
-| 渲染 | `_localize_timeline` 在 render 前把三条轨逐条 localize 进 `render/src/`，MoviePy/ffmpeg 只吃本地路径这件事被关在这一步里面 |
+| 渲染 | `_localize_timeline` 在 render 前把四条轨（画面/声音/字幕/覆盖层）逐条 localize 进 `render/src/`，MoviePy/ffmpeg 只吃本地路径这件事被关在这一步里面 |
 
 对象键只有三种布局（`mediaops.probe()` 从此不再返回 `path`——元数据里没有本机路径可用）：
 
@@ -787,6 +787,34 @@ curl -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
 收尾），控制流与原有注释照旧。**两份形状**（包依赖方向、`_drive` 不再膨胀、跨挂起的事实
 不许再退回 `ctx.extras`）由 `tests/test_plan_layout.py`（31 项）钉着。
 
+**复盘进记忆**（`agent_framework/plan_retro.py`）：用户在卡上动过哪些地方，不用他下次再打一遍字。
+卡面差异是两份现成数据（`submit_plan` 存下的候选卡 + 浏览器回传的确认帧）一比就出来的结构化事实，
+指望模型在终答里「顺手记住」实测会写成「用户不喜欢音乐」这种没有锚点的断言，下一轮读它就少排一步。
+
+* **三条信号**：① 确认帧差异——跳过第几步「哪个节点」、把哪个枚举参数从卡面默认改成什么、
+  「其他」里手写的自由文本（分「某一步」与「整体」两种锚点）；值等于卡面默认就不算动过，
+  整步被跳过时不再记它步内的选择，卡上没有的步骤/参数忽略（那些在 `validate_execute` 已打回）；
+  ② 「换一版」时写的理由，原话落一条；③ **成片退回**——本会话此前已经真渲染出过成片
+  （`render_video` 的产物行还在），而本轮计划里又排了渲染，就落一条带「当轮用户原话」的退回记录。
+  dry-run 的回执是 `__no_store__`、不写产物表，所以「先看看会渲成什么样」不会被误判成退回。
+* **只落动作，不落结论**：写「跳过第 3 步 select_BGM」而不是「用户不要背景音乐」——一次勾选只是
+  一个数据点，写成结论下轮就会把偶然当偏好。自由文本进记忆前先 `neutralize`（与计划卡自定义
+  诉求同一口径：这段每轮整段进 system，尖括号不中和就是一道 prompt 注入面）。
+* **落点与上限**：`user` 存卡面差异与换一版原话，`tool` 存退回信号（分类只能用 `memory.CATEGORIES`
+  白名单，PG 侧 `memories.category` 有同名 CHECK）；一轮最多 8 行、整行不超过 160 字——注入侧
+  本来按 2000/4000 字截**更早**的行，一行太长等于把整段老记忆挤出去；同一次确认被重放（崩溃续跑、
+  前端重复点击）时整行相同，第二次写不进去，否则一次跳过会攒成「每次都跳过」。
+* **两处调用点都在 `runner.run` 之前**：确认帧是既成事实，与本轮跑不跑得动无关——渲染跑到一半崩了，
+  「跳过 BGM」这条偏好也不该跟着丢。`MemoryStore` 是进程级单例、按执行身份解析 user_id，而身份要
+  进 `runner.run` 才绑上，所以 `Agent._record_retro` 自己按传入的 user_id 显式绑一次身份（不绑就会
+  把 A 的偏好写进 `default` 名下）；写记忆抛错只打告警，不拖垮用户此刻的这条 run。
+* **开关**：没接记忆存储时整条路不启用——`--no-memory` 起的服务，或 `Agent` 构造时不传
+  `memory_store`，`Agent.retro` 就是 `None`。
+
+验证：`tests/test_plan_retrospective.py`（35 项，三条信号各自的分界：默认值不产生行 / 跳过整步不再
+记账步内参数 / dry-run 不算退回 / 分类白名单 / 重放不重复写 / 一轮限量 / 换身份不串台 /
+写失败不抛出 / 没绑身份时不会落到 `default`）。
+
 ### 3.16 HITL：弹窗提问与渲染前确认（同一条 run 内挂起）
 
 三条触发路径共用同一套挂起 / 回投 / 续跑 / 落盘机制——**同一条 run 停在中间等人工**。
@@ -1009,9 +1037,9 @@ python -m pytest -q                              # 全量：一条命令收完 t
 python tests/test_approval_gate.py               # 单文件直跑（exit code 判定，便于反复调一个用例）
 ```
 
-当前规模：`tests/test_*.py` **59 份脚本**，`python -m pytest` 收出 59 个用例
-（2026-10-02 全量复跑 59/59 绿；注意 `pytest.ini` 的 `addopts` 里已经有一个 `-q`，
-命令行再带 `-q` 会变成 `-qq`，末尾那行 `59 passed in …` 就不打印了，判据看 exit code 与点数）。
+当前规模：`tests/test_*.py` **72 份脚本**，`python -m pytest` 收出同样 72 个用例
+（2026-10-03 全量复跑 72/72 绿，退出码 0；注意 `pytest.ini` 的 `addopts` 里已经有一个 `-q`，
+命令行再带 `-q` 会变成 `-qq`，末尾那行 `N passed in …` 就不打印了，判据看 exit code 与点数）。
 
 **`tests/` 里每份文件都是自带 `asyncio.run(main())` 的独立脚本，一个真 pytest 用例也没有**。
 `pytest.ini` 写着 `testpaths = tests`，直接收集会把脚本里的 `async def` 判成「缺异步插件」、
@@ -1201,19 +1229,22 @@ faster-whisper 权重（几百 MB～GB，镜像预置）；系统字体（`font_
   另两点如实：① 小文件（<2MB）走单请求路径，没有分片会话可作废，因此不显示「取消上传」，
   要中止只能等那一个请求自己结束；② init 声明整文件 `sha256` 的强校验只有脚本/CLI 客户端会发，
   浏览器换成交逐片摘要列（形态差异，非缺口）。
-- **两台常驻服务的当前状态（2026-10-02 15:31 起重启，今天所有改动已上线）**：:8001
-  `python -u run_storyline.py`（15:31:06 起），:8000 `python -u run_server.py`（随后起），
+- **两台常驻服务的当前状态（2026-10-03 15:26 起 :8001、15:29 起 :8000，本轮改动已上线）**：:8001
+  `python -u run_storyline.py`，:8000 `python -u run_server.py`，
   两行命令行**都不带 flag**，走内置默认值（`--port 8000`、`--storage pg_minio`、
   `--config examples/storyline/config.toml`）。`GET :8000/health` 200、`GET :8001` 在听，
-  两者的 stdout 这次都接进了 `.storyline_server.log` / `.main_server.log`。
+  两者的 stdout 这次接在 `.tmp/storyline_r7.log` / `.tmp/main_8000_r13.log`（`.tmp/` 已在
+  `.gitignore` 里）。这一次 :8001 带上线的是 dry-run 的路由旁路与证据分级第五级，:8000 带上的是
+  访问日志凭证打码与 MQ handler 的异常留痕（见下两条）。
   * 启动日志**这次逐行核到**（此前两轮重启都没落文件，那几条只是"应该生效"）：
     `storage=pg_minio 连通性与落盘校验` / `内部身份已登记 ['default','cron']` /
     `技能库已按 examples\skills 刷新 4 份` / `启动对账：本次 0 条` /
-    `Storyline 已接入 21 个剪辑节点（DAG 契约 19 节点，rerun_from 可用）` /
-    `中文名词表已装载：49 条工具名 / 剪辑节点 / 技能，参数标签 79 个` /
-    `计划门已就绪：19 个可规划节点` /
+    `Storyline 已接入 22 个剪辑节点（DAG 契约 20 节点，rerun_from 可用）` /
+    `中文名词表已装载：50 条（工具 / 剪辑节点 / 技能），参数标签 82 条` /
+    `计划门已就绪：20 个可规划节点` /
     **`提示词库已接线：8 份来自 prompts（系统提示 + 规划轮段 + 子 Agent + 纠错说明）`** /
-    `一致性检查通过：提示词与 4 份技能里点名的工具都在注册表实现 47 个工具里`。
+    `一致性检查通过：提示词面与 4 份技能正文点名的工具都在真实的 48 个工具里`。
+    （这四行里的计数就是「加了一个节点/工具/技能之后该变没变」的对照物。）
   * 这一次重启同时把 §3.19 一致性装配修复、结构性改造 3/4/6/7 的代码带上线
     （旧 :8000 进程起于 11:10，早于这些改动）。§3.11 的影子缓冲**代码在跑、单副本不走广播这条路径**，
     而这是设计口径不是欠账：启动日志如实写着「回投广播: 关闭（单副本直连：OutBound 帧只推本进程
@@ -1241,13 +1272,26 @@ faster-whisper 权重（几百 MB～GB，镜像预置）；系统字体（`font_
   * 仓库根有 `start.bat`（先 :8001 后 :8000 的一键启动）。它起的进程**不带 `-u`、stdout 只在自己
     的控制台窗口里**，而且会和脚本化重启抢端口（本次真撞上一回 `[Errno 10048]` 后自我退出）。
     要用它启动就别再叠一层脚本重启；要复核启动日志则用 `python -u … >> .main_server.log 2>&1`。
-  * 老提醒仍然成立：uvicorn 的访问日志会把 WS 查询串里的 token 原样写进 `.main_server.log`——
-    该文件已在 `.gitignore` 里，但别贴进 issue。
+  * WS 握手把凭证带在查询串上（浏览器不给 WS 加自定义头），uvicorn 的日志一度把
+    `WebSocket /ws/{conv}?token=<明文>` 整行写进日志文件——**2026-10-03 起已打码**：
+    `agent_framework/server.server._mask_credentials_in_access_logs()` 在 lifespan 里给
+    `uvicorn.access` / `uvicorn.error` 挂了一道 filter，把 `token=` 后面那段换成 `***`。
+    装在 lifespan 而不是模块导入时：uvicorn 启动会 `dictConfig` 一遍日志，那一步清掉 logger
+    上已有的 filter，导入时装等于白装。真机核过：重启后新起的 WS 行是 `?token=***`，
+    旧日志（`.tmp/main_8000_r12.log` 等）里的明文行仍在文件里，那是历史数据，要贴 issue 前自己删。
+  * **run 静默失败已留痕**（2026-10-03）：`agent_framework/mq.py` 的分区 worker 过去把 handler
+    的异常 `except Exception: pass` 吞掉——error 帧只推给挂了 WS 的会话，浏览器没开这条会话时
+    这次 run 就「无声消失」，日志里连一行 traceback 都没有（真机两条 run 都在 `iteration=0` 死了，
+    没有任何可读的东西）。现在按 `topic/group/partition/run_id` 记 `log.exception`，
+    上面那条 402 就是靠这行日志定位到的（而不是靠猜）。
   * **2026-10-02 16:20 起这台机器的模型额度用尽**（DeepSeek `GET /user/balance` 复核 0 CNY；
     库里 40 个身份共用同一把 key——`app_secrets` 各行 sha256 前 8 位一致）。表现是
     `:8000/:8001` 上任何一轮对话都在**第一次 LLM 调用**就回「模型账户余额不足（402）」、
     run 直接落 `failed`（`iteration=0`）。充值或在页面重填 key 之前界面上跑不了真流程；
     `/settings/api-key` 写进 PG 即生效，两个服务热读，**不必重启**。
+    **2026-10-03 15:29 重启时仍是这个状态**：三条待恢复 run（`26104a3c9d74` / `bd7f54c68119` /
+    `e2778f38a4eb`）逐条原样报 402，额度未恢复——所以「模型驱动的那半条链路」（规划轮出卡、
+    执行轮调工具）当天无法真机复验，能验的都在不依赖模型的那半条上验。
   主服务只在启动时建 MCP 连接，所以**改 Storyline 侧或 `config.toml` 白名单后必须重启 :8000**，
   否则它拿的还是旧工具表；只改主服务侧（如本轮的 `agent.py`）时 :8001 可以不动。
 - **块 A/B/C（§3.14、§3.15、§3.10）落地后仍存在的边界**，逐条如实：
@@ -1282,6 +1326,101 @@ faster-whisper 权重（几百 MB～GB，镜像预置）；系统字体（`font_
   剩下的边界如实：① 超出目标的部分是**从尾部裁掉**，不是重新排一版更紧凑的时间线，
   所以「剪一条 30 秒」得到的是前 30 秒而不是 30 秒的高光（要高光仍走 `speech_rough_cut` 的精选模式）；
   ② 没声明目标、或本来就不超目标时行为与改动前一致（原样返回、不追加说明）。
+- 画面覆盖层：`render_video` 收 `overlay_events`，主轨画面与口播声音都不动，只在指定窗口上盖
+  一层（用户那句「部分画面用风景替换，音声不变」）。每项写 `segments: [asr 段 id]`，
+  **不写秒**——秒数由渲染前的 `resolve_overlay_anchors` 按成片算（先在这个素材的声音区间上找，
+  配音模式没有源片时刻可言，退到画面轨；多个 id 取并集窗口）。id 逐字取自 `asr` 的
+  `asr_segments[].id`，`speech_rough_cut` 合并相邻段时把 id 汇总进 `ids`。认不出的 id 当场打回，
+  错误里列出真实存在的 id，并留下 `render_jobs.status=failed` 行——不出「说盖了其实没盖」的成片。
+  覆盖层**永远静音**（自带音轨就会和口播抢同一个声床），MoviePy 与 ffmpeg 兜底两条路径都合成它，
+  并且一起过 `resync_original_audio_timeline` / `av_sync_check` / `_check_overlay_media`，
+  段数计入成片的 `timeline_digest.overlay_segments`（`tests/test_av_sync.py` ⑤⑥⑦⑧、
+  `tests/test_render_pipeline.py` ⑧⑨ 逐条钉住，含抽帧比色）。
+  剩下的边界如实：① 锚点粒度是**段（句）**不是词——本仓的 faster-whisper 没开 `word_timestamps`，
+  所以「绑词不绑秒」在这里落地为「绑句 id 不绑秒」，一句之内切换画面做不到；
+  ② 盖层比窗口长时**截尾**而不是拉时长（拉会变速），比素材短时留最后一段画面；
+  ③ 覆盖层只参与音画同步判定，不参与画面语义（它盖住的是谁、对不对题，机器无从判断）。
+- 转写修字闸：新增显式调用节点 `correct_transcript`（ASR 之后、粗剪之前），
+  把「模型顺手改个字」这件必然会发生的事收进一道闸。它只接受 `corrections=[{id, text}]`
+  （id 逐字取自 `asr_segments[].id`），**只换文本**：`start`/`end`/`clip`/`id` 逐字保留，
+  四种越界当场 `ValueError`——id 不存在（报错列出真实 id）、同一 id 改两遍（否则后一条静默盖掉
+  前一条）、text 为空（修字不是删段）、改动体量超 `±max(3, 30%×原字数)`（字数口径是「中文逐字 +
+  拉丁按词」，改一个同音字 UTF-8 字节会动三个而字数不动；想换内容请去 `speech_rough_cut.keep_segments`
+  选段，报错里就这么写）。产物三件：修好的整份 `asr_segments`（被点名那条带 `corrected`）、
+  修字表 `corrections`（改前/改后/落在第几秒/改了几个字——「谁改的」有据可查）、
+  `unchanged_suspects` 可疑段待办（纯语气词、同字连三遍、识别失败占位这类**形状**启发，不判错别字）。
+  下游只有一处采用：`speech_rough_cut` 探 Store（`state.store.has("correct_transcript")`），
+  有就用修过的那份，于是字幕（逐条取自粗剪文本）自动跟着改对；覆盖层锚点读的 id 与源时间窗都没被
+  触碰，修字前后 `resolve_overlay_anchors` 得到同一个输出窗口（`tests/test_transcript_correction.py`
+  就比这两次解析相等）。它不进任何节点的 `required_nodes`，也不被拦截器自动补齐——
+  **不修字时整条链路一字不变**，这是可选路径而不是必经步骤（44 项离线用例，含 mock 夹具的同键契约）。
+  剩下的边界如实：① ±30% 是**字数比例**，不是语义判据——把一句改成正好等长的另一句话它放行，
+  闸只挡「挪位置/删句子/大改」这三类会砸掉时间轴的改动；② 可疑清单是启发式，正常句也可能被列、
+  真错字也可能不被列（机器判不了对错）；③ 修字结果不覆写 `asr` 产物本身（原转写永远留在库里可查，
+  这是刻意的两份）；④ 新工具要在 Storyline 服务端重启后才会注册进 MCP（`available_nodes` 白名单
+  已加，运行中的进程还看不到它）。
+- 复盘进记忆：用户在计划卡上动过的地方由服务端自己算（`agent_framework/plan_retro.py`：候选卡 vs
+  确认帧一比，加「换一版」原话、加「本会话已真渲过、本轮又排渲染」的退回信号），落成 `memories` 表
+  里带锚点的短行（`user` 存卡面差异与换一版理由，`tool` 存退回），下一轮规划读 system 就能看见，
+  不用用户把同一句偏好打第四遍。只落动作不落结论；自由文本进记忆前先 `neutralize`；
+  一轮最多 8 行、整行 ≤160 字；整行相同不重复写（重放与重复点击不攒「每次都跳过」）；
+  调用点在 `runner.run` **之前**，所以 `_record_retro` 自己按传入 user_id 绑身份，写失败只告警
+  （35 项离线用例 `tests/test_plan_retrospective.py`，含「不绑身份就会写进 default 名下」这条）。
+  剩下的边界如实：① 退回的口径是「产物行在 + 本轮又排渲染」，**看不出**「用户嘴上说不要但没重跑」；
+  ② `render_jobs` 同一产物是复位同一行，库里数不出「第 N 次渲染」，所以退回行只写「此前已出过成片」；
+  ③ 记忆只增不减，注入侧按 2000/4000 字截更早的行——攒够之后最早的偏好就读不到了，精简仍要靠
+  `update_memory`；④ 写了哪几条不回投界面，用户只能从下一轮的行为反推（告警只在服务端日志）；
+  ⑤ `--no-memory` 或构造 `Agent` 时没传 `memory_store`，这条整条不启用（`Agent.retro` 为 `None`）；
+  ⑥ 只覆盖「计划卡这条路」的信号——直接在聊天里提的偏好仍要靠模型自己调 `update_memory`。
+- 出片前先看账：`render_video` 收 `dry_run=true` 时**只回出片计划、不烧像素**（用户那句
+  「这个工具也不是动态的」——改一版渲一版才知道排成什么样，试错成本是一次编码）。它与真渲走
+  **同一批判断函数**（`resync_original_audio_timeline` → `av_sync_check` →
+  `validate_timeline_objects` → `_overlay_window_issues`），只是把「raise」换成「记进
+  `blocking` 收下来」，再由 `render_plan` 把时间线翻成人能核对的一张账（总长/分辨率/画面轨
+  段数与秒数/人声轨含空档与末端/字幕前 3 条/覆盖层锚点与落点/转场/BGM）。**不留痕**：不下载
+  字节、不建 `render_jobs` 行、不建工作区 `render/` 目录、返回值带 `__no_store__` 因而不进
+  `artifacts`（否则库里留下一条永远渲不出成片的假产物）。`timeline_digest` 同源，所以 dry_run 的
+  `sha16` 与之后同一次真渲的 `sha16` 相等（`tests/test_render_pipeline.py` ⑩ 钉这条；
+  账本身算得对不对、闸放不放行 dry_run、证据账本 `evidence_ledger` 的分级判定，
+  由 `tests/test_dry_run_plan.py` 45 项纯函数用例钉住）。渲染闸 `should_gate_render`
+  放行 dry_run 调用——闸管的是「未终态不许收尾」，dry_run 不产生终态。
+  **但账要拿得到，还差路由层这一步**（真机踩过）：`render_video` 是唯一的长耗时节点，MCP
+  handler 见它就交给渲染分发器「提交 + 轮询」，而分发器一进门就 `render_jobs.enqueue` 落一条
+  queued 行——dry-run 的节点体刻意不开任务行、不推进度，于是那一行永远停在 queued（界面显示
+  「正在出片」、看门狗按停滞判死），真正该回的账被进度视图盖掉：连续 20 次 `render_status`
+  全回 `status=queued percent=0`。现在 `_register_one` 在进分发器**之前**读一次 `dry_run`
+  （`_flag_on`，字符串 `"true"/"1"/"on"` 也算开），开着就直接调节点体、内联回账。
+  上面那批同名离线用例当时全绿着放过了这个 bug——它们测的是纯函数，没穿过路由层，
+  所以补了 `tests/test_dry_run_dispatch.py`（20 项，内存替身存储）钉两件事：dry_run 内联回账
+  且**不留** `render_jobs` / `artifacts` 行，真渲照旧走分发器**且必须**留一行。
+  剩下的边界如实：① 它验不了字节层面的事（对象取不到、覆盖层源片真实长度不够、编码耗时、
+  成片音画实测），这四项在返回的 `not_checked` 里逐条写明，所以它是**计划**不是**体检报告**；
+  ② `will_render:true` 不等于成片一定好看，只等于「按这张账画得出来」。
+- 证据分级上卡片：渲染产物（真渲与 dry_run 都是）除账本外再带一本 `evidence`——每条是
+  「一句主张 + 它能被哪类证据证明 + 这一次到底拿到没有」。五级只有 `machine`（机器算过）、
+  `byte`（量过字节）、`frame`（抽帧看过）、`listening`（只有人耳）、`eyeball`（只有人眼）；
+  `status` 只有 `verified`
+  与 `UNVERIFIED`，未验的一律写明**为什么拿不到**。规则只有一条：**没做的那一步不许出现在
+  verified 里**——过去用户第三次报「音画不同步」时，「渲染完成」这句话把「按数据算的」「量过
+  字节的」和「机器压根验不了的」混成一团，前两类替第三类背了书。`frame` 是机器够得到的最高一级：
+  `_frame_spotcheck` 用 ffmpeg 从**渲好的成片**取 15%/50%/85% 三帧灰度裸流（不装图片库，
+  一帧就是 w*h 字节），算亮度均值判黑屏（阈值 luma<6.0）、比 sha256 指纹判定格，抽完即删。
+  账本只在一个出口生成（`evidence_ledger`），再顺着既有链路一路传到卡片：工具结果 →
+  `render_jobs.result`（所以 `render_status` 与模型看的 `tool_view` 自动带上）→ WS `media` 帧 →
+  `qa.parts` 持久片段 → `/convs/{id}/messages` 重放 → Vue 折叠区（`✓ 量过字节 ｜ ？ 只有人耳`）。
+  卡片侧只留 `{claim, label, verified}` 三样，`proof` 长文本不进持久片段。产物同时带一句
+  `evidence_rule`，要求模型只引用 `verified` 条目，未验的几条要当面说没验过、不替它们背书。
+  （`tests/test_dry_run_plan.py` ⑤ 钉分级词表与降级规则、`tests/test_render_pipeline.py` ⑪
+  钉真链路上的落点、`tests/test_media_replay.py` 钉三条出口同账、
+  `tests/test_dry_run_dispatch.py` 钉 MCP 路由层：dry_run 内联回账且不落任务行）。
+  卡片这一栏在浏览器里对着**一次真渲**核过：折叠区显示「9 项有证据 · 3 项没验」，未验的三条
+  分别是 `只有人耳`（听感）与两条 `只有人眼`（字幕排布、内容对不对题）。
+  剩下的边界如实：① 上面那三条**永远** UNVERIFIED——机器没有听觉，也没有对内容的判据，
+  这一眼/这一耳只能用户来；② 抽帧只取三个点，不是全片扫描，
+  中间闪一帧黑、或某段素材整段错都查不出；③ 黑屏阈值 `luma<6.0` 与三个取样点是经验值，
+  没做过片库标定；④ 抽帧失败只做**证据降级**（写明没跑成），不改判这次渲染——不能因为体检
+  仪器坏了就把片子判死；⑤ 本地 mock 兜底节点不产 `evidence`（它压根没编码），那种卡片只是
+  没有这一栏，不是假装验过。
 - `agent_framework/video_editing.py` 已从**生产装配里摘出**，只剩离线测试夹具身份：
   真节点、真 DAG、真 Interceptor 都在 Storyline 服务端，主服务里那套 mock 节点既不注册也不兜底
   （两套图并存时依赖补齐与 `require_prior_kind` 只在 mock 侧生效，那是第二个真相）。

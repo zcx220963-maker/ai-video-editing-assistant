@@ -37,6 +37,8 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 
+from .plan.support import OUTPUT_FIELD_NAMES
+
 # 「像工具名」的标识符：小写字母开头、至少含一个下划线。
 _TOOLISH = re.compile(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b")
 
@@ -128,6 +130,11 @@ def skill_field_names(*, node_param_keys: Iterable[str] = (),
     所以调用方传列表，别传生成器。
     """
     out = {str(k) for k in node_param_keys}
+    # 节点**产出**的字段名单源在计划门那一层（``plan.support.OUTPUT_FIELD_NAMES``）：
+    # 技能正文里讲「evidence / not_checked / will_render」这些回执键是正常表达，
+    # 而它们不是任何工具的入参键，所以 schema 扫不出来。不收这一份就会挂假告警
+    # ——这台检查最怕的就是假告警。
+    out |= set(OUTPUT_FIELD_NAMES)
     for batch in tools:
         out |= schema_property_names(batch)
     return out

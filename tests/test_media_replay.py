@@ -3,7 +3,7 @@
 
 运行：  python tests/test_media_replay.py    # 全离线：内存替身 + mock 节点，不起容器/不联网
 
-钉住三件事：
+钉住四件事：
 ① 一轮成功渲染后，MediaCardHook 除了当轮回投，还把**持久链接**（渲染对象键 + artifact_id）
    落进本轮 assistant 行的 ``qa.parts``（新增 type=media 片段）——刷新前这条链接已在库里；
 ② GET /convs/{id}/messages 读历史时把这条链接重放成与**实时 WS media 帧同形**的播放卡
@@ -117,24 +117,38 @@ async def _plain_turn_no_render(storage, user_id: str, conv_id: str) -> list:
 
 async def _capture_real_shaped(storage, user_id: str, conv_id: str) -> dict:
     """喂给 MediaCardHook 一条**真远程节点形状**的工具结果（顶层带 artifact_id），
-    验证同一套 record→assistant 落库路径把 artifact_id/duration/title 如实记下。"""
+    验证同一套 record→assistant 落库路径把 artifact_id/duration/title 如实记下，
+    并且证据分级那本账**两条路都跟着走**（当轮 WS 帧 + qa.parts 持久片段）。"""
     await storage.conversations.ensure(user_id, conv_id)
     real_packed = {
         "node": "render_video", "artifact_id": "A9",
         "output": {"video": f"renders/{user_id}_{conv_id}/A9.mp4",
                    "media_url": "memory://creation-assets/x?ttl=3600",
-                   "duration": 2.5, "width": 640, "height": 360, "title": "带产物名的成片"},
+                   "duration": 2.5, "width": 640, "height": 360, "title": "带产物名的成片",
+                   "evidence": [
+                       {"claim": "成片真实存在：2.5s / 640x360 / 含音轨", "level": "byte",
+                        "label": "量过字节", "status": "verified", "proof": "ffprobe"},
+                       {"claim": "听感：音量平衡", "level": "listening",
+                        "label": "只有人耳", "status": "UNVERIFIED", "proof": "机器没有听觉"},
+                       {"claim": "", "level": "machine", "status": "verified"},   # 不合法，该被跳过
+                   ]},
     }
+    # 内存替身的 presign 会查对象存在性（真 MinIO 不查），先放一段假字节，历史端点才签得出直链。
+    async def chunks():
+        yield b"FAKE-MP4-BYTES"
+    await storage.objects.put(real_packed["output"]["video"], chunks(), content_type="video/mp4")
+    mq = _RecorderMQ()
     ctx = AgentHookContext(
         session=Session(user_id=user_id, conversation_id=conv_id),
         messages=[{"role": "tool", "tool_call_id": "t1", "name": "render_video",
                    "content": json.dumps(real_packed, ensure_ascii=False)}],
         extras={"run_id": "rA9"},
     )
-    await MediaCardHook(_RecorderMQ()).after_execute_tools(ctx)
-    return await storage.messages.append(
+    await MediaCardHook(mq).after_execute_tools(ctx)
+    row = await storage.messages.append(
         user_id, conv_id, "assistant", content="好了",
         qa={"parts": [{"type": "answer", "content": "好了"}]})
+    return {"row": row, "published": [p for _t, p in mq.published if p.get("type") == "media"]}
 
 
 def main() -> None:
@@ -170,12 +184,28 @@ def main() -> None:
                   "实时当轮 OutBound media 帧照旧回投（本次修复没动这条路）")
 
             # 真远程节点的 packed 结果（顶层带 artifact_id）经同一条路径被如实持久化。
-            real_row = asyncio.run(_capture_real_shaped(storage, uid, "c_real"))
+            cap = asyncio.run(_capture_real_shaped(storage, uid, "c_real"))
+            real_row = cap["row"]
             rmp = next((p for p in (real_row.get("qa") or {}).get("parts", [])
                         if isinstance(p, dict) and p.get("type") == "media"), {})
             check(rmp.get("artifact_id") == "A9" and rmp.get("duration") == 2.5
                   and rmp.get("title") == "带产物名的成片",
                   f"真节点 packed 形状的 artifact_id/时长/标题被完整记录：{rmp}")
+            # 证据分级：当轮帧、持久片段、历史重放三条路都得带上同一本账
+            rframe = cap["published"][0] if cap["published"] else {}
+            check([e["claim"] for e in rframe.get("evidence") or []] ==
+                  ["成片真实存在：2.5s / 640x360 / 含音轨", "听感：音量平衡"],
+                  f"当轮 WS 帧带上证据账，且不合法那条（空 claim）被跳过："
+                  f"{rframe.get('evidence')}")
+            check(rmp.get("evidence") == rframe.get("evidence"),
+                  "同一本账落进 qa.parts 持久片段（刷新后还在，不是只活当轮）")
+            replay = client.get("/convs/c_real/messages", headers=hdr).json()["messages"]
+            rcard = next((c for m in replay for c in m.get("media") or []), {})
+            check((rcard.get("evidence") or [{}])[0].get("verified") is True
+                  and (rcard.get("evidence") or [{}, {}])[1].get("verified") is False,
+                  f"历史重放的卡片带出账本，verified/未验一目了然：{rcard.get('evidence')}")
+            check(set((rcard.get("evidence") or [{}])[0]) == {"claim", "label", "verified"},
+                  "卡片只取三样（主张/级别/验没验），proof 那种长文本不进持久片段")
 
             # ---- ② 历史端点把持久链接重放成可播卡（与 WS media 帧同形）----
             got = client.get("/convs/cmr/messages", headers=hdr)

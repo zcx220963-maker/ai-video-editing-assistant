@@ -77,7 +77,7 @@ def node_classes() -> list[type]:
 
 def case_nodes() -> None:
     classes = node_classes()
-    check(len(classes) == 19, f"扫描到 19 个剪辑节点类（实得 {len(classes)}）")
+    check(len(classes) == 20, f"扫描到 20 个剪辑节点类（实得 {len(classes)}）")
     missing = [c.__name__ for c in classes if not c.display_name.strip()]
     check(not missing, f"每个节点都声明了中文名（缺失：{missing}）")
     names = [c.name for c in classes]

@@ -86,6 +86,14 @@ class PlanGate:
     def output_keys(self) -> set[str]:
         return self.vocab.output_keys()
 
+    def explicit_call_nodes(self) -> set[str]:
+        """必须**显式写进 steps** 的节点（执行期不自动补齐的那几个）。
+
+        规划轮提示段用它把这件事说在前面——原先只有校验器知道，模型要交一次卡、
+        吃一次打回才知道。
+        """
+        return self.vocab.explicit_call_nodes()
+
     def planning_registry(self, *, submit_tool: Any, confirm_tool: Any) -> ToolRegistry:
         return self.vocab.planning_registry(submit_tool=submit_tool,
                                             confirm_tool=confirm_tool)

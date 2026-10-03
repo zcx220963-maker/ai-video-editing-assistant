@@ -87,7 +87,50 @@ class AsrNode(BaseNode):
 
     async def process(self, state, inputs):
         clips = inputs["load_media"]["clips"]
-        return {"asr_segments": [{"clip": c["id"], "text": f"asr:{c['id']}"} for c in clips]}
+        # 段 id 与真节点同形（asr-N）：修字闸与覆盖层锚点都按 id 寻址，夹具不给 id 就验不到那条路。
+        return {"asr_segments": [{"id": f"asr-{n}", "clip": c["id"], "text": f"asr:{c['id']}"}
+                                 for n, c in enumerate(clips)]}
+
+
+class CorrectTranscriptNode(BaseNode):
+    name = "correct_transcript"
+    description = "ASR 修字闸：只改文本，时间戳与段 id 不动（产物键与真节点契约一致）"
+    required_nodes = ["asr"]
+    require_explicit_call = True
+
+    async def process(self, state, inputs):
+        # 与真节点同形状（storyline_server/nodes/core_nodes.py CorrectTranscriptNode）：
+        # 只换 text，id/clip/时间逐字保留；mock 不复制「可疑段」那套启发式，交空清单并写明。
+        segs = inputs["asr"]["asr_segments"]
+        corrections = inputs.get("corrections")
+        if not corrections:
+            raise ValueError("correct_transcript 需要你传入 corrections（[{id, text}]）")
+        by_id = {str(s.get("id", "")): s for s in segs}
+        fixed: dict[str, str] = {}
+        ledger: list[dict] = []
+        for c in corrections:
+            sid = str(c.get("id", "")).strip()
+            if sid not in by_id:
+                raise ValueError(f"修字锚点认不出来：{sid!r}")
+            if sid in fixed:
+                raise ValueError(f"同一个 id 被改了两遍：{sid}")
+            text = str(c.get("text", "")).strip()
+            if not text:
+                raise ValueError(f"{sid} 的 text 是空的")
+            fixed[sid] = text
+            ledger.append({"id": sid, "clip": by_id[sid].get("clip"),
+                           "at": [by_id[sid].get("start"), by_id[sid].get("end")],
+                           "before": by_id[sid].get("text", ""), "after": text,
+                           "changed_units": 0})
+        patched = []
+        for s in segs:
+            seg = dict(s)
+            if str(seg.get("id", "")) in fixed:
+                seg["text"] = fixed[str(seg.get("id", ""))]
+                seg["corrected"] = True
+            patched.append(seg)
+        return {"asr_segments": patched, "corrections": ledger, "corrected": len(ledger),
+                "unchanged_suspects": [], "note": "mock：不跑可疑段启发式，只验契约形状"}
 
 
 class SpeechRoughCutNode(BaseNode):
@@ -96,7 +139,11 @@ class SpeechRoughCutNode(BaseNode):
     required_nodes = ["asr"]
 
     async def process(self, state, inputs):
-        segs = inputs["asr"]["asr_segments"]
+        # 与真节点一致：修过字的那一份优先（correct_transcript 不会被自动补齐，靠探 Store）。
+        source = inputs["asr"]
+        if await state.store.has("correct_transcript"):
+            source = await state.store.get("correct_transcript") or source
+        segs = source["asr_segments"]
         return {"rough_clips": [s["clip"] for s in segs if s["text"]]}
 
 
@@ -280,7 +327,7 @@ ALL_NODE_CLASSES = [
     # 输入阶段 → 素材处理层 → 逻辑与脚本层 → 时间轴规划层 → 最终输出
     SearchMediaNode, LoadMediaNode,
     SplitShotsNode, UnderstandClipsNode, FilterClipsNode, GroupClipsNode,
-    AsrNode, SpeechRoughCutNode,
+    AsrNode, CorrectTranscriptNode, SpeechRoughCutNode,
     ScriptTemplateRecNode, GenerateScriptNode, GenerateAITransitionNode,
     TransitionRecNode, TextRecNode, GenerateVoiceoverNode, SelectBGMNode,
     PlanTimelineNode, PlanTimelineProNode, PlanTimelineAITransitionNode,

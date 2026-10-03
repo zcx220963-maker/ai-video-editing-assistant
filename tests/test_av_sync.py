@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
@@ -158,6 +159,8 @@ def main() -> int:
              "src_start": 311.26, "src_end": 333.96},
         ],
     }
+    # resync 会**原地**改 hand，所以先把「未校准的原样」留一份给 ⑥ 的闸门用例。
+    hand_misaligned = copy.deepcopy(hand)
     n = resync_original_audio_timeline(hand)
     check(n == 2, f"校准了 2 段错位的（实际 {n}）")
     by_start = {e["start"]: e for e in hand["events"]}
@@ -170,6 +173,137 @@ def main() -> int:
     check(by_start[0.0]["src_start"] == 0.0, "本来就对齐的不动")
     # 幂等：再跑一遍不该继续改
     check(resync_original_audio_timeline(hand) == 0, "再校准一次是幂等的（0 改动）")
+
+    print("\n=== ⑥ 渲染前的同步闸：认不出的错位不许静默出片 ===")
+    # 校准只**修**它认得出的；闸门负责**拦**它认不出的。缺这道闸，模型换一种写法
+    # （真机烧了六次 40 轮预算那句「严格音画同步」）就能带着错位出片还自称同步。
+    from storyline_server.nodes.core_nodes import av_sync_check  # noqa: PLC0415
+
+    mis = copy.deepcopy(hand_misaligned)
+    worst0, bad0 = av_sync_check(mis)
+    check(len(bad0) == 1 and 4.0 < worst0 < 4.1,
+          f"修之前就能拦下（{len(bad0)} 条违规，最大偏差 {worst0:.2f}s）")
+    check(resync_original_audio_timeline(mis) > 0 and not av_sync_check(mis)[1],
+          "校准之后同一份时间线无违规（闸与校准对得上，不会互挑刺）")
+
+    blind = {"mode": "original_audio",
+             "events": [{"path": ONCAM, "start": 0.0, "end": 5.0,
+                         "src_start": 0.0, "src_end": 5.0}],
+             "audio_events": []}
+    b_bad = av_sync_check(blind)[1]
+    check(bool(b_bad) and "没排任何声音段" in b_bad[0],
+          f"原声模式却空着声音段 = 盲排，判违规：{b_bad[:1]}")
+
+    gap_tl = {"mode": "original_audio",
+              "events": [
+                  # 口播素材的画面排在 8.0~15.0，而它的声音只在 0~7.72 与 16.84 之后
+                  {"path": ONCAM, "start": 8.0, "end": 15.0,
+                   "src_start": 8.0, "src_end": 15.0},
+                  # 空镜排在没有它声音的位置——它没有嘴可对，不该报
+                  {"path": BROLL, "start": 15.0, "end": 16.84,
+                   "src_start": 3.0, "src_end": 4.84},
+              ],
+              "audio_events": [
+                  {"path": ONCAM, "start": 0.0, "end": 7.72,
+                   "src_start": 0.0, "src_end": 7.72},
+                  {"path": ONCAM, "start": 16.84, "end": 40.36,
+                   "src_start": 201.99, "src_end": 225.51},
+              ]}
+    g_bad = av_sync_check(gap_tl)[1]
+    check(len(g_bad) == 1 and "没有它自己的声音在播" in g_bad[0],
+          f"只判有嘴型可言的段（出镜落在声音空档），空镜不误报：{g_bad[:1]}")
+    check(resync_original_audio_timeline(copy.deepcopy(gap_tl)) == 0,
+          "这类错位校准认不出（正是闸存在的理由）")
+    worst_b, bad_b = av_sync_check(tl)
+    check(not bad_b and worst_b < 0.01,
+          f"builder 正常产物放行（最大偏差 {worst_b:.3f}s）")
+
+    print("\n=== ⑦ 成片指纹：把「实际渲染的那一版」记进产物 ===")
+    from storyline_server.nodes.core_nodes import timeline_digest  # noqa: PLC0415
+
+    d1 = timeline_digest(tl, max_drift=worst_b, resynced=0)
+    d2 = timeline_digest(tl, max_drift=worst_b, resynced=0)
+    d3 = timeline_digest(gap_tl, max_drift=8.0, resynced=2)
+    check(d1["sha16"] == d2["sha16"] and len(d1["sha16"]) == 16, "同一份时间线指纹稳定")
+    check(d1["sha16"] != d3["sha16"], "不同时间线指纹不同")
+    check(d1["mode"] == "original_audio" and d1["video_segments"] == len(tl["events"])
+          and d1["audio_segments"] == len(tl["audio_events"]),
+          f"段数与模式如实入账：{d1['video_segments']} 画面 / {d1['audio_segments']} 声音")
+    check(d3["max_av_drift_sec"] == 8.0 and d3["resynced_segments"] == 2,
+          "最大偏差与校准段数入账（以后能核对，不用猜）")
+
+    print("\n=== ⑧ 覆盖层锚点：盖画面认「哪句话」，不认手写的秒 ===")
+    from storyline_server.nodes.core_nodes import (  # noqa: PLC0415
+        resolve_overlay_anchors,
+    )
+
+    anchors = [
+        {"id": "asr-0", "clip": "m0", "start": 0.0, "end": 7.72, "text": "第一句"},
+        {"id": "asr-1", "clip": "m0", "start": 156.81, "end": 165.93, "text": "第二句"},
+        {"id": "asr-2", "clip": "m0", "start": 201.99, "end": 225.51, "text": "第三句"},
+    ]
+    paths = {"m0": ONCAM}
+
+    ov_tl = copy.deepcopy(tl)
+    ov_tl["overlay_events"] = [
+        {"segments": ["asr-2"], "path": BROLL},
+        {"segments": ["asr-0", "asr-1"], "path": BROLL, "fit": "contain"},
+        {"start": 0.0, "end": 2.0, "path": BROLL, "src_start": 1.0, "src_end": 3.0},
+    ]
+    n_ov = resolve_overlay_anchors(ov_tl, anchors, media_paths=paths)
+    ovs = ov_tl["overlay_events"]
+    # 声音轴：asr-0→0~7.72、asr-1→7.72~16.84、asr-2→16.84~40.36
+    check(n_ov == 2, f"解析了 2 层锚点写法（实际 {n_ov}，第 3 层是显式秒数写法）")
+    check(abs(ovs[0]["start"] - 16.84) < 0.01 and abs(ovs[0]["end"] - 40.36) < 0.01,
+          f"asr-2 → 输出 {ovs[0]['start']}~{ovs[0]['end']} 秒（由声音轨算出，不是手写）")
+    check(abs(ovs[1]["start"] - 0.0) < 0.01 and abs(ovs[1]["end"] - 16.84) < 0.01,
+          f"多段锚点取并集 {ovs[1]['start']}~{ovs[1]['end']}")
+    check(ovs[0]["src_start"] == 0.0 and abs(ovs[0]["src_end"] - 23.52) < 0.01
+          and ovs[0]["fit"] == "cover",
+          "缺省：盖层从自己源片 0 秒起取满窗口、铺满裁切")
+    check(ovs[2]["src_start"] == 1.0 and ovs[2]["end"] == 2.0,
+          "写了 start/end 的层不被锚点改写")
+
+    bad_tl = {"mode": "original_audio", "events": [],
+              "audio_events": copy.deepcopy(tl["audio_events"]),
+              "overlay_events": [{"segments": ["asr-9"], "path": BROLL}]}
+    try:
+        resolve_overlay_anchors(bad_tl, anchors, media_paths=paths)
+        check(False, "不存在的 id 应当报错")
+    except ValueError as e:
+        msg = str(e)
+        check("asr-9" in msg and "asr-0" in msg and "asr_segments[].id" in msg,
+              "报错把不认识的 id 和真实存在的 id 一起说出来")
+
+    cut_tl = {"mode": "original_audio", "events": [],
+              "audio_events": [a for a in copy.deepcopy(tl["audio_events"])
+                               if abs(a["src_start"] - 156.81) > 0.01],
+              "overlay_events": [{"segments": ["asr-1"], "path": BROLL}]}
+    try:
+        resolve_overlay_anchors(cut_tl, anchors, media_paths=paths)
+        check(False, "被剪掉的段落应当报错")
+    except ValueError as e:
+        check("多半已被剪掉" in str(e), f"锚点落在没有声音的窗口 → 直说：{str(e)[:60]}…")
+
+    # 盖层用的是口播素材本身时，它也有嘴型要对——同一道校准/闸门管着它
+    cam_ov = {"mode": "original_audio",
+              "events": copy.deepcopy(tl["events"]),
+              "audio_events": copy.deepcopy(tl["audio_events"]),
+              "overlay_events": [{"segments": ["asr-2"], "path": ONCAM}]}
+    resolve_overlay_anchors(cam_ov, anchors, media_paths=paths)
+    check(resync_original_audio_timeline(cam_ov) == 1,
+          "盖层取口播素材时，校准把它的源时刻也钉到声音上")
+    o0 = cam_ov["overlay_events"][0]
+    check(abs(o0["src_start"] - 201.99) < 0.01, f"钉到声音的源时刻：{o0['src_start']}")
+    check(not av_sync_check(cam_ov)[1], "钉完之后闸门放行")
+    o0["src_start"] = 10.0
+    o0["src_end"] = 15.0
+    off_bad = av_sync_check(cam_ov)[1]
+    check(bool(off_bad) and "覆盖层" in off_bad[0],
+          f"盖层错位同样被拦下：{off_bad[0][:44]}…")
+
+    d_ov = timeline_digest(cam_ov, max_drift=0.0, resynced=1)
+    check(d_ov["overlay_segments"] == 1, "成片指纹记下覆盖层层数")
 
     print()
     print("全部通过" if not _fails else f"有 {_fails} 项未通过")

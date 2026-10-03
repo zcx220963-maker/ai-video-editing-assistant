@@ -33,11 +33,25 @@ _HINT = "\n\n[Analyze the error above and try a different approach.]"
 
 
 class ToolError(Exception):
-    """工具执行失败。带工具名与原始详情，字符串形式即回喂给模型的文本。"""
+    """工具执行失败。带工具名与原始详情，字符串形式即回喂给模型的文本。
 
-    def __init__(self, tool: str, detail: str) -> None:
+    ``counts_as_failure`` 把两种「失败」分开：
+
+    * ``True``（默认）——真跑坏了（超时、后端报错）。计入连续失败守卫，连着两次就
+      让模型停下来别再原地重试。
+    * ``False``——**这条错误本身就是可执行的反馈**：模型读着清单改输入再交一次，
+      那就是正路，不是原地重试。典型是 ``submit_plan`` 的校验打回。
+
+    混在一起算，守卫会把「改一个字再交一次」判成「工具坏了」，逼模型停下来把锅
+    抛给用户——真机实测：规划轮就因此弹出一张「当前这轮没有可用的剪辑执行工具，
+    你希望怎么处理？」的选项卡，用户对着它无从下手。
+    """
+
+    def __init__(self, tool: str, detail: str, *,
+                 counts_as_failure: bool = True) -> None:
         self.tool = tool
         self.detail = detail
+        self.counts_as_failure = counts_as_failure
         super().__init__(detail)
 
     def __str__(self) -> str:

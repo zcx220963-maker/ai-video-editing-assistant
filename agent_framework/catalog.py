@@ -81,6 +81,8 @@ PARAM_LABELS: dict[str, str] = {
     "clips": "镜头", "shot": "镜头", "shots": "镜头", "clip": "待剪片段",
     "groups": "分组", "script": "文案", "custom_script": "指定文案",
     "bgm": "配乐", "voiceover": "配音", "timeline": "时间线",
+    "overlay_events": "画面覆盖层", "dry_run": "只出计划不渲染",
+    "corrections": "修字表",
     "highlight": "高光", "keep_original_audio": "保留原声",
     "keep_segments": "保留片段", "target_duration_sec": "目标时长（秒）",
     "wait_sec": "等待时长（秒）", "duration": "时长（秒）",

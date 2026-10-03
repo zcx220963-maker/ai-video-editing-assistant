@@ -24,6 +24,8 @@ description: 【WORKFLOW SKILL】通用剪辑流程。适用于任何视频剪�
 可以在一轮里同时调用多个互不依赖的工具，系统会并行执行。例如：
 - load_media 之后可以一轮同时调 asr + split_shots（都只依赖 load_media）
 - asr 完成后可以一轮同时调 speech_rough_cut + understand_clips（互不依赖）
+- 转写有错字要修时调 correct_transcript（显式调用、不会被自动补齐）：它得**先于** speech_rough_cut 单独跑完，
+  粗剪读的就是它那份文本，所以两者不能同轮并发
 - generate_script 完成后可以一轮同时调 generate_voiceover + select_BGM
 但有依赖关系的工具不要同时调（如 split_shots 和 understand_clips）。
 

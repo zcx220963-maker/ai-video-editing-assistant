@@ -95,7 +95,7 @@ ffmpeg/ffprobe 阻塞原语（调用方一律 `asyncio.to_thread`）：`probe`�
 - `tts(text, dst)`：edge-tts，产物 <512B 视为失败。
 **所有网络/模型失败抛 ProviderError，由节点捕获降级，绝不炸整条流水线。**
 
-### 3.4 `storyline_server/nodes/core_nodes.py` — 19 个真实节点
+### 3.4 `storyline_server/nodes/core_nodes.py` — 20 个真实节点
 与 mock 同名同依赖（DAG 联机实测输出）：
 
 | 节点 | 依赖 | 真实实现 |
@@ -107,7 +107,8 @@ ffmpeg/ffprobe 阻塞原语（调用方一律 `asyncio.to_thread`）：`probe`�
 | filter_clips | understand_clips | 按主题关键词保留/丢弃 → `{clips, dropped}` |
 | group_clips | filter_clips | 按源素材聚合、合并 ≤4 组 → `{groups}` |
 | asr | load_media | whisper 分段转写 → `{asr_segments, warnings}` |
-| speech_rough_cut | asr | 按 max_pause_sec 保留口播段 → `{rough_clips, kept_sec}` |
+| correct_transcript | asr | **显式调用**的修字闸：`corrections=[{id, text}]` 只换文本，id/时间戳逐字保留 → `{asr_segments, corrections, corrected, unchanged_suspects}` |
+| speech_rough_cut | asr | 按 max_pause_sec 保留口播段 → `{rough_clips, kept_sec}`；Store 里有 correct_transcript 时改用修过字的那一份 |
 | script_template_rec | – | 模板库匹配 → `{templates}`（data/templates.json：vlog 三幕/知识口播/好物测评/自由） |
 | generate_script | group_clips, script_template_rec, text_rec | LLM 逐组产文案（支持 custom_script 直书），失败按字幕拼接兜底 → `{group_scripts, title}` |
 | generate_ai_transition | group_clips | VL 生成转场文案 → `{transitions}` |
@@ -118,7 +119,7 @@ ffmpeg/ffprobe 阻塞原语（调用方一律 `asyncio.to_thread`）：`probe`�
 | plan_timeline | speech_rough_cut, 4 项 | 基础时间线（画面+音轨+字幕）；满足原声条件时改出原声混剪时间线 |
 | plan_timeline_pro | speech_rough_cut, 6 项 | 叠加转场/花字推荐；同样支持原声混剪 |
 | plan_timeline_ai_transition | speech_rough_cut, 6 项 | 插入 xfade 转场事件（kind:"transition"）；同样支持原声混剪 |
-| render_video | 三个 timeline | 优先级 ai>pro>base 取最新；MoviePy 合成，异常回退 ffmpeg concat，**保证产出 mp4**；字节 publish 进 MinIO `renders/`，进度与结果写 `render_jobs`（status/stage/percent/error + 终态 `result`）。执行位已挪出请求生命周期（README §3.10）：handler 登记 + 后台起跑，内联只等 `render_grace_sec`，未完成即回 `{node, artifact_id, output:null, render:{status,stage,percent}, hint}` 并指向 `render_status`；done 后 `render_status` 从 `result` 重建 `{video, duration, width, height, title}` 并现签 `media_url`。返回值顶层保持 `node/artifact_id/output` 三键——`MediaCardHook` 与 `record_rendered_media` 就认这个形状 |
+| render_video | 三个 timeline | 优先级 ai>pro>base 取最新；MoviePy 合成，异常回退 ffmpeg concat，**保证产出 mp4**；字节 publish 进 MinIO `renders/`，进度与结果写 `render_jobs`（status/stage/percent/error + 终态 `result`）。执行位已挪出请求生命周期（README §3.10）：handler 登记 + 后台起跑，内联只等 `render_grace_sec`，未完成即回 `{node, artifact_id, output:null, render:{status,stage,percent}, hint}` 并指向 `render_status`；done 后 `render_status` 从 `result` 重建 `{video, duration, width, height, title}` 并现签 `media_url`。返回值顶层保持 `node/artifact_id/output` 三键——`MediaCardHook` 与 `record_rendered_media` 就认这个形状。另有 `dry_run` 开关：只回出片计划、不产出成片也不留痕（见下段） |
 
 **原声保真混剪（口播原声 + 空镜画面）**：三个 plan 节点的依赖把 `speech_rough_cut`
 排在 `generate_voiceover` **之前**，因此口播区间先落盘。当 ①`rough_clips` 非空且
@@ -129,6 +130,71 @@ ffmpeg/ffprobe 阻塞原语（调用方一律 `asyncio.to_thread`）：`probe`�
   `AudioFileClip(源视频).subclipped(...)` 直接从 mp4 取声）；
 - 时间线总长 = 口播净时长；画面轨用**非口播源素材**（空镜）循环铺满、裁到等长；
 - 字幕逐字取 ASR 原文；TTS 配音环节整体跳过。
+
+**画面覆盖层 `timeline.overlay_events`（讲到这句换画面，声音不动）**：主轨画面与口播声音
+都不动，只在指定窗口上盖一层素材。每一项写 `segments: [asr 段 id]` 而不是秒数——id 逐字取自
+`asr` 产出的 `asr_segments[].id`（`asr-N`，在 `asyncio.gather` **之后**编号所以稳定），
+`speech_rough_cut` 合并相邻段时把 id 汇总进 `ids`。渲染前 `resolve_overlay_anchors` 把 id
+换成成片秒数：先在这个素材的**声音**区间上找（口播正播这句的墙壁窗口），找不到再退到**画面**
+轨（配音模式的声音是 mp3，没有源片时刻可言）；多个 id 取并集窗口。认不出的 id 直接报错并
+列出真实存在的 id，不静默跳过。粒度如实：id 是**段（句）**级，不是词级——faster-whisper
+在本仓没开 `word_timestamps`，所以「绑词不绑秒」实现为「绑句 id 不绑秒」。
+覆盖层**永远静音**（自带音轨就会和口播抢声床）；MoviePy 走 `_overlay_layers`（cover 缩放后
+居中裁、contain 保比例，`except` 收集逐层原因后 raise——静默丢层查不到现场），
+ffmpeg 兜底走 `overlay=...:enable='between(t,…)'`；同样经过 `_localize_timeline`、
+`_check_overlay_media`（取不到字节 / 源区间超出素材长度 / 盖超出片总长）、`_trim_timeline`、
+分段渲染的 `_slice_timeline`，并被 `resync_original_audio_timeline` 一起掰齐、被
+`av_sync_check` 一起判偏差、计入 `timeline_digest.overlay_segments`。
+
+**转写修字闸 `correct_transcript`（只改字，不许挪位置）**：ASR 的错别字只有人能看出来，但
+「让模型顺手改一下」一旦放开时间戳就会变成下一次音画同步事故——句子被挪走，覆盖层的锚点也就锚错。
+所以这是一个**受闸的显式调用节点**（`require_explicit_call`，不进任何节点的 `required_nodes`）：
+入参只有 `corrections=[{id, text}]`，`id` 逐字取自 `asr_segments[].id`。四种情况当场 `ValueError`：
+id 不存在（报错列出真实 id）、同一 id 改两遍（否则后一条静默盖掉前一条）、text 为空（修字不是删段）、
+改动体量超出 `±max(3, ceil(0.3×原字数))`（口径是「中文逐字 + 拉丁按词」，不是字节数，改一个同音字
+UTF-8 字节会动三个而字数不动）；换内容不归它管，报错里直接指向 `speech_rough_cut.keep_segments`。
+产出把整份 `asr_segments` 原样带上，只替换被点名那条的 `text` 并加 `corrected` 标记，
+`corrections` 是修字表（改前/改后/落在第几秒/改了几个字），`unchanged_suspects` 是**形状**启发式清单
+（纯语气词、同字连三遍、识别失败占位）——它不判错别字，只给模型一张待办。
+下游采用只有一处判断：`speech_rough_cut` 探 Store（`state.store.has("correct_transcript")`），
+有就用修过的那份，`rough_clips` 的区间与 `ids` 不变，字幕随粗剪文本一起改对；覆盖层锚点读的是
+`asr` 那份的 id 与源时间窗，二者都未被触碰，所以修字前后 `resolve_overlay_anchors` 得到同一个输出
+窗口（测试里就比这两次解析的结果相等）。不修字时链路一字不变（闸是可选路径，不是必经）。
+（`tests/test_transcript_correction.py` 逐条钉住；mock 夹具 `agent_framework/video_editing.py`
+带同名同产物键的替身，离线用例验得到同一条路。）
+
+**`render_video` 的 `dry_run`（先回出片计划，不烧像素）**：同一个入口、同一批判断函数，
+只是把「raise」换成「记进 blocking 收下来」：deepcopy 时间线 → `resync_original_audio_timeline`
+→ `av_sync_check` → `validate_timeline_objects` → `_overlay_window_issues`，然后 `render_plan`
+把时间线翻成人能核对的一张账（总长/分辨率/fps/画面轨段数与秒数/人声轨含空档与末端/字幕条数与
+前 3 条文案/覆盖层的锚点与落点/转场/BGM 音量与文件名）。**不下载字节、不建 `render_jobs` 行、
+不开 `jobs`、不建工作区 `render/` 目录、不编码**；返回带 `__no_store__` 哨兵，
+`BaseNode.__call__` 因此跳过 Store 入库——`artifacts` 里不会留下一条永远渲不出成片的假产物。
+`not_checked` 如实列出它验不了的四项（字节是否真取得到、覆盖层源片实际长度、编码耗时、成片
+音画实测），所以它是「计划」而不是「体检报告」。`timeline_digest` 与真渲走同一函数，因此
+dry_run 的 `sha16` 与之后同一次真渲的 `sha16` 必然相等（测试 ⑩ 就钉这条）。渲染闸
+`should_gate_render` 对 dry_run 调用**放行**：闸的原话是「未终态不许收尾」，而 dry_run 根本不产生
+终态，拦它等于逼模型为了通过检查去渲一盘无意义的像素。
+
+**证据分级 `output.evidence`（「渲染完成」底下混着三种东西）**：`evidence_ledger(plan, worst_drift,
+resynced, bgm, probed, frames, frame_reason)` 在渲染出口生成一本账，每条是
+`{claim, level, label, status, proof}`。`level` 只有四级——`machine`（机器算过：编排、同步偏差、
+声音空档、覆盖层落点、BGM 音量系数）、`byte`（量过字节：ffprobe 的时长/分辨率/有无音轨）、
+`frame`（抽帧看过：不是黑屏、画面在动）、`listening`（只有人耳）；`status` 只有 `verified` 与
+`UNVERIFIED`，未验的 `proof` 必须写「为什么拿不到」。规则一条：**没做的那一步不许出现在 verified
+里**，末三条（听感、字幕排得对不对、内容对不对题）在任何一次调用里都是 UNVERIFIED——机器没有听觉，
+也没有对内容的判据。`frame` 是机器够得到的最高一级，靠 `_frame_spotcheck` 真取像素：ffmpeg 出
+15%/50%/85% 三帧的灰度裸流（不引入图片库，一帧即 w*h 字节），均值判黑屏（`luma<6.0`）、sha256
+指纹判定格，取完删掉临时文件；抽帧失败只把这两条降级为 UNVERIFIED 并写明原因，**不改判这次渲染**。
+真渲与 dry_run 共用同一本账（dry_run 下 `byte`/`frame` 自然全是 UNVERIFIED，因为不下载字节也不
+编码）。账本随 `output` 进 `render_jobs.result`，所以 `render_status` 与模型看到的 `tool_view`
+不必另接线就能拿到它；再顺 `MediaCardHook` 走 WS `media` 帧、`record_rendered_media` 进
+`qa.parts`、`_render_media_views` 重放，卡片侧只取 `{claim, label, verified}` 三样（`proof`
+长文本不落进持久片段），`evidence_rule` 一句要求模型只引用 verified 条目。
+（`tests/test_dry_run_plan.py` ⑤ 验分级与降级规则，`tests/test_render_pipeline.py` ⑪ 验真链路落点与
+不残留 `.gray` 临时文件，`tests/test_media_replay.py` 验三条出口同账。）
+剩下的边界：① 三点抽样不是全片扫描，中段一闪而过的黑屏查不出；② `luma<6.0` 与取样比例是经验值，
+没在片库上标定过；③ 本地 mock 兜底节点不产证据（它不编码），卡片只是缺这一栏。
 
 跨节点开关传递：Interceptor 补齐依赖时以默认入参执行依赖节点，故 `invoke()` 先把
 客户端参数留痕到 `NodeState.flags`，`_wants_original_audio` 依次查 inputs → flags →

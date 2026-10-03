@@ -306,6 +306,124 @@ async def case_reject_nodes() -> None:
     check(issues.ok, f"曲库标签给 1 个候选仍然通过（用户指定了那一首）：{issues.errors[:1]}")
 
 
+# ---- ②′ 一次打回交全部问题（步骤级错误不短路依赖检查） ---------------------
+
+def _gate_with_explicit_node() -> PlanGate:
+    """接上「必须显式调用」的节点：group_clips 不会被自动补齐，plan_timeline 依赖它。
+
+    离线夹具的契约里原本没有这类节点，而真机上模型最自然的写法恰恰是漏掉它——
+    只写 plan_timeline，以为 group_clips 会被服务端补上（真机实测就是这么撞的）。
+    """
+    reg = fake_registry()
+    reg.register(NodeTool("group_clips", "镜头分组", "按主题把镜头分组",
+                          {"group_by": {"type": "string", "enum": ["topic", "scene"],
+                                        "description": "分组口径"}},
+                          requires=["split_shots"]))
+    nodes = dict(fake_contract().nodes)
+    nodes["group_clips"] = NodeContract("group_clips", requires=("split_shots",),
+                                        explicit=True)
+    nodes["plan_timeline"] = NodeContract("plan_timeline",
+                                          requires=("group_clips", "select_BGM"))
+    return PlanGate(registry=reg, contract=EditingContract(nodes=nodes), catalog=CATALOG,
+                    skills=skills_loader(),
+                    extra_options=lambda node, key: _tags(node, key))
+
+
+async def case_all_issues_at_once() -> None:
+    print("\n=== ②′ 一次打回交全部问题：步骤级错误不许短路依赖检查 ===")
+    gate = _gate_with_explicit_node()
+    plan = one_plan()
+    # 两处毛病各属一层：① 参数层——布尔开关只给一个候选，用户没得挑；
+    # ② 依赖层——plan_timeline 依赖 group_clips，而卡上没写它（不可自动补齐）。
+    # 原先第一层一报错就 return，第二层压根不查：模型要交两回卡才知道两件事，
+    # 真机上第二回还半路撞上失败守卫，被推去问用户「这轮没有剪辑工具怎么办」。
+    step_of(plan, "plan_timeline")["param_options"] = [
+        {"key": "keep_original_audio", "options": [{"value": True}], "default": True}]
+    plans, issues = await gate.validate({"plans": [plan]})
+    joined = "；".join(issues.errors)
+
+    check(plans == [] and issues.errors, "打回：有错就一张卡都不放行")
+    check("只给了 1 个候选值" in joined, "参数层的问题在清单里（单值开关没有选择余地）")
+    check("group_clips" in joined and "不会自动补齐" in joined,
+          "依赖层的问题也在同一份清单里（原先被步骤级错误短路掉）")
+    check(len(issues.errors) >= 2,
+          f"同一次提交把两层的错一并交出去：{len(issues.errors)} 条")
+
+    # 反例：两处都改对了就一次通过——不短路不代表放宽判据。
+    good = one_plan()
+    step_of(good, "plan_timeline")["param_options"] = [
+        {"key": "keep_original_audio", "options": [{"value": True}, {"value": False}],
+         "default": True}]
+    good["steps"].insert(3, {"node": "group_clips", "why": "按主题把镜头分组",
+                             "expectation": "分成 3 组",
+                             "param_options": [{"key": "group_by",
+                                                "options": [{"value": "topic"},
+                                                            {"value": "scene"}],
+                                                "default": "topic"}]})
+    plans2, issues2 = await gate.validate({"plans": [good]})
+    check(issues2.ok and [s["node"] for s in plans2[0]["steps"]][:4]
+          == ["load_media", "split_shots", "select_BGM", "group_clips"],
+          f"补上 group_clips 与第二个候选值即通过：{issues2.errors[:2]}")
+
+
+# ---- ②″ 不可补齐的前置藏在「没上卡的中间节点」后面 -------------------------
+
+def _gate_with_explicit_chain() -> PlanGate:
+    """``select_BGM`` → ``generate_script`` → ``script_template_rec``（不可自动补齐）。
+
+    真机事故（用户截图那一跑）：三张候选卡都写了 ``select_BGM``，一张都没写
+    ``generate_script``／``script_template_rec``。闭包原先遇到没上卡的中间节点就
+    ``continue``，于是卡面看着齐全、一路放行；用户点完「按此执行」跑到 select_BGM
+    才被执行期拦下（「script_template_rec 需要你直接调用……请先调用
+    script_template_rec，再调用 generate_script」），那条 run 就废在那儿。
+
+    这里**不**重注册 select_BGM：离线夹具自带的那张（带 bgm_style 参数）要留着，
+    参数校验才走得到依赖那一层。
+    """
+    reg = fake_registry()
+    reg.register(NodeTool("script_template_rec", "模板推荐", "推荐脚本模板",
+                          {"style": {"type": "string", "enum": ["vlog", "interview"],
+                                     "description": "脚本风格"}},
+                          requires=["split_shots"]))
+    reg.register(NodeTool("generate_script", "文案生成", "按模板写文案", {},
+                          requires=["script_template_rec"]))
+    nodes = dict(fake_contract().nodes)
+    nodes["select_BGM"] = NodeContract("select_BGM", requires=("generate_script",))
+    nodes["generate_script"] = NodeContract("generate_script",
+                                            requires=("script_template_rec",))
+    nodes["script_template_rec"] = NodeContract("script_template_rec",
+                                                requires=("split_shots",), explicit=True)
+    return PlanGate(registry=reg, contract=EditingContract(nodes=nodes), catalog=CATALOG,
+                    skills=skills_loader(),
+                    extra_options=lambda node, key: _tags(node, key))
+
+
+async def case_explicit_dep_behind_missing_node() -> None:
+    print("\n=== ②″ 缺的前置藏在没上卡的中间节点后面（闭包要穿过去）===")
+    gate = _gate_with_explicit_chain()
+    plans, issues = await gate.validate({"plans": [one_plan()]})
+    joined = "；".join(issues.errors)
+
+    # 注意这里查的是 issues（依赖层的问题只进清单，不像步骤级错误那样把归一化结果
+    # 也丢掉——SubmitPlanTool 判的是 ``issues.errors``，那张「空表」的约定只覆盖
+    # 步骤级错误）。
+    check(not issues.ok and issues.errors,
+          "打回：卡上有 select_BGM、没有 generate_script，submit_plan 会拒绝这张卡")
+    check("script_template_rec" in joined and "不会自动补齐" in joined,
+          f"点名真正缺的那个（它在没上卡的中间节点后面）：{issues.errors[:1]}")
+    check(len(issues.errors) == 1,
+          f"同一个缺失节点只报一条（下游 select_BGM/plan_timeline/render_video 都撞它，"
+          f"报三条会挤满清单）：{len(issues.errors)} 条")
+
+    fixed = one_plan()
+    fixed["steps"].insert(2, {"node": "script_template_rec", "why": "先把脚本模板定下来",
+                              "expectation": "模板就绪"})
+    plans2, issues2 = await gate.validate({"plans": [fixed]})
+    check(issues2.ok and [s["node"] for s in plans2[0]["steps"]][:3]
+          == ["load_media", "split_shots", "script_template_rec"],
+          f"把缺的那个补进卡即通过（位置也接得上）：{issues2.errors[:2]}")
+
+
 # ---- ③ 非法跳过 / 拓扑序 --------------------------------------------------
 
 async def case_skip_and_topology() -> None:
@@ -615,11 +733,18 @@ async def case_submit_tool() -> None:
         bad = json.loads(json.dumps(one_plan()))
         step_of(bad, "render_video")["node"] = "not_a_node"
         r = await tool.execute(plans=[bad])
-        check(is_tool_error(r) and "计划校验未通过" in str(r),
-              "第一次不过：打回并带上失败原因")
+        # 「计划还没写对」是可执行的反馈，不是坏工具原地重试：模型照着清单改一版再交
+        # 正是正路。所以这条错误**不计入** agent 的连续失败守卫——真机实测里被它
+        # 数成 2 次失败后，模型被推去问用户「这轮没有剪辑工具怎么办」，那条岔路是死路。
+        check(is_tool_error(r) and "计划校验未通过" in str(r)
+              and not r.counts_as_failure,
+              "第一次不过：打回并带上失败原因，且不算作连续失败")
         r2 = await tool.execute(plans=[bad])
-        check(is_tool_error(r2) and "计划校验未通过" in str(r2),
-              "第二次不过：仍然打回并带上失败原因（停止重试由 agent 2-strike 规则管，不由工具管）")
+        # 到本工具自己的重试上限：再打回只是换着说法重交，出路是把卡点交回用户。
+        # 这一条才计数（模型确实在原地重试），也才由守卫那一侧兜底。
+        check(is_tool_error(r2) and r2.counts_as_failure
+              and "ask_user" in str(r2) and "最后一次的校验意见" in str(r2),
+              "第二次不过：到自己重试上限则计数，并要求走 ask_user 把卡点交回用户")
         check(drain_plan_cards() == [], "被打回的计划不落库")
         await hook.after_execute_tools(ctx)
         check(hook_mq.frames == [], "被打回时不回投计划卡")
@@ -940,6 +1065,8 @@ async def main() -> None:
     await case_multi_version()
     case_claim_predicates()
     await case_reject_nodes()
+    await case_all_issues_at_once()
+    await case_explicit_dep_behind_missing_node()
     await case_skip_and_topology()
     await case_hygiene()
     await case_execute_frame()

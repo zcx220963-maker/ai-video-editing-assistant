@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import random
 import re
@@ -337,7 +339,134 @@ class AsrNode(StoryNode):
         for segs, warns in results:
             segments.extend(segs)
             warnings.extend(warns)
+        # 段 id：画面覆盖层按 id 锚定（见 resolve_overlay_anchors），不按手写的秒。
+        # 在 gather **之后**编号，所以同一次转写的序号是稳定的。
+        for n, seg in enumerate(segments):
+            seg["id"] = f"asr-{n}"
         return {"asr_segments": segments, "warnings": warnings}
+
+
+# --------------------------------------------------------------------------
+# 修字闸：ASR 的错别字只有人能看出来，但「谁改的、改了哪句、时间动没动」必须机器记着
+# --------------------------------------------------------------------------
+
+_SUSPECT_FILLER = ("嗯", "啊", "呃", "哦", "唉", "那个", "就是说", "然后那个", "反正")
+_CJK = re.compile(r"[\u4e00-\u9fff]")
+_LATIN_WORD = re.compile(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*")
+_PUNCT = re.compile(r"[\s，。、！？；：,.!?;:…—–\-\"'\"“”‘’()（）\[\]{}]")
+
+
+def _unit_count(text: str) -> int:
+    """内容体量：中文逐字计、拉丁按词计。
+
+    修字闸要比的是「改完还是不是同一句话」，字节数和 token 数都会骗人（改一个同音字，
+    UTF-8 字节数会动三个），字数不会。
+    """
+    return len(_CJK.findall(text)) + len(_LATIN_WORD.findall(text))
+
+
+def _suspect(text: str) -> str:
+    """一段转写「大概还需要修」的启发式理由（空串=没可疑）。
+
+    这不是判错别字——机器判不了。它只是给模型一张待办清单：这几句的形状像识别打结，
+    你要不要顺手改一下。
+    """
+    body = _PUNCT.sub("", text)
+    if not body:
+        return "只有标点和空白，没有内容"
+    if re.search(r"(.)\1{2,}", body):
+        return "同一个字连着出现三遍以上，像识别打结"
+    if any(m in text for m in ("听不清", "无法识别", "(?)", "（?）", "背景音", "杂音")):
+        return "带着识别失败的占位说法"
+    stripped = body
+    for filler in _SUSPECT_FILLER:
+        stripped = stripped.replace(filler, "")
+    if not stripped:
+        return "整段只有语气词"
+    if len(stripped) * 3 < len(body):
+        return "整段几乎全是语气词（要不要留个响嘴的停顿，是内容判断不是拼写判断）"
+    return ""
+
+
+class CorrectTranscriptNode(StoryNode):
+    name = "correct_transcript"
+    display_name = "转写修字"
+    description = (
+        "ASR 修字闸：只改文本，时间戳与段 id 一律不动。"
+        "传 corrections=[{id, text}]，id 逐字取自 asr 返回的 asr_segments[].id。"
+        "口播粗剪与字幕会自动采用修过的文本；画面覆盖层的锚点不受影响（id 没动）。"
+    )
+    required_nodes = ["asr"]
+    require_explicit_call = True
+    input_schema = _obj("转写修字", {
+        "corrections": {
+            "type": "array",
+            "description": "修正项列表，每项 {id, text}；id 必须是 asr_segments[].id，"
+                           "text 是改后的**整句**（同音字、专名、漏字），不要只传 diff",
+            "items": {"type": "object"},
+        },
+    }, required=["corrections"])
+
+    async def process(self, state, inputs):
+        segs = inputs["asr"]["asr_segments"]
+        corrections = inputs.get("corrections")
+        if not corrections:
+            raise ValueError(
+                "correct_transcript 需要你传入 corrections（[{id, text}]）。"
+                "先读 asr 的整份转写，把识别错的字写进 text——时间戳和 id 不归你写，"
+                "本工具只换文本；确实没有要修的就别调它。"
+            )
+        by_id = {str(s.get("id", "")): s for s in segs}
+        seen: set[str] = set()
+        fixed: dict[str, str] = {}
+        ledger: list[dict[str, Any]] = []
+        for c in corrections:
+            sid = str(c.get("id", "")).strip()
+            if sid not in by_id:
+                raise ValueError(
+                    f"修字锚点认不出来：{sid!r} 不在本次转写里。\n"
+                    f"真实存在的 id（前 20 个）：{[s.get('id') for s in segs[:20]]}"
+                )
+            if sid in seen:
+                raise ValueError(
+                    f"同一个 id 被改了两遍：{sid}——后一条会静默盖掉前一条，请合成一条 text")
+            old_text = str(by_id[sid].get("text", ""))
+            new_text = re.sub(r"\s+", " ", str(c.get("text", ""))).strip()
+            if not new_text:
+                raise ValueError(f"{sid} 的 text 是空的：修字不是删段，这句确实不要就别改它")
+            old_n, new_n = _unit_count(old_text), _unit_count(new_text)
+            tolerance = max(3, (old_n * 3 + 9) // 10)   # 允许 ±30%，且至少 3 个字
+            if abs(new_n - old_n) > tolerance:
+                raise ValueError(
+                    f"{sid} 改动过大（原 {old_n} 个字/词 → 新 {new_n} 个，只允许 ±{tolerance}）。"
+                    "这道闸只管同音错别字、专名和漏字，不管换内容——"
+                    "想丢掉或换成别的话，请在 speech_rough_cut 的 keep_segments 里选段。"
+                )
+            seen.add(sid)
+            fixed[sid] = new_text
+            ledger.append({"id": sid, "clip": by_id[sid].get("clip"),
+                           "at": [by_id[sid]["start"], by_id[sid]["end"]],
+                           "before": old_text, "after": new_text,
+                           "changed_units": new_n - old_n})
+
+        patched: list[dict[str, Any]] = []
+        for s in segs:
+            seg = dict(s)
+            sid = str(seg.get("id", ""))
+            if sid in fixed:
+                seg["text"] = fixed[sid]      # 只动这一个键，其余逐字保留
+                seg["corrected"] = True
+            patched.append(seg)
+        suspects = []
+        for seg in patched:
+            why = _suspect(str(seg.get("text", "")))
+            if why and not seg.get("corrected"):
+                suspects.append({"id": seg.get("id"), "clip": seg.get("clip"),
+                                 "at": [seg["start"], seg["end"]],
+                                 "text": seg.get("text", ""), "why": why})
+        return {"asr_segments": patched, "corrections": ledger,
+                "corrected": len(ledger), "unchanged_suspects": suspects,
+                "note": "时间戳与 id 未动：字幕、口播粗剪、覆盖层锚点仍按原区间对齐"}
 
 
 class SpeechRoughCutNode(StoryNode):
@@ -372,7 +501,13 @@ class SpeechRoughCutNode(StoryNode):
     })
 
     async def process(self, state, inputs):
-        segs = inputs["asr"]["asr_segments"]
+        # 修字优先：correct_transcript 标了「必须显式调用」、也不在下面的 required_nodes 里，
+        # 所以拦截器不会替我补齐它——只能自己探 Store：用户/模型修过字，这段口播的文本就得按改后的走。
+        # 它只换 text、id 与时间戳逐字不动，因此后面的区间合并与选段逻辑一字不用改。
+        source = inputs["asr"]
+        if await state.store.has("correct_transcript"):
+            source = await state.store.get("correct_transcript") or source
+        segs = source["asr_segments"]
         clip_filter = inputs.get("clip")
         if clip_filter:
             segs = [s for s in segs if s.get("clip") == clip_filter]
@@ -383,8 +518,12 @@ class SpeechRoughCutNode(StoryNode):
             if rough and s["clip"] == rough[-1]["clip"] and s["start"] - rough[-1]["end"] < 0.5:
                 rough[-1]["end"] = s["end"]
                 rough[-1]["text"] += " " + s["text"]
+                if s.get("id"):
+                    rough[-1]["ids"].append(s["id"])
             else:
-                rough.append(dict(s))
+                item = dict(s)
+                item["ids"] = [s["id"]] if s.get("id") else []
+                rough.append(item)
 
         # LLM 选段优先：Agent 读 ASR 转写后自行挑段落，直接用
         keep = inputs.get("keep_segments")
@@ -398,6 +537,14 @@ class SpeechRoughCutNode(StoryNode):
                             float(r["start"]) - float(seg["start"])) < 1.0:
                             seg["text"] = r["text"]
                             break
+                # 覆盖层锚点认的是 ASR 段 id；模型手写的 keep_segments 只有秒，
+                # 这里按源时间窗把落在其中的 ASR 段 id 补回去，缺了它覆盖层就无处可锚。
+                if not seg.get("ids"):
+                    seg["ids"] = [
+                        r_id for r in rough if r.get("clip") == seg.get("clip")
+                        and float(r["end"]) > float(seg["start"])
+                        and float(r["start"]) < float(seg["end"])
+                        for r_id in r.get("ids", [])]
                 resolved.append(seg)
             return {"rough_clips": resolved, "kept_sec": round(sum(
                 float(r["end"]) - float(r["start"]) for r in resolved), 2),
@@ -1319,12 +1466,20 @@ def _trim_timeline(tl: dict[str, Any], target: float | None
 
     events = [e for e in (_clip(x) for x in tl.get("events", [])) if e]
     audio = [a for a in (_clip(x) for x in tl.get("audio_events", [])) if a]
+    overlays = [o for o in (_clip(x) for x in tl.get("overlay_events", [])
+                            if isinstance(x, dict) and x.get("start") is not None)
+                if o and o["end"] > o["start"]]
     subs = [s for s in (_clip(x) for x in tl.get("subtitles", []))
             if s and s["end"] > s["start"]]
     total = round(max([float(e["end"]) for e in events]) if events else limit, 3)
     note = f"已按目标时长裁到 {total}s（原 {tl.get('duration')}s）"
-    return {**tl, "duration": total, "events": events,
-            "audio_events": audio, "subtitles": subs}, note
+    trimmed = {**tl, "duration": total, "events": events,
+               "audio_events": audio, "subtitles": subs}
+    if overlays:
+        trimmed["overlay_events"] = overlays
+    else:
+        trimmed.pop("overlay_events", None)
+    return trimmed, note
 
 
 def _plan_output(state, inputs, tl: dict[str, Any], key: str) -> dict[str, Any]:
@@ -1422,6 +1577,10 @@ async def _localize_timeline(tl: dict[str, Any], workspace, dst_dir: Path) -> di
            "events": [{**ev, "path": await _p(ev["path"])} for ev in tl.get("events", [])],
            "audio_events": [{**ae, "path": await _p(ae["path"])}
                             for ae in tl.get("audio_events", [])]}
+    if tl.get("overlay_events"):
+        out["overlay_events"] = [{**ov, "path": await _p(ov["path"])}
+                                 for ov in tl["overlay_events"] if isinstance(ov, dict)
+                                 and ov.get("path")]
     if (tl.get("bgm") or {}).get("path"):
         out["bgm"] = {**tl["bgm"], "path": await _p(tl["bgm"]["path"])}
     return out
@@ -1545,7 +1704,8 @@ def resync_original_audio_timeline(tl: Any) -> int:
         return None
 
     changed = 0
-    for ev in events:
+    picture = list(events) + [o for o in (tl.get("overlay_events") or []) if isinstance(o, dict)]
+    for ev in picture:
         if not isinstance(ev, dict):
             continue
         path = str(ev.get("path") or "")
@@ -1564,6 +1724,391 @@ def resync_original_audio_timeline(tl: Any) -> int:
     return changed
 
 
+def resolve_overlay_anchors(tl: Any, anchors: Any, *, media_paths: Any = None) -> int:
+    """把 ``overlay_events[].segments`` 里的转写段 id 换成输出时间轴上的秒。返回解析了几层。
+
+    为什么要有它（借 chengfeng-videocut 的「绑词不绑秒」）：覆盖层的意图是
+    「讲到这句话时把画面换成风景」，而这句话在哪一秒**取决于前面剪了多少**。
+    模型手写秒数时，每改一次剪辑就得重算一遍坐标——这正是音画不同步的另一种形态。
+    锚在段 id 上，秒数由这一道现算，剪掉的段落自动不占位置。
+
+    映射只用时间线自身：id 的源时间窗（ASR 的 ``start``/``end``，源片秒）落在输出轴上的
+    哪一段——先按 ``audio_events``（原声混剪时「这句话正在被播」就是这句话的位置），
+    再按 ``events``（配音模式下声音是念稿，只有画面在这几秒放这段源片）。
+    两条轨都没有这个源窗口时才报错，而不是安静地盖在错误的位置。
+    """
+    if not isinstance(tl, dict):
+        return 0
+    overlays = tl.get("overlay_events")
+    if not isinstance(overlays, list) or not overlays:
+        return 0
+
+    by_id = {str(a.get("id")): a for a in (anchors or [])
+             if isinstance(a, Mapping) and a.get("id")}
+
+    def _spans(items: Any) -> list[tuple[str, float, float, float, float]]:
+        out = []
+        for it in items or []:
+            if not isinstance(it, Mapping) or it.get("start") is None:
+                continue
+            s = float(it["start"])
+            e = float(it["end"]) if it.get("end") is not None else s + float(it.get("duration") or 0)
+            ss = float(it.get("src_start") or 0.0)
+            se = float(it["src_end"]) if it.get("src_end") is not None else ss + (e - s)
+            out.append((str(it.get("path") or ""), s, e, ss, se))
+        return out
+
+    # 两条可对上的轨：声音（原声混剪时这句话正在被播）与画面（配音模式下这句话的画面在放）。
+    voice_spans = _spans(tl.get("audio_events"))
+    pic_spans = _spans(tl.get("events"))
+    single_path = {p for p, *_ in voice_spans} or {p for p, *_ in pic_spans}
+    resolved = 0
+
+    def _clip_path(clip_id: str) -> str:
+        p = str((media_paths or {}).get(clip_id) or "")
+        if p:
+            return p
+        if len(single_path) == 1:
+            return next(iter(single_path))      # 只有一个声源时不必再认素材编号
+        raise ValueError(
+            f"覆盖层的锚点段落属于素材「{clip_id}」，但时间线里认不出它的对象键"
+            f"（时间线里有 {sorted(single_path)}）。"
+            "请在 overlay 里改用 start/end 显式秒数，或先 load_media 让素材编号可用。")
+
+    def _output_window(anchor: Mapping) -> tuple[float, float] | None:
+        src0, src1 = float(anchor["start"]), float(anchor["end"])
+        path = _clip_path(str(anchor.get("clip") or ""))
+        for spans in (voice_spans, pic_spans):   # 先声音，再画面
+            hits = []
+            for p, s, e, ss, se in spans:
+                if p != path:
+                    continue
+                o0, o1 = max(src0, ss), min(src1, se)
+                if o1 > o0:
+                    hits.append((s + (o0 - ss), s + (o1 - ss)))
+            if hits:
+                return min(h[0] for h in hits), max(h[1] for h in hits)
+        return None
+
+    for i, ov in enumerate(overlays, 1):
+        if not isinstance(ov, dict):
+            continue
+        ids = [str(x) for x in (ov.get("segments") or [])]
+        if not ids:
+            continue                             # 显式秒数写法，原样交给渲染
+        windows = []
+        missing = []
+        for sid in ids:
+            anchor = by_id.get(sid)
+            if anchor is None:
+                missing.append(sid)
+                continue
+            win = _output_window(anchor)
+            if win is None:
+                missing.append(
+                    f"{sid}（声音轨和画面轨都没有源片 "
+                    f"{anchor.get('start')}~{anchor.get('end')} 秒这一段"
+                    f"（按 {Path(str(_clip_path(str(anchor.get('clip') or '')))).name} 找），"
+                    f"多半已被剪掉）")
+                continue
+            windows.append(win)
+        if missing:
+            real = ", ".join(sorted(by_id)[:12])
+            raise ValueError(
+                f"第 {i} 个覆盖层（overlay_events[{i - 1}]）的锚点认不出来："
+                + ", ".join(missing)
+                + f"\nasr 段里真实存在的 id 是：{real or '（本轮没跑 asr，所以一个也没有）'}"
+                + "\n锚点必须逐字取自 asr 返回的 asr_segments[].id；"
+                  "确实要按秒盖，就在这个覆盖层里直接写 start/end，别写 segments。")
+        ov["start"] = round(min(w[0] for w in windows), 3)
+        ov["end"] = round(max(w[1] for w in windows), 3)
+        ov.setdefault("src_start", 0.0)
+        if ov.get("src_end") is None:
+            ov["src_end"] = round(float(ov["src_start"]) + (ov["end"] - ov["start"]), 3)
+        ov.setdefault("fit", "cover")
+        resolved += 1
+    return resolved
+
+
+SYNC_TOLERANCE_SEC = 0.25   # 音画同步闸值：证据账判「达标」用的就是这一个数，别在两处写两份
+
+
+def av_sync_check(tl: Any, *, tolerance: float = SYNC_TOLERANCE_SEC) -> tuple[float, list[str]]:
+    """渲染前的同步闸：返回 (最大偏差秒数, 违规说明清单)。
+
+    和 ``resync_original_audio_timeline`` 的分工：那道**修**它认得出的错位，
+    这道**拦**它认不出的。少了这一道，校准就是静默放行——模型换一种写法
+    （口播素材的画面落在没有它声音的位置、或原声模式压根没排声音段），
+    错位照样出片，而回给用户的还是那句「严格音画同步」。真机为这句话烧了
+    六次 40 轮预算，用户第三次报同一件事时才查出根因。
+
+    只判**有嘴型可言**的段：画面素材同时出现在声音段里（同源）才要求对齐；
+    空镜（不同源）不动——它没有嘴可对。
+    """
+    if not isinstance(tl, Mapping):
+        return 0.0, []
+    events = tl.get("events") or []
+    audios = tl.get("audio_events") or []
+    spans: list[tuple[float, float, float, str]] = []
+    for a in audios:
+        if not isinstance(a, Mapping):
+            continue
+        s, e, ss = a.get("start"), a.get("end"), a.get("src_start")
+        if s is None or e is None or ss is None:
+            continue
+        spans.append((float(s), float(e), float(ss), str(a.get("path") or "")))
+    voice_paths = {p for *_, p in spans if p}
+
+    def _oncam(items: Any, label: str) -> list[tuple[str, dict]]:
+        return [(label, ev) for ev in (items or [])
+                if isinstance(ev, dict) and str(ev.get("path") or "") in voice_paths
+                and ev.get("start") is not None and ev.get("src_start") is not None]
+
+    oncam = _oncam(events, "画面") + _oncam(tl.get("overlay_events"), "覆盖层")
+    if not spans:
+        if str(tl.get("mode") or "") == "original_audio" and events:
+            return 0.0, [f"原声混剪（mode=original_audio）却没排任何声音段"
+                         f"（audio_events 缺失或为空），却有 {len(events)} 个画面段"
+                         f"——口播素材上屏时无从判断嘴型，等于盲排"]
+        return 0.0, []
+
+    def voice_at(wall: float, path: str) -> float | None:
+        for s, e, ss, p in spans:
+            if p == path and s <= wall < e:
+                return ss + (wall - s)
+        return None
+
+    worst = 0.0
+    bad: list[str] = []
+    for i, (label, ev) in enumerate(oncam, 1):
+        s, e = float(ev["start"]), float(ev["end"])
+        path = str(ev.get("path") or "")
+        reported = False       # 同一段的起点/终点是同一个错位，只报一条，但两点都要测偏差
+        for point, wall in (("起点", s), ("终点", max(s, e - 0.01))):
+            v = voice_at(wall, path)
+            if v is None:
+                bad.append(f"第 {i} 段{label}（输出 {s:.2f}–{e:.2f} 秒）用的是口播素材，"
+                           f"但{point} {wall:.2f} 秒处没有它自己的声音在播"
+                           f"——画面与声音不同源，嘴型必然对不上")
+                break
+            drift = abs(float(ev["src_start"]) + (wall - s) - v)
+            worst = max(worst, drift)
+            if drift > tolerance and not reported:
+                bad.append(f"第 {i} 段{label}（输出 {s:.2f}–{e:.2f} 秒）在{point} {wall:.2f} 秒处"
+                           f"比声音早/晚 {drift:.2f} 秒：画面取源时刻 "
+                           f"{float(ev['src_start']) + (wall - s):.2f}，"
+                           f"而此刻声音正播到源时刻 {v:.2f}")
+                reported = True
+    return worst, bad
+
+
+def _span_end(item: Mapping[str, Any]) -> float:
+    """一段的结束秒：配音段只带 duration，其余带 end——两种写法都要认。"""
+    end = item.get("end")
+    if end is None:
+        end = float(item.get("start") or 0.0) + float(item.get("duration") or 0.0)
+    return float(end)
+
+
+def _track_ledger(items: Any) -> dict[str, Any]:
+    """一条轨的账：几段、总共多少秒、铺到第几秒、中间有哪些空洞。"""
+    spans = sorted((float(x.get("start") or 0.0), _span_end(x))
+                   for x in (items or []) if isinstance(x, Mapping))
+    seconds = round(sum(max(0.0, e - s) for s, e in spans), 3)
+    gaps: list[list[float]] = []
+    covered = 0.0
+    for s, e in spans:
+        if s - covered > 0.05:
+            gaps.append([round(covered, 3), round(s, 3)])
+        covered = max(covered, e)
+    return {"segments": len(spans), "seconds": seconds,
+            "reaches": round(covered, 3),
+            "gaps": [[a, b] for a, b in gaps if b - a > 0.05]}
+
+
+def render_plan(tl: dict[str, Any]) -> dict[str, Any]:
+    """出片计划：这份时间线**将要**渲成什么样（dry-run 的正文，一个像素都不渲）。
+
+    与 ``timeline_digest`` 的分工：digest 是渲完之后入库的指纹，plan 是渲之前给
+    人看的那一眼。两者读的是同一份时间线，所以 dry-run 的 sha16 与真渲成片的
+    sha16 相等——「看到的即是渲出来的」这句话因此可核对，不用信措辞。
+
+    纯函数、不碰字节；输出一律不出现本机路径（只留文件名）。
+    """
+    overlays = [o for o in (tl.get("overlay_events") or []) if isinstance(o, Mapping)]
+    subs = [s for s in (tl.get("subtitles") or []) if isinstance(s, Mapping)]
+    bgm = tl.get("bgm") if isinstance(tl.get("bgm"), Mapping) else None
+    return {
+        "duration": round(float(tl.get("duration") or 0), 3),
+        "resolution": f"{tl.get('width') or 1280}x{tl.get('height') or 720}",
+        "fps": tl.get("fps") or 25.0,
+        "mode": str(tl.get("mode") or "voiceover"),
+        "picture": _track_ledger(tl.get("events")),
+        "voice": _track_ledger(tl.get("audio_events")),
+        "subtitles": {**_track_ledger(subs),
+                      "sample": [str(s.get("text") or "") for s in subs[:3]]},
+        "overlays": [{
+            "at": [round(float(o.get("start") or 0), 3), round(_span_end(o), 3)],
+            "anchors": [str(x) for x in (o.get("segments") or [])],
+            "source": Path(str(o.get("path") or "")).name,
+            "fit": str(o.get("fit") or "cover"),
+            "src_window": [round(float(o.get("src_start") or 0.0), 3),
+                           round(float(o.get("src_end") or 0.0), 3)]
+            if o.get("src_start") is not None or o.get("src_end") is not None else None,
+            "audio": False,      # 覆盖层永远静音，这里如实记下
+        } for o in overlays if o.get("start") is not None],
+        "transitions": sum(1 for e in (tl.get("events") or [])
+                           if isinstance(e, Mapping) and e.get("kind") == "transition"),
+        "bgm": ({"volume": round(float(bgm.get("volume") or 0), 2),
+                 "asset": Path(str(bgm.get("path") or "")).name} if bgm else None),
+    }
+
+
+def timeline_digest(tl: Any, *, max_drift: float, resynced: int) -> dict[str, Any]:
+    """「实际被渲染的那一版」时间线的指纹，落进成片产物。
+
+    为什么要它：真机用户三次报「音画不同步」，而我们手里只有 render_jobs.result 的
+    duration/title——看不出当时那份时间线到底怎么排的、偏差多大，只能靠猜。有了
+    指纹，「这版出镜 5 段、最大偏差 0.00 秒」就是可自证的记录，不是模型的措辞。
+    """
+    return {
+        "sha16": hashlib.sha256(json.dumps(
+            tl, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()[:16],
+        "mode": str(tl.get("mode") or "") if isinstance(tl, Mapping) else "",
+        "video_segments": len(tl.get("events") or []) if isinstance(tl, Mapping) else 0,
+        "audio_segments": len(tl.get("audio_events") or []) if isinstance(tl, Mapping) else 0,
+        "overlay_segments": len(tl.get("overlay_events") or []) if isinstance(tl, Mapping) else 0,
+        "max_av_drift_sec": round(float(max_drift), 3),
+        "resynced_segments": int(resynced),
+    }
+
+
+EVIDENCE_LEVELS = ("machine", "byte", "frame", "listening", "eyeball")
+EVIDENCE_LABELS = {"machine": "机器算过", "byte": "量过字节",
+                   "frame": "抽帧看过", "listening": "只有人耳",
+                   "eyeball": "只有人眼"}
+
+
+def _ev(claim: str, level: str, *, verified: bool, proof: str = "") -> dict[str, Any]:
+    """一条证据：主张 + 哪类证据能了结它 + 这一次到底拿到没有。"""
+    return {"claim": claim, "level": level, "label": EVIDENCE_LABELS[level],
+            "status": "verified" if verified else "UNVERIFIED",
+            "proof": proof if verified else (proof or "这一条没验")}
+
+
+def _frame_spotcheck(path: Path, duration: float, dst_dir: Path) -> dict[str, Any]:
+    """从**渲好的成片**里真取几帧：判「不是黑屏」与「画面在动」。
+
+    为什么值得花这几百毫秒：证据分级里 `frame` 是机器能够到的最高一级——时间线算得再对，
+    也只证明「我打算这么排」；黑屏、定格、整片没画面这类事故只有像素知道。
+    用 ffmpeg 出灰度裸流而不是装图片库：一帧就是 w*h 个字节，均值和指纹在 Python 里算，
+    不新增依赖。
+    """
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    times = ([0.0] if duration < 0.8 else
+             [round(duration * f, 3) for f in (0.15, 0.5, 0.85)])
+    luma: list[float] = []
+    fingerprints: list[str] = []
+    for i, t in enumerate(times):
+        raw = dst_dir / f"spot_{i}.gray"
+        mediaops.ffmpeg("-ss", f"{t:.3f}", "-i", str(path), "-frames:v", "1",
+                        "-vf", "format=gray", "-f", "rawvideo", str(raw), timeout=120)
+        data = raw.read_bytes()
+        raw.unlink(missing_ok=True)
+        if not data:
+            raise MediaError(f"第 {i + 1} 帧（{t}s）取出来是空的")
+        luma.append(round(sum(data) / len(data), 2))
+        fingerprints.append(hashlib.sha256(data).hexdigest()[:12])
+    black = [i for i, v in enumerate(luma) if v < 6.0]
+    return {"at": times, "luma": luma, "black_indices": black,
+            "distinct": len(set(fingerprints)) == len(fingerprints),
+            "min_luma": min(luma)}
+
+
+def evidence_ledger(plan: Mapping[str, Any], *, worst_drift: float, resynced: int,
+                    bgm: bool = False, probed: Mapping[str, Any] | None = None,
+                    frames: Mapping[str, Any] | None = None,
+                    frame_reason: str = "") -> list[dict[str, Any]]:
+    """这盘片子**能被证明到什么程度**，逐条落成账（渲染产物与渲染任务里都留一份）。
+
+    为什么要它（借来的第三条）：模型和用户拿到的都只是一句「渲染完成」，而「完成」底下
+    混着三种完全不同的东西——按数据算出来的、量过真实字节/像素的、以及机器压根验不了的
+    （听感、字幕好不好看、盖上去的是不是你要那张）。不分级就等于让前两类替第三类背书，
+    而第三次报「音画不同步」时手里没有任何一条可核对的记录。
+
+    规则只有一条：**没做的那一步不许出现在 verified 里**。拿不到的证据写明为什么拿不到。
+    """
+    tol = SYNC_TOLERANCE_SEC
+    led: list[dict[str, Any]] = [
+        _ev(f"成片按这份编排排：总长 {plan['duration']}s、画面 {plan['picture']['segments']} 段/"
+            f"{plan['picture']['seconds']}s、声音 {plan['voice']['segments']} 段/"
+            f"{plan['voice']['seconds']}s、字幕 {plan['subtitles']['segments']} 条",
+            "machine", verified=True,
+            proof="render_plan 与 timeline_digest 读同一份时间线（sha16 可核对）"),
+        _ev(f"音画同步：出镜画面的源时刻与同一时刻声音的源时刻最大偏差 "
+            f"{round(float(worst_drift), 3)}s（闸值 {tol}s）"
+            + (f"，渲染前自动钉回 {resynced} 段" if resynced else ""),
+            "machine", verified=abs(float(worst_drift)) <= tol,
+            proof="av_sync_check 在渲染前对最终时间线算的数；"
+                  "它验的是**时间码**，嘴型像不像仍要人看"),
+        _ev("声音有静音空档：" + ("、".join(f"{a}~{b}s" for a, b in plan["voice"]["gaps"][:4])
+                                  if plan["voice"]["gaps"] else "无（排满了）"),
+            "machine", verified=True, proof="按 audio_events 的墙壁区间算"),
+    ]
+    if plan["overlays"]:
+        led.append(_ev(
+            "覆盖层落点：" + "；".join(f"第 {i} 层盖 {o['at'][0]}~{o['at'][1]}s"
+                                       f"（锚 {','.join(o['anchors']) or '秒数写法'}）"
+                                       for i, o in enumerate(plan["overlays"], 1)),
+            "machine", verified=True,
+            proof="resolve_overlay_anchors 按 asr 段 id 现算，主轨画面与声音都未改动"))
+    if bgm:
+        led.append(_ev(f"配乐音量 {plan['bgm']['volume'] if plan['bgm'] else '—'}"
+                       "（相对人声，非听感判断）", "machine", verified=True,
+                       proof="按时间线里的音量系数记录"))
+
+    if probed is not None:
+        led.append(_ev(f"成片字节真实存在：{probed['duration']}s / "
+                       f"{probed['width']}x{probed['height']} / "
+                       f"{'含音轨' if probed.get('has_audio') else '无音轨'}",
+                       "byte", verified=True, proof="ffprobe 渲好的那个文件"))
+        led.append(_ev("成片确实有声音轨（不是排了声音却导出静音文件）", "byte",
+                       verified=bool(probed.get("has_audio")),
+                       proof="ffprobe 的流清单"
+                             + ("" if probed.get("has_audio") else "：这条时间线没排出声音")))
+    else:
+        led.append(_ev("成片字节（时长/分辨率/有无音轨）", "byte", verified=False,
+                       proof="还没渲——dry_run 不下载字节也不编码"))
+        led.append(_ev("声音是否真的进了导出文件", "byte", verified=False,
+                       proof="还没渲"))
+
+    if frames is not None:
+        led.append(_ev(f"画面不是黑屏：抽帧 {len(frames['at'])} 张，"
+                       f"平均亮度最低 {frames['min_luma']}",
+                       "frame", verified=not frames["black_indices"],
+                       proof="ffmpeg 取 15%/50%/85% 三帧的灰度均值"
+                             + (f"；第 {frames['black_indices']} 帧接近全黑"
+                                if frames["black_indices"] else "")))
+        led.append(_ev("画面在动（不是定格一张）", "frame", verified=frames["distinct"],
+                       proof="三帧灰度数据指纹"
+                             + ("互不相同" if frames["distinct"] else "完全相同——像定格")))
+    else:
+        led.append(_ev("画面不是黑屏 / 不是定格", "frame", verified=False,
+                       proof=frame_reason or "抽帧这一步没跑成（不影响成片是否存在）"))
+
+    led += [
+        _ev("听感：音量平衡、有没有爆音、口型听不听得出来", "listening", verified=False,
+            proof="机器没有听觉——这一条只能你听，或换一条能听音轨的路子"),
+        _ev("字幕排得对不对：有没有溢出画面、字体缺不缺、句子断得自然不自然", "eyeball",
+            verified=False,
+            proof="抽帧只比了亮度与指纹，读不出字；机器只知道排了 "
+                  f"{plan['subtitles']['segments']} 条"),
+        _ev("内容对不对题：这段画面是不是你说的那个、盖上去的是不是你要那张", "eyeball",
+            verified=False, proof="机器没有对内容的判据——需要你这一眼"),
+    ]
+    return led
+
+
 class RenderVideoNode(StoryNode):
     name = "render_video"
     display_name = "成片渲染"
@@ -1579,9 +2124,20 @@ class RenderVideoNode(StoryNode):
         **_TIMELINE_PROPS,
         "timeline": {
             "type": "object",
-            "description": "自定义时间线 JSON（含 events/audio_events/subtitles/bgm 等）；"
+            "description": "自定义时间线 JSON（含 events/audio_events/subtitles/overlay_events/bgm 等）；"
                            "传入后直接用这份时间线渲染，跳过 plan_timeline* 自动生成。"
                            "用于精确控制画面穿插、字幕、转场等自动规划工具搞不定的需求",
+        },
+        "overlay_events": {
+            "type": "array",
+            "description": "画面覆盖层：主轨画面与口播声音都不动，只在指定窗口上盖一层"
+                           "（配「讲这句时换成风景/录屏，声音不变」这类需求）。"
+                           "每项 {segments: [asr 段 id], path: 盖层素材的对象键, "
+                           "fit?: cover(裁满)/contain(留边), src_start?/src_end?: 盖层素材自取源片哪一段，"
+                           "缺省从 0 起取满窗口}。segments 里的 id 必须逐字取自 asr 返回的 "
+                           "asr_segments[].id，秒数由系统按成片算，不要自己写；"
+                           "不想锚句子时可直接写 start/end（输出秒）。覆盖层永远静音。",
+            "items": {"type": "object"},
         },
         "wait_sec": {
             "type": "number",
@@ -1593,6 +2149,14 @@ class RenderVideoNode(StoryNode):
             "description": "渲染路径：auto（默认，先 MoviePy 失败再问用户）/ ffmpeg（直接用 ffmpeg 兜底渲染）/"
                            "low_res（降分辨率重试 MoviePy）。auto 模式下 MoviePy 失败会返回可选方案让用户选，"
                            "不会静默兜底。",
+        },
+        "dry_run": {
+            "type": "boolean",
+            "description": "只要出片计划、不要渲：把真渲染会跑的每一道校验（锚点换算、音画同步校准与闸门、"
+                           "对象键是否存在、覆盖层窗口）全跑一遍，回一份「将要渲成什么样」的账"
+                           "（时长/段数/字幕/覆盖层盖在哪几秒/会被拦下的原因），"
+                           "不下载字节、不编码、不写渲染任务、不产出成片。"
+                           "改完编排想确认渲得出来、或想核对盖了哪几秒，但不想再等一次渲染时用。",
         },
     })
 
@@ -1618,10 +2182,34 @@ class RenderVideoNode(StoryNode):
         artifact = state.artifact_id or "_default"
         sess = state.session_id
         jobs = self.storage.render_jobs
+        dry = _flag_on(inputs.get("dry_run")
+                       if inputs.get("dry_run") is not None
+                       else (state.flags.get("dry_run") if getattr(state, "flags", None) else None))
         # open 回带**本次尝试的令牌**：后面所有写（进度/成功/失败）都带上它，
         # 令牌一旦被换掉（判死、重开），本次的迟到写就自动作废。
-        row = await jobs.open(sess, artifact)
+        # dry_run 不开任务行：它不是一次渲染，留下一行 running/queued 反而会被
+        # 看门狗判停滞、被界面当成「正在出片」。
+        row = None if dry else await jobs.open(sess, artifact)
         attempt = str((row or {}).get("attempt") or "")
+        # 覆盖层锚点：segments 里写的是 asr 段 id，渲染只认秒——这一步把 id 换成
+        # 「这句话在成片时间轴上的位置」（见 resolve_overlay_anchors）。放在校准之前，
+        # 因为校准要按秒判断嘴型；认不出的 id 在这里就报错，不带病渲染。
+        if inputs.get("overlay_events"):
+            # 参数传入的覆盖层直接盖到这份时间线上：主轨仍是 builder 排好的那一版，
+            # 模型不必为了加一层画面而重写成千上百个手写秒数。
+            tl = {**tl, "overlay_events": [dict(o) for o in inputs["overlay_events"]
+                                           if isinstance(o, Mapping)]}
+        anchors = (await store.get("asr") or {}).get("asr_segments") or []
+        media_paths = {m.get("id"): m.get("path") for m in
+                       ((await store.get("load_media") or {}).get("media") or [])}
+        try:
+            resolve_overlay_anchors(tl, anchors, media_paths=media_paths)
+        except ValueError as exc:
+            if not dry:
+                await jobs.fail(sess, artifact, str(exc), attempt=attempt)
+            raise
+        if dry:
+            return await self._dry_run(state, tl, artifact=artifact, title=title)
         # **开启任务之后**再校验对象键是否真的存在。
         #
         # 为什么放在 open 之后而不是之前：渲染失败必须留下一条 failed 的渲染任务
@@ -1637,6 +2225,28 @@ class RenderVideoNode(StoryNode):
         # 切、声音按"ASR 音频时间码"排，两套轴不重合 → 嘴型对不上。
         # 这里按声音把画面钉回去，两条路径（builder / 手写）都覆盖。
         fixed = resync_original_audio_timeline(tl)
+        # 校准之后立刻验收：认不出的错位不再静默出片（见 av_sync_check）。
+        worst_drift, av_bad = av_sync_check(tl)
+        if av_bad:
+            msg = (f"渲染前的音画同步闸拦下了这份时间线（校准已自动改回 {fixed} 段，"
+                   "以下是它认不出、必须由你改对的）：\n"
+                   + "\n".join(f"  · {b}" for b in av_bad[:8])
+                   + "\n规则：出镜画面的 src_start/src_end 必须等于「这个输出时刻，"
+                     "该素材自己的声音正在播的源时刻」。要么把出镜段挪到它自己声音"
+                     "所在的窗口，要么在它没有声音的位置改用空镜（不同源素材）。")
+            await jobs.fail(sess, artifact, msg, attempt=attempt)
+            raise ValueError(msg)
+        digest = timeline_digest(tl, max_drift=worst_drift, resynced=fixed)
+        # 覆盖了哪几秒：锚点算出来的窗口只有这一份，写进产物才能事后核对
+        # 「用户说盖了、到底盖在哪」（本地化之后 path 会变成本机路径，那时再取就没意义了）。
+        overlay_notes = [
+            "第 {} 层：锚 {} → 成片 {}~{}s".format(
+                i, "/".join(str(x) for x in o["segments"]), o["start"], o["end"])
+            for i, o in enumerate(tl.get("overlay_events") or [], 1)
+            if isinstance(o, dict) and o.get("segments")]
+        if tl.get("overlay_events"):
+            overlay_notes.append(
+                f"共 {len(tl['overlay_events'])} 层盖在画面之上；主轨的排列与口播声音都没改动")
         # 校验对象键真的存在：一次 HEAD 就能拦下写错的键，并告诉模型正确的键
         # （见 validate_timeline_objects；这里放在 open 之后，失败才会留下 failed 记录）
         try:
@@ -1657,6 +2267,7 @@ class RenderVideoNode(StoryNode):
         try:
             tl = await _localize_timeline(tl, self.storage.workspace,
                                           self._work(state, "render", "src"))
+            await _check_overlay_media(tl)
             moviepy_error = None
             if render_mode == "ffmpeg":
                 probe("ffmpeg_fallback", 60)
@@ -1694,6 +2305,19 @@ class RenderVideoNode(StoryNode):
                                 attempt or None, result=fallback)
                 return fallback
             info = await asyncio.to_thread(mediaops.probe, dst)
+            # 证据分级：抽帧实测这几百毫秒买的是「机器能够到的最高一级证据」。
+            # 抽帧失败**不算渲染失败**（片子确实存在，字节也已经量到了），只是那两条
+            # 主张降回 UNVERIFIED，并写明为什么降——不许把没做成的那步写成做过了。
+            plan = render_plan(tl)
+            try:
+                frames = await asyncio.to_thread(
+                    _frame_spotcheck, dst, float(info["duration"] or 0.0),
+                    self._work(state, "render", "spot"))
+                frame_reason = ""
+            except Exception as exc:  # noqa: BLE001 - 证据降级，不改判这次渲染
+                frames, frame_reason = None, (
+                    f"抽帧这一步没跑成（{type(exc).__name__}: {str(exc)[:160]}），"
+                    "所以「不是黑屏/不是定格」这两条没有像素级证据")
             object_key = f"renders/{_safe(sess)}/{_safe(artifact)}.mp4"
             await self.storage.workspace.publish(
                 dst, object_key, content_type="video/mp4")
@@ -1701,7 +2325,16 @@ class RenderVideoNode(StoryNode):
             # 终态产物整份入库（不含会过期的 media_url）：提交 + 轮询的轮询端据此在
             # 任意实例、进程重启之后重建出与阻塞渲染同形状的结果。
             out = {"video": object_key, "duration": info["duration"],
-                   "width": info["width"], "height": info["height"], "title": title}
+                   "width": info["width"], "height": info["height"], "title": title,
+                   "timeline_digest": digest,
+                   "evidence": evidence_ledger(
+                       plan, worst_drift=worst_drift, resynced=fixed,
+                       bgm=bool(tl.get("bgm")), probed=info, frames=frames,
+                       frame_reason=frame_reason),
+                   "evidence_rule": "只有 status=verified 的条目能对用户声称验过；"
+                                    "UNVERIFIED 的那几条要如实说没验过，别替它们背书"}
+            if overlay_notes:
+                out["notes"] = overlay_notes
             await jobs.succeed(sess, artifact, object_key, float(info["duration"]),
                                result=out, attempt=attempt or None)
             done = True
@@ -1717,6 +2350,69 @@ class RenderVideoNode(StoryNode):
                 self.storage.workspace.cleanup(sess, state.artifact_id, "render")
         return {**out,
                 "media_url": await self.storage.objects.presign_get(object_key)}
+
+    async def _dry_run(self, state, tl: dict[str, Any], *, artifact: str,
+                       title: str) -> dict[str, Any]:
+        """dry_run：把渲染前的每一道校验跑一遍，只回账、不出片。
+
+        与真渲染**共用同一批判定函数**（resync → av_sync_check →
+        validate_timeline_objects → _overlay_window_issues），只改两件事：
+        ① 跑在**副本**上——看一眼不该改动共享库里的时间线；
+        ② 把「抛」换成「收」——dry-run 的用处正是「现在就把会被拦下的原因都告诉我」，
+        抛出去只剩第一条，剩下的要再撞一次才知道。
+        所以这里的账与真渲染同源：blocking 为空 = 这道闸拦不住它。
+        """
+        work = copy.deepcopy(tl)
+        fixed = resync_original_audio_timeline(work)
+        worst, av_bad = av_sync_check(work)
+        blocking = list(av_bad)
+        try:
+            await validate_timeline_objects(work, self.storage)
+        except ValueError as exc:
+            blocking.append(str(exc))
+        blocking += _overlay_window_issues(work)
+        plan = render_plan(work)
+        warnings: list[str] = []
+        if plan["picture"]["reaches"] + 0.05 < plan["duration"]:
+            warnings.append(
+                f"画面轨只排到 {plan['picture']['reaches']}s 而成片 {plan['duration']}s"
+                f"——末尾 {round(plan['duration'] - plan['picture']['reaches'], 2)}s 会定格。")
+        if plan["voice"]["segments"] == 0:
+            warnings.append("这条时间线一个声音段都没排，成片是静音的。")
+        for a, b in plan["voice"]["gaps"][:6]:
+            warnings.append(f"声音在 {a}~{b}s 之间是空的（这段没有口播也没有配音）。")
+        if fixed:
+            warnings.append(f"渲染前会自动把 {fixed} 段出镜画面的源时刻按声音钉回去"
+                            "（这一条不用你改，但说明画面排得歪了）。")
+        return {
+            # 这不是一次渲染产物：不写进 artifacts，否则下游会以为「这步已经有成片了」
+            "__no_store__": True,
+            "dry_run": True,
+            "artifact_id": artifact,
+            "title": title,
+            "will_render": not blocking,
+            "plan": plan,
+            "evidence": evidence_ledger(
+                plan, worst_drift=worst, resynced=fixed, bgm=bool(work.get("bgm")),
+                frame_reason="dry_run 不编码，也就没有帧可抽（要像素级证据得真渲一次）"),
+            "evidence_rule": "只有 status=verified 的条目能对用户声称验过；"
+                             "UNVERIFIED 的那几条要如实说没验过，别替它们背书",
+            "timeline_digest": timeline_digest(work, max_drift=worst, resynced=fixed),
+            "blocking": blocking,
+            "warnings": warnings,
+            "not_checked": [
+                "素材/盖层的源区间是否超出它的实际长度——那要把字节取回来 probe 才知道，"
+                "dry-run 不下载任何字节",
+                "字幕会不会溢出画面、机器上缺不缺那个字体——只有渲出来抽帧看得见",
+                "听感（音量平衡、口型听不听得出来）——只有人耳",
+                "实际编码耗时与文件体积——取决于当时机器负载",
+            ],
+            "hint": (
+                "先按 blocking 逐条改对再渲：这几条真渲染会被同一道闸原样拦下。"
+                if blocking else
+                "这份编排渲得出来。要出片就把同一个调用去掉 dry_run 再发一次；"
+                "两次的时间线指纹 sha16 相同，可拿来核对「看到的即是渲出来的」。"),
+        }
 
 
 class _JobProgress:
@@ -1811,6 +2507,132 @@ def _subtitle_layers(tl: dict[str, Any], size: tuple[int, int],
     return layers
 
 
+def _flag_on(value: Any) -> bool:
+    """布尔入参的稳妥读法：模型偶尔把开关写成字符串 "false"，``bool("false")`` 却是真。"""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no", "off", "none",
+                                             "否", "不", "假")
+    return bool(value)
+
+
+def _overlay_window_issues(tl: dict[str, Any]) -> list[str]:
+    """覆盖层里**不碰字节就能判出**的问题（dry-run 与真渲染共用这一份判据）。"""
+    total = float(tl.get("duration") or 0)
+    bad: list[str] = []
+    for i, ov in enumerate(tl.get("overlay_events") or [], 1):
+        if not isinstance(ov, dict) or not ov.get("path"):
+            bad.append(f"第 {i} 层没有 path（要盖哪段素材？）")
+            continue
+        if ov.get("start") is None or ov.get("end") is None:
+            if ov.get("segments"):
+                bad.append(f"第 {i} 层锚了 segments（{ov['segments']}）却没算出盖在哪几秒——"
+                           "锚点解析这一步没跑到，先确认 asr 产物在这个会话里存在")
+            else:
+                bad.append(f"第 {i} 层既没锚到 asr 段落（segments），也没写 start/end——"
+                           "这一层不知道该盖在哪几秒")
+            continue
+        if float(ov["end"]) > total + 0.05:
+            bad.append(f"第 {i} 层盖到 {float(ov['end']):.2f} 秒，超出成片总长 {total:.2f} 秒")
+    return bad
+
+
+async def _check_overlay_media(tl: dict[str, Any]) -> None:
+    """渲染前把每个覆盖层**探一遍**，画不出来的直接指名道姓报错。
+
+    为什么不沿用「丢字幕不丢成片」那条静默兜底：少一层盖层，用户看到的画面和计划卡
+    说好的不一样，而成片照样返回成功——这种错**只有画面本身知道**，界面、产物、
+    回执上全看不出来。先探一次（一个盖层一次 ffprobe）就能把它变成报错。
+    """
+    bad = _overlay_window_issues(tl)
+    for i, ov in enumerate(tl.get("overlay_events") or [], 1):
+        path = str((ov or {}).get("path") or "") if isinstance(ov, dict) else ""
+        if not path or ov.get("start") is None:
+            continue      # 已在 _overlay_window_issues 里报过，别再探一个没定的层
+        try:
+            info = await asyncio.to_thread(mediaops.probe, path)
+        except MediaError as e:
+            bad.append(f"第 {i} 层（{Path(path).name}）取不到画面：{e}")
+            continue
+        clip_dur = float(info.get("duration") or 0.0)
+        s0 = float(ov.get("src_start") or 0.0)
+        s1 = float(ov.get("src_end") or (s0 + max(0.2, float(ov["end"]) - float(ov["start"]))))
+        if s1 > clip_dur + 0.05:
+            bad.append(f"第 {i} 层要取源片 {s0:.2f}~{s1:.2f} 秒，而这个素材只有 "
+                       f"{clip_dur:.2f} 秒（改小 src_end，或换一段更长的素材）")
+    if bad:
+        raise ValueError("覆盖层有画不出来的，先改掉再渲：\n"
+                         + "\n".join(f"  · {b}" for b in bad))
+
+
+def _close_clips(handles: list) -> None:
+    """关掉每一个 MoviePy 文件 clip。
+
+    每一个都握着一个 ffmpeg 子进程和打开的文件：漏关一个，Windows 上就把整份
+    工作区目录锁到进程结束——失败清理和 sweep_stale 都删不掉它，「工作区随时
+    可弃」成了空话。关不掉只可能是成片已经没了的事，所以这里不往上抛。
+    """
+    for c in handles:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
+def _overlay_layers(tl: dict[str, Any], size: tuple[int, int], handles: list) -> list:
+    """覆盖层（overlay_events）→ 画面层：盖在主轨之上，**永远不带声音**。
+
+    为什么不带声音：覆盖层的用途是「讲到这句时换成风景镜头，口播继续」——
+    盖层自带音轨就会和口播抢同一个声床，正是用户报的「音声不变」被破坏。
+
+    与字幕那条兜底口径**不同**：这里丢层等于用户的指令没执行，而且「层没出来」
+    在成片里只是一帧颜色不对，没有任何现场能反推。所以逐层收集原因后 raise——
+    真机上 MoviePy 2.x 的 VideoFileClip 没有 .width（只有 .w），那个
+    AttributeError 被静默 continue 吞掉过，排查时只剩「绿色没盖上」一句话。
+    """
+    from moviepy import VideoFileClip
+    from moviepy.video.fx import Crop
+
+    w, h = size
+    layers = []
+    bad: list[str] = []
+    for i, ov in enumerate(tl.get("overlay_events") or [], 1):
+        try:
+            if not isinstance(ov, dict) or not ov.get("path"):
+                bad.append(f"第 {i} 层没有 path")
+                continue
+            s0 = float(ov.get("src_start") or 0.0)
+            s1 = float(ov.get("src_end") or (s0 + 2.0))
+            src = VideoFileClip(ov["path"], audio=False)
+            handles.append(src)
+            s1 = min(s1, float(src.duration))
+            if s1 - s0 < 0.05:
+                bad.append(f"第 {i} 层取源片 {s0:.2f}~{s1:.2f} 秒，实际长度为 0"
+                           f"（素材只有 {float(src.duration):.2f} 秒，改小 src_start）")
+                continue
+            clip = src.subclipped(s0, s1)
+            # 盖层最多盖到窗口结束：源片比窗口长就截尾（不拉时长，拉时长会变速）
+            window = max(0.2, float(ov["end"]) - float(ov["start"]))
+            if float(clip.duration) > window:
+                clip = clip.subclipped(0, window)
+            sw, sh = float(src.w), float(src.h)
+            contain = str(ov.get("fit") or "cover") == "contain"
+            k = min(w / sw, h / sh) if contain else max(w / sw, h / sh)
+            clip = clip.resized((max(1, int(round(sw * k))), max(1, int(round(sh * k)))))
+            if not contain:
+                clip = clip.with_effects([Crop(x_center=int(clip.w) // 2,
+                                               y_center=int(clip.h) // 2,
+                                               width=w, height=h)])
+            layers.append(clip.with_start(float(ov["start"]))
+                          .with_position("center"))
+        except Exception as exc:
+            bad.append(f"第 {i} 层（{Path(ov.get('path') or '?').name}，盖在 "
+                       f"{ov.get('start')}~{ov.get('end')} 秒）画不出来：{type(exc).__name__}: {exc}")
+    if bad:
+        raise ValueError("覆盖层有画不出来的，先改掉再渲：\n"
+                         + "\n".join(f"  · {b}" for b in bad))
+    return layers
+
+
 def _render_with_moviepy(tl: dict[str, Any], dst: Path, settings: Settings,
                          notify) -> None:
     """MoviePy 2.x 渲染：多轨合成 + 字幕 + 配音 + BGM（阻塞，to_thread 内跑）。"""
@@ -1847,6 +2669,16 @@ def _render_with_moviepy(tl: dict[str, Any], dst: Path, settings: Settings,
     duration = min(float(duration), composed.duration)
     notify("subtitles", 40)
     sub_layers = _subtitle_layers(tl, (w, h), settings)
+    if tl.get("overlay_events"):
+        try:
+            ov_layers = _overlay_layers(tl, (w, h), handles)
+        except ValueError:
+            # raise 发生在 write_videofile 的 finally 之前：此刻已开的主轨和盖层
+            # clip 一个都没关，Windows 上就把整份工作区目录锁到进程结束。
+            _close_clips(handles)
+            raise
+    else:
+        ov_layers = []
     # 字幕与画面层**拍平在同一层**合成，而不是套一层 CompositeVideoClip。
     #
     # 为什么：MoviePy 2.x 的 compose_on 在背景带 alpha 时，每层每帧都要新建整幅
@@ -1859,7 +2691,8 @@ def _render_with_moviepy(tl: dict[str, Any], dst: Path, settings: Settings,
     # 「先合成画面、再把它和字幕合成」在数学上等价。已逐帧验证：
     # .runtime/audit/verify_p1_flatten.py 对真实素材 75/75 帧像素 sha1 完全一致，
     # 耗时 40.7 → 24.4 ms/帧（1.67×）。
-    canvas = CompositeVideoClip([*layers, *sub_layers], size=(w, h)) if sub_layers else composed
+    canvas = (CompositeVideoClip([*layers, *ov_layers, *sub_layers], size=(w, h))
+              if (sub_layers or ov_layers) else composed)
     canvas = canvas.subclipped(0, duration)
     notify("audio", 55)
     audio_items = []
@@ -1900,14 +2733,7 @@ def _render_with_moviepy(tl: dict[str, Any], dst: Path, settings: Settings,
                                logger=_encode_logger(notify),
                                temp_audiofile=str(dst.with_name("temp_audio.m4a")))
     finally:
-        # 每一个文件 clip 都握着一个 ffmpeg 子进程和打开的文件：漏关一个，Windows 上
-        # 就把整份工作区目录锁到进程结束——失败清理和 sweep_stale 都删不掉它，
-        # 「工作区随时可弃」成了空话。关不掉也只可能是成片已经没了的事。
-        for c in handles:
-            try:
-                c.close()
-            except Exception:
-                pass
+        _close_clips(handles)
 
 
 
@@ -1949,7 +2775,7 @@ def _render_segmented(tl: dict[str, Any], dst: Path, settings: Settings,
 
 
 def _slice_timeline(tl: dict[str, Any], start: float, end: float) -> dict[str, Any]:
-    """从时间线中截取 [start, end) 区间的 events/audio_events/subtitles。"""
+    """从时间线中截取 [start, end) 区间的 events/audio_events/subtitles/overlay_events。"""
     def _clip_events(events, key="events"):
         out = []
         for ev in events:
@@ -1958,11 +2784,13 @@ def _slice_timeline(tl: dict[str, Any], start: float, end: float) -> dict[str, A
                 continue
             ns, ne = max(s, start), min(e, end)
             offset = ns - s
-            out.append({**ev, "start": round(ns - start, 3), "end": round(ne - start, 3),
-                        "src_start": round(float(ev.get("src_start", 0)) + offset, 3),
-                        "src_end": round(float(ev.get("src_end", 0)) + offset, 3)})
+            cut = {**ev, "start": round(ns - start, 3), "end": round(ne - start, 3)}
+            if "src_start" in ev and "src_end" in ev:
+                cut["src_start"] = round(float(ev["src_start"]) + offset, 3)
+                cut["src_end"] = round(float(ev["src_end"]) + offset, 3)
+            out.append(cut)
         return out
-    return {
+    sliced = {
         "width": tl.get("width", 1280), "height": tl.get("height", 720),
         "fps": tl.get("fps", 25.0), "duration": round(end - start, 3),
         "events": _clip_events(tl.get("events", [])),
@@ -1971,6 +2799,9 @@ def _slice_timeline(tl: dict[str, Any], start: float, end: float) -> dict[str, A
         "bgm": tl.get("bgm"), "transition_styles": tl.get("transition_styles", []),
         "mode": tl.get("mode", ""),
     }
+    if tl.get("overlay_events"):
+        sliced["overlay_events"] = _clip_events(tl["overlay_events"], "overlay_events")
+    return sliced
 
 
 def _attempt_dir(dst: Path, tag: str) -> Path:
@@ -2021,6 +2852,36 @@ def _render_via_ffmpeg(tl: dict[str, Any], dst: Path, notify=None) -> None:
     video_only = tmp / "_video.mp4"
     mediaops.ffmpeg("-f", "concat", "-safe", "0", "-i", str(list_file),
                     "-c", "copy", str(video_only))
+
+    # 1b. 覆盖层：盖在主轨之上，**不带声音**（声音仍全部来自 audio_events/BGM）。
+    overlays = [o for o in (tl.get("overlay_events") or [])
+                if isinstance(o, dict) and o.get("path")
+                and o.get("start") is not None and o.get("end") is not None]
+    if overlays:
+        w, h = int(tl.get("width") or 1280), int(tl.get("height") or 720)
+        base = video_only
+        video_only = tmp / "_video_ov.mp4"
+        args = ["-i", str(base)]
+        for k, o in enumerate(overlays):
+            s0 = float(o.get("src_start") or 0.0)
+            olen = max(0.04, float(o["end"]) - float(o["start"]))
+            args += ["-ss", f"{s0:.3f}", "-t", f"{olen:.3f}", "-i", str(o["path"])]
+        chain, prev = [], "[0:v]"
+        for k, o in enumerate(overlays):
+            s, e = float(o["start"]), float(o["end"])
+            ratio = ("increase" if str(o.get("fit") or "cover") != "contain" else "decrease")
+            fit_part = (f"scale={w}:{h}:force_original_aspect_ratio={ratio}"
+                        + (f",crop={w}:{h}" if ratio == "increase" else ""))
+            chain.append(f"[{k + 1}:v]{fit_part},setpts=PTS-STARTPTS+{s:.3f}/TB[f{k}]")
+            mid = f"[m{k}]"
+            chain.append(f"{prev}[f{k}]overlay=x=(W-w)/2:y=(H-h)/2:eof_action=pass"
+                         f":enable='between(t,{s:.3f},{e:.3f})'{mid}")
+            prev = mid
+        args += ["-filter_complex", ";".join(chain), "-map", prev, "-an",
+                 "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                 str(video_only)]
+        mediaops.ffmpeg(*args)
+        say("video_track", 80)
     say("audio", 82)
 
     # 2. 抽取 audio_events 各段音频
@@ -2118,7 +2979,7 @@ REAL_NODE_CLASSES = [
     # 输入阶段 → 素材处理层 → 逻辑与脚本层 → 时间轴规划层 → 最终输出
     SearchMediaNode, LoadMediaNode,
     SplitShotsNode, UnderstandClipsNode, FilterClipsNode, GroupClipsNode,
-    AsrNode, SpeechRoughCutNode,
+    AsrNode, CorrectTranscriptNode, SpeechRoughCutNode,
     ScriptTemplateRecNode, GenerateScriptNode, GenerateAITransitionNode,
     TransitionRecNode, TextRecNode, GenerateVoiceoverNode, SelectBGMNode,
     PlanTimelineNode, PlanTimelineProNode, PlanTimelineAITransitionNode,

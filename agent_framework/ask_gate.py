@@ -63,6 +63,32 @@ _EXPLICIT = re.compile(r"(请|麻烦)(回复|回答|选择|点选)|你(回复|�
                        r"|请你确认(?![:：])|麻烦你确认(?![:：])"
                        r"|等你(回复|回答|选择|点选|选完)")
 
+# 「你做完 X，我就做 Y」的将来小句：这是在**告知接下来会发生什么**，不是索取。
+#
+# 真机事故（用户原话「怎么我第一个弹窗的问题还没选完，就继续了然后跳第二次弹窗，
+# 第一次都没提交啊」）：规划轮交出计划卡后收尾写「你点选确认后我再开始跑剪辑。」，
+# ``_SEEKING`` 里的「点选」直接命中 → ask_gate 把一句告知判成提问、白打回一轮 →
+# 模型照着打回改用 ``ask_user`` 重问「你想按哪一版来剪？」（卡上本来就在问这个）→
+# 弹窗是单例，这一问把用户正填着的计划确认卡顶掉了，选到一半的答案全丢。
+#
+# 判据的关键是「动词 + 后/完 + 我/就/再…」：后头跟的是**模型自己的下一步动作**，
+# 说明那个动词是在描述流程，不是在要用户此刻回答。只认「你」起头的形式——
+# 「请你选后我再开工」这类祈使句不该被中和，那确实是在索取。
+_FUTURE_CLAUSE = re.compile(
+    r"(?<![请要需烦])你(?:点选|点一下|选一下|选一个|选一选|挑一个|选择|挑|选|确认|回复|回答|决定)"
+    r"(?:确认|一下)?(?:完之后|完后|之后|完毕|完|后)"
+    r"(?:我|咱|就|再|接着|然后|开始|马上|立刻|便)")
+
+
+def _neutralize_future_clauses(text: str) -> str:
+    """先把「你做完 X 我就做 Y」的将来小句换成占位符，再交给判据。
+
+    只要替换后的残句不再命中任何一条判据即可，不必保留长度。占位符取 ``…``：
+    它在四条判据的字符集里都不出现。
+    """
+    return _FUTURE_CLAUSE.sub("…", text)
+
+
 # 只在这些情况下才需要「+ 问号」才算提问：单靠措辞可能出现在正常叙述里
 _QUESTION_MARK = re.compile(r"[?？]")
 
@@ -106,7 +132,9 @@ def looks_like_plan_invite(text: Any) -> bool:
     也可能只是在陈述计划内容；后者该由「假称已提交」那道守卫处置，
     混在一起会把正常收尾也打回、白烧一轮。真正可靠的特征是**索取动作**。
     """
-    return bool(_PLAN_INVITE.search(str(text or "")))
+    # 同样先中和将来小句：「你确认后我就开工」是**告知**，不是要用户回复；
+    # 而「你确认后回复我」那种索取（没有「我就…」的下文）照旧命中。
+    return bool(_PLAN_INVITE.search(_neutralize_future_clauses(str(text or ""))))
 
 
 def looks_like_asking_user(text: Any) -> bool:
@@ -121,7 +149,7 @@ def looks_like_asking_user(text: Any) -> bool:
 
     宁可漏一点也不要误伤：把正常结论判成提问会让用户白等一轮。
     """
-    body = "" if text is None else str(text)
+    body = _neutralize_future_clauses("" if text is None else str(text))
     if not body.strip():
         return False
     if _SEEKING.search(body):

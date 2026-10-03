@@ -10,7 +10,8 @@ import re
 from typing import Any, Mapping, Sequence
 
 from .support import (PLAN_MAX_CANDIDATES, PLAN_STEPS_MAX,
-                      PlanIssues, as_card_value, clean, coerce_plans, num)
+                      PlanIssues, as_card_value, clean, coerce_plans, num,
+                      topology_view)
 from .vocab import PlanVocabulary
 
 # 词表外别名的形状：snake_case 标识符（至少一个下划线）。
@@ -80,15 +81,28 @@ class PlanValidator:
             norm = await self._validate_step(step, tag, step_index, allowed, skills, issues)
             if norm is not None:
                 norm_steps.append(norm)
-        if len(issues.errors) > before:
-            return None
-        self._check_topology(tag, norm_steps, issues)
-        self._check_explicit_deps(tag, norm_steps, issues)
-        self._check_skip_rules(tag, norm_steps, issues)
-        self._check_duplicates(tag, norm_steps, issues)
+        ok = len(issues.errors) == before
+        # 步骤级错误（参数不合规、缺 why…）不再**短路**掉下面这几条：拓扑与依赖检查
+        # 只看节点名与 requires，拿原始步骤也判得出来。原先一有步骤级错误就 return，
+        # 一次校验只暴露一层规则——真机实测模型交了两回才把「布尔开关要给两个候选」
+        # 与「group_clips 必须显式上卡」先后试出来：白烧一轮迭代，还半路撞上失败守卫
+        # 被推去问用户「这轮没有剪辑工具怎么办」（那一轮就是死路）。
+        view = norm_steps if ok else topology_view(self.vocab.contract, steps)
+        self._check_topology(tag, view, issues)
+        self._check_explicit_deps(tag, view, issues)
+        if ok:
+            # 跳过规则要写回步骤字段（skippable / skip_reason），只在归一化过的步骤上跑。
+            self._check_skip_rules(tag, view, issues)
+        self._check_duplicates(tag, view, issues)
+        # 文案卫生扫的是**原始** why/expectation：归一化只是 clean()，两处同文；
+        # 用原始的还能覆盖到没归一化成功的步骤（它们同样会被替换器扫）。
         self._check_hygiene(tag, [plan.get("label"), plan.get("goal"),
-                                  *[s["why"] for s in norm_steps],
-                                  *[s["expectation"] for s in norm_steps]], issues)
+                                  *[text for step in steps
+                                    if isinstance(step, Mapping)
+                                    for text in (step.get("why"),
+                                                 step.get("expectation"))]], issues)
+        if not ok:
+            return None
         return {
             "plan_id": tag,
             "label": clean(plan.get("label")),
@@ -306,14 +320,18 @@ class PlanValidator:
         ``_check_topology`` 写明「前置没上卡是允许的（拦截器会补齐）」，
         这对可自动补齐的依赖成立；对这几个不成立，所以补这一道。
 
-        查的是**传递闭包**：漏掉的可能是间接前置（``generate_script ← script_template_rec``，
-        而卡上只写了 ``generate_script``）。
+        查的是**传递闭包**，而且要**穿过没上卡的中间节点**：真机三张卡都是
+        ``select_BGM → generate_script → script_template_rec``（最后一个不可补齐），
+        中间那个自己不是，但它踩着一个是的。
         """
         explicit = self.vocab.explicit_call_nodes()
         if not explicit:
             return                  # 契约没接上／没有这类节点：退回原行为
         present = {s["node"] for s in steps}
-        reported: set[tuple[str, str]] = set()
+        # 按**缺的那个节点**去重：一张卡漏一个 script_template_rec，下游三个步骤都会
+        # 撞上它，三条几乎一样的话只会把清单挤满（补一个节点三处都解决）。
+        # 取最先撞上的那一步当锚点——步骤序就是拓扑序，它排在那之前即可。
+        reported: set[str] = set()
         for step in steps:
             queue: list[str] = list(step["requires"])
             seen: set[str] = set()
@@ -322,14 +340,17 @@ class PlanValidator:
                 if dep in seen:
                     continue
                 seen.add(dep)
-                if dep not in present:
-                    if dep in explicit and (dep, step["node"]) not in reported:
-                        reported.add((dep, step["node"]))
-                        issues.error(
-                            f"计划 {tag} 的步骤「{step['node']}」依赖「{dep}」，"
-                            f"但 {dep} 不会自动补齐（它需要你传入创意决策参数）。"
-                            f"请把 {dep} 也写进这张计划的 steps，排在 {step['node']} 之前。")
-                    continue            # 没上卡的中间节点：继续顺着它的前置查
+                if dep not in present and dep in explicit and dep not in reported:
+                    reported.add(dep)
+                    issues.error(
+                        f"计划 {tag} 的步骤「{step['node']}」依赖「{dep}」，"
+                        f"但 {dep} 不会自动补齐（它需要你传入创意决策参数）。"
+                        f"请把 {dep} 也写进这张计划的 steps，排在 {step['node']} 之前。")
+                # 没上卡的中间节点**也要继续顺着它的前置查**：原先这里 `continue`
+                # 直接掐断，于是上面那种写法一路放行，卡面看着齐全，用户点完确认
+                # 跑到 select_BGM 才被执行期拦下。执行期的
+                # ``Interceptor._ensure_deps`` 是递归穿过没跑过的中间节点的，
+                # 校验必须与它同口径，否则等于没拦。
                 contract = self.vocab.contract.get(dep)
                 if contract is not None:
                     queue.extend(contract.requires)

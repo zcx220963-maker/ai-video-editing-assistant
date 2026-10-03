@@ -162,7 +162,10 @@ async def main() -> None:
             task = ready[0]
             node_name = task["name"]
             await tm.claim(task["id"], "sub_agent")
-            if node_name != "search_media":  # search_media 是可选旁支，剪辑主链不需要
+            # 两条旁支不进主链：search_media 是可选检索支；correct_transcript 是
+            # **显式调用**节点（require_explicit_call），拦截器不会自动补、没有用户
+            # 给的 corrections 就没有可修的字——按序自动驱一遍等于逼它报错。
+            if node_name not in ("search_media", "correct_transcript"):
                 await interceptor.invoke(node_name, state)
                 executed.append(node_name)
             await tm.complete(task["id"])

@@ -22,8 +22,12 @@ CUSTOM_MAX_CHARS = 200         # 单条自定义诉求长度
 OUTPUT_FIELD_NAMES = frozenset({
     "media", "clips", "asr_segments", "clip_captions", "rough_clips", "groups",
     "templates", "templates_info", "group_scripts", "voiceover", "bgm",
-    "timeline", "events", "audio_events", "subtitles", "warnings",
+    "timeline", "events", "audio_events", "overlay_events", "subtitles", "warnings",
+    "ids", "corrections", "unchanged_suspects", "corrected",
     "shot_count", "structure", "raw_text", "group_id", "start", "end", "duration",
+    # 渲染产物的账本与 dry_run 回执（技能正文按字段解释给模型看，不是可调用名）：
+    "evidence", "evidence_rule", "render_plan", "blocking", "not_checked",
+    "will_render", "timeline_digest", "src_start", "src_end",
 })
 
 MCP_PREFIX = "storyline_"
@@ -95,6 +99,30 @@ class PlanIssues:
 
     def warn(self, msg: str) -> None:
         self.warnings.append(msg)
+
+def topology_view(contract: Any, steps: Any) -> list[dict[str, Any]]:
+    """原始步骤 → 够拓扑检查用的最小形状（位置、节点名、契约里现成的 requires）。
+
+    给「已经出现步骤级错误」的那条路用：拓扑与依赖两道检查只读这几个字段，而
+    ``requires`` 按节点名问契约就有，不依赖这一步归一化成功。于是「参数不合规」
+    与「group_clips 没上卡」能在同一次打回里一起交给模型，不必交两回卡、吃两回打回。
+
+    ``skippable`` 一律 False：跳过规则的判据（下游踩没踩着它）要归一化后的完整
+    步骤集才成立，这条路上不跑它。
+    """
+    out: list[dict[str, Any]] = []
+    for index, step in enumerate(steps or (), start=1):
+        if not isinstance(step, Mapping):
+            continue
+        node = clean(step.get("node"))
+        if not node:
+            continue
+        node_contract = contract.get(node) if contract is not None else None
+        out.append({"seq": index, "node": node, "skippable": False, "skip_reason": "",
+                    "requires": list(node_contract.requires)
+                    if node_contract is not None else []})
+    return out
+
 
 def coerce_plans(payload: Any) -> list[Mapping[str, Any]] | None:
     if isinstance(payload, str):

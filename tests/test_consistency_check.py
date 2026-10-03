@@ -206,7 +206,22 @@ def case_skill_field_names() -> None:
                                     param_keys=bad_names) == ["param_options"],
           "来源漏传 → 正是那条假告警（用例确实守得住）")
 
-    check(C.skill_field_names() == set(), "都不传时返回空集（不崩）")
+    from agent_framework.plan.support import OUTPUT_FIELD_NAMES
+
+    check(C.skill_field_names() == set(OUTPUT_FIELD_NAMES),
+          "都不传时只余「节点产出字段」这一份恒定豁免（不崩）")
+
+    # 真机第二条假告警的形状：技能正文解释渲染回执字段（不是可调用名）。
+    # （dry_run 是 render_video 的**入参**，走 node_param_keys 那一层豁免。）
+    body = ("dry_run 的回执里有 not_checked 与 will_render，"
+            "出镜段取 src_start/src_end，修字闸看 unchanged_suspects。")
+    produced = C.skill_field_names(node_param_keys={"dry_run"}, tools=[main_batch])
+    check(C.unknown_tools_in_skills({"s": body}, {"load_media"},
+                                    param_keys=produced) == [],
+          "技能正文解释产出字段（not_checked 等）→ 不报假告警")
+    check(C.unknown_tools_in_skills({"s": body}, {"load_media"},
+                                    param_keys=set()) != [],
+          "不收产出字段这一份 → 正是那条假告警（用例守得住）")
 
 
 def main() -> None:

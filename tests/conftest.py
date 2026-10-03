@@ -2,12 +2,12 @@
 
 背景（这是历史包袱，不是谁写错了用例）：
 
-``tests/test_*.py`` 共 53 个文件，**全部**是自带 ``asyncio.run(main())`` 的独立脚本，
+``tests/test_*.py`` 下的**每一个**文件都是自带 ``asyncio.run(main())`` 的独立脚本，
 用自己的 ``check()`` 记断言数、用退出码报结果；一个真正的 pytest 用例也没有。
 原始运行方式是 ``.tmp/run_all_tests.py``（子进程逐个跑）。
 
 但 ``pytest.ini`` 里写着 ``testpaths = tests`` —— 于是 ``python -m pytest``
-会去收集这 53 个脚本，把里面的 ``async def`` 判成「缺 async 插件」、把 ``tmp``
+会去收集这些脚本，把里面的 ``async def`` 判成「缺 async 插件」、把 ``tmp``
 参数判成「fixture 不存在」，结论一片红。**命令能跑，结论全是假故障**：
 既掩盖真实回归，也让人不敢用标准入口。
 

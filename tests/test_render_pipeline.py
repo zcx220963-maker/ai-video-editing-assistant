@@ -37,8 +37,10 @@ from agent_framework.storage.media import kind_of, mime_of, probe as probe_meta
 from storyline_server import mediaops
 from storyline_server.nodes.core_nodes import (
     _localize_timeline,
+    _overlay_layers,
     _render_via_ffmpeg,
     _render_with_moviepy,
+    _slice_timeline,
     _subtitle_layers,
     build_real_registry,
 )
@@ -110,7 +112,7 @@ async def seed(storage, src: Path) -> str:
     return mid
 
 
-def fake_providers():
+def fake_providers(transcribe=None):
     async def llm(messages):
         return json.dumps({
             "title": "渲染管线验证片",
@@ -124,7 +126,8 @@ def fake_providers():
 
     return build_providers(Settings().caps,
                            vision=lambda images, prompt, **kw: "测试画面：条纹与色块",
-                           transcribe=lambda wav: [], llm=llm, tts=tts)
+                           transcribe=transcribe or (lambda wav: []),
+                           llm=llm, tts=tts)
 
 
 def inside(p: Path, root: Path) -> bool:
@@ -200,6 +203,17 @@ async def main() -> None:
     check(abs(float(job["duration_sec"]) - float(out["duration"])) < 0.05,
           "render_jobs 里存了成片时长（供列表页直接显示）")
     check(await storage.render_jobs.ready("p:main", "art1"), "ready 需 done + 有成片 key")
+    # 成片指纹：把「实际被渲染的那一版时间线」记进产物（render_jobs.result 与返回体同源）。
+    # 用户三次报「音画不同步」时我们手里只有 duration/title，只能猜；现在能自证。
+    digest = out.get("timeline_digest") or {}
+    tl_ok = (await state.store.get("plan_timeline"))["timeline"]
+    check(len(str(digest.get("sha16") or "")) == 16
+          and digest.get("video_segments") == len(tl_ok["events"])
+          and digest.get("audio_segments") == len(tl_ok["audio_events"])
+          and float(digest.get("max_av_drift_sec", 99)) < 0.25,
+          f"成片里存了指纹（sha16 + 段数 + 最大偏差）：{digest}")
+    check((await storage.render_jobs.get("p:main", "art1"))["result"]["timeline_digest"]
+          == digest, "指纹随 render_jobs.result 入库（轮询口/重启后都拿得到）")
     exec_nodes = await storage.artifacts("p:main", "art1").executed()
     check({"load_media", "plan_timeline", "render_video"} <= set(exec_nodes)
           and len(exec_nodes) >= 10, f"整链产物在 artifacts 表（{len(exec_nodes)} 行）")
@@ -263,6 +277,38 @@ async def main() -> None:
               "失败只收 render/ 自己那份副本，不动 material/ 的中转字节（清了只是逼重跑重新下载）")
         check(not await fail_state.store.has("render_video"),
               "artifacts 表里没有失败产物的 render_video 行（不产引用死链的成功）")
+
+    # ---------- ④b 音画同步闸：校准认不出的错位必须拦，不静默出片 ----------
+    # ④ 那份是「字节取不到」；这份是「字节都在、嘴型对不上」：同源素材的画面被排在
+    # 没有它自己声音的窗口里——resync 认不出（它只掰得动「有声音但对歪」的段）。
+    # 没有这道闸，片子照出，回给用户的还是那句「严格音画同步」（真机报了三次）。
+    av_state = NodeState(session_id="p:av", artifact_id="af_av",
+                         user_request="口播画面排在静音窗口里",
+                         store=await _open_store(storage, "p:av", "af_av"),
+                         user_id=USER, conversation_id=CONV)
+    tl = json.loads(json.dumps(tl))
+    dur = float(tl["duration"])
+    # 手写一份原声时间线：画面沿用它自己的素材，声音却只排前半段 →
+    # 后半段的画面是「同源素材在播，却没有它自己的声音」，嘴在动而音已停。
+    mis = {**tl, "mode": "original_audio",
+           "audio_events": [{"path": tl["events"][0]["path"], "start": 0.0,
+                             "end": round(dur / 2, 3), "src_start": 0.0,
+                             "src_end": round(dur / 2, 3), "kind": "original"}]}
+    check(any(e["path"] == tl["events"][0]["path"] and e["start"] >= dur / 2
+              for e in mis["events"]),
+          f"用例前提成立：有同源画面落在声音之外（{[(e['start'], e['path'].split('/')[-1]) for e in mis['events']]}）")
+    await av_state.store.put("plan_timeline", {"timeline": mis})
+    try:
+        await reg.get("render_video")(av_state)
+        check(False, "出镜画面落在没有它声音的窗口时，渲染闸必须打回")
+    except ValueError as e:
+        gate = await storage.render_jobs.get("p:av", "af_av")
+        check("音画同步闸" in str(e) and "没有它自己的声音在播" in str(e),
+              f"闸回的是可执行的逐条原因（{str(e)[:60]}…）")
+        check(gate["status"] == "failed" and gate["video_object_key"] is None,
+              "闸在 jobs.open 之后：失败留下 failed 行（界面/render_status 据此报告）")
+        check(not await av_state.store.has("render_video"),
+              "被闸拦下的渲染不写产物行（不出「有了」的假象）")
 
     # 同一产物重跑：状态复位为 running 后再次成功，仍只有一行
     retry = NodeState(session_id="p:fail", artifact_id="af", user_request="换成好素材重渲",
@@ -349,6 +395,212 @@ async def main() -> None:
     layers = _subtitle_layers(tl_local, (tl_local["width"], tl_local["height"]), settings)
     check(len(layers) == len(subs),
           f"字幕一条一层、与画面层并列，不再逐条嵌套合成（{len(layers)}/{len(subs)}）")
+
+    print("\n=== ⑧ 覆盖层：两条渲染路径都要真的画出像素 ===")
+    # 只验「时间线里有这一层」不够——覆盖层最容易悄悄不生效（层没进合成、
+    # enable 窗口算错、fit 分支抛异常被吞掉，片子照样出）。这里拿一块纯绿素材
+    # 盖在中间一秒上，抽帧看那一眼看到的是不是绿，两条路径各验一次。
+    ov_src = raw / "green_overlay.mp4"
+    make_source(ov_src, ["color=c=green:size=640x360:rate=25:duration=2"], 900)
+    tl_dur = float(tl_local["duration"])
+    mid = round(tl_dur / 2, 3)
+    ov_tl = {**tl_local, "overlay_events": [
+        {"path": str(ov_src), "start": mid, "end": round(mid + 1.0, 3),
+         "src_start": 0.0, "src_end": 1.0, "fit": "cover"}]}
+
+    def _rgb_at(video: Path, at: float) -> tuple[int, int, int]:
+        png = video.with_name(f"{video.stem}_g{at:.2f}.png")
+        mediaops.ffmpeg("-v", "error", "-ss", f"{at:.3f}", "-i", str(video),
+                        "-frames:v", "1", str(png))
+        from PIL import Image  # noqa: PLC0415
+        px = list(Image.open(png).convert("RGB").resize((16, 16)).getdata())
+        png.unlink(missing_ok=True)
+        return tuple(sum(c[i] for c in px) // len(px) for i in range(3))
+
+    def _is_green(rgb) -> bool:
+        return rgb[1] > 120 and rgb[1] > rgb[0] + 40 and rgb[1] > rgb[2] + 40
+
+    built = _overlay_layers(ov_tl, (int(ov_tl["width"]), int(ov_tl["height"])), [])
+    check(len(built) == 1, f"覆盖层进得了合成层列表，没被兜底 except 吞掉（{len(built)} 层）")
+
+    for label, runner in (("moviepy", lambda src, dst: _render_with_moviepy(
+                               src, dst, settings, lambda *a: None)),
+                          ("ffmpeg", lambda src, dst: _render_via_ffmpeg(src, dst))):
+        with_ov = fb_dir / f"overlay_{label}.mp4"
+        await asyncio.to_thread(runner, ov_tl, with_ov)
+        check(with_ov.exists() and with_ov.stat().st_size > 5_000,
+              f"{label} 路径带覆盖层也能出片")
+        rgb_in = _rgb_at(with_ov, mid + 0.5)
+        rgb_out = _rgb_at(with_ov, max(0.1, mid - 0.8))
+        check(_is_green(rgb_in), f"{label}：盖层窗口内是那块绿（RGB{rgb_in}）")
+        check(not _is_green(rgb_out),
+              f"{label}：窗口外仍是主轨（RGB{rgb_out}）——覆盖层不改别处的画面")
+        check(mediaops.probe(with_ov)["has_audio"],
+              f"{label}：盖层不带声音，音轨仍在（声音没被覆盖层抢走）")
+
+    trace_ov: list[tuple[str, int]] = []
+    await asyncio.to_thread(_render_via_ffmpeg, ov_tl, fb_dir / "ov_trace.mp4",
+                            lambda s, p: trace_ov.append((s, p)))
+    percents = [p for _, p in trace_ov]
+    check(all(b >= a for a, b in zip(percents, percents[1:])),
+          f"兜底路径带覆盖层时进度仍只增不减：{trace_ov}")
+    sliced = _slice_timeline({**tl_local, "overlay_events": ov_tl["overlay_events"]},
+                             mid, mid + 1.0)
+    check(len(sliced.get("overlay_events") or []) == 1
+          and abs(sliced["overlay_events"][0]["start"]) < 0.01,
+          f"分段渲染前切片带上覆盖层：{sliced['overlay_events'][0]}")
+
+    print("\n=== ⑨ 节点级入口：模型只写 asr 段 id，秒数由 render_video 算 ===")
+    # ⑧ 验的是渲染体（本机路径、手写的秒）。这一节验的是模型走的那条路：
+    # 它只会被要求写 segments: ["asr-1"]，秒数由 resolve_overlay_anchors 按成片算。
+    # 锚错 id 必须当场报错并留 failed 行——否则就是「用户说盖了、其实没盖」。
+    node_src = raw / "flat_speaker.mp4"
+    make_source(node_src, ["color=c=blue:size=640x360:rate=25:duration=3"], 440)
+    mat_node = await seed(storage, node_src)
+    # 两句之间留 0.7 秒空隙：小于 0.5 秒 speech_rough_cut 会把它们并成一段，
+    # 那时「锚第二句」等于盖满全片，窗口外那条断言就失去意义了。
+    speech = [{"text": "第一句话在这里", "start": 0.2, "end": 1.2},
+              {"text": "第二句话在这里", "start": 1.9, "end": 2.7}]
+    reg_ov = build_real_registry(settings, fake_providers(
+        transcribe=lambda wav: list(speech)), storage)
+    itp_ov = Interceptor(reg_ov)
+    ov_key = f"users/{USER}/convs/{CONV}/green_node.mp4"
+    await _put_file(storage, ov_key, ov_src)
+    ov_state = NodeState(session_id="p:ov", artifact_id="af_ov",
+                         user_request="讲到第二句时换成空镜，口播声音不动",
+                         store=await _open_store(storage, "p:ov", "af_ov"),
+                         user_id=USER, conversation_id=CONV)
+    await prep_creative(itp_ov, ov_state, [mat_node])
+    ov_params = {"keep_original_audio": True, "material_ids": [mat_node]}
+
+    try:
+        await itp_ov.invoke("render_video", ov_state,
+                            overlay_events=[{"segments": ["asr-99"], "path": to_ref(ov_key)}],
+                            **ov_params)
+        check(False, "锚点 id 不存在时 render_video 必须打回")
+    except ValueError as e:
+        check("锚点认不出来" in str(e) and "asr-0" in str(e),
+              f"报错直接列出真实存在的 id：{str(e).replace(chr(10), ' / ')[:120]}")
+        bad_job = await storage.render_jobs.get("p:ov", "af_ov")
+        check(bad_job["status"] == "failed" and "锚点" in str(bad_job["error"]),
+              f"坏锚点留下 failed 行，界面据此报告（{bad_job['status']}）")
+
+    ids = [s["id"] for s in (await ov_state.store.get("asr"))["asr_segments"]]
+    check(ids == ["asr-0", "asr-1"],
+          f"asr 段自带稳定 id，覆盖层就是锚它（{ids}）")
+    packed_ov = await itp_ov.invoke(
+        "render_video", ov_state,
+        overlay_events=[{"segments": [ids[1]], "path": to_ref(ov_key)}], **ov_params)
+    out_ov = packed_ov["output"]
+    tl_ov = (await ov_state.store.get("plan_timeline"))["timeline"]
+    a1 = tl_ov["audio_events"][1]
+    check((out_ov.get("timeline_digest") or {}).get("overlay_segments") == 1,
+          f"指纹记下了这一层：{out_ov.get('timeline_digest')}")
+    ov_local = await storage.objects.localize(out_ov["video"], tmp / "ov_client")
+    inside_rgb = _rgb_at(ov_local, (float(a1["start"]) + float(a1["end"])) / 2)
+    outside_rgb = _rgb_at(ov_local, 0.4)
+    check(_is_green(inside_rgb),
+          f"锚到第二句话，那句话正播时画面是绿的（RGB{inside_rgb}）")
+    check(not _is_green(outside_rgb),
+          f"第一句话仍归主轨（RGB{outside_rgb}）——秒数按成片算，不是全片盖满")
+    check(mediaops.probe(ov_local)["has_audio"],
+          "口播声音没被覆盖层抢走（原声仍在）")
+    done_job = await storage.render_jobs.get("p:ov", "af_ov")
+    check(done_job["status"] == "done", "同一次运行里失败→改对→成功，行状态跟着复位")
+
+    print("\n=== ⑩ dry_run：先回出片计划，不烧像素 ===")
+    # 「改了编排 → 渲 → 十分钟 → 被闸拦下 / 或者根本不是我要的那版」这条循环太贵。
+    # dry_run 把渲染前的每一道校验原样跑一遍（同一批判定函数），只回账。
+    dry_state = NodeState(session_id="p:dry", artifact_id="af_dry",
+                          user_request="先告诉我这版会渲成什么样",
+                          store=await _open_store(storage, "p:dry", "af_dry"),
+                          user_id=USER, conversation_id=CONV)
+    await prep_creative(itp, dry_state, [mat])
+    packed_dry = await itp.invoke("render_video", dry_state, material_ids=[mat],
+                                  dry_run=True)
+    dry = packed_dry["output"]
+    check(dry.get("dry_run") is True and dry.get("will_render") is True,
+          f"好编排：dry_run 说渲得出来（blocking={dry['blocking']}）")
+    check("video" not in dry and "media_url" not in dry,
+          "回的是账，不是成片引用")
+    plan = dry["plan"]
+    tl_dry = (await dry_state.store.get("plan_timeline"))["timeline"]
+    check(plan["picture"]["segments"] == len(tl_dry["events"])
+          and plan["voice"]["segments"] == len(tl_dry["audio_events"])
+          and abs(plan["duration"] - float(tl_dry["duration"])) < 0.01,
+          f"账对得上这份时间线：{plan['duration']}s / 画面 {plan['picture']['segments']} 段"
+          f" / 声音 {plan['voice']['segments']} 段")
+    check(dry["timeline_digest"]["video_segments"] == plan["picture"]["segments"]
+          and dry["timeline_digest"]["audio_segments"] == plan["voice"]["segments"]
+          and dry["timeline_digest"]["overlay_segments"] == len(plan["overlays"]),
+          "指纹与账同源（同一份时间线的两种说法，不会各算各的）")
+    check(await storage.render_jobs.get("p:dry", "af_dry") is None,
+          "dry_run 不开渲染任务行（留下一行 running 会被看门狗判停滞、被界面当成正在出片）")
+    check(not await dry_state.store.has("render_video"),
+          "dry_run 不写 artifacts：它不是一次渲染产物，写了就是「这步已有产出」的假象")
+    check(not (ws / "p_dry" / "af_dry" / "render").exists(),
+          "dry_run 不建 render/ 目录：既不取字节也不写字节")
+    check(len(dry["not_checked"]) >= 3,
+          f"dry_run 如实交代自己看不到的（{len(dry['not_checked'])} 条）")
+
+    # 会被闸拦下的那份：dry_run 现在就把它报出来，而不是等十分钟
+    mis2 = json.loads(json.dumps(tl))
+    dur2 = float(mis2["duration"])
+    mis2["mode"] = "original_audio"
+    mis2["audio_events"] = [{"path": mis2["events"][0]["path"], "start": 0.0,
+                             "end": round(dur2 / 2, 3), "src_start": 0.0,
+                             "src_end": round(dur2 / 2, 3), "kind": "original"}]
+    bad_dry = (await itp.invoke("render_video", dry_state, dry_run=True,
+                                timeline=mis2))["output"]
+    check(bad_dry["will_render"] is False and bad_dry["blocking"],
+          f"坏编排：dry_run 当场说渲不出来（{str(bad_dry['blocking'][0])[:50]}…）")
+    check(await storage.render_jobs.get("p:dry", "af_dry") is None,
+          "被 dry_run 判死的编排同样不写渲染任务行")
+    try:
+        await itp.invoke("render_video", dry_state, dry_run=True,
+                         overlay_events=[{"segments": ["asr-777"],
+                                          "path": to_ref(ov_key)}])
+        check(False, "dry_run 里锚错 id 同样要当场报错")
+    except ValueError as e:
+        check("锚点认不出来" in str(e), f"dry_run 也跑锚点解析（{str(e).splitlines()[0]}）")
+        check(await storage.render_jobs.get("p:dry", "af_dry") is None,
+              "dry_run 的失败不留下 failed 行（压根没开过任务）")
+    # 关掉 dry_run：同一份编排真的出片，指纹与 dry_run 说的一致
+    real_after_dry = (await itp.invoke("render_video", dry_state,
+                                       material_ids=[mat]))["output"]
+    check(real_after_dry["timeline_digest"]["sha16"] == dry["timeline_digest"]["sha16"],
+          "按 dry_run 的账去掉开关再渲，成片指纹一致（不会「看到一版、渲出另一版」）")
+
+    print("\n=== ⑪ 证据分级：账本在真链路上的落点 ===")
+    # 「渲染完成」这四个字底下混着三种东西：算出来的、量过字节/像素的、机器验不了的。
+    # 这里钉的是「没做的那一步不许自称做过」——dry_run 没下字节，它那本账里
+    # byte/frame 就必须是 UNVERIFIED；真渲之后同一类条目要升上来，而听感那条永远不升。
+    dry_led = dry["evidence"]
+    check(dry_led and all(e["status"] == "UNVERIFIED" for e in dry_led
+                          if e["level"] in ("byte", "frame")),
+          f"dry_run 的账：byte/frame {sum(1 for e in dry_led if e['level'] in ('byte', 'frame'))} "
+          "条全是 UNVERIFIED（它压根没下载也没编码）")
+    check(any(e["level"] == "machine" and e["status"] == "verified" for e in dry_led),
+          "同一本账里 machine 级是验过的——分级不是「全都算未验」的挡箭牌")
+    check(dry.get("evidence_rule"), "账本随附引用规则：只有 verified 的能对用户声称验过")
+
+    ov_led = out_ov["evidence"]
+    by_level: dict[str, list[dict]] = {}
+    for e in ov_led:
+        by_level.setdefault(e["level"], []).append(e)
+    check(all(e["status"] == "verified" for e in by_level.get("byte", [])),
+          f"真渲之后 byte 级条目升为 verified（{len(by_level.get('byte', []))} 条，ffprobe 量的）")
+    check(any(e["status"] == "verified" for e in by_level.get("frame", [])),
+          f"抽帧真跑了：frame 级有 verified 条目（{[e['claim'][:14] for e in by_level.get('frame', [])]}）")
+    check(all(e["status"] == "UNVERIFIED" for e in by_level.get("listening", [])),
+          "听感那条在成片产物里仍是 UNVERIFIED（机器没有听觉）")
+    check(any("对不对题" in e["claim"] and e["status"] == "UNVERIFIED" for e in ov_led),
+          "「盖上去的是不是你要那张」如实标未验——只有用户这一眼知道")
+    job_ov = await storage.render_jobs.get("p:ov", "af_ov")
+    check((job_ov.get("result") or {}).get("evidence"),
+          "整本账进了 render_jobs.result：轮询端与历史重放拼得出的同一份")
+    leftover = list((ws / "p_ov" / "af_ov" / "render").rglob("*.gray"))
+    check(not leftover, f"抽帧的灰度裸流读完即删（工作区残留 {len(leftover)} 个）")
 
     print()
     print("FAILED" if FAILS else "ALL PASSED", f"({FAILS} failures)")

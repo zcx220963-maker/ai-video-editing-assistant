@@ -191,6 +191,7 @@ def build_preview(artifacts: Mapping[str, Any]) -> dict[str, Any]:
     events = [e for e in (tl.get("events") or []) if isinstance(e, Mapping)]
     audio_events = [a for a in (tl.get("audio_events") or []) if isinstance(a, Mapping)]
     subs = [s for s in (tl.get("subtitles") or []) if isinstance(s, Mapping)]
+    overlays = [o for o in (tl.get("overlay_events") or []) if isinstance(o, Mapping)]
     plays = sum(_num(e.get("end")) - _num(e.get("start")) for e in events)
     timeline = {
         "node": tl_node,
@@ -201,6 +202,7 @@ def build_preview(artifacts: Mapping[str, Any]) -> dict[str, Any]:
         "video_events": len(events),
         "video_seconds": round(plays, 2),
         "audio_events": len(audio_events),
+        "overlay_events": len(overlays),
         "subtitles": len(subs),
         "speaker_ratio": round(_num(tl.get("speaker_ratio")), 2),
         "events": [{
@@ -222,6 +224,9 @@ def build_preview(artifacts: Mapping[str, Any]) -> dict[str, Any]:
     kept_n = shots_block["kept"]
     if shots_block["total"] and kept_n == 0:
         warnings.append("筛选后一个片段都没保留——请检查筛选条件。")
+    if any(not (o.get("segments") or []) and o.get("start") is None for o in overlays):
+        warnings.append(
+            "有覆盖层既没写锚点段落（segments）也没写起止秒，渲染时这一层会被跳过。")
     # 人声被截断的迹象：最后一句的结束时间超过成片时长
     all_speech_end = max(
         (_num(s["end"]) for segs in asr_map.values() for s in segs), default=0.0)

@@ -486,6 +486,22 @@ def _find_media(obj: Any) -> dict[str, Any] | None:
     return None
 
 
+def _evidence_view(raw: Any) -> list[dict[str, Any]]:
+    """渲染产物里的证据账 → 卡片用的最小形状（主张 / 级别 / 验没验）。
+
+    只挑这三样：`proof`（怎么验的）在工具结果里模型已经读过一份，卡片不复述全文；
+    用户在界面上要的是「这一条到底验过没有」这一眼。
+    """
+    out: list[dict[str, Any]] = []
+    for e in (raw if isinstance(raw, list) else []):
+        if not isinstance(e, dict) or not e.get("claim"):
+            continue
+        out.append({"claim": str(e["claim"]),
+                    "label": str(e.get("label") or e.get("level") or ""),
+                    "verified": str(e.get("status") or "") == "verified"})
+    return out
+
+
 class MediaCardHook(AgentHook):
     """after_execute_tools 观测节点 → 成片播放卡片回投 MQ OutBound。
 
@@ -516,18 +532,20 @@ class MediaCardHook(AgentHook):
             if not item or item["media_url"] in seen:
                 continue
             seen.add(item["media_url"])
-            await self._mq.publish(
-                self._topic,
-                session_id,
-                {
-                    "type": "media",
-                    "session_id": session_id,
-                    "run_id": context.extras.get("run_id"),
-                    "media_url": item["media_url"],
-                    "title": item.get("title") or "",
-                    "duration": item.get("duration"),
-                },
-            )
+            # 证据分级（真节点在终态产物里带一份）：卡片要说清哪几条是机器算过/抽帧看过、
+            # 哪几条压根没验。没有这个字段的链路（离线替身、旧数据）不硬造一条空账。
+            evidence = _evidence_view(item.get("evidence"))
+            frame = {
+                "type": "media",
+                "session_id": session_id,
+                "run_id": context.extras.get("run_id"),
+                "media_url": item["media_url"],
+                "title": item.get("title") or "",
+                "duration": item.get("duration"),
+            }
+            if evidence:
+                frame["evidence"] = evidence
+            await self._mq.publish(self._topic, session_id, frame)
             # 除了当轮回投，再落一条**持久链接**到本轮 assistant 行的 qa.parts（README §6）：
             # media_url 是会过期的 presigned 直链，不能当持久键；用渲染的对象键（真节点回在
             # video 字段）+ artifact_id 才是稳定指针，读取历史时再现签一条直链。
@@ -538,6 +556,7 @@ class MediaCardHook(AgentHook):
                     "video_object_key": object_key,
                     "title": item.get("title") or "",
                     "duration": item.get("duration"),
+                    **({"evidence": evidence} if evidence else {}),
                 })
 
 def _truncate(s: str, n: int) -> str:

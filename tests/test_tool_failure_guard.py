@@ -21,6 +21,7 @@ from __future__ import annotations
 import sys as _sys; from pathlib import Path as _Path; _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 
 import asyncio
+import re
 import sys
 from typing import Any
 
@@ -105,6 +106,45 @@ class BoomTool(Tool):
     async def execute(self, **kwargs: Any) -> str:
         self.calls += 1
         raise RuntimeError("素材文件不存在")
+
+
+class ScriptedFailureTool(Tool):
+    """按脚本决定这次失败算不算「失败」：None=成功，True=真失败，False=反馈类错误。
+
+    ``counts_as_failure=False`` 是 ``ToolError`` 的另一半语义：这条错误本身就是可执行
+    的反馈（如 ``submit_plan`` 的校验打回），模型读着清单改输入再交一次就是正路。
+    """
+
+    def __init__(self, name: str, script: list[bool | None]) -> None:
+        self._name = name
+        self.script = list(script)
+        self.calls = 0
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return "按脚本区分失败性质的替身工具"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}, "required": []}
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(self, **kwargs: Any) -> str:
+        outcome = self.script[min(self.calls, len(self.script) - 1)]
+        self.calls += 1
+        if outcome is None:
+            return f"ok #{self.calls}"
+        if outcome:
+            raise ToolError(self._name, f"真跑坏了 #{self.calls}")
+        raise ToolError(self._name, f"清单在此，改好再交 #{self.calls}",
+                        counts_as_failure=False)
 
 
 def build_agent(steps: list[Any], *, tools: list[Tool]) -> AgentOnceRun:
@@ -244,11 +284,46 @@ async def case_d_hard_stop() -> None:
           "⑤ 拒绝话里给出路（换参数 / 说明卡点 / 规划轮直接交卡）")
 
 
+async def case_e_feedback_is_not_a_failure() -> None:
+    print("\n=== ⑥ 反馈类错误不计入失败：模型照着清单改，不会被守卫打断 ===")
+    tool = ScriptedFailureTool("submit_plan", [False])   # 每次都只是「打回重写」
+    agent = build_agent(
+        [("tool", "submit_plan", {})] * 6 + [("answer", "按清单改好再交一次")],
+        tools=[tool])
+    out = await agent.run(Session(user_id="u", conversation_id="c_guard_e"), "来一版计划")
+    last = agent.llm.calls[-1]
+
+    check(tool.calls == 6,
+          f"⑥ 六次都真打到工具上（一次没被守卫拦在门外）：{tool.calls}")
+    check(guards(last) == [], f"⑥ 一条守卫提示都没有：{guards(last)}")
+    check(chain_violations(last) == [], f"⑥ 链子照常收口：{chain_violations(last)}")
+    check(out == "按清单改好再交一次", f"⑥ run 正常收尾：{out}")
+
+
+async def case_f_feedback_neither_adds_nor_clears() -> None:
+    print("\n=== ⑦ 反馈类错误既不计数也不清零：夹在中间的真失败照数 ===")
+    # 第一次真失败、第二次反馈、随后三次真失败。反馈那次既不该被数成一次失败
+    # （否则念的是 3/4/5），也不该把计数清零（否则第一次真失败作废、只念 2/3）。
+    tool = ScriptedFailureTool("asr", [True, False, True, True, True])
+    agent = build_agent([("tool", "asr", {})] * 5 + [("answer", "说明卡在哪")],
+                        tools=[tool])
+    await agent.run(Session(user_id="u", conversation_id="c_guard_f"), "跑一下")
+    last = agent.llm.calls[-1]
+
+    check(tool.calls == 5, f"⑦ 阈值 4 之前都不拦：真打了 {tool.calls} 次")
+    g = guards(last)
+    counted = [int(re.search(r"连续失败 (\d+) 次", text).group(1)) for _, text in g]
+    check(counted == [2, 3, 4],
+          f"⑦ 真失败的计数如实累加（2→3→4），反馈那次不在其中：{counted}")
+
+
 async def main() -> int:
     await case_a_order_after_failure()
     await case_b_same_batch_two_calls()
     await case_c_no_guard_before_two()
     await case_d_hard_stop()
+    await case_e_feedback_is_not_a_failure()
+    await case_f_feedback_neither_adds_nor_clears()
     print("\n" + ("SMOKE PASSED" if not FAILS else f"SMOKE FAILED：{FAILS}"), flush=True)
     print(f"用例 {CHECKS} 条", flush=True)
     return 0 if not FAILS else 1
