@@ -2990,8 +2990,11 @@ REAL_NODE_CLASSES = [
 def build_real_registry(settings: Settings, providers: Providers, storage: Storage,
                         allowed: list[str] | None = None) -> NodeRegistry:
     """实例化真实节点；allowed 为 TOML available_nodes 白名单。"""
+    # 网页出片通道（Hyperframes 类）延迟到这里导入：web_nodes 反过来引本模块的
+    # StoryNode/_obj，模块级互相导入会因加载顺序炸掉其中一边。
+    from .web_nodes import RenderWebNode
     reg = NodeRegistry()
-    name_to_cls = {cls.name: cls for cls in REAL_NODE_CLASSES}
+    name_to_cls = {cls.name: cls for cls in [*REAL_NODE_CLASSES, RenderWebNode]}
     for nm in (allowed or list(name_to_cls)):
         cls = name_to_cls.get(nm)
         if cls is not None:

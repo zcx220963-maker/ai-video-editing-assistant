@@ -36,21 +36,38 @@ class MessageCenter:
         return ident.user_id, ident.conversation_id
 
     async def send(self, sender: str, to: str, content: str,
-                   msg_type: str = "message") -> str:
-        """往收件人 ``to`` 的收件箱插一条消息，返回确认串供 LLM 感知发送成功。"""
+                   msg_type: str = "message",
+                   dedup_key: str | None = None) -> str:
+        """往收件人 ``to`` 的收件箱插一条消息，返回确认串供 LLM 感知发送成功。
+
+        dedup_key（可选）是投递幂等键：同一收件箱里已有未消费的同键消息时不再重复
+        投递（崩溃恢复/重试重放同一条指令不会翻倍）。
+        """
         user_id, conv_id = self._scope()
-        await self._inbox.send(user_id, conv_id, to, {
+        row = await self._inbox.send(user_id, conv_id, to, {
             "type": msg_type,
             "from": sender,
             "content": content,
             "timestamp": time.time(),
-        }, type_=msg_type, sender=sender)
-        return f"Sent {msg_type} to {to}"
+        }, type_=msg_type, sender=sender, dedup_key=dedup_key)
+        suffix = "（同键未消费消息已存在，未重复投递）" \
+            if dedup_key and row.get("_deduplicated") else ""
+        return f"Sent {msg_type} to {to}{suffix}"
 
     async def read_inbox(self, name: str) -> list[dict[str, Any]]:
-        """读出并标记已读（一条消息只消费一次），返回消息正文列表。"""
+        """读出并标记已读（原子领取：一条消息只被一个消费者拿到），返回消息正文列表。
+
+        每条消息额外带 ``_id``（收件箱行号），消费方可据此做本地去重/审计对账。
+        """
         user_id, conv_id = self._scope()
-        return [row["content"] for row in await self._inbox.read(user_id, conv_id, name)]
+        rows = await self._inbox.read(user_id, conv_id, name)
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            content = row.get("content")
+            item = dict(content) if isinstance(content, dict) else {"body": content}
+            item["_id"] = row.get("id")
+            out.append(item)
+        return out
 
     async def peek(self, name: str) -> list[dict[str, Any]]:
         """只读不标记（诊断/测试用）。"""
@@ -93,12 +110,18 @@ class SendMessageTool(Tool):
                 "to": {"type": "string", "description": "收件人 Agent 名字"},
                 "content": {"type": "string", "description": "消息正文"},
                 "type": {"type": "string", "description": "消息类型，默认 message"},
+                "dedup_key": {
+                    "type": "string",
+                    "description": "可选幂等键：同一收件箱已有未消费的同键消息时不重复投递",
+                },
             },
             "required": ["to", "content"],
         }
 
-    async def execute(self, to: str, content: str, type: str = "message") -> str:  # noqa: A002
-        return await self._center.send(self._sender, to, content, type)
+    async def execute(self, to: str, content: str, type: str = "message",  # noqa: A002
+                      dedup_key: str | None = None) -> str:
+        return await self._center.send(self._sender, to, content, type,
+                                       dedup_key=dedup_key)
 
 
 class ReadInboxTool(Tool):

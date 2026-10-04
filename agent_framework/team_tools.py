@@ -153,8 +153,8 @@ class Team:
     async def claim_task(self, task_id: int, owner: str) -> str:
         return _json(await self.task_manager.claim(int(task_id), owner))
 
-    async def complete_task(self, task_id: int) -> str:
-        return _json(await self.task_manager.complete(int(task_id)))
+    async def complete_task(self, task_id: int, owner: str = MAIN_AGENT_NAME) -> str:
+        return _json(await self.task_manager.complete(int(task_id), owner))
 
     async def start_subagent(
         self, name: str, prompt: str, allow_tools: list[str] | None = None
@@ -324,11 +324,14 @@ def register_team_tools(
     registry.register(
         FunctionTool(
             "complete_task",
-            "把一个已认领的任务标记为完成，其下游任务随之解锁。",
+            "把一个已认领的任务标记为完成，其下游任务随之解锁。"
+            "只有认领者本人能交付；重复交付幂等（原样返回）。",
             {
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "integer", "description": "任务 id"},
+                    "owner": {"type": "string",
+                              "description": "交付者（认领者）名字，缺省 main_agent"},
                 },
                 "required": ["task_id"],
             },

@@ -323,6 +323,27 @@ class PlanTimelineAITransitionNode(BaseNode):
         }
 
 
+class RenderWebNode(BaseNode):
+    name = "render_web"
+    description = "把网页(HTML/URL)渲染成视频:headless 逐帧截图 + ffmpeg 合成(独立终点节点)"
+    required_nodes = []
+
+    async def process(self, state, inputs):
+        # 与真节点（storyline_server/nodes/web_nodes.py RenderWebNode）同形状的产物契约:
+        # video 对象键 + duration/width/height/title + media_url。strictly mock:
+        # 不截帧、不合成——离线只验「模型选了这条独立终点路径后拿到的是成片卡形状」。
+        artifact = state.artifact_id or "_default"
+        object_key = f"renders/{_safe(state.session_id)}/{_safe(artifact)}/web.mp4"
+        title = str(inputs.get("title") or "网页出片")
+        return {
+            "video": object_key,
+            "media_url": f"memory://creation-assets/{object_key}?ttl=3600",
+            "duration": 0.0, "width": 0, "height": 0, "title": title,
+            "web_render": {"frames": 0, "fps": 0, "planned_sec": 0.0,
+                           "source": "url" if not inputs.get("html") else "html"},
+        }
+
+
 ALL_NODE_CLASSES = [
     # 输入阶段 → 素材处理层 → 逻辑与脚本层 → 时间轴规划层 → 最终输出
     SearchMediaNode, LoadMediaNode,
@@ -331,7 +352,7 @@ ALL_NODE_CLASSES = [
     ScriptTemplateRecNode, GenerateScriptNode, GenerateAITransitionNode,
     TransitionRecNode, TextRecNode, GenerateVoiceoverNode, SelectBGMNode,
     PlanTimelineNode, PlanTimelineProNode, PlanTimelineAITransitionNode,
-    RenderVideoNode,
+    RenderVideoNode, RenderWebNode,
 ]
 
 

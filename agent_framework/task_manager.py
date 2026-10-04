@@ -123,9 +123,30 @@ class TaskManager:
         return await self._with_open_deps(got)
 
     # ---- 完成：置 completed，其下游此前置即视为满足 ----
-    async def complete(self, task_id: int) -> dict[str, Any]:
+    async def complete(self, task_id: int, owner: str) -> dict[str, Any]:
+        """完成任务。生产语义（任务幂等 + 锁）：
+
+        * 只有**认领者本人**能交付——原子条件改写（claimed 且 owner 匹配），
+          两个协程/实例同时 complete 同一条，只有一个生效；
+        * 重复交付（同 owner 再 complete 已完成任务）**幂等**：原样返回、不报错，
+          崩溃恢复重放这条指令不会二次解锁下游；
+        * pending 不能跳过认领直接交付；他人认领/他人已交付都给出精确错误。
+        """
         task = await self._require(task_id)
-        await self._tasks.complete(self.scope, int(task_id))
+        if task["status"] == COMPLETED and task["owner"] == owner:
+            return {**task, "_unlocked": []}
+        if task["status"] == PENDING:
+            raise TaskError(f"任务 #{task_id} 尚未认领，先 claim 再 complete")
+        if task["status"] == CLAIMED and task["owner"] != owner:
+            raise TaskError(f"任务 #{task_id} 由 {task['owner']} 认领，只有认领者可交付")
+        row = await self._tasks.complete(self.scope, int(task_id), owner=owner)
+        if row is None:
+            # 检查与改写之间有竞态：重读一次，给出当下的事实而不是笼统失败
+            after = await self._require(task_id)
+            if after["status"] == COMPLETED and after["owner"] == owner:
+                return {**after, "_unlocked": []}
+            raise TaskError(f"任务 #{task_id} 无法由 {owner} 交付"
+                            f"（当前 {after['status']} @ {after['owner'] or '无主'}）")
         after = {t["id"]: t for t in await self.list_all()}
         done = after[int(task_id)]
         # 本次解锁了谁：下游里此前只被本任务挡着、现在可认领的

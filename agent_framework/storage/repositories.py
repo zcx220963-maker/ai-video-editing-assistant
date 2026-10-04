@@ -804,17 +804,37 @@ class InboxRepo(_Repo):
     table = "inbox_messages"
 
     async def send(self, user_id: str, conv_id: str, agent: str, content: Any,
-                   *, type_: str = "message", sender: str = "") -> dict[str, Any]:
+                   *, type_: str = "message", sender: str = "",
+                   dedup_key: str | None = None) -> dict[str, Any]:
+        """插一条消息。dedup_key 给定时做投递幂等：同一收件箱里已有**未消费**的
+        同键消息就直接返回那一行，不重复投（崩溃恢复/重试重放同一条指令不会翻倍）。
+        键存进 content._dedup，收件方读到时能看见。"""
+        if dedup_key:
+            for r in await self.peek(user_id, conv_id, agent):
+                c = r.get("content")
+                if isinstance(c, dict) and c.get("_dedup") == dedup_key:
+                    return {**r, "_deduplicated": True}   # 运行时标记，不落库
+            content = dict(content) if isinstance(content, dict) else {"body": content}
+            content["_dedup"] = dedup_key
         # consumed_at 显式写 NULL：两引擎返回的行都带这一列，调用方不必猜 schema 默认值
         return await self.db.insert(self.table, {
             "user_id": user_id, "conv_id": conv_id, "agent": agent, "type": type_,
             "sender": sender, "content": content, "consumed_at": None})
 
     async def read(self, user_id: str, conv_id: str, agent: str) -> list[dict[str, Any]]:
-        rows = await self.peek(user_id, conv_id, agent)
-        for r in rows:
-            await self.db.update(self.table, {"consumed_at": _now()}, where={"id": r["id"]})
-        return rows
+        """原子消费：领取未读行并**在领取的同一笔原子改写里**打上 consumed_at
+        （PG 用 FOR UPDATE SKIP LOCKED，内存引擎锁内比较-改写）。原先「先 peek
+        再逐行 update」在两个消费者并发读同一收件箱时会把同一批消息各消费一遍；
+        领取语义保证每条消息恰好被一个消费者拿到。"""
+        out: list[dict[str, Any]] = []
+        while True:
+            rows = await self.db.claim(self.table, {"consumed_at": _now()},
+                                       where={"user_id": user_id, "conv_id": conv_id,
+                                              "agent": agent, "consumed_at": is_null()},
+                                       order_by=["id"], limit=200)
+            out.extend(rows)
+            if len(rows) < 200:
+                return out
 
     async def peek(self, user_id: str, conv_id: str, agent: str) -> list[dict[str, Any]]:
         return await self.db.select(self.table, where={"user_id": user_id, "conv_id": conv_id,
@@ -885,9 +905,21 @@ class TasksRepo(_Repo):
                                   order_by=["id"], limit=1)
         return await self.get(task_id) if got else None
 
-    async def complete(self, scope: str, task_id: int) -> dict[str, Any] | None:
-        await self.db.update(self.table, {"status": "completed"},
-                             where={"id": task_id, "scope": scope})
+    async def complete(self, scope: str, task_id: int, *,
+                       owner: str | None = None) -> dict[str, Any] | None:
+        """完成任务。owner 给定时走原子条件改写：只有「claimed 且 owner 匹配」的行
+        能被置 completed——认领者才能交付；抢不到（他人已交付/非认领状态）返回 None，
+        由上层区分精确错误。owner=None 保留无条件路径，仅供内部收尾使用。"""
+        if owner is not None:
+            got = await self.db.claim(self.table, {"status": "completed"},
+                                      where={"scope": scope, "id": task_id,
+                                             "status": "claimed", "owner": owner},
+                                      order_by=["id"], limit=1)
+            if not got:
+                return None
+        else:
+            await self.db.update(self.table, {"status": "completed"},
+                                 where={"id": task_id, "scope": scope})
         return await self.get(task_id)
 
     async def ready(self, scope: str) -> list[dict[str, Any]]:
@@ -1103,6 +1135,36 @@ class SkillsRepo(_Repo):
 
     async def drop(self, name: str) -> int:
         await self.db.delete("skill_files", where={"skill": name})
+        return await self.db.delete(self.table, where={"name": name})
+
+
+class McpServersRepo(_Repo):
+    """动态 MCP Server 注册：配置与启停状态落库，运行时热连/热断。
+
+    与部署期 mcp.json 的关系：json 是发版才能改的静态清单，这里是运行期通道——
+    配置经 HTTP 接口写入后 enable 即连、disable 即断，工具注册表随之增删。
+    """
+
+    table = "mcp_servers"
+
+    async def upsert(self, name: str, config: Mapping[str, Any], *,
+                     enabled: bool = False) -> dict[str, Any]:
+        return await self.db.upsert(self.table, {
+            "name": name, "config": dict(config), "enabled": bool(enabled),
+            "updated_at": _now()})
+
+    async def list(self) -> list[dict[str, Any]]:
+        return await self.db.select(self.table, order_by=["name"])
+
+    async def get(self, name: str) -> dict[str, Any] | None:
+        return await self.db.get_by_pk(self.table, {"name": name})
+
+    async def set_enabled(self, name: str, enabled: bool) -> dict[str, Any] | None:
+        await self.db.update(self.table, {"enabled": bool(enabled), "updated_at": _now()},
+                             where={"name": name})
+        return await self.get(name)
+
+    async def drop(self, name: str) -> int:
         return await self.db.delete(self.table, where={"name": name})
 
 

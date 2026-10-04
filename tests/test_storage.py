@@ -179,21 +179,22 @@ async def test_lazy_imports() -> None:
 # 边表随父表受约），显式列出以免静态检查假阳性。users 是归属表本身，其主键 id
 # 就是其它表的 owner 列。
 GLOBAL_TABLES = {"users", "skills", "skill_files", "scheduled_jobs", "task_edges",
-                 "checkpoint_entries"}   # 一致点链随父 run 归属，本行不重复挂会话列
+                 "checkpoint_entries",
+                 "mcp_servers"}   # 动态 MCP 注册：部署级配置，无 owner 列（同 scheduled_jobs）
 SCOPE_COLS = ("user_id", "owner_user_id", "scope", "session_id", "conv_id")
 PATH_COLS = {"path", "file_path", "local_path", "abs_path", "filepath", "dir", "root"}
 
 
 async def test_schema_static() -> None:
     tables, sequences, sql = load_schema()
-    check(len(tables) == 20, f"20 张表（实得 {len(tables)}）")
+    check(len(tables) == 21, f"21 张表（实得 {len(tables)}）")
     check(sequences == frozenset({"task_seq"}), "序列只声明 task_seq")
     check(set(tables) == {
         "users", "conversations", "messages", "materials", "upload_sessions",
         "artifacts", "render_jobs",
         "checkpoints", "checkpoint_entries", "inbox_messages", "tasks", "task_edges",
         "subagents", "scheduled_jobs", "memories", "skills", "skill_files", "timelines",
-        "app_secrets", "token_usage"}, "表名与设计一一对应")
+        "app_secrets", "token_usage", "mcp_servers"}, "表名与设计一一对应")
 
     n_create = sql.count("CREATE TABLE")
     check(n_create == sql.count("CREATE TABLE IF NOT EXISTS"), "建表语句全幂等")

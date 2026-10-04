@@ -88,10 +88,11 @@ async def main() -> None:
         check(c1["status"] == CLAIMED and c1["owner"] == "SubAgent B", "认领后 claimed 且写入 owner")
 
         # ---- 完成 #1、#2 → 解锁 #3（blockedBy 边留着，open_deps 清空才可认领）----
-        await tm.complete(1)
+        await tm.complete(1, "SubAgent B")  # 认领者本人交付
         check((await tm.get(3))["blockedBy"] == [1, 2], "依赖边不随完成删除（图真相不变）")
         check((await tm.get(3))["open_deps"] == [2], "完成 #1 后 #3 仍被 [2] 阻塞（open_deps 现算）")
-        unlocked = (await tm.complete(2))["_unlocked"]
+        await tm.claim(2, "SubAgent A")
+        unlocked = (await tm.complete(2, "SubAgent A"))["_unlocked"]
         check(unlocked == [3], f"#2 完成解锁下游 #3：{unlocked}")
         check((await tm.get(3))["open_deps"] == [], "#1、#2 都完成后 #3 的 open_deps 清空")
         check(3 in {t["id"] for t in await tm.ready()}, "open_deps 清空后 #3 变为可认领")
@@ -109,7 +110,7 @@ async def main() -> None:
         check((await tm.get(3))["status"] == CLAIMED, "#3 已被认领")
 
         # ---- 完成 #3 → 解锁 #4、#5 ----
-        un3 = (await tm.complete(3))["_unlocked"]
+        un3 = (await tm.complete(3, ok[0]["owner"]))["_unlocked"]
         check(set(un3) == {4, 5}, f"#3 完成解锁 #4、#5：{un3}")
         check({t["id"] for t in await tm.ready()} >= {4, 5}, "#4、#5 现在可认领")
 

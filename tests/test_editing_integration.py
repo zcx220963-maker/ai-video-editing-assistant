@@ -138,9 +138,9 @@ async def main() -> None:
         check(list(ids) == sorted(ids), "任务按拓扑序插入，id 递增即依赖递增")
         check(by_name["render_video"]["id"] > by_name["plan_timeline"]["id"],
               "下游节点编号大于其上游（拓扑序落进 id 段）")
-        # 初始可认领 = 无依赖节点（load_media / search_media）。
+        # 初始可认领 = 无依赖节点（load_media / search_media / render_web 独立终点）。
         first_ready = {r["name"] for r in await tm.ready()}
-        check(first_ready == {"load_media", "search_media"},
+        check(first_ready == {"load_media", "search_media", "render_web"},
               f"链首无依赖节点先可认领：{first_ready}")
         # render_video 对应任务初始被阻塞。
         rv = by_name["render_video"]["id"]
@@ -168,7 +168,7 @@ async def main() -> None:
             if node_name not in ("search_media", "correct_transcript"):
                 await interceptor.invoke(node_name, state)
                 executed.append(node_name)
-            await tm.complete(task["id"])
+            await tm.complete(task["id"], "sub_agent")  # 认领者本人交付
 
         check(set(executed) >= {"load_media", "split_shots", "understand_clips",
                                "filter_clips", "group_clips", "generate_script",

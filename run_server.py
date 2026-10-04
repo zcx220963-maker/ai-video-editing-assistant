@@ -86,6 +86,7 @@ from agent_framework.team_tools import Team, register_team_tools
 from agent_framework.tool import ToolRegistry
 from agent_framework.tools.cron import CronScheduler, register_cron_tools
 from agent_framework.tools.file import register_file_tools, session_workspace_root
+from agent_framework.mcp_manager import McpManager
 from agent_framework.tools.mcp import (
     MCPClient,
     MCPServerConfig,
@@ -230,6 +231,7 @@ class Runtime:
     storage: Storage | None = None
     plan_gate: PlanGate | None = None
     mcp_clients: list[MCPClient] = field(default_factory=list)
+    mcp_manager: Any | None = None
     startup: Any = None   # async callable()：create_app 的 on_startup 同一实现，测试可直调
     shutdown: Any = None  # async callable()：create_app 的 on_shutdown
 
@@ -466,6 +468,8 @@ def build_runtime(
 
     # ---- 启动钩子：checkpoint 自动恢复 + MCP/Storyline 外部工具接入（失败仅告警）----
     mcp_clients: list[MCPClient] = []
+    # 动态 MCP：配置在 PG（/mcp/servers 接口管理），运行期热连/热断——与静态 json 并存
+    mcp_manager = McpManager(storage, registry)
     mcp_path = None if mcp_config is False else _resolve_dir(mcp_config, DEFAULT_MCP_CONFIG)
     storyline_path = None if storyline_config is False else _resolve_dir(
         storyline_config, DEFAULT_STORYLINE_CONFIG
@@ -540,6 +544,12 @@ def build_runtime(
                         _info(f"MCP server「{sc.name}」已接入 {len(names)} 个工具：{names}")
                     except Exception as exc:  # noqa: BLE001
                         _warn(f"MCP server「{sc.name}」连接失败，已跳过：{exc}")
+
+        # (b2) 动态 MCP：库里 enabled 的 server 热连（配置由 /mcp/servers 接口管理）
+        live = await mcp_manager.connect_enabled()
+        if live:
+            n_tools = sum(len(v) for v in live.values())
+            _info(f'动态 MCP 已接入 {n_tools} 个工具：{sorted(live)}')
 
         # (c) Storyline MCP：剪辑节点的**唯一**来源。连不上 = 没有剪辑能力，明确告警。
         if storyline_path is None:
@@ -670,6 +680,7 @@ def build_runtime(
     async def _shutdown() -> None:
         if team_obj is not None:
             await team_obj.shutdown()
+        await mcp_manager.close_all()
         for client in mcp_clients:
             try:
                 await client.close()
@@ -694,6 +705,8 @@ def build_runtime(
         upload_sweep_sec=upload_sweep_sec,
         fetch_policy=fetch_policy,
         skill_loader=skill_loader,
+        skills_dir=skills_import_dir,
+        mcp_manager=mcp_manager,
         editing_contract=editing_contract,
         broadcast_url=broadcast_url or None,
         broadcast_channel=broadcast_channel,
@@ -711,6 +724,7 @@ def build_runtime(
         storage=storage,
         plan_gate=plan_gate,
         mcp_clients=mcp_clients,
+        mcp_manager=mcp_manager,
         startup=_startup,
         shutdown=_shutdown,
     )

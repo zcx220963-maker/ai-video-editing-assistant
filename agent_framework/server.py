@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -67,7 +67,9 @@ from .identity import storyline_session_id
 from .llm_openai import (DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_THINKING,
                          get_default_llm)
 from .media_fetch import FetchPolicy, FetchRejected, fetch_media
+from .mcp_manager import McpManagerError
 from .mq import MessageQueue
+from .tools.mcp import MCPServerConfig
 from .storage import IntegrityConflict, Storage
 from .tool import is_tool_error
 from .checkpoint import STATUS_AWAITING_APPROVAL
@@ -416,6 +418,78 @@ def readable_decision(row: Mapping[str, Any], decision: str, message: str,
     return decision, new_message, out
 
 
+_SKILLS_UI_HTML = """<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>技能库管理</title>
+<style>
+ body{font-family:system-ui,"Segoe UI","Microsoft YaHei",sans-serif;max-width:860px;
+      margin:32px auto;padding:0 16px;color:#1f2328}
+ h1{font-size:22px} .row{display:flex;gap:8px;align-items:center;margin:12px 0}
+ button{padding:6px 14px;border:1px solid #d0d7de;border-radius:6px;background:#f6f8fa;
+        cursor:pointer} button:hover{background:#eef1f4}
+ table{border-collapse:collapse;width:100%;margin-top:12px}
+ th,td{border:1px solid #d8dee4;padding:6px 10px;text-align:left;font-size:14px}
+ th{background:#f6f8fa} .ok{color:#1a7f37}.bad{color:#cf222e}
+ #msg{margin-left:8px;font-size:13px;color:#656d76}
+ input[type=file]{font-size:14px}
+</style></head><body>
+<h1>技能库管理 <span id="msg"></span></h1>
+<div class="row">
+  <button onclick="reload()">重新扫描导入目录</button>
+  <input type="file" id="zip" accept=".zip">
+  <button onclick="upload()">上传技能包(.zip)</button>
+  <a href="/" style="margin-left:auto;font-size:13px;color:#0969da">← 返回会话</a>
+</div>
+<table id="tbl"><thead><tr>
+  <th>名称</th><th>中文名</th><th>常驻</th><th>可用</th><th>描述</th><th>附件</th>
+</tr></thead><tbody></tbody></table>
+<script>
+const msg = t => document.getElementById("msg").textContent = t;
+const auth = () => ({ "Authorization": "Bearer " + (localStorage.getItem("ca.token") || "") });
+async function load() {
+  try {
+    const r = await fetch("/skills", { headers: auth() });
+    if (r.status === 401) { msg("凭证无效:请先在主页面登录"); return; }
+    const data = await r.json();
+    const tb = document.querySelector("#tbl tbody");
+    tb.innerHTML = "";
+    for (const s of data.skills) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${s.name}</td><td>${s.display || "—"}</td>
+        <td>${s.always ? "是" : "否"}</td>
+        <td class="${s.available ? "ok" : "bad"}">${s.available ? "可用" : (s.unavailable_reason || "不可用")}</td>
+        <td>${(s.description || "").slice(0, 80)}</td><td>${(s.files || []).join(", ") || "—"}</td>`;
+      tb.appendChild(tr);
+    }
+    msg(`共 ${data.skills.length} 个技能`);
+  } catch (e) { msg("加载失败:" + e); }
+}
+async function reload() {
+  const r = await fetch("/skills/reload", { method: "POST", headers: auth() });
+  const d = await r.json().catch(() => ({}));
+  msg(r.ok ? "已重扫:" + (d.imported || []).join(", ") : ("失败:" + (d.detail || r.status)));
+  load();
+}
+async function upload() {
+  const f = document.getElementById("zip").files[0];
+  if (!f) { msg("先选择 .zip 文件"); return; }
+  const r = await fetch("/skills/upload?filename=" + encodeURIComponent(f.name),
+                        { method: "POST", headers: auth(), body: await f.arrayBuffer() });
+  const d = await r.json().catch(() => ({}));
+  msg(r.ok ? "已导入:" + (d.imported || []).join(", ") : ("失败:" + (d.detail || r.status)));
+  load();
+}
+load();
+</script></body></html>"""
+
+
+class McpServerRequest(BaseModel):
+    """POST /mcp/servers 请求体：name + MCPServerConfig 字面量（字段见 tools/mcp.py）。"""
+
+    name: str
+    config: dict = {}
+    enabled: bool = False
+
+
 def create_app(
     agent: Agent,
     mq: MessageQueue,
@@ -431,6 +505,8 @@ def create_app(
     upload_sweep_sec: float = 600.0,       # 放弃的分片多久扫一次；<=0 关掉后台清扫（测试用）
     fetch_policy: FetchPolicy | None = None,          # /fetch_media 的护栏（上限/超时/yt-dlp）
     skill_loader: Any | None = None,  # SkillLoader：/tools 端点用
+    skills_dir: str | Path | None = None,  # 技能导入目录：/skills/reload 热同步用
+    mcp_manager: Any | None = None,   # McpManager：/mcp/servers 动态注册端点用
     editing_contract: Any | None = None,   # ContractSlot：/runs/*/fork 展开 rerun_nodes 的下游
     broadcast_url: str | None = None,      # Redis DSN：多副本时把 OutBound 帧广播给各实例
     broadcast_channel: str = OUTBOUND_CHANNEL,
@@ -582,6 +658,157 @@ def create_app(
         return {"groups": groups, "skills": skills_list,
                 # 参数标签的单源：前端每次渲染入参先查这张表，本地那份退为兜底
                 "params_display": get_catalog().params_display()}
+
+    # ---- 技能库管理：文件夹热同步 / zip 上传注册 / 可视面板 ----
+
+    async def _sync_skill_catalog() -> None:
+        """技能增删后把中文名并回出口词表（best-effort：取不到只退机器名）。"""
+        if skill_loader is None:
+            return
+        try:
+            displays = {s.name: s.display
+                        for s in await skill_loader.discover() if s.display}
+            if displays:
+                get_catalog().update(displays)
+        except Exception:
+            pass
+
+    @app.get("/skills")
+    async def skills_list(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """技能库清单：名称/中文名/描述/常驻/可用性，供管理面板展示。"""
+        skills = await skill_loader.discover() if skill_loader else []
+        return {"skills": [
+            {"name": s.name, "display": s.display, "description": s.description,
+             "always": s.always, "available": s.available,
+             "unavailable_reason": s.unavailable_reason,
+             "files": [f["relpath"] for f in s.files]}
+            for s in skills]}
+
+    @app.post("/skills/reload")
+    async def skills_reload(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """重新扫描技能导入目录（同启动期 sync_from_dir，幂等覆盖）——
+        往文件夹里丢一个新技能目录后调它即生效，不必重启服务。"""
+        if skill_loader is None:
+            raise HTTPException(409, "技能库未启用（--no-skills）")
+        if not skills_dir:
+            raise HTTPException(409, "本服务未配置技能导入目录")
+        imported = await skill_loader.sync_from_dir(skills_dir)
+        await _sync_skill_catalog()
+        return {"imported": imported}
+
+    @app.post("/skills/upload")
+    async def skills_upload(request: Request,
+                            filename: str = "skill.zip",
+                            user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """上传技能包（zip 原始字节流，与 /upload 同款不做 multipart）。
+
+        包内 SKILL.md 的 frontmatter name 即技能名；解析失败/路径越界/超限一律 400，
+        不留半截入库。
+        """
+        if skill_loader is None:
+            raise HTTPException(409, "技能库未启用（--no-skills）")
+        data = await request.body()
+        try:
+            imported = await skill_loader.import_zip(filename, data)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except Exception as exc:  # noqa: BLE001 - 坏包统一 400，不泄漏栈
+            raise HTTPException(400, f"技能包解析失败：{exc}")
+        await _sync_skill_catalog()
+        return {"imported": imported}
+
+    @app.get("/skills-ui", response_class=None)
+    async def skills_ui() -> HTMLResponse:
+        """技能管理页（免构建的独立小页）：列出/上传/重扫，凭证走 localStorage 的 ca.token。"""
+        return HTMLResponse(_SKILLS_UI_HTML)
+
+    # ---- MCP 动态注册：配置落库，热连/热断 ----
+
+    @app.get("/mcp/servers")
+    async def mcp_servers_list(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """动态 MCP Server 清单：配置（凭证掩码）+ 启停状态 + 在线工具名。"""
+        if mcp_manager is None:
+            raise HTTPException(409, "MCP 动态注册未启用")
+        rows = await storage.mcp_servers.list()
+        live = mcp_manager.live_servers()
+        servers: list[dict[str, Any]] = []
+        for r in rows:
+            cfg = dict(r.get("config") or {})
+            for sect in ("headers", "env"):
+                h = cfg.get(sect)
+                if isinstance(h, dict):
+                    cfg[sect] = {
+                        k: (secrets.mask(str(v))
+                            if any(t in k.lower() for t in ("auth", "token", "key", "secret"))
+                            else v)
+                        for k, v in h.items()}
+            updated = r.get("updated_at")
+            servers.append({
+                "name": r["name"], "config": cfg, "enabled": bool(r.get("enabled")),
+                "live": r["name"] in live, "tools": live.get(r["name"], []),
+                "updated_at": updated.isoformat() if hasattr(updated, "isoformat") else "",
+            })
+        return {"servers": servers}
+
+    @app.post("/mcp/servers")
+    async def mcp_servers_upsert(req: McpServerRequest,
+                                 user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """登记/更新一个 MCP Server（只写配置，不改变连接状态——启停走 enable/disable）。"""
+        if mcp_manager is None:
+            raise HTTPException(409, "MCP 动态注册未启用")
+        name = (req.name or "").strip()
+        if not name or len(name) > 64 or not all(c.isalnum() or c in "_-" for c in name):
+            raise HTTPException(400, "名称只允许字母数字与 _ -（1~64 位）")
+        try:
+            cfg = MCPServerConfig.from_dict(name, req.config)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, f"配置形状不对：{exc}")
+        if not cfg.url and not cfg.command:
+            raise HTTPException(400, "url 与 command 至少给一个")
+        await storage.mcp_servers.upsert(name, req.config, enabled=req.enabled)
+        return {"saved": name, "enabled": req.enabled,
+                "live": mcp_manager.is_live(name), "tools": mcp_manager.tool_names(name)}
+
+    @app.post("/mcp/servers/{name}/enable")
+    async def mcp_servers_enable(name: str,
+                                 user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """热连：按库里配置连接并注册工具（幂等；撞名/连不上如实报错，不落半截状态）。"""
+        if mcp_manager is None:
+            raise HTTPException(409, "MCP 动态注册未启用")
+        if await storage.mcp_servers.get(name) is None:
+            raise HTTPException(404, f"MCP server {name!r} 未注册")
+        try:
+            names = await mcp_manager.connect(name)
+        except McpManagerError as exc:
+            raise HTTPException(400, str(exc))
+        except Exception as exc:  # noqa: BLE001 - 远端不可达等
+            raise HTTPException(502, f"连接失败：{exc}")
+        await storage.mcp_servers.set_enabled(name, True)
+        return {"name": name, "live": True, "tools": names}
+
+    @app.post("/mcp/servers/{name}/disable")
+    async def mcp_servers_disable(name: str,
+                                  user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """热断：注销该 server 的全部工具并关闭连接（配置行保留）。"""
+        if mcp_manager is None:
+            raise HTTPException(409, "MCP 动态注册未启用")
+        if await storage.mcp_servers.get(name) is None:
+            raise HTTPException(404, f"MCP server {name!r} 未注册")
+        removed = await mcp_manager.disconnect(name)
+        await storage.mcp_servers.set_enabled(name, False)
+        return {"name": name, "live": False, "removed": removed}
+
+    @app.delete("/mcp/servers/{name}")
+    async def mcp_servers_delete(name: str,
+                                 user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """删除：先断开（若在线）再删配置行。"""
+        if mcp_manager is None:
+            raise HTTPException(409, "MCP 动态注册未启用")
+        if await storage.mcp_servers.get(name) is None:
+            raise HTTPException(404, f"MCP server {name!r} 未注册")
+        await mcp_manager.disconnect(name)
+        await storage.mcp_servers.drop(name)
+        return {"deleted": name}
 
     @app.post("/register")
     async def register(req: RegisterRequest | None = None) -> dict[str, str]:

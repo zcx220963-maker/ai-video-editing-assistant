@@ -14,10 +14,13 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import mimetypes
 import os
 import shutil
+import tempfile
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
@@ -204,6 +207,41 @@ class SkillLoader:
                     await self._objects.delete(stale["object_key"])
             imported.append(name)
         return imported
+
+    async def import_zip(self, filename: str, data: bytes,
+                         *, max_bytes: int = 20 * 1024 * 1024) -> list[str]:
+        """上传技能包（zip）→ 解到临时目录 → 走同一份 sync_from_dir（幂等覆盖）。
+
+        包形状两种都收：根上直接 SKILL.md，或若干顶层目录各含 SKILL.md。
+        安装面做三道防线：大小上限、条目数上限、zip-slip（压缩包内路径越界）拒收。
+        返回导入的技能名清单。
+        """
+        if not (filename or "").lower().endswith(".zip"):
+            raise ValueError("技能包必须是 .zip 文件")
+        if not data:
+            raise ValueError("技能包内容为空")
+        if len(data) > max_bytes:
+            raise ValueError(f"技能包过大（{len(data)} 字节 > 上限 {max_bytes}）")
+        with tempfile.TemporaryDirectory(prefix="skill_upload_") as td:
+            root = Path(td)
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                members = zf.namelist()
+                if len(members) > 500:
+                    raise ValueError(f"压缩包条目过多（{len(members)} > 500）")
+                root_resolved = str(root.resolve())
+                for m in members:
+                    target = (root / m).resolve()
+                    if not str(target).startswith(root_resolved):
+                        raise ValueError(f"压缩包路径越界，拒收：{m}")
+                zf.extractall(root)
+            if (root / "SKILL.md").is_file():
+                # 根上直接 SKILL.md 的形状：包进一个子目录，统一交给 sync_from_dir
+                sub = root / "_packaged"
+                sub.mkdir()
+                for p in list(root.iterdir()):
+                    if p != sub:
+                        shutil.move(str(p), str(sub / p.name))
+            return await self.sync_from_dir(root)
 
     async def drop(self, name: str) -> int:
         """删技能：删行的同时清掉它的附件对象，否则对象成为永不被引用的孤儿字节。

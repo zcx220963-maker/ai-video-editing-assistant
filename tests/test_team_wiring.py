@@ -72,10 +72,10 @@ async def part1_team_tools(tmp: Path) -> None:
     check(need.issubset(set(reg.tool_names)), f"团队 8 工具全部注册：{sorted(need)}")
 
     plan = json.loads(await reg.execute("plan_editing_team", {}))
-    check(len(plan["created_tasks"]) == 20, f"DAG 自动组队 → 20 个任务（实际 {len(plan['created_tasks'])}）")
-    check(await st1.db.count("tasks") == 20, "20 行任务进了 PG tasks 表（不落本地目录）")
+    check(len(plan["created_tasks"]) == 21, f"DAG 自动组队 → 21 个任务（实际 {len(plan['created_tasks'])}）")
+    check(await st1.db.count("tasks") == 21, "21 行任务进了 PG tasks 表（不落本地目录）")
     tasks = json.loads(await reg.execute("list_tasks", {}))
-    check(len(tasks) == 20 and all(t["status"] == PENDING for t in tasks), "任务板 20 个 pending")
+    check(len(tasks) == 21 and all(t["status"] == PENDING for t in tasks), "任务板 21 个 pending")
     check(all(t["scope"] == "default:default" for t in tasks),
           "离线直调落在缺省作用域，任务板按 用户:会话 分块")
 
@@ -83,12 +83,12 @@ async def part1_team_tools(tmp: Path) -> None:
     first = min(ready_ids)
     claimed = json.loads(await reg.execute("claim_task", {"task_id": first, "owner": "tester"}))
     check(claimed["status"] == CLAIMED and claimed["owner"] == "tester", f"claim_task 认领 #{first}")
-    done = json.loads(await reg.execute("complete_task", {"task_id": first}))
+    done = json.loads(await reg.execute("complete_task", {"task_id": first, "owner": "tester"}))  # 认领者本人交付
     check(done["status"] == COMPLETED, f"complete_task 完成 #{first}")
     downstream_ready = [t["id"] for t in await team.task_manager.ready()]
     check(first not in downstream_ready, "已完成任务不再出现在可认领列表")
     status = json.loads(await reg.execute("team_status", {}))
-    check(len(status["tasks"]) == 20, "team_status 能看到任务板")
+    check(len(status["tasks"]) == 21, "team_status 能看到任务板")
     edges = await st1.db.select("task_edges")
     check(len(edges) == sum(len(t["blockedBy"]) for t in tasks),
           f"依赖边一Edge一行落在 task_edges：{len(edges)} 行")

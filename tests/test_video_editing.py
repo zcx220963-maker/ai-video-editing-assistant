@@ -64,8 +64,9 @@ async def main() -> None:
         "generate_script", "script_template_rec", "generate_voiceover",
         "select_BGM", "transition_rec", "text_rec", "plan_timeline",
         "plan_timeline_pro", "plan_timeline_ai_transition", "render_video",
+        "render_web",
     }
-    check(len(doc_nodes) == 20, "流程图白名单共 20 个节点")
+    check(len(doc_nodes) == 21, "流程图白名单共 21 个节点（含网页出片 render_web）")
     check(set(reg.names()) == doc_nodes, f"节点全集已注册（缺 {doc_nodes - set(reg.names())}）")
 
     # ---- 1c. 新节点也受拦截器 DAG 约束 ----

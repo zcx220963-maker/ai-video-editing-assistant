@@ -50,6 +50,7 @@ from .repositories import (
     InboxRepo,
     JobsRepo,
     MaterialsRepo,
+    McpServersRepo,
     MemoriesRepo,
     MessagesRepo,
     RenderJobsRepo,
@@ -127,6 +128,7 @@ class Storage:
         self.skills = SkillsRepo(db)
         self.secrets = SecretsRepo(db)
         self.timelines = TimelinesRepo(db)
+        self.mcp_servers = McpServersRepo(db)
 
     def artifacts(self, session_id: str, artifact_id: str = "") -> ArtifactsRepo:
         """FileStore 的落点：一次渲染一份，(session_id, artifact_id) 定作用域。"""
