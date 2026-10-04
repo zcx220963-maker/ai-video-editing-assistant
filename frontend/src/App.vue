@@ -5,7 +5,7 @@
 //   delta / stream_end / answer（MQ OutBound → Connection Manager 回投）。
 // 身份（spec §7）：首次访问 POST /register 换一份 token，之后 HTTP 带 Bearer、
 //   WS 带 ?token=；请求里不再出现 user_id——它由服务端从 token 反查。
-import { reactive, ref, nextTick, onMounted, onBeforeUnmount } from "vue";
+import { computed, reactive, ref, nextTick, onMounted, onBeforeUnmount } from "vue";
 
 const TOKEN_KEY = "ca.token";
 // 浏览器只留凭证：身份由 token 反查，会话列表与历史都从服务端读。
@@ -274,6 +274,19 @@ const skillsMsg = ref("");
 const itemModal = ref(null);      // {kind:'tool'|'skill'|'mcp', ...}
 const skillForm = ref(null);      // null=查看态;非空=编辑态
 const skillBusy = ref(false);
+// —— 工具库两级导航:父列表(分类) → 二级清单 ——
+const toolView = ref(null);       // null=父列表;'tools'|'skills'|'mcp'=已进入的分类
+const catManage = ref(null);      // 分类管理弹窗:null|'tools'|'skills'|'mcp'
+const toolCount = computed(() => {
+  const g = toolLib.value && toolLib.value.groups;
+  return g ? Object.values(g).reduce((n, items) => n + items.length, 0) : 0;
+});
+function openCatManage(cat) { catManage.value = cat; }
+function createSkillFromManage() {
+  itemModal.value = { kind: "skill", create: true, detail: null, loading: false };
+  editSkillForm(true);
+  catManage.value = null;
+}
 // 服务端词表（/tools 的 name_display）灌进来的 {机器名: 中文名}：界面标签的第一来源。
 // 拉不到（离线装配 / Storyline 未连通）时退回 TOOL_LABELS，再退机器名本身。
 const catalogLabels = ref({});
@@ -892,6 +905,7 @@ async function ensureCatalog() {
 async function toggleHelp() {
   activePanel.value = activePanel.value === 'tools' ? null : 'tools';
   if (activePanel.value === 'tools') {
+    toolView.value = null;            // 每次打开都回到父列表
     await loadTools();
     loadMcpAdmin();
     loadSkillsAdmin();
@@ -3304,7 +3318,39 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         <div v-if="loadingTools" class="lib-empty">正在加载工具库…</div>
         <div v-else-if="toolLib && toolLib.error" class="lib-empty bad">工具库加载失败：{{ toolLib.error }}</div>
         <template v-else-if="toolLib">
-          <template v-for="(items, cat) in toolLib.groups" :key="cat">
+
+          <!-- 父列表:三大分类,右侧 ✎ = 该类条目的增删管理 -->
+          <template v-if="!toolView">
+            <div class="lib-empty">点分类进入清单；右侧 ✎ 直接增删该类条目。</div>
+            <div class="cat-row" @click="toolView = 'tools'">
+              <b>🧰 工具</b>
+              <span class="cat-count">{{ toolCount }} 个</span>
+              <span class="cat-desc">内置代码工具与剪辑节点；运行期经 MCP 服务扩展</span>
+              <button class="tt-copy pencil" title="增删工具（经 MCP 服务）"
+                      @click.stop="openCatManage('tools')">✎</button>
+            </div>
+            <div class="cat-row" @click="toolView = 'skills'">
+              <b>📚 技能（Skill）</b>
+              <span class="cat-count">{{ skillsAdmin.length }} 个</span>
+              <span class="cat-desc">SKILL.md 说明文档；上传 / 编辑 / 删除</span>
+              <button class="tt-copy pencil" title="新增 / 删除技能"
+                      @click.stop="openCatManage('skills')">✎</button>
+            </div>
+            <div class="cat-row" @click="toolView = 'mcp'">
+              <b>🔌 MCP 服务</b>
+              <span class="cat-count">{{ mcpServers.length }} 个</span>
+              <span class="cat-desc">第三方工具源；热连 / 热断</span>
+              <button class="tt-copy pencil" title="新增 / 删除 MCP 服务"
+                      @click.stop="openCatManage('mcp')">✎</button>
+            </div>
+          </template>
+
+          <!-- 二级：工具清单 -->
+          <template v-else-if="toolView === 'tools'">
+            <div class="cat-back">
+              <button class="help" @click="toolView = null">← 返回分类</button><b>🧰 工具</b>
+            </div>
+            <template v-for="(items, cat) in toolLib.groups" :key="cat">
             <div class="td-group">{{ cat }}</div>
             <div v-for="t in items" :key="t.name" class="td-item">
               <b>{{ toolLabel(t.name, t.name_display) }}</b>
@@ -3315,8 +3361,15 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <span class="td-desc">{{ t.desc }}</span>
             </div>
           </template>
+          </template>
+
+          <!-- 二级：技能清单 -->
+          <template v-else-if="toolView === 'skills'">
+            <div class="cat-back">
+              <button class="help" @click="toolView = null">← 返回分类</button><b>📚 技能（Skill）</b>
+            </div>
           <template v-if="toolLib.skills && toolLib.skills.length">
-            <div class="td-group">技能（Skill）</div>
+            <div class="td-group">全部技能（机器名视角，✎ 查看详情 / 编辑 / 删除）</div>
             <div v-for="sk in toolLib.skills" :key="sk.name" class="td-item">
               <b>{{ toolLabel(sk.name, sk.name_display) }}</b>
               <button class="tt-copy" title="复制技能标识（排障用）"
@@ -3327,10 +3380,15 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <span class="td-desc">{{ sk.desc }}</span>
             </div>
           </template>
+          </template>
 
-          <!-- —— MCP 服务管理（动态注册）：查 / 增 / 改 / 启停 / 删 —— -->
+          <!-- 二级：MCP 服务清单 -->
+          <template v-else-if="toolView === 'mcp'">
+            <div class="cat-back">
+              <button class="help" @click="toolView = null">← 返回分类</button><b>🔌 MCP 服务</b>
+            </div>
           <div class="td-group mcp-head">
-            <span>MCP 服务（第三方工具源）</span>
+            <span>动态注册的服务（✎ 详情 / 编辑；启用即连，断开即移除其工具）</span>
             <span class="td-row-btns">
               <button class="help" @click="openMcpModal(null)">＋ 新增</button>
             </span>
@@ -3355,31 +3413,64 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             还没有动态 MCP 服务（mcp.json 里的静态服务不在此列）。
           </div>
 
-          <!-- —— 技能库管理 —— -->
-          <div class="td-group mcp-head">
-            <span>技能库管理</span>
-            <span class="td-row-btns">
-              <input type="file" id="skill-zip" accept=".zip" style="display:none"
-                     @change="uploadSkillZip" />
-              <button class="help" @click="pickSkillZip">上传 .zip</button>
-              <button class="help" @click="reloadSkillsDir">重扫导入目录</button>
-            </span>
-          </div>
-          <div v-if="skillsMsg" class="lib-empty">{{ skillsMsg }}</div>
-          <div v-if="loadingSkillsAdmin" class="lib-empty">加载中…</div>
-          <div v-for="sk in skillsAdmin" :key="'adm-' + sk.name" class="td-item">
-            <b>{{ sk.display || sk.name }}</b>
-            <span class="td-name">
-              <span :class="sk.available ? 'st-ok' : 'st-bad'">{{ sk.available ? "可用" : "不可用" }}</span>
-              · 常驻：{{ sk.always ? "是" : "否" }} · {{ (sk.files || []).length }} 个附件
-            </span>
-            <span class="td-row-btns">
-              <button class="tt-copy pencil" title="详情 / 编辑"
-                      @click="openSkillModal(sk.name)">✎</button>
-              <button class="help danger" @click="delSkill(sk)">删除</button>
-            </span>
-          </div>
+          </template>
         </template>
+      </div>
+
+      <!-- —— 分类管理弹窗：父列表 ✎ 打开，支持该类条目的增删 —— -->
+      <div v-if="catManage" class="modal-mask" @click.self="catManage = null">
+        <div class="modal-card">
+          <div class="modal-head">
+            <b>{{ catManage === "tools" ? "管理：工具"
+                  : catManage === "skills" ? "管理：技能" : "管理：MCP 服务" }}</b>
+            <button class="help" @click="catManage = null">×</button>
+          </div>
+          <div class="modal-body">
+            <template v-if="catManage === 'tools'">
+              <p class="modal-note">内置工具与剪辑节点定义在代码 / 剪辑服务端，不能直接增删；
+                运行期增删工具的唯一通道是 MCP 服务——删除一个服务即移除它注册的全部工具。</p>
+              <div v-for="s in mcpServers" :key="'mt-' + s.name" class="kv">
+                <b>{{ s.name }}</b>
+                <span>{{ (s.tools || []).length }} 个工具 · {{ s.live ? "在线" : "停用" }}</span>
+                <span class="td-row-btns">
+                  <button class="help danger" @click="delMcp(s)">删除</button>
+                </span>
+              </div>
+              <div class="td-row-btns">
+                <button class="help" @click="openMcpModal(null); catManage = null">＋ 注册 MCP 服务（新增工具）</button>
+              </div>
+            </template>
+            <template v-else-if="catManage === 'skills'">
+              <div class="td-row-btns" style="margin-bottom:4px">
+                <input type="file" id="skill-zip" accept=".zip" style="display:none"
+                       @change="uploadSkillZip" />
+                <button class="help" @click="pickSkillZip">上传 .zip</button>
+                <button class="help" @click="reloadSkillsDir">重扫导入目录</button>
+                <button class="help" @click="createSkillFromManage">＋ 新增技能</button>
+              </div>
+              <div v-if="skillsMsg" class="lib-empty">{{ skillsMsg }}</div>
+              <div v-for="sk in skillsAdmin" :key="'ms-' + sk.name" class="kv">
+                <b>{{ sk.display || sk.name }}</b>
+                <span class="cat-desc">{{ sk.name }}</span>
+                <span class="td-row-btns">
+                  <button class="help danger" @click="delSkill(sk)">删除</button>
+                </span>
+              </div>
+            </template>
+            <template v-else>
+              <div v-for="s in mcpServers" :key="'mm-' + s.name" class="kv">
+                <b>{{ s.name }}</b>
+                <span>{{ s.live ? "在线" : (s.enabled ? "启用未连" : "停用") }} · {{ (s.tools || []).length }} 个工具</span>
+                <span class="td-row-btns">
+                  <button class="help danger" @click="delMcp(s)">删除</button>
+                </span>
+              </div>
+              <div class="td-row-btns">
+                <button class="help" @click="openMcpModal(null); catManage = null">＋ 新增 MCP 服务</button>
+              </div>
+            </template>
+          </div>
+        </div>
       </div>
 
       <!-- —— 条目弹窗：工具 / 技能 / MCP 服务 的详情与增删改 —— -->
@@ -4992,4 +5083,15 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .modal-note { margin: 0; color: #656d76; font-size: 12px; }
 .lib-empty.bad { color: #cf222e; }
+.cat-row {
+  display: flex; align-items: center; gap: 10px;
+  border: 1px solid #d0d7de; border-radius: 10px;
+  padding: 12px; margin: 6px 0; cursor: pointer; background: #fff;
+}
+.cat-row:hover { border-color: #0969da; background: #f6f9fe; }
+.cat-row b { font-size: 15px; }
+.cat-count { color: #0969da; font-size: 13px; white-space: nowrap; }
+.cat-desc { color: #656d76; font-size: 12px; flex: 1; }
+.cat-back { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.cat-back b { font-size: 15px; }
 </style>
