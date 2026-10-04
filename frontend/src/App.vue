@@ -309,6 +309,10 @@ const toolCount = computed(() => {
   return g ? Object.values(g).reduce((n, items) => n + items.length, 0) : 0;
 });
 function openCatManage(cat) { catManage.value = cat; }
+function toggleCat(cat) {
+  // 再点一次已展开的分类 = 收起;父列表永远常驻
+  toolView.value = toolView.value === cat ? null : cat;
+}
 function createSkillFromManage() {
   itemModal.value = { kind: "skill", create: true, detail: null, loading: false };
   editSkillForm(true);
@@ -3350,58 +3354,38 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         <div v-else-if="toolLib && toolLib.error" class="lib-empty bad">工具库加载失败：{{ toolLib.error }}</div>
         <template v-else-if="toolLib">
 
-          <!-- 父列表:三大分类,右侧 ✎ = 该类条目的增删管理 -->
-          <template v-if="!toolView">
-            <div class="lib-empty">点分类进入清单；右侧 ✎ 直接增删该类条目。</div>
-            <div class="cat-row" @click="toolView = 'tools'">
-              <b>工具</b>
-              <span class="cat-count">{{ toolCount }} 个</span>
-              <span class="cat-desc">内置代码工具与剪辑节点；运行期经 MCP 服务扩展</span>
-              <button class="tt-copy pencil" title="增删工具（经 MCP 服务）"
-                      @click.stop="openCatManage('tools')">✎</button>
-            </div>
-            <div class="cat-row" @click="toolView = 'skills'">
-              <b>技能（Skill）</b>
-              <span class="cat-count">{{ skillsAdmin.length }} 个</span>
-              <span class="cat-desc">SKILL.md 说明文档；上传 / 编辑 / 删除</span>
-              <button class="tt-copy pencil" title="新增 / 删除技能"
-                      @click.stop="openCatManage('skills')">✎</button>
-            </div>
-            <div class="cat-row" @click="toolView = 'mcp'">
-              <b>MCP 服务</b>
-              <span class="cat-count">{{ mcpServers.length }} 个</span>
-              <span class="cat-desc">第三方工具源；热连 / 热断</span>
-              <button class="tt-copy pencil" title="新增 / 删除 MCP 服务"
-                      @click.stop="openCatManage('mcp')">✎</button>
-            </div>
-          </template>
-
-          <!-- 二级：工具清单 -->
-          <template v-else-if="toolView === 'tools'">
-            <div class="cat-back">
-              <button class="help" @click="toolView = null">← 返回分类</button><b>工具</b>
-            </div>
+          <!-- 一级:工具 -->
+          <div class="cat-row" :class="{ active: toolView === 'tools' }" @click="toggleCat('tools')">
+            <b>工具</b>
+            <span class="cat-count">{{ toolCount }} 个</span>
+            <span class="cat-desc">内置代码工具与剪辑节点；运行期经 MCP 服务扩展</span>
+            <button class="tt-copy pencil" title="增删工具（经 MCP 服务）"
+                    @click.stop="openCatManage('tools')">✎</button>
+          </div>
+          <div v-if="toolView === 'tools'" class="cat-children">
             <template v-for="(items, cat) in toolLib.groups" :key="cat">
-            <div class="td-group">{{ cat }}</div>
-            <div v-for="t in items" :key="t.name" class="td-item">
-              <div class="td-title">
-                <b>{{ toolLabel(t.name, t.name_display) }}</b>
-                <button class="tt-copy pencil" title="详情 / 修改"
-                        @click="openToolModal(t, cat)">✎</button>
+              <div class="td-group">{{ cat }}</div>
+              <div v-for="t in items" :key="t.name" class="td-item">
+                <div class="td-title">
+                  <b>{{ toolLabel(t.name, t.name_display) }}</b>
+                  <button class="tt-copy pencil" title="详情 / 修改"
+                          @click="openToolModal(t, cat)">✎</button>
+                </div>
+                <span class="td-intro">{{ t.desc }}</span>
               </div>
-              <span class="td-intro">{{ t.desc }}</span>
-            </div>
-          </template>
-          </template>
+            </template>
+          </div>
 
-          <!-- 二级：技能清单 -->
-          <template v-else-if="toolView === 'skills'">
-            <div class="cat-back">
-              <button class="help" @click="toolView = null">← 返回分类</button><b>技能（Skill）</b>
-            </div>
-          <template v-if="toolLib.skills && toolLib.skills.length">
-            <div class="td-group">全部技能（机器名视角，✎ 查看详情 / 编辑 / 删除）</div>
-            <div v-for="sk in toolLib.skills" :key="sk.name" class="td-item">
+          <!-- 一级:技能 -->
+          <div class="cat-row" :class="{ active: toolView === 'skills' }" @click="toggleCat('skills')">
+            <b>技能（Skill）</b>
+            <span class="cat-count">{{ skillsAdmin.length }} 个</span>
+            <span class="cat-desc">SKILL.md 说明文档；上传 / 编辑 / 删除</span>
+            <button class="tt-copy pencil" title="新增 / 删除技能"
+                    @click.stop="openCatManage('skills')">✎</button>
+          </div>
+          <div v-if="toolView === 'skills'" class="cat-children">
+            <div v-for="sk in (toolLib.skills || [])" :key="sk.name" class="td-item">
               <div class="td-title">
                 <b>{{ toolLabel(sk.name, sk.name_display) }}</b>
                 <span v-if="sk.available !== '可用'" class="st-bad"
@@ -3411,47 +3395,46 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               </div>
               <span class="td-intro">{{ sk.desc }}</span>
             </div>
-          </template>
-          </template>
+          </div>
 
-          <!-- 二级：MCP 服务清单 -->
-          <template v-else-if="toolView === 'mcp'">
-            <div class="cat-back">
-              <button class="help" @click="toolView = null">← 返回分类</button><b>MCP 服务</b>
-            </div>
-          <div class="td-group mcp-head">
-            <span>动态注册的服务（✎ 详情 / 编辑；启用即连，断开即移除其工具）</span>
-            <span class="td-row-btns">
+          <!-- 一级:MCP 服务 -->
+          <div class="cat-row" :class="{ active: toolView === 'mcp' }" @click="toggleCat('mcp')">
+            <b>MCP 服务</b>
+            <span class="cat-count">{{ mcpServers.length }} 个</span>
+            <span class="cat-desc">第三方工具源；热连 / 热断</span>
+            <button class="tt-copy pencil" title="新增 / 删除 MCP 服务"
+                    @click.stop="openCatManage('mcp')">✎</button>
+          </div>
+          <div v-if="toolView === 'mcp'" class="cat-children">
+            <div class="td-row-btns" style="margin-bottom:4px">
               <button class="help" @click="openMcpModal(null)">＋ 新增</button>
-            </span>
-          </div>
-          <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
-          <div v-if="loadingMcp" class="lib-empty">加载中…</div>
-          <div v-for="s in mcpServers" :key="s.name" class="td-item">
-            <div class="td-title">
-              <b>{{ s.name }}</b>
-              <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
-                      @click="openMcpModal(s)">✎</button>
             </div>
-            <span class="td-name">
-              <span :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
-              · {{ (s.tools || []).length }} 个工具
-            </span>
-            <span class="td-intro">{{ (s.config && (s.config.url || s.config.command)) || "—" }}</span>
-            <span class="td-row-btns">
-              <button class="help" :disabled="mcpBusy" @click="toggleMcp(s)">{{ s.live ? "断开" : "启用" }}</button>
-              <button class="help danger" @click="delMcp(s)">删除</button>
-            </span>
+            <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
+            <div v-if="loadingMcp" class="lib-empty">加载中…</div>
+            <div v-for="s in mcpServers" :key="s.name" class="td-item">
+              <div class="td-title">
+                <b>{{ s.name }}</b>
+                <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
+                        @click="openMcpModal(s)">✎</button>
+              </div>
+              <span class="td-name">
+                <span :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
+                · {{ (s.tools || []).length }} 个工具
+              </span>
+              <span class="td-intro">{{ (s.config && (s.config.url || s.config.command)) || "—" }}</span>
+              <span class="td-row-btns">
+                <button class="help" :disabled="mcpBusy" @click="toggleMcp(s)">{{ s.live ? "断开" : "启用" }}</button>
+                <button class="help danger" @click="delMcp(s)">删除</button>
+              </span>
+            </div>
+            <div v-if="!loadingMcp && !mcpServers.length" class="lib-empty">
+              还没有动态 MCP 服务（mcp.json 里的静态服务不在此列）。
+            </div>
           </div>
-          <div v-if="!loadingMcp && !mcpServers.length" class="lib-empty">
-            还没有动态 MCP 服务（mcp.json 里的静态服务不在此列）。
-          </div>
-
-          </template>
         </template>
       </div>
 
-      <!-- —— 分类管理弹窗：父列表 ✎ 打开，支持该类条目的增删 —— -->
+            <!-- —— 分类管理弹窗：父列表 ✎ 打开，支持该类条目的增删 —— -->
       <div v-if="catManage" class="modal-mask" @click.self="catManage = null">
         <div class="modal-card">
           <div class="modal-head">
@@ -5158,6 +5141,15 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   padding: 12px; margin: 6px 0; cursor: pointer; background: #fff;
 }
 .cat-row:hover { border-color: #0969da; background: #f6f9fe; }
+.cat-row.active {
+  background: #e7eefb; border-color: #0969da;
+  box-shadow: inset 3px 0 0 #0969da;
+}
+.cat-row.active b { color: #0550ae; }
+.cat-children {
+  margin: 4px 0 10px 10px; padding-left: 12px;
+  border-left: 2px solid rgba(9, 105, 218, 0.25);
+}
 .cat-row b { font-size: 15px; }
 .cat-count { color: #0969da; font-size: 13px; white-space: nowrap; }
 .cat-desc { color: #656d76; font-size: 12px; flex: 1; }
