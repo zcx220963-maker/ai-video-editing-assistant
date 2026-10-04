@@ -274,6 +274,33 @@ const skillsMsg = ref("");
 const itemModal = ref(null);      // {kind:'tool'|'skill'|'mcp', ...}
 const skillForm = ref(null);      // null=查看态;非空=编辑态
 const skillBusy = ref(false);
+// —— 布局:左栏收起/展开 + 右侧抽屉拖宽 ——
+const railOpen = ref(localStorage.getItem("ca.railOpen") !== "0");
+function toggleRail() {
+  railOpen.value = !railOpen.value;
+  localStorage.setItem("ca.railOpen", railOpen.value ? "1" : "0");
+}
+const drawerW = ref(Number(localStorage.getItem("ca.drawerW")) || 380);
+const resizing = ref(false);
+function startResize(ev) {
+  if (ev.button !== 0) return;
+  resizing.value = true;
+  const startX = ev.clientX, startW = drawerW.value;
+  const move = (e) => {
+    // 向左拖 = 变宽;夹在 300~720
+    drawerW.value = Math.min(720, Math.max(300, startW + (startX - e.clientX)));
+  };
+  const up = () => {
+    resizing.value = false;
+    localStorage.setItem("ca.drawerW", String(drawerW.value));
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", up);
+  };
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", up);
+  ev.preventDefault();
+}
+
 // —— 工具库两级导航:父列表(分类) → 二级清单 ——
 const toolView = ref(null);       // null=父列表;'tools'|'skills'|'mcp'=已进入的分类
 const catManage = ref(null);      // 分类管理弹窗:null|'tools'|'skills'|'mcp'
@@ -2853,14 +2880,17 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 
 <template>
   <div class="shell">
-    <!-- 左侧：卷宗栏 -->
-    <aside class="rail">
+    <!-- 左侧：卷宗栏（可收起） -->
+    <aside class="rail" :class="{ closed: !railOpen }">
+      <button v-if="!railOpen" class="rail-open-btn" title="展开卷宗栏"
+              @click="toggleRail">»</button>
       <div class="brand">
         <div class="seal">创</div>
         <div class="brand-text">
           <b>智能创作助手</b>
           <span>纸上创作台</span>
         </div>
+        <button class="rail-toggle" title="收起卷宗栏" @click="toggleRail">«</button>
       </div>
 
       <button class="new" @click="newConv">✚<span class="lbl"> 开一册新卷</span></button>
@@ -3148,7 +3178,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
     </main>
 
     <!-- 右侧抽屉：工具库 / 素材库 / 音乐库 / 时间线 / 执行记录 / 设置（互斥，同时只开一个） -->
-    <aside v-if="activePanel" class="drawer">
+    <aside v-if="activePanel" class="drawer" :style="{ width: drawerW + 'px' }">
+      <div class="drawer-grip" title="拖拽调宽" @mousedown="startResize"></div>
       <header class="drawer-head">
         <b>{{ activePanel === 'plan' ? '📋 剪辑链路' : activePanel === 'tools' ? '工具库' : activePanel === 'library' ? '素材库' : activePanel === 'bgm' ? '🎵 音乐库' : activePanel === 'timeline' ? '时间线编辑器' : activePanel === 'runs' ? '执行记录 · 时间旅行' : '设置' }}</b>
         <button class="drawer-x" @click="activePanel = null">×</button>
@@ -4077,7 +4108,25 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   background: linear-gradient(180deg, #2b2620, #211d18);
   color: #e9e2d2; padding: 22px 16px 16px;
   border-right: 3px solid var(--vermilion);
+  transition: margin-left .22s ease;
+  overflow: visible;
 }
+.rail.closed { margin-left: -267px; }   /* 宽度+边框,整体滑出 */
+.rail-toggle {
+  margin-left: auto; border: none; background: transparent; color: #e9e2d2;
+  opacity: .5; cursor: pointer; font-size: 16px; padding: 4px 6px; border-radius: 6px;
+}
+.rail-toggle:hover { opacity: 1; background: rgba(255, 253, 247, .12); }
+.rail-open-btn {
+  position: absolute; left: 264px; top: 18px; z-index: 30;
+  border: none; border-radius: 0 8px 8px 0; cursor: pointer;
+  background: linear-gradient(180deg, #2b2620, #211d18); color: #e9e2d2;
+  border-right: 3px solid var(--vermilion); border-left: none;
+  padding: 10px 7px; font-size: 15px; opacity: .55;
+}
+.rail-open-btn:hover { opacity: 1; }
+.rail.closed .brand, .rail.closed .new, .rail.closed .convs,
+.rail.closed .who { visibility: hidden; }
 .brand { display: flex; gap: 12px; align-items: center; padding: 0 4px 18px; }
 .seal {
   width: 46px; height: 46px; flex: none; display: grid; place-items: center;
@@ -4134,8 +4183,17 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   width: 380px; flex: none; display: flex; flex-direction: column;
   background: rgba(255, 253, 247, 0.72);
   border-left: 1px solid var(--line);
-  overflow: hidden;
+  overflow: hidden; position: relative;
 }
+.drawer-grip {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 7px;
+  cursor: col-resize; z-index: 20;
+}
+.drawer-grip::after {
+  content: ""; position: absolute; left: 3px; top: 50%; height: 46px; width: 2px;
+  transform: translateY(-50%); background: var(--line); border-radius: 2px; opacity: .8;
+}
+.drawer-grip:hover::after { background: var(--vermilion); opacity: 1; }
 .drawer-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 16px 18px 12px; border-bottom: 1px solid var(--line);
