@@ -3353,11 +3353,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             <template v-for="(items, cat) in toolLib.groups" :key="cat">
             <div class="td-group">{{ cat }}</div>
             <div v-for="t in items" :key="t.name" class="td-item">
-              <b>{{ toolLabel(t.name, t.name_display) }}</b>
-              <button class="tt-copy" title="复制机器名（排障用）"
-                      @click="copyMachine(t.name)">{{ copiedName === t.name ? "已复制" : "⧉" }}</button>
-              <button class="tt-copy pencil" title="详情 / 修改"
-                      @click="openToolModal(t, cat)">✎</button>
+              <div class="td-title">
+                <b>{{ toolLabel(t.name, t.name_display) }}</b>
+                <button class="tt-copy pencil" title="详情 / 修改"
+                        @click="openToolModal(t, cat)">✎</button>
+              </div>
               <span class="td-desc">{{ t.desc }}</span>
             </div>
           </template>
@@ -3371,11 +3371,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <template v-if="toolLib.skills && toolLib.skills.length">
             <div class="td-group">全部技能（机器名视角，✎ 查看详情 / 编辑 / 删除）</div>
             <div v-for="sk in toolLib.skills" :key="sk.name" class="td-item">
-              <b>{{ toolLabel(sk.name, sk.name_display) }}</b>
-              <button class="tt-copy" title="复制技能标识（排障用）"
-                      @click="copyMachine(sk.name)">{{ copiedName === sk.name ? "已复制" : "⧉" }}</button>
-              <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
-                      @click="openSkillModal(sk.name)">✎</button>
+              <div class="td-title">
+                <b>{{ toolLabel(sk.name, sk.name_display) }}</b>
+                <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
+                        @click="openSkillModal(sk.name)">✎</button>
+              </div>
               <span class="td-name">{{ sk.available }} · 常驻：{{ sk.always }}</span>
               <span class="td-desc">{{ sk.desc }}</span>
             </div>
@@ -3396,7 +3396,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
           <div v-if="loadingMcp" class="lib-empty">加载中…</div>
           <div v-for="s in mcpServers" :key="s.name" class="td-item">
-            <b>{{ s.name }}</b>
+            <div class="td-title">
+              <b>{{ s.name }}</b>
+              <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
+                      @click="openMcpModal(s)">✎</button>
+            </div>
             <span class="td-name">
               <span :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
               · {{ (s.tools || []).length }} 个工具
@@ -3404,8 +3408,6 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             <span class="td-desc">{{ (s.config && (s.config.url || s.config.command)) || "—" }}</span>
             <span class="td-row-btns">
               <button class="help" :disabled="mcpBusy" @click="toggleMcp(s)">{{ s.live ? "断开" : "启用" }}</button>
-              <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
-                      @click="openMcpModal(s)">✎</button>
               <button class="help danger" @click="delMcp(s)">删除</button>
             </span>
           </div>
@@ -5050,7 +5052,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 .mcp-form input, .mcp-form select {
   padding: 5px 8px; border: 1px solid #d0d7de; border-radius: 6px; font-size: 13px;
 }
-.tt-copy.pencil { color: #0969da; font-weight: 600; }
+.tt-copy.pencil { color: #0969da; font-weight: 600; opacity: 0.85;
+  font-size: 13px; line-height: 1; }
+.td-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.td-title b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.td-title .tt-copy { flex: 0 0 auto; }
 .modal-mask {
   position: fixed; inset: 0; background: rgba(31, 35, 40, .45);
   display: flex; align-items: center; justify-content: center; z-index: 90;
