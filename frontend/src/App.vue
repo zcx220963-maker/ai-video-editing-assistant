@@ -3323,21 +3323,21 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <template v-if="!toolView">
             <div class="lib-empty">点分类进入清单；右侧 ✎ 直接增删该类条目。</div>
             <div class="cat-row" @click="toolView = 'tools'">
-              <b>🧰 工具</b>
+              <b>工具</b>
               <span class="cat-count">{{ toolCount }} 个</span>
               <span class="cat-desc">内置代码工具与剪辑节点；运行期经 MCP 服务扩展</span>
               <button class="tt-copy pencil" title="增删工具（经 MCP 服务）"
                       @click.stop="openCatManage('tools')">✎</button>
             </div>
             <div class="cat-row" @click="toolView = 'skills'">
-              <b>📚 技能（Skill）</b>
+              <b>技能（Skill）</b>
               <span class="cat-count">{{ skillsAdmin.length }} 个</span>
               <span class="cat-desc">SKILL.md 说明文档；上传 / 编辑 / 删除</span>
               <button class="tt-copy pencil" title="新增 / 删除技能"
                       @click.stop="openCatManage('skills')">✎</button>
             </div>
             <div class="cat-row" @click="toolView = 'mcp'">
-              <b>🔌 MCP 服务</b>
+              <b>MCP 服务</b>
               <span class="cat-count">{{ mcpServers.length }} 个</span>
               <span class="cat-desc">第三方工具源；热连 / 热断</span>
               <button class="tt-copy pencil" title="新增 / 删除 MCP 服务"
@@ -3348,7 +3348,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <!-- 二级：工具清单 -->
           <template v-else-if="toolView === 'tools'">
             <div class="cat-back">
-              <button class="help" @click="toolView = null">← 返回分类</button><b>🧰 工具</b>
+              <button class="help" @click="toolView = null">← 返回分类</button><b>工具</b>
             </div>
             <template v-for="(items, cat) in toolLib.groups" :key="cat">
             <div class="td-group">{{ cat }}</div>
@@ -3366,7 +3366,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <!-- 二级：技能清单 -->
           <template v-else-if="toolView === 'skills'">
             <div class="cat-back">
-              <button class="help" @click="toolView = null">← 返回分类</button><b>📚 技能（Skill）</b>
+              <button class="help" @click="toolView = null">← 返回分类</button><b>技能（Skill）</b>
             </div>
           <template v-if="toolLib.skills && toolLib.skills.length">
             <div class="td-group">全部技能（机器名视角，✎ 查看详情 / 编辑 / 删除）</div>
@@ -3386,7 +3386,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <!-- 二级：MCP 服务清单 -->
           <template v-else-if="toolView === 'mcp'">
             <div class="cat-back">
-              <button class="help" @click="toolView = null">← 返回分类</button><b>🔌 MCP 服务</b>
+              <button class="help" @click="toolView = null">← 返回分类</button><b>MCP 服务</b>
             </div>
           <div class="td-group mcp-head">
             <span>动态注册的服务（✎ 详情 / 编辑；启用即连，断开即移除其工具）</span>
