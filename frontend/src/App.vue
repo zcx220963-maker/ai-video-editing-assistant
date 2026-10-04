@@ -270,6 +270,10 @@ const mcpMsg = ref("");
 const skillsAdmin = ref([]);
 const loadingSkillsAdmin = ref(false);
 const skillsMsg = ref("");
+// —— 条目弹窗：工具 / 技能 / MCP 服务 的详情与增删改 ——
+const itemModal = ref(null);      // {kind:'tool'|'skill'|'mcp', ...}
+const skillForm = ref(null);      // null=查看态;非空=编辑态
+const skillBusy = ref(false);
 // 服务端词表（/tools 的 name_display）灌进来的 {机器名: 中文名}：界面标签的第一来源。
 // 拉不到（离线装配 / Storyline 未连通）时退回 TOOL_LABELS，再退机器名本身。
 const catalogLabels = ref({});
@@ -945,6 +949,7 @@ async function saveMcp() {
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
     mcpForm.value = null;
+    itemModal.value = null;
     mcpMsg.value = "已保存：" + j.saved + "（点「启用」才会连接）";
     await loadMcpAdmin();
   } catch (e) {
@@ -1038,6 +1043,85 @@ async function delSkill(s) {
   const j = await r.json().catch(() => ({}));
   skillsMsg.value = r.ok ? "已删除：" + j.deleted : "失败：" + (j.detail || r.status);
   await loadSkillsAdmin();
+}
+
+// ---- 条目弹窗 ----
+
+function openToolModal(t, cat) {
+  // 动态 MCP 工具的名字带 "{服务名}_" 前缀：弹窗里给出来源与跳转
+  const live = mcpServers.value.find(
+    (sv) => sv.live && t.name.startsWith(sv.name + "_"));
+  itemModal.value = {
+    kind: "tool", name: t.name, desc: t.desc, cat,
+    display: toolLabel(t.name, t.name_display), params: t.params || null,
+    source: live ? "mcp" : "code", serverName: live ? live.name : "",
+  };
+}
+
+function openMcpModal(s) {
+  editMcp(s);                       // 复用既有的表单填充逻辑
+  itemModal.value = { kind: "mcp", create: !s, server: s || null };
+  mcpMsg.value = "";
+}
+
+async function openSkillModal(name) {
+  itemModal.value = { kind: "skill", name, detail: null, loading: true };
+  skillForm.value = null;
+  try {
+    await ensureIdentity();
+    const r = await fetch(`/skills/${encodeURIComponent(name)}`, { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    itemModal.value.detail = j;
+  } catch (e) {
+    itemModal.value.detail = null;
+    itemModal.value.error = e.message;
+  } finally {
+    itemModal.value.loading = false;
+  }
+}
+
+function editSkillForm(create) {
+  const d = itemModal.value.detail;
+  skillForm.value = (create || !d) ? {
+    name: "", display: "", always: false, description: "", requires: "", body: "",
+  } : {
+    name: d.name, display: d.display || "", always: !!d.always,
+    description: d.description || "", requires: (d.requires || []).join(", "),
+    body: d.body || "",
+  };
+  skillsMsg.value = "";
+}
+
+async function saveSkillForm() {
+  const f = skillForm.value;
+  if (!f || !f.name.trim()) { skillsMsg.value = "技能名必填"; return; }
+  skillBusy.value = true;
+  try {
+    const r = await fetch(`/skills/${encodeURIComponent(f.name.trim())}`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ display: f.display, always: !!f.always,
+                             description: f.description, requires: f.requires,
+                             body: f.body }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    skillsMsg.value = "已保存：" + j.saved;
+    await loadSkillsAdmin();
+    await loadTools();                      // /tools 技能清单与词表同步刷新
+    await openSkillModal(f.name.trim());    // 回到查看态,展示刚保存的内容
+  } catch (e) {
+    skillsMsg.value = "保存失败：" + e.message;
+  } finally {
+    skillBusy.value = false;
+  }
+}
+
+async function delSkillFromModal() {
+  const name = itemModal.value.name;
+  await delSkill({ name });
+  if (!skillsMsg.value.startsWith("失败")) itemModal.value = null;
 }
 
 function msgs(cid) {
@@ -3226,6 +3310,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <b>{{ toolLabel(t.name, t.name_display) }}</b>
               <button class="tt-copy" title="复制机器名（排障用）"
                       @click="copyMachine(t.name)">{{ copiedName === t.name ? "已复制" : "⧉" }}</button>
+              <button class="tt-copy pencil" title="详情 / 修改"
+                      @click="openToolModal(t, cat)">✎</button>
               <span class="td-desc">{{ t.desc }}</span>
             </div>
           </template>
@@ -3235,6 +3321,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <b>{{ toolLabel(sk.name, sk.name_display) }}</b>
               <button class="tt-copy" title="复制技能标识（排障用）"
                       @click="copyMachine(sk.name)">{{ copiedName === sk.name ? "已复制" : "⧉" }}</button>
+              <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
+                      @click="openSkillModal(sk.name)">✎</button>
               <span class="td-name">{{ sk.available }} · 常驻：{{ sk.always }}</span>
               <span class="td-desc">{{ sk.desc }}</span>
             </div>
@@ -3244,7 +3332,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <div class="td-group mcp-head">
             <span>MCP 服务（第三方工具源）</span>
             <span class="td-row-btns">
-              <button class="help" @click="editMcp(null)">＋ 新增</button>
+              <button class="help" @click="openMcpModal(null)">＋ 新增</button>
             </span>
           </div>
           <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
@@ -3258,30 +3346,13 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             <span class="td-desc">{{ (s.config && (s.config.url || s.config.command)) || "—" }}</span>
             <span class="td-row-btns">
               <button class="help" :disabled="mcpBusy" @click="toggleMcp(s)">{{ s.live ? "断开" : "启用" }}</button>
-              <button class="help" @click="editMcp(s)">编辑</button>
+              <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
+                      @click="openMcpModal(s)">✎</button>
               <button class="help danger" @click="delMcp(s)">删除</button>
             </span>
           </div>
           <div v-if="!loadingMcp && !mcpServers.length" class="lib-empty">
             还没有动态 MCP 服务（mcp.json 里的静态服务不在此列）。
-          </div>
-          <div v-if="mcpForm" class="mcp-form">
-            <input v-model="mcpForm.name" placeholder="名称（字母数字与 _ -）" />
-            <select v-model="mcpForm.type">
-              <option value="streamableHttp">HTTP（streamableHttp）</option>
-              <option value="stdio">本地进程（stdio）</option>
-            </select>
-            <input v-if="mcpForm.type === 'streamableHttp'"
-                   v-model="mcpForm.url" placeholder="http://host:port/mcp" />
-            <template v-else>
-              <input v-model="mcpForm.command" placeholder="命令，如 npx" />
-              <input v-model="mcpForm.args" placeholder="命令参数（逗号分隔）" />
-            </template>
-            <input v-model.number="mcpForm.tool_timeout" type="number" placeholder="工具超时（秒）" />
-            <span class="td-row-btns">
-              <button class="help" :disabled="mcpBusy || !mcpForm.name.trim()" @click="saveMcp">保存</button>
-              <button class="help" @click="mcpForm = null">取消</button>
-            </span>
           </div>
 
           <!-- —— 技能库管理 —— -->
@@ -3303,10 +3374,115 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               · 常驻：{{ sk.always ? "是" : "否" }} · {{ (sk.files || []).length }} 个附件
             </span>
             <span class="td-row-btns">
+              <button class="tt-copy pencil" title="详情 / 编辑"
+                      @click="openSkillModal(sk.name)">✎</button>
               <button class="help danger" @click="delSkill(sk)">删除</button>
             </span>
           </div>
         </template>
+      </div>
+
+      <!-- —— 条目弹窗：工具 / 技能 / MCP 服务 的详情与增删改 —— -->
+      <div v-if="itemModal" class="modal-mask" @click.self="itemModal = null">
+        <div class="modal-card">
+          <div class="modal-head">
+            <b>{{ itemModal.kind === "tool" ? "工具详情"
+                  : itemModal.kind === "mcp" ? (itemModal.create ? "新增 MCP 服务" : "编辑 MCP 服务")
+                  : (itemModal.create ? "新增技能" : "技能详情") }}</b>
+            <button class="help" @click="itemModal = null">×</button>
+          </div>
+
+          <!-- 工具：详情只读（代码型/远程节点不可在线改写） -->
+          <div v-if="itemModal.kind === 'tool'" class="modal-body">
+            <div class="kv"><span>机器名</span><b>{{ itemModal.name }}</b></div>
+            <div class="kv"><span>界面名</span><b>{{ itemModal.display }}</b></div>
+            <div class="kv"><span>分类</span><b>{{ itemModal.cat }}</b></div>
+            <div class="kv top"><span>说明</span><p>{{ itemModal.desc }}</p></div>
+            <div v-if="itemModal.params && itemModal.params.properties"
+                 class="kv top"><span>参数</span>
+              <ul class="param-list">
+                <li v-for="(pv, pk) in itemModal.params.properties" :key="pk">
+                  <b>{{ pk }}</b>（{{ pv.type || "any" }}<template
+                    v-if="(itemModal.params.required || []).includes(pk)">，必填</template>）{{ pv.description || "" }}
+                </li>
+              </ul>
+            </div>
+            <p class="modal-note">{{ itemModal.source === "mcp"
+              ? "该工具来自动态 MCP 服务「" + itemModal.serverName + "」——修改/下线请编辑那个服务。"
+              : "内置代码工具或 Storyline 远程节点：定义在代码/剪辑服务端，不可在线改写；扩展能力请用 MCP 动态注册或技能。" }}</p>
+            <div v-if="itemModal.source === 'mcp'" class="td-row-btns">
+              <button class="help"
+                      @click="openMcpModal(mcpServers.find(x => x.name === itemModal.serverName))">
+                编辑来源服务「{{ itemModal.serverName }}」
+              </button>
+            </div>
+          </div>
+
+          <!-- MCP 服务：编辑表单 -->
+          <div v-else-if="itemModal.kind === 'mcp'" class="modal-body">
+            <input v-model="mcpForm.name" placeholder="名称（字母数字与 _ -）" />
+            <select v-model="mcpForm.type">
+              <option value="streamableHttp">HTTP（streamableHttp）</option>
+              <option value="stdio">本地进程（stdio）</option>
+            </select>
+            <input v-if="mcpForm.type === 'streamableHttp'"
+                   v-model="mcpForm.url" placeholder="http://host:port/mcp" />
+            <template v-else>
+              <input v-model="mcpForm.command" placeholder="命令，如 npx" />
+              <input v-model="mcpForm.args" placeholder="命令参数（逗号分隔）" />
+            </template>
+            <input v-model.number="mcpForm.tool_timeout" type="number" placeholder="工具超时（秒）" />
+            <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
+            <div class="td-row-btns">
+              <button class="help" :disabled="mcpBusy || !mcpForm.name.trim()" @click="saveMcp">保存</button>
+              <template v-if="!itemModal.create">
+                <button class="help" :disabled="mcpBusy" @click="toggleMcp(itemModal.server)">{{ itemModal.server.live ? "断开" : "启用" }}</button>
+                <button class="help danger" @click="delMcp(itemModal.server); itemModal = null">删除</button>
+              </template>
+              <button class="help" @click="itemModal = null">取消</button>
+            </div>
+          </div>
+
+          <!-- 技能：详情查看 + 表单编辑 + 删除 -->
+          <div v-else class="modal-body">
+            <template v-if="!skillForm">
+              <div v-if="itemModal.loading" class="lib-empty">加载中…</div>
+              <div v-else-if="itemModal.error" class="lib-empty bad">{{ itemModal.error }}</div>
+              <template v-else-if="itemModal.detail">
+                <div class="kv"><span>机器名</span><b>{{ itemModal.detail.name }}</b></div>
+                <div class="kv"><span>中文名</span><b>{{ itemModal.detail.display || "—" }}</b></div>
+                <div class="kv"><span>状态</span><b>
+                  <span :class="itemModal.detail.available ? 'st-ok' : 'st-bad'">
+                    {{ itemModal.detail.available ? "可用" : (itemModal.detail.unavailable_reason || "不可用") }}</span>
+                  · 常驻：{{ itemModal.detail.always ? "是" : "否" }}</b></div>
+                <div class="kv top"><span>描述</span><p>{{ itemModal.detail.description }}</p></div>
+                <div class="kv"><span>依赖</span><b>{{ (itemModal.detail.requires || []).join("，") || "—" }}</b></div>
+                <div class="kv"><span>附件</span><b>{{ (itemModal.detail.files || []).join("，") || "—" }}</b></div>
+                <div class="kv top"><span>正文（SKILL.md）</span>
+                  <pre class="skill-pre">{{ itemModal.detail.body }}</pre></div>
+                <div class="td-row-btns">
+                  <button class="help" @click="editSkillForm(false)">✎ 编辑</button>
+                  <button class="help danger" @click="delSkillFromModal()">删除</button>
+                </div>
+              </template>
+            </template>
+            <template v-else>
+              <input v-model.trim="skillForm.name" :disabled="!itemModal.create"
+                     placeholder="技能名（字母数字与 _ -，创建后不可改）" />
+              <input v-model="skillForm.display" placeholder="中文名（界面显示）" />
+              <input v-model="skillForm.description" placeholder="description（触发关键，写清何时用）" />
+              <input v-model="skillForm.requires" placeholder="依赖（可选），如 CLI: curl, ENV: KEY" />
+              <label class="kv chk"><input type="checkbox" v-model="skillForm.always" /> 常驻注入（每次对话都带上正文）</label>
+              <textarea v-model="skillForm.body" rows="14"
+                        placeholder="SKILL.md 正文（markdown，不含 frontmatter）"></textarea>
+              <div v-if="skillsMsg" class="lib-empty">{{ skillsMsg }}</div>
+              <div class="td-row-btns">
+                <button class="help" :disabled="skillBusy || !skillForm.name.trim()" @click="saveSkillForm">保存</button>
+                <button class="help" @click="skillForm = null">取消</button>
+              </div>
+            </template>
+          </div>
+        </div>
       </div>
 
       <div v-if="activePanel === 'library'" class="library">
@@ -4783,4 +4959,37 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 .mcp-form input, .mcp-form select {
   padding: 5px 8px; border: 1px solid #d0d7de; border-radius: 6px; font-size: 13px;
 }
+.tt-copy.pencil { color: #0969da; font-weight: 600; }
+.modal-mask {
+  position: fixed; inset: 0; background: rgba(31, 35, 40, .45);
+  display: flex; align-items: center; justify-content: center; z-index: 90;
+}
+.modal-card {
+  width: min(680px, calc(100vw - 32px)); max-height: min(80vh, 720px);
+  overflow: auto; background: #fff; border-radius: 12px; padding: 16px 18px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .22);
+}
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px; font-size: 15px;
+}
+.modal-body { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.modal-body input, .modal-body select, .modal-body textarea {
+  padding: 6px 9px; border: 1px solid #d0d7de; border-radius: 6px;
+  font-size: 13px; width: 100%; box-sizing: border-box;
+}
+.modal-body textarea { font-family: Consolas, "Courier New", monospace; line-height: 1.5; }
+.kv { display: flex; gap: 8px; align-items: baseline; }
+.kv > span:first-child { color: #656d76; flex: 0 0 5.5em; }
+.kv.top { flex-direction: column; gap: 3px; }
+.kv.chk { gap: 6px; align-items: center; }
+.kv.chk input { width: auto; }
+.param-list { margin: 0; padding-left: 16px; }
+.skill-pre {
+  margin: 0; padding: 8px; background: #f6f8fa; border: 1px solid #e1e4e8;
+  border-radius: 6px; white-space: pre-wrap; word-break: break-word;
+  max-height: 260px; overflow: auto; font-size: 12px; line-height: 1.5;
+}
+.modal-note { margin: 0; color: #656d76; font-size: 12px; }
+.lib-empty.bad { color: #cf222e; }
 </style>

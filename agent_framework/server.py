@@ -502,6 +502,16 @@ class McpServerRequest(BaseModel):
     enabled: bool = False
 
 
+class SkillUpsertRequest(BaseModel):
+    """PUT /skills/{name} 请求体：弹窗表单直接编辑技能的 frontmatter 与正文。"""
+
+    display: str = ""
+    always: bool = False
+    description: str = ""
+    requires: str = ""       # 如 "CLI: curl, ENV: KEY"
+    body: str = ""
+
+
 def create_app(
     agent: Agent,
     mq: MessageQueue,
@@ -654,7 +664,8 @@ def create_app(
                 name = fn.get("name", "")
                 desc = fn.get("description", "")
                 cat = _tool_category(name)
-                groups.setdefault(cat, []).append({"name": name, "desc": desc})
+                groups.setdefault(cat, []).append({"name": name, "desc": desc,
+                                                   "params": fn.get("parameters")})
         skills_list: list[dict[str, str]] = []
         if skill_loader is not None:
             try:
@@ -743,6 +754,42 @@ def create_app(
             raise HTTPException(404, f"技能 {name!r} 不存在")
         await skill_loader.drop(name)
         return {"deleted": name}
+
+    @app.get("/skills/{name}")
+    async def skill_detail(name: str,
+                           user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """技能详情（含 SKILL.md 正文与依赖），详情弹窗的数据源。"""
+        if skill_loader is None:
+            raise HTTPException(409, "技能库未启用（--no-skills）")
+        sk = await skill_loader.get(name)
+        if sk is None:
+            raise HTTPException(404, f"技能 {name!r} 不存在")
+        return {"name": sk.name, "display": sk.display, "description": sk.description,
+                "always": sk.always, "requires": sk.requires, "available": sk.available,
+                "unavailable_reason": sk.unavailable_reason, "body": sk.body,
+                "files": [f["relpath"] for f in sk.files]}
+
+    @app.put("/skills/{name}")
+    async def skill_upsert(name: str, req: SkillUpsertRequest,
+                           user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """创建/更新技能（upsert）：正文与 frontmatter 直接由弹窗表单编辑保存。
+
+        附件清单原样保留（编辑文案不动附件；附件管理仍走 zip 上传/重扫）。
+        frontmatter 由表单字段现拼，库里与磁盘上不再有两份真相。
+        """
+        if skill_loader is None:
+            raise HTTPException(409, "技能库未启用（--no-skills）")
+        name = (name or "").strip()
+        if not name or len(name) > 64 or not all(c.isalnum() or c in "_-" for c in name):
+            raise HTTPException(400, "技能名只允许字母数字与 _ -（1~64 位）")
+        prev = await skill_loader.get(name)
+        files = [dict(f) for f in (prev.files if prev else [])]
+        fm = {"name": name, "display": req.display, "description": req.description,
+              "always": "true" if req.always else "false", "requires": req.requires}
+        await storage.skills.upsert(name, req.body, description=req.description,
+                                    frontmatter=fm, files=files)
+        await _sync_skill_catalog()
+        return {"saved": name, "attachments_kept": len(files)}
 
     @app.get("/skills-ui", response_class=None)
     async def skills_ui() -> HTMLResponse:
