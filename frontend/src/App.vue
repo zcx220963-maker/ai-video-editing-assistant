@@ -3358,7 +3358,6 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                 <button class="tt-copy pencil" title="详情 / 修改"
                         @click="openToolModal(t, cat)">✎</button>
               </div>
-              <span class="td-desc">{{ t.desc }}</span>
             </div>
           </template>
           </template>
@@ -3373,11 +3372,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             <div v-for="sk in toolLib.skills" :key="sk.name" class="td-item">
               <div class="td-title">
                 <b>{{ toolLabel(sk.name, sk.name_display) }}</b>
+                <span v-if="sk.available !== '可用'" class="st-bad"
+                      :title="sk.available">⚠</span>
                 <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
                         @click="openSkillModal(sk.name)">✎</button>
               </div>
-              <span class="td-name">{{ sk.available }} · 常驻：{{ sk.always }}</span>
-              <span class="td-desc">{{ sk.desc }}</span>
             </div>
           </template>
           </template>
@@ -3405,7 +3404,6 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <span :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
               · {{ (s.tools || []).length }} 个工具
             </span>
-            <span class="td-desc">{{ (s.config && (s.config.url || s.config.command)) || "—" }}</span>
             <span class="td-row-btns">
               <button class="help" :disabled="mcpBusy" @click="toggleMcp(s)">{{ s.live ? "断开" : "启用" }}</button>
               <button class="help danger" @click="delMcp(s)">删除</button>
@@ -4155,7 +4153,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   margin: 14px 0 6px; padding-bottom: 4px; border-bottom: 1px solid var(--line);
 }
 .td-item {
-  display: flex; flex-direction: column; gap: 2px; padding: 8px 0;
+  display: flex; flex-direction: column; gap: 2px; padding: 6px 0;
   border-bottom: 1px dashed rgba(233, 226, 210, 0.3);
 }
 .td-item b { font-family: var(--serif); font-size: 13.5px; color: var(--ink); }
