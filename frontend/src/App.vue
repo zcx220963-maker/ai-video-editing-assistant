@@ -261,6 +261,15 @@ const scroller = ref(null);
 
 const toolLib = ref(null);
 const loadingTools = ref(false);
+// —— 工具库管理态：MCP 服务（动态注册）与技能库的增删改查 ——
+const mcpServers = ref([]);
+const loadingMcp = ref(false);
+const mcpForm = ref(null);        // null=表单收起;{name,type,url,command,args,tool_timeout}
+const mcpBusy = ref(false);
+const mcpMsg = ref("");
+const skillsAdmin = ref([]);
+const loadingSkillsAdmin = ref(false);
+const skillsMsg = ref("");
 // 服务端词表（/tools 的 name_display）灌进来的 {机器名: 中文名}：界面标签的第一来源。
 // 拉不到（离线装配 / Storyline 未连通）时退回 TOOL_LABELS，再退机器名本身。
 const catalogLabels = ref({});
@@ -878,7 +887,157 @@ async function ensureCatalog() {
 
 async function toggleHelp() {
   activePanel.value = activePanel.value === 'tools' ? null : 'tools';
-  if (activePanel.value === 'tools') await loadTools();
+  if (activePanel.value === 'tools') {
+    await loadTools();
+    loadMcpAdmin();
+    loadSkillsAdmin();
+  }
+}
+
+// ---- MCP 服务管理：配置落库，enable 即连 / disable 即断 ----
+// 撞名与连不上服务端都如实报错（400/502），这里把 detail 原样展示。
+
+async function loadMcpAdmin() {
+  loadingMcp.value = true;
+  try {
+    await ensureIdentity();
+    const r = await fetch("/mcp/servers", { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    mcpServers.value = j.servers || [];
+  } catch (e) {
+    mcpMsg.value = "加载失败：" + e.message;
+  } finally {
+    loadingMcp.value = false;
+  }
+}
+
+function editMcp(s) {
+  mcpForm.value = s ? {
+    name: s.name,
+    type: (s.config && s.config.type) || "streamableHttp",
+    url: (s.config && s.config.url) || "",
+    command: (s.config && s.config.command) || "",
+    args: ((s.config && s.config.args) || []).join(", "),
+    tool_timeout: (s.config && s.config.tool_timeout) || 60,
+  } : { name: "", type: "streamableHttp", url: "", command: "", args: "", tool_timeout: 60 };
+  mcpMsg.value = "";
+}
+
+async function saveMcp() {
+  const f = mcpForm.value;
+  if (!f || !f.name.trim()) { mcpMsg.value = "名称必填"; return; }
+  const config = { type: f.type, tool_timeout: Number(f.tool_timeout) || 60,
+                   enabled_tools: ["*"] };
+  if (f.type === "stdio") {
+    config.command = f.command.trim();
+    config.args = f.args.split(",").map((x) => x.trim()).filter(Boolean);
+  } else {
+    config.url = f.url.trim();
+  }
+  mcpBusy.value = true;
+  try {
+    const r = await fetch("/mcp/servers", {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ name: f.name.trim(), config }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    mcpForm.value = null;
+    mcpMsg.value = "已保存：" + j.saved + "（点「启用」才会连接）";
+    await loadMcpAdmin();
+  } catch (e) {
+    mcpMsg.value = "保存失败：" + e.message;
+  } finally {
+    mcpBusy.value = false;
+  }
+}
+
+async function toggleMcp(s) {
+  mcpBusy.value = true;
+  try {
+    const op = s.live ? "disable" : "enable";
+    const r = await fetch(`/mcp/servers/${encodeURIComponent(s.name)}/${op}`,
+                          { method: "POST", headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    mcpMsg.value = op === "enable"
+      ? `已连接，注册 ${(j.tools || []).length} 个工具`
+      : "已断开";
+    await loadMcpAdmin();
+  } catch (e) {
+    // detail 本身已是人话(如「连接失败:<urlopen error ...>」),不再叠加前缀
+    mcpMsg.value = e.message;
+  } finally {
+    mcpBusy.value = false;
+  }
+}
+
+async function delMcp(s) {
+  if (!confirm(`删除 MCP 服务 ${s.name}？（在线会先断开）`)) return;
+  const r = await fetch(`/mcp/servers/${encodeURIComponent(s.name)}`,
+                        { method: "DELETE", headers: authHeaders() });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { mcpMsg.value = "删除失败：" + (j.detail || r.status); return; }
+  mcpMsg.value = "已删除：" + j.deleted;
+  await loadMcpAdmin();
+}
+
+// ---- 技能库管理：上传 zip / 重扫导入目录 / 删除 ----
+
+async function loadSkillsAdmin() {
+  loadingSkillsAdmin.value = true;
+  try {
+    await ensureIdentity();
+    const r = await fetch("/skills", { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    skillsAdmin.value = j.skills || [];
+  } catch (e) {
+    skillsMsg.value = "加载失败：" + e.message;
+  } finally {
+    loadingSkillsAdmin.value = false;
+  }
+}
+
+function pickSkillZip() {
+  const el = document.getElementById("skill-zip");
+  if (el) el.click();
+}
+
+async function uploadSkillZip(ev) {
+  const f = ev.target.files && ev.target.files[0];
+  ev.target.value = "";
+  if (!f) return;
+  skillsMsg.value = "上传中…";
+  const r = await fetch(`/skills/upload?filename=${encodeURIComponent(f.name)}`,
+                        { method: "POST", headers: authHeaders(),
+                          body: await f.arrayBuffer() });
+  const j = await r.json().catch(() => ({}));
+  skillsMsg.value = r.ok
+    ? "已导入：" + (j.imported || []).join(", ")
+    : "失败：" + (j.detail || r.status);
+  await loadSkillsAdmin();
+}
+
+async function reloadSkillsDir() {
+  skillsMsg.value = "重扫中…";
+  const r = await fetch("/skills/reload", { method: "POST", headers: authHeaders() });
+  const j = await r.json().catch(() => ({}));
+  skillsMsg.value = r.ok
+    ? "已重扫：" + (j.imported || []).join(", ")
+    : "失败：" + (j.detail || r.status);
+  await loadSkillsAdmin();
+}
+
+async function delSkill(s) {
+  if (!confirm(`删除技能 ${s.name}？附件一并删除，不可撤销。`)) return;
+  const r = await fetch(`/skills/${encodeURIComponent(s.name)}`,
+                        { method: "DELETE", headers: authHeaders() });
+  const j = await r.json().catch(() => ({}));
+  skillsMsg.value = r.ok ? "已删除：" + j.deleted : "失败：" + (j.detail || r.status);
+  await loadSkillsAdmin();
 }
 
 function msgs(cid) {
@@ -3080,6 +3239,73 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <span class="td-desc">{{ sk.desc }}</span>
             </div>
           </template>
+
+          <!-- —— MCP 服务管理（动态注册）：查 / 增 / 改 / 启停 / 删 —— -->
+          <div class="td-group mcp-head">
+            <span>MCP 服务（第三方工具源）</span>
+            <span class="td-row-btns">
+              <button class="help" @click="editMcp(null)">＋ 新增</button>
+            </span>
+          </div>
+          <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
+          <div v-if="loadingMcp" class="lib-empty">加载中…</div>
+          <div v-for="s in mcpServers" :key="s.name" class="td-item">
+            <b>{{ s.name }}</b>
+            <span class="td-name">
+              <span :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
+              · {{ (s.tools || []).length }} 个工具
+            </span>
+            <span class="td-desc">{{ (s.config && (s.config.url || s.config.command)) || "—" }}</span>
+            <span class="td-row-btns">
+              <button class="help" :disabled="mcpBusy" @click="toggleMcp(s)">{{ s.live ? "断开" : "启用" }}</button>
+              <button class="help" @click="editMcp(s)">编辑</button>
+              <button class="help danger" @click="delMcp(s)">删除</button>
+            </span>
+          </div>
+          <div v-if="!loadingMcp && !mcpServers.length" class="lib-empty">
+            还没有动态 MCP 服务（mcp.json 里的静态服务不在此列）。
+          </div>
+          <div v-if="mcpForm" class="mcp-form">
+            <input v-model="mcpForm.name" placeholder="名称（字母数字与 _ -）" />
+            <select v-model="mcpForm.type">
+              <option value="streamableHttp">HTTP（streamableHttp）</option>
+              <option value="stdio">本地进程（stdio）</option>
+            </select>
+            <input v-if="mcpForm.type === 'streamableHttp'"
+                   v-model="mcpForm.url" placeholder="http://host:port/mcp" />
+            <template v-else>
+              <input v-model="mcpForm.command" placeholder="命令，如 npx" />
+              <input v-model="mcpForm.args" placeholder="命令参数（逗号分隔）" />
+            </template>
+            <input v-model.number="mcpForm.tool_timeout" type="number" placeholder="工具超时（秒）" />
+            <span class="td-row-btns">
+              <button class="help" :disabled="mcpBusy || !mcpForm.name.trim()" @click="saveMcp">保存</button>
+              <button class="help" @click="mcpForm = null">取消</button>
+            </span>
+          </div>
+
+          <!-- —— 技能库管理 —— -->
+          <div class="td-group mcp-head">
+            <span>技能库管理</span>
+            <span class="td-row-btns">
+              <input type="file" id="skill-zip" accept=".zip" style="display:none"
+                     @change="uploadSkillZip" />
+              <button class="help" @click="pickSkillZip">上传 .zip</button>
+              <button class="help" @click="reloadSkillsDir">重扫导入目录</button>
+            </span>
+          </div>
+          <div v-if="skillsMsg" class="lib-empty">{{ skillsMsg }}</div>
+          <div v-if="loadingSkillsAdmin" class="lib-empty">加载中…</div>
+          <div v-for="sk in skillsAdmin" :key="'adm-' + sk.name" class="td-item">
+            <b>{{ sk.display || sk.name }}</b>
+            <span class="td-name">
+              <span :class="sk.available ? 'st-ok' : 'st-bad'">{{ sk.available ? "可用" : "不可用" }}</span>
+              · 常驻：{{ sk.always ? "是" : "否" }} · {{ (sk.files || []).length }} 个附件
+            </span>
+            <span class="td-row-btns">
+              <button class="help danger" @click="delSkill(sk)">删除</button>
+            </span>
+          </div>
         </template>
       </div>
 
@@ -4542,5 +4768,19 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   .new { padding: 10px 0; font-size: 18px; }
   .paper, .head, .composer, .attach-bar, .link-bar { padding-left: 18px; padding-right: 18px; }
   .drawer { width: 100%; }
+}
+
+/* —— 工具库管理区（MCP 服务 / 技能库）—— */
+.mcp-head { display: flex; align-items: center; justify-content: space-between; }
+.td-row-btns { display: inline-flex; gap: 6px; align-items: center; }
+.st-ok { color: #1a7f37; }
+.st-bad { color: #8b949e; }
+.help.danger { color: #cf222e; }
+.mcp-form {
+  display: flex; flex-direction: column; gap: 6px;
+  border: 1px solid #d0d7de; border-radius: 8px; padding: 8px; margin: 6px 0;
+}
+.mcp-form input, .mcp-form select {
+  padding: 5px 8px; border: 1px solid #d0d7de; border-radius: 6px; font-size: 13px;
 }
 </style>
