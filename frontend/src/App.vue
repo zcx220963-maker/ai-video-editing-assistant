@@ -3358,6 +3358,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                 <button class="tt-copy pencil" title="详情 / 修改"
                         @click="openToolModal(t, cat)">✎</button>
               </div>
+              <span class="td-intro">{{ t.desc }}</span>
             </div>
           </template>
           </template>
@@ -3377,6 +3378,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                 <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
                         @click="openSkillModal(sk.name)">✎</button>
               </div>
+              <span class="td-intro">{{ sk.desc }}</span>
             </div>
           </template>
           </template>
@@ -3404,6 +3406,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <span :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
               · {{ (s.tools || []).length }} 个工具
             </span>
+            <span class="td-intro">{{ (s.config && (s.config.url || s.config.command)) || "—" }}</span>
             <span class="td-row-btns">
               <button class="help" :disabled="mcpBusy" @click="toggleMcp(s)">{{ s.live ? "断开" : "启用" }}</button>
               <button class="help danger" @click="delMcp(s)">删除</button>
@@ -5052,6 +5055,10 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .tt-copy.pencil { color: #0969da; font-weight: 600; opacity: 0.85;
   font-size: 13px; line-height: 1; }
+.td-intro {
+  font-size: 11.5px; color: var(--ink-soft); opacity: 0.72; line-height: 1.5;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .td-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .td-title b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .td-title .tt-copy { flex: 0 0 auto; }
