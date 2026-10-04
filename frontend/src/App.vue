@@ -3354,9 +3354,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         <div v-else-if="toolLib && toolLib.error" class="lib-empty bad">工具库加载失败：{{ toolLib.error }}</div>
         <div v-else-if="toolLib" class="td-split">
 
-          <!-- 左栏:分类列表(常驻;选中的加深) -->
           <div class="td-cats">
-            <div class="cat-row" :class="{ active: toolView === 'tools' }" @click="toggleCat('tools')">
+            <div class="cat-row" :class="{ active: !toolView || toolView === 'tools' }" @click="toggleCat('tools')">
               <div class="cat-top">
                 <b>工具</b>
                 <button class="tt-copy pencil" title="增删工具（经 MCP 服务）"
@@ -3382,14 +3381,58 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             </div>
           </div>
 
-          <!-- 右栏:选中分类的子清单 -->
           <div class="td-detail">
-            <div v-if="!toolView" class="lib-empty">点左侧分类查看清单。</div>
-
-            <template v-else-if="toolView === 'tools'">
-              <template v-for="(items, cat) in toolLib.groups" :key="cat">
+            <template v-if="!toolView">
+              <template v-for="(items, cat) in toolLib.groups" :key="'f-' + cat">
                 <div class="td-group">{{ cat }}</div>
-                <div v-for="t in items" :key="t.name" class="td-item">
+                <div v-for="t in items" :key="'f-' + t.name" class="td-item">
+                  <div class="td-title">
+                    <b>{{ toolLabel(t.name, t.name_display) }}</b>
+                    <button class="tt-copy pencil" title="详情 / 修改"
+                            @click="openToolModal(t, cat)">✎</button>
+                  </div>
+                  <span class="td-intro">{{ t.desc }}</span>
+                </div>
+              </template>
+              <div class="td-group">技能（Skill）</div>
+              <div v-for="sk in (toolLib.skills || [])" :key="'f-' + sk.name" class="td-item">
+                <div class="td-title">
+                  <b>{{ toolLabel(sk.name, sk.name_display) }}</b>
+                  <span v-if="sk.available !== '可用'" class="st-bad"
+                        :title="sk.available">⚠</span>
+                  <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
+                          @click="openSkillModal(sk.name)">✎</button>
+                </div>
+                <span class="td-intro">{{ sk.desc }}</span>
+              </div>
+              <div class="td-group mcp-head">
+                <span>MCP 服务（第三方工具源）</span>
+                <span class="td-row-btns">
+                  <button class="help" @click="openMcpModal(null)">＋ 新增</button>
+                </span>
+              </div>
+              <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
+              <div v-for="s in mcpServers" :key="'f-' + s.name" class="td-item">
+                <div class="td-title">
+                  <b>{{ s.name }}</b>
+                  <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
+                          @click="openMcpModal(s)">✎</button>
+                </div>
+                <span class="td-name">
+                  <span :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
+                  · {{ (s.tools || []).length }} 个工具
+                </span>
+                <span class="td-intro">{{ (s.config && (s.config.url || s.config.command)) || "—" }}</span>
+                <span class="td-row-btns">
+                  <button class="help" :disabled="mcpBusy" @click="toggleMcp(s)">{{ s.live ? "断开" : "启用" }}</button>
+                  <button class="help danger" @click="delMcp(s)">删除</button>
+                </span>
+              </div>
+            </template>
+            <template v-else-if="toolView === 'tools'">
+              <template v-for="(items, cat) in toolLib.groups" :key="'t-' + cat">
+                <div class="td-group">{{ cat }}</div>
+                <div v-for="t in items" :key="'t-' + t.name" class="td-item">
                   <div class="td-title">
                     <b>{{ toolLabel(t.name, t.name_display) }}</b>
                     <button class="tt-copy pencil" title="详情 / 修改"
@@ -3399,9 +3442,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                 </div>
               </template>
             </template>
-
             <template v-else-if="toolView === 'skills'">
-              <div v-for="sk in (toolLib.skills || [])" :key="sk.name" class="td-item">
+              <div v-for="sk in (toolLib.skills || [])" :key="'s-' + sk.name" class="td-item">
                 <div class="td-title">
                   <b>{{ toolLabel(sk.name, sk.name_display) }}</b>
                   <span v-if="sk.available !== '可用'" class="st-bad"
@@ -3412,14 +3454,13 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                 <span class="td-intro">{{ sk.desc }}</span>
               </div>
             </template>
-
             <template v-else-if="toolView === 'mcp'">
               <div class="td-row-btns" style="margin-bottom:6px">
                 <button class="help" @click="openMcpModal(null)">＋ 新增</button>
               </div>
               <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
               <div v-if="loadingMcp" class="lib-empty">加载中…</div>
-              <div v-for="s in mcpServers" :key="s.name" class="td-item">
+              <div v-for="s in mcpServers" :key="'m-' + s.name" class="td-item">
                 <div class="td-title">
                   <b>{{ s.name }}</b>
                   <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
