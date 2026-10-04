@@ -437,10 +437,11 @@ _SKILLS_UI_HTML = """<!doctype html>
   <button onclick="reload()">重新扫描导入目录</button>
   <input type="file" id="zip" accept=".zip">
   <button onclick="upload()">上传技能包(.zip)</button>
+  <span style="font-size:12px;color:#656d76">删除不可撤销</span>
   <a href="/" style="margin-left:auto;font-size:13px;color:#0969da">← 返回会话</a>
 </div>
 <table id="tbl"><thead><tr>
-  <th>名称</th><th>中文名</th><th>常驻</th><th>可用</th><th>描述</th><th>附件</th>
+  <th>名称</th><th>中文名</th><th>常驻</th><th>可用</th><th>描述</th><th>附件</th><th>操作</th>
 </tr></thead><tbody></tbody></table>
 <script>
 const msg = t => document.getElementById("msg").textContent = t;
@@ -454,14 +455,25 @@ async function load() {
     tb.innerHTML = "";
     for (const s of data.skills) {
       const tr = document.createElement("tr");
+      const tr = document.createElement("tr");
       tr.innerHTML = `<td>${s.name}</td><td>${s.display || "—"}</td>
         <td>${s.always ? "是" : "否"}</td>
         <td class="${s.available ? "ok" : "bad"}">${s.available ? "可用" : (s.unavailable_reason || "不可用")}</td>
-        <td>${(s.description || "").slice(0, 80)}</td><td>${(s.files || []).join(", ") || "—"}</td>`;
+        <td>${(s.description || "").slice(0, 80)}</td><td>${(s.files || []).join(", ") || "—"}</td>
+        <td><button data-n="${s.name}" onclick="del(this.dataset.n)"
+             style="padding:2px 8px;font-size:12px;color:#cf222e">删除</button></td>`;
       tb.appendChild(tr);
     }
     msg(`共 ${data.skills.length} 个技能`);
   } catch (e) { msg("加载失败:" + e); }
+}
+async function del(name) {
+  if (!confirm("删除技能 " + name + "？附件一并删除，不可撤销。")) return;
+  const r = await fetch("/skills/" + encodeURIComponent(name),
+                        { method: "DELETE", headers: auth() });
+  const d = await r.json().catch(() => ({}));
+  msg(r.ok ? "已删除:" + d.deleted : ("失败:" + (d.detail || r.status)));
+  load();
 }
 async function reload() {
   const r = await fetch("/skills/reload", { method: "POST", headers: auth() });
@@ -716,6 +728,21 @@ def create_app(
             raise HTTPException(400, f"技能包解析失败：{exc}")
         await _sync_skill_catalog()
         return {"imported": imported}
+
+    @app.delete("/skills/{name}")
+    async def skills_delete(name: str,
+                            user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """删除技能：删行的同时清附件对象（best-effort，删不掉不阻断删行）。
+
+        注：出口词表只增不撤，被删技能的中文名残留到下次重启——仅影响界面标签，
+        不影响任何执行语义。
+        """
+        if skill_loader is None:
+            raise HTTPException(409, "技能库未启用（--no-skills）")
+        if await skill_loader.get(name) is None:
+            raise HTTPException(404, f"技能 {name!r} 不存在")
+        await skill_loader.drop(name)
+        return {"deleted": name}
 
     @app.get("/skills-ui", response_class=None)
     async def skills_ui() -> HTMLResponse:
