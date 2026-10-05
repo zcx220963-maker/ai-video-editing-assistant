@@ -191,13 +191,21 @@ class Storage:
         await self.objects.close()
 
 
-def _load_env_file(path: Path = Path(".env")) -> None:
+def _load_env_file(path: Path | None = None) -> None:
     """把 .env 里的 KEY=VALUE 落进环境变量（不覆盖已有值、不打印任何值）。
 
     项目不引 python-dotenv：只需 KEY=VALUE 一种形态，十余行自足以让
     「copy .env.example .env 后直接起服务」这条运行方式成立（spec §12）。
+    查找顺序：cwd/.env → 仓库根/.env（backend 启动时 cwd 在 backend，
+    而 .env 惯例放在仓库根与 docker-compose 共用）。
     """
-    if not path.is_file():
+    if path is None:
+        for cand in (Path(".env"),
+                     Path(__file__).resolve().parents[3] / ".env"):
+            if cand.is_file():
+                path = cand
+                break
+    if path is None or not path.is_file():
         return
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         s = line.strip()

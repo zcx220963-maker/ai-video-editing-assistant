@@ -109,8 +109,11 @@ from agent_framework.video_editing import (
 )
 
 RUNTIME_DIR = Path(".runtime")
-DEFAULT_MCP_CONFIG = Path("mcp.json")
-DEFAULT_STORYLINE_CONFIG = Path("examples") / "storyline" / "config.toml"
+# 目录锚点:后端资产锚到本文件所在目录(backend/),前端产物锚到仓库根(frontend/)
+BACKEND_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = BACKEND_ROOT.parent
+DEFAULT_MCP_CONFIG = BACKEND_ROOT / "mcp.json"
+DEFAULT_STORYLINE_CONFIG = BACKEND_ROOT / "examples" / "storyline" / "config.toml"
 DEFAULT_MAX_CONTEXT_TOKENS = 8_000
 # 主服务侧会话工作区的过期回收线（与 Storyline 的 [storage].workspace_ttl_sec 对齐）：
 # 崩溃/异常退出遗留的 {会话}/{产物} 目录（含 _files 沙箱）在启动时按 mtime 扫掉。
@@ -353,7 +356,8 @@ def build_runtime(
 
     # ---- Context sources（记忆与技能都在 PG，本地目录仅是技能的导入源）----
     context_sources: list = []
-    skills_import_dir = (_resolve_dir(skills_dir, Path("examples") / "skills")
+    skills_import_dir = (_resolve_dir(skills_dir,
+                                      BACKEND_ROOT / "examples" / "skills")
                          if use_skills else None)
     skill_loader: SkillLoader | None = None
     if use_skills:
@@ -801,7 +805,7 @@ def parse_args() -> argparse.Namespace:
                    help="禁用 yt-dlp 兜底解析：只认直链与页面里的 <video>/og:video 地址")
     p.add_argument(
         "--static-dir",
-        default=str(Path(__file__).parent / "frontend" / "dist"),
+        default=str(REPO_ROOT / "frontend" / "dist"),
         help="前端构建产物目录；不存在时只提供 API。设空字符串可禁用托管。",
     )
     return p.parse_args()
