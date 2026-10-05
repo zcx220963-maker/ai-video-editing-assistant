@@ -1190,6 +1190,27 @@ async function fromRunAsSkill(run) {
   }
 }
 
+async function fromConversationAsSkill() {
+  if (!active.value) { alert("先选一个会话"); return; }
+  try {
+    await ensureIdentity();
+    const r = await fetch("/skills/from_run", {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ conversation_id: active.value }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    await loadSkillsAdmin();
+    skillsMsg.value = "已沉淀：" + j.name + "（净 " + j.steps + " 步，剔 " +
+      (j.dropped || 0) + " 次重复/失败" + (j.llm_polished ? "，模型润色" : "，模板") + "）";
+    await openSkillModal(j.name);
+    editSkillForm(false);
+  } catch (e) {
+    alert("沉淀失败：" + e.message);
+  }
+}
+
 function msgs(cid) {
   if (!histories[cid]) histories[cid] = [];
   return histories[cid];
@@ -3931,9 +3952,14 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       <div v-if="activePanel === 'runs'" class="runs">
         <div class="lib-head">
           <span class="lib-count">{{ runList.length }} 次执行</span>
-          <button class="help" @click="loadRuns" :disabled="loadingRuns">
-            {{ loadingRuns ? "刷新中…" : "刷新" }}
-          </button>
+          <span class="td-row-btns">
+            <button class="help" title="把本会话所有已完成的执行合并净化成一篇技能——
+只保留每个动作修正后的最终做法"
+                    @click="fromConversationAsSkill">✦ 沉淀整个会话</button>
+            <button class="help" @click="loadRuns" :disabled="loadingRuns">
+              {{ loadingRuns ? "刷新中…" : "刷新" }}
+            </button>
+          </span>
         </div>
         <div v-if="runsError" class="lib-empty bad">{{ runsError }}</div>
         <div v-else-if="loadingRuns && !runList.length" class="lib-empty">正在取执行记录…</div>

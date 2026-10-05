@@ -26,7 +26,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from agent_framework.checkpoint import CheckpointManager
 from agent_framework.skill_flows import (
-    draft_body, extract_steps, first_user_request, pick_skill_name,
+    clean_steps, draft_body, extract_steps, first_user_request, merge_runs,
+    pick_skill_name,
 )
 from agent_framework.storage import build_storage
 
@@ -116,11 +117,50 @@ async def part4_checkpoint_roundtrip() -> None:
     check(steps[0]["tool"] == "load_media", "步骤顺序与执行一致")
 
 
+def _step(tool, args=None, result="ok"):  # noqa: ANN001
+    return {"tool": tool, "args": args or {}, "result": result}
+
+
+async def part5_clean_and_merge() -> None:
+    print("\n[5] 净化与合并：试错链收敛成干净主流程")
+    raw = [
+        _step("submit_plan", {"plans": []}),                       # 控制面:剔
+        _step("ask_user", {}, "请你选择"),                          # 问询:剔
+        _step("load_media", {"material_ids": ["m1"]}),
+        _step("render_video", {"artifact_id": "a1"}, "Error: 编码失败"),   # 失败:剔
+        _step("render_video", {"artifact_id": "a1"}, "Error: 编码失败"),   # 重试失败:剔
+        _step("render_video", {"artifact_id": "a1"}),              # 重试成功:留
+        _step("fetch_media", {"url": "u1"}, "ok1"),
+        _step("fetch_media", {"url": "u2"}, "ok2"),                # 同名不同参:都留
+    ]
+    cleaned, dropped = clean_steps(raw)
+    check([s["tool"] for s in cleaned] ==
+          ["load_media", "render_video", "fetch_media", "fetch_media"],
+          f"控制面/失败剔除、纯重试合并、不同参保留：{[s['tool'] for s in cleaned]}")
+    check(dropped == 4, f"剔除计数（2 控制面 + 2 失败重试）={dropped}")
+    check(cleaned[1]["args"] == {"artifact_id": "a1"},
+          "重试合并保留的是成功那次的参数")
+
+    # 会话级:run2 修正了 BGM 并重渲(换了产物作用域)
+    run1 = [_step("load_media"), _step("select_BGM", {"query": "轻快"}),
+            _step("render_video", {"artifact_id": "art-1"})]
+    run2 = [_step("select_BGM", {"query": "钢琴版"}),
+            _step("render_video", {"artifact_id": "art-2"})]
+    merged, replaced = merge_runs([run1, run2])
+    check([s["tool"] for s in merged] == ["load_media", "select_BGM", "render_video"],
+          f"跨 run 同工具只留最后一次,位置在首次出现处：{[s['tool'] for s in merged]}")
+    check(merged[1]["args"] == {"query": "钢琴版"}
+          and merged[2]["args"] == {"artifact_id": "art-2"},
+          "保留的是修正后的参数(新 BGM/新产物作用域)")
+    check(replaced == 2, f"被替换计数={replaced}")
+
+
 async def main() -> None:
     await part1_extract()
     await part2_fallback_draft()
     await part3_name_pick()
     await part4_checkpoint_roundtrip()
+    await part5_clean_and_merge()
     print(f"\n==== {_checks} 项检查，{_fails} 项失败 ====")
     if _fails:
         sys.exit(1)

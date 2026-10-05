@@ -73,7 +73,8 @@ from .tools.mcp import MCPServerConfig
 from .storage import IntegrityConflict, Storage
 from .tool import is_tool_error
 from .checkpoint import STATUS_AWAITING_APPROVAL, CheckpointManager
-from .skill_flows import draft_body, extract_steps, first_user_request, pick_skill_name
+from .skill_flows import (clean_steps, draft_body, extract_steps,
+                          first_user_request, merge_runs, pick_skill_name)
 
 
 def _mask_credentials_in_access_logs() -> None:
@@ -514,9 +515,10 @@ class SkillUpsertRequest(BaseModel):
 
 
 class SkillFromRunRequest(BaseModel):
-    """POST /skills/from_run 请求体：把一条执行流水沉淀为技能。"""
+    """POST /skills/from_run 请求体：run_id=沉淀单条执行；conversation_id=整会话合并沉淀。"""
 
-    run_id: str
+    run_id: str = ""
+    conversation_id: str = ""
     name: str = ""
     display: str = ""
 
@@ -811,16 +813,45 @@ def create_app(
         if skill_loader is None:
             raise HTTPException(409, "技能库未启用（--no-skills）")
         cm = CheckpointManager(storage)
-        cp = await cm.load(req.run_id)
-        if cp is None:
-            raise HTTPException(404, f"执行 {req.run_id!r} 不存在")
-        # 归属核对：别人的 run 一律按 404（不泄露存在性）
-        if not str(cp.session_id).startswith(f"u:{user_id}:"):
-            raise HTTPException(404, f"执行 {req.run_id!r} 不存在")
-        steps = extract_steps(cp.messages)
-        if not steps:
-            raise HTTPException(400, "这条执行没有可沉淀的工具调用")
-        user_request = first_user_request(cp.messages)
+        runs_steps: list[list[dict[str, Any]]] = []
+        user_request = ""
+        scope_label = ""
+        if req.conversation_id:
+            # 会话级：该会话所有**已完成**执行，按时间正序逐条净化后合并——
+            # 跨 run 同名工具只保留最后一次（后一次代表用户修正后的做法），
+            # 「改了 N 次才出成片」的试错链由此收敛成一条干净主流程。
+            rows = await cm.list_for_session(session_key(user_id, req.conversation_id))
+            for row in reversed(rows):          # list_for_session 最近在前 → 反转成正序
+                if row.get("status") != "completed":
+                    continue
+                cp = await cm.load(row["run_id"])
+                if cp is None:
+                    continue
+                cleaned, _ = clean_steps(extract_steps(cp.messages))
+                if cleaned:
+                    runs_steps.append(cleaned)
+                if not user_request:
+                    user_request = first_user_request(cp.messages)
+            scope_label = f"会话 {req.conversation_id}"
+            if not runs_steps:
+                raise HTTPException(400, "这个会话没有已完成的、含工具调用的执行可沉淀")
+            steps, dropped = merge_runs(runs_steps)
+        else:
+            if not req.run_id:
+                raise HTTPException(400, "run_id 与 conversation_id 至少给一个")
+            cp = await cm.load(req.run_id)
+            if cp is None:
+                raise HTTPException(404, f"执行 {req.run_id!r} 不存在")
+            # 归属核对：别人的 run 一律按 404（不泄露存在性）
+            if not str(cp.session_id).startswith(f"u:{user_id}:"):
+                raise HTTPException(404, f"执行 {req.run_id!r} 不存在")
+            raw = extract_steps(cp.messages)
+            steps, dropped = clean_steps(raw)
+            user_request = first_user_request(cp.messages)
+            scope_label = f"执行 {req.run_id[:8]}"
+            if not steps:
+                raise HTTPException(400, "这条执行没有可沉淀的创作步骤"
+                                         "（失败尝试与问询/查询类调用不计入）")
 
         try:
             llm = _runtime_llm()
@@ -828,11 +859,12 @@ def create_app(
             llm = None
         body, polished = await draft_body(steps, user_request, llm=llm)
 
-        base = (req.name or f"run_flow_{req.run_id[:6]}").strip()
+        base = (req.name or (f"conv_flow_{req.conversation_id[:6]}"
+                             if req.conversation_id else f"run_flow_{req.run_id[:6]}")).strip()
         existing = {sk.name for sk in await skill_loader.discover()}
         name = pick_skill_name(base, existing)
         display = (req.display or "会话流程沉淀").strip()
-        description = (f"【WORKFLOW SKILL】由执行 {req.run_id[:8]} 沉淀："
+        description = (f"【WORKFLOW SKILL】由{scope_label}沉淀："
                        f"{user_request[:80]}")
         await storage.skills.upsert(name, body, description=description,
                                     frontmatter={"name": name, "display": display,
@@ -841,7 +873,7 @@ def create_app(
                                     files=[])
         await _sync_skill_catalog()
         return {"name": name, "display": display, "steps": len(steps),
-                "llm_polished": polished}
+                "dropped": dropped, "llm_polished": polished}
 
     @app.get("/skills-ui", response_class=None)
     async def skills_ui() -> HTMLResponse:

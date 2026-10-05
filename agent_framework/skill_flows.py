@@ -74,6 +74,72 @@ def _args_line(args: dict[str, Any]) -> str:
     return "关键参数: " + "；".join(parts)
 
 
+# 这些不是创作步骤：规划/问询/查询/技能加载/协作面调用，进技能只会教模型绕路
+NON_FLOW_TOOLS = frozenset({
+    "submit_plan", "confirm_plan", "ask_user",
+    "render_status", "read_node_history", "load_skill",
+    "read_memory", "update_memory",
+    "send_message", "read_inbox", "spawn_subagent", "start_subagent",
+    "team_status", "plan_editing_team", "list_tasks", "claim_task",
+    "complete_task", "create_cron_job", "list_cron_jobs", "delete_cron_job",
+})
+
+
+def _is_failed(result: str) -> bool:
+    """ToolError 的字符串形状以 Error 开头（tool.py），失败尝试不进流程。"""
+    return result.startswith("Error")
+
+
+def _fingerprint(step: dict[str, Any]) -> str:
+    """动作指纹：工具 + 参数（排除 artifact_id——分叉换作用域不改变动作本身）。"""
+    args = {k: v for k, v in (step.get("args") or {}).items() if k != "artifact_id"}
+    return step["tool"] + ":" + json.dumps(args, ensure_ascii=False, sort_keys=True)
+
+
+def clean_steps(steps: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """净化单条 run 的流水，返回 (净步骤, 剔除数)：
+
+    1) 剔除非创作步骤（规划/问询/查询/协作面）；
+    2) 剔除失败尝试——改了三次才成的试错不进技能，成功做法才进；
+    3) 紧邻同名且参数相同的连发合并为一次（纯重试）；参数不同的连发是合法多次使用，保留。
+    """
+    flow = [st for st in steps
+            if st["tool"] not in NON_FLOW_TOOLS and not _is_failed(st["result"])]
+    out: list[dict[str, Any]] = []
+    dropped = len(steps) - len(flow)
+    i = 0
+    while i < len(flow):
+        j = i
+        while j + 1 < len(flow) and flow[j + 1]["tool"] == flow[i]["tool"]:
+            j += 1
+        streak = flow[i:j + 1]
+        if len(streak) == 1 or len({_fingerprint(x) for x in streak}) > 1:
+            out.extend(streak)
+        else:
+            out.append(streak[-1])          # 纯重试：只留最后一次
+            dropped += len(streak) - 1
+        i = j + 1
+    return out, dropped
+
+
+def merge_runs(runs_steps: list[list[dict[str, Any]]]) -> tuple[list[dict[str, Any]], int]:
+    """会话级合并：跨 run 同名工具只保留最后一次——后一次代表用户修正后的做法；
+    位置留在首次出现处，主流程顺序不乱。返回 (合并步骤, 被替换数)。"""
+    out: list[dict[str, Any]] = []
+    pos: dict[str, int] = {}
+    replaced = 0
+    for steps in runs_steps:
+        for st in steps:
+            t = st["tool"]
+            if t in pos:
+                out[pos[t]] = st
+                replaced += 1
+            else:
+                pos[t] = len(out)
+                out.append(st)
+    return out, replaced
+
+
 def flow_lines(steps: list[dict[str, Any]]) -> list[str]:
     """给 LLM 看的流水原文（也是模板步骤的原料）。"""
     lines = []
