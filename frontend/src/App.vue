@@ -41,38 +41,68 @@ function authHeaders(extra = {}) {
 
 // 凭证是身份的唯一来源：token 丢了就是新身份（旧历史仍在服务端那个用户名下，只有原 token 能找回）。
 let identityPromise = null;
+// —— 登录门禁：未登录（或凭证失效）只显示登录/注册页，登录成功才进主界面 ——
+const loginView = ref(true);
+const loginMode = ref("login");            // login | register
+const loginForm = reactive({ username: "", password: "" });
+const loginErr = ref("");
+const loginBusy = ref(false);
+
 function ensureIdentity() {
   if (userId.value) return Promise.resolve(userId.value);
   if (!identityPromise) {
-    identityPromise = (token.value ? whoami() : register()).catch((e) => {
+    identityPromise = (token.value ? whoami() : Promise.reject(new Error("未登录"))).catch((e) => {
       identityPromise = null;             // 失败不留半成品 promise，下次操作会重试
+      loginView.value = true;             // 凭证缺失/失效 → 回到登录页
       throw e;
     });
   }
   return identityPromise;
 }
 
+async function submitAuth() {
+  if (loginBusy.value) return;
+  loginBusy.value = true; loginErr.value = "";
+  try {
+    const path = loginMode.value === "login" ? "/auth/login" : "/auth/register";
+    const r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: loginForm.username.trim(),
+                             password: loginForm.password }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    token.value = j.token;                 // JWT
+    userId.value = j.user_id;
+    hadToken.value = true;
+    localStorage.setItem(TOKEN_KEY, j.token);
+    loginView.value = false;
+    identityPromise = null;
+    await ensureIdentity();
+    loadConvs();
+    ensureCatalog();
+  } catch (e) {
+    loginErr.value = e.message;
+  } finally {
+    loginBusy.value = false;
+  }
+}
+
+function switchLoginMode() {
+  loginMode.value = loginMode.value === "login" ? "register" : "login";
+  loginErr.value = "";
+}
+
 async function whoami() {
   const r = await fetch("/whoami", { headers: authHeaders() });
-  if (r.status === 401) {                 // 服务端认不得这张 token（库被清过）：换新的
+  if (r.status === 401) {                 // 服务端认不得这张凭证：清掉,回登录页
     forgetToken();
-    return register();
+    return null;
   }
   if (!r.ok) throw new Error("无法确认身份（HTTP " + r.status + "）");
   userId.value = (await r.json()).user_id;
   return userId.value;
-}
-
-async function register() {
-  const r = await fetch("/register", { method: "POST" });
-  if (!r.ok) throw new Error("无法取得身份（HTTP " + r.status + "）");
-  const j = await r.json();
-  token.value = j.token;                  // 明文 token 只在这一次响应里出现
-  userId.value = j.user_id;
-  hadToken.value = true;
-  localStorage.setItem(TOKEN_KEY, j.token);
-  identityPromise = null;
-  return j.user_id;
 }
 
 function freshConv() {
@@ -1203,11 +1233,12 @@ function wsUrl(cid) {
 }
 
 function forgetToken() {
-  if (!hadToken.value) return;         // 本来就没凭证：不是「失效」，是还没注册过
   hadToken.value = false;
   localStorage.removeItem(TOKEN_KEY);
   token.value = "";
   userId.value = "";
+  identityPromise = null;
+  loginView.value = true;              // 凭证没了就回登录页
 }
 
 const _reconnectAttempts = {};
@@ -2905,7 +2936,31 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 </script>
 
 <template>
-  <div class="shell">
+  <!-- 登录/注册门禁:登录成功才进入主界面 -->
+  <div v-if="loginView" class="login-mask">
+    <div class="login-card">
+      <div class="seal login-seal">创</div>
+      <h1>智能创作助手</h1>
+      <p class="login-sub">一句话驱动「查资料 → 写文案 → 剪视频 → 出片」</p>
+      <input v-model.trim="loginForm.username" placeholder="用户名（中英文/数字/_ -）"
+             autocomplete="username" @keyup.enter="submitAuth" />
+      <input v-model="loginForm.password" type="password" placeholder="密码（至少 6 位）"
+             autocomplete="current-password" @keyup.enter="submitAuth" />
+      <div v-if="loginErr" class="login-err">{{ loginErr }}</div>
+      <button class="login-btn" :disabled="loginBusy || !loginForm.username
+              || loginForm.password.length < 6" @click="submitAuth">
+        {{ loginBusy ? "…" : (loginMode === "login" ? "登 录" : "注 册 并 登 录") }}
+      </button>
+      <div class="login-switch">
+        {{ loginMode === "login" ? "还没有账号？" : "已有账号？" }}
+        <a href="#" @click.prevent="switchLoginMode">
+          {{ loginMode === "login" ? "注册新账号" : "去登录" }}
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <div class="shell" v-else>
     <!-- 左侧：卷宗栏（可收起） -->
     <aside class="rail" :class="{ closed: !railOpen }">
       <button v-if="!railOpen" class="rail-open-btn" title="展开卷宗栏"
@@ -5158,6 +5213,35 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   .paper, .head, .composer, .attach-bar, .link-bar { padding-left: 18px; padding-right: 18px; }
   .drawer { width: 100%; }
 }
+
+/* —— 登录门禁 —— */
+.login-mask {
+  position: fixed; inset: 0; z-index: 200;
+  background: linear-gradient(160deg, #211d18, #2b2620 55%, #35302a);
+  display: flex; align-items: center; justify-content: center;
+}
+.login-card {
+  width: min(360px, calc(100vw - 40px));
+  background: rgba(255, 253, 247, 0.97); border-radius: 14px;
+  padding: 34px 30px 26px; text-align: center;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .45);
+  display: flex; flex-direction: column; gap: 10px;
+}
+.login-seal { margin: 0 auto 4px; }
+.login-card h1 { font-family: var(--serif); font-size: 20px; color: var(--ink); margin: 0; }
+.login-sub { font-size: 12px; color: #8b949e; margin: 0 0 8px; }
+.login-card input {
+  padding: 9px 12px; border: 1px solid #d0d7de; border-radius: 8px;
+  font-size: 14px; width: 100%; box-sizing: border-box;
+}
+.login-btn {
+  padding: 10px; border: none; border-radius: 8px; cursor: pointer;
+  background: var(--vermilion); color: #fff9ef; font-size: 15px; letter-spacing: 4px;
+}
+.login-btn:disabled { opacity: .45; cursor: default; }
+.login-err { color: #cf222e; font-size: 12.5px; }
+.login-switch { font-size: 12.5px; color: #656d76; }
+.login-switch a { color: #0969da; cursor: pointer; text-decoration: none; }
 
 /* —— 工具库管理区（MCP 服务 / 技能库）—— */
 .mcp-head { display: flex; align-items: center; justify-content: space-between; }

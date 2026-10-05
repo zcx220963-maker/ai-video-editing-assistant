@@ -79,6 +79,24 @@ class UsersRepo(_Repo):
                                     limit=1)
         return rows[0]["id"] if rows else None
 
+    async def register_user(self, username: str, password_hash: str) -> str:
+        """账号密码注册：username 唯一（先查后插，PG 侧另有唯一索引兜并发）。
+
+        token_hash 仍必填（表约束）：账号用户填随机占位——他们用密码+JWT 登录，
+        不走旧 token 反查通道。返回 user_id。"""
+        got = await self.find_by_username(username)
+        if got is not None:
+            raise IntegrityConflict(f"用户名 {username!r} 已被使用")
+        uid = new_id("u", 12)
+        await self.db.insert(self.table, {
+            "id": uid, "token_hash": token_hash(new_id("unclaimed", 24)),
+            "username": username, "password_hash": password_hash})
+        return uid
+
+    async def find_by_username(self, username: str) -> dict[str, Any] | None:
+        rows = await self.db.select(self.table, where={"username": username}, limit=1)
+        return rows[0] if rows else None
+
     async def get(self, user_id: str) -> dict[str, Any] | None:
         return await self.db.get_by_pk(self.table, {"id": user_id})
 

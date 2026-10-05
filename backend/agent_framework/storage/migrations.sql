@@ -76,3 +76,9 @@ ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS approval jsonb NOT NULL DEFAULT
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS owner_instance_id text;
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
 CREATE INDEX IF NOT EXISTS ck_lease_idx ON checkpoints(status, lease_expires_at);
+
+-- 账号密码登录:username 与 password_hash 补列。历史匿名身份两列为空,不可密码登录,
+-- 但仍可用旧 token。username 唯一索引只约束非空行。
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text;
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_uidx ON users (username);

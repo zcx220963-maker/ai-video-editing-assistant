@@ -39,6 +39,7 @@ import json
 import subprocess
 import sys
 import urllib.parse
+import re
 import uuid
 
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -514,6 +515,25 @@ class SkillUpsertRequest(BaseModel):
     body: str = ""
 
 
+class AuthCredentials(BaseModel):
+    """账号密码登录/注册请求体。"""
+
+    username: str
+    password: str
+
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fff]{2,32}$")
+
+def _check_credentials(username: str, password: str) -> tuple[str, str]:
+    username = (username or "").strip()
+    password = password or ""
+    if not _USERNAME_RE.match(username):
+        raise HTTPException(400, "用户名 2~32 位，仅限中英文、数字、_ -")
+    if len(password) < 6 or len(password) > 128:
+        raise HTTPException(400, "密码至少 6 位（至多 128）")
+    return username, password
+
+
+
 class SkillFromRunRequest(BaseModel):
     """POST /skills/from_run 请求体：run_id=沉淀单条执行；conversation_id=整会话合并沉淀。"""
 
@@ -968,6 +988,27 @@ def create_app(
         await mcp_manager.disconnect(name)
         await storage.mcp_servers.drop(name)
         return {"deleted": name}
+
+    @app.post("/auth/register")
+    async def auth_register(req: AuthCredentials) -> dict[str, str]:
+        """账号密码注册：创建身份并直接签发 JWT（与登录同形，省一次往返）。"""
+        username, password = _check_credentials(req.username, req.password)
+        try:
+            uid = await auth.register_user(username, password)
+        except IntegrityConflict as exc:
+            raise HTTPException(409, str(exc))
+        token = await auth.issue_jwt(uid)
+        return {"user_id": uid, "username": username, "token": token}
+
+    @app.post("/auth/login")
+    async def auth_login(req: AuthCredentials) -> dict[str, str]:
+        """账号密码登录：成功签发 JWT（7 天有效）。失败统一 401，不区分用户不存在与密码错。"""
+        username, password = _check_credentials(req.username, req.password)
+        token = await auth.login(username, password)
+        if token is None:
+            raise HTTPException(401, "用户名或密码不对")
+        row = await auth._users.find_by_username(username)
+        return {"user_id": row["id"], "username": username, "token": token}
 
     @app.post("/register")
     async def register(req: RegisterRequest | None = None) -> dict[str, str]:

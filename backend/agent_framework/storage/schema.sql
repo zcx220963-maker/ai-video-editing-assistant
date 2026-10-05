@@ -6,6 +6,8 @@
 CREATE TABLE IF NOT EXISTS users (
   id            text PRIMARY KEY,
   token_hash    text NOT NULL UNIQUE,
+  username      text UNIQUE,
+  password_hash text,
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 
