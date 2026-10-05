@@ -1169,27 +1169,7 @@ async function delSkillFromModal() {
   if (!skillsMsg.value.startsWith("失败")) itemModal.value = null;
 }
 
-// —— 执行流水沉淀为技能：后端从 checkpoint 链提取步骤，LLM 润色（无密钥退回模板）——
-async function fromRunAsSkill(run) {
-  try {
-    await ensureIdentity();
-    const r = await fetch("/skills/from_run", {
-      method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ run_id: run.run_id }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
-    await loadSkillsAdmin();
-    skillsMsg.value = "已沉淀：" + j.name + "（" + j.steps + " 步" +
-      (j.llm_polished ? "，模型润色" : "，模板") + "）";
-    await openSkillModal(j.name);
-    editSkillForm(false);       // 直接进编辑态：用户检查/改名后保存
-  } catch (e) {
-    alert("沉淀失败：" + e.message);
-  }
-}
-
+// —— 执行流水沉淀为技能：后端把本会话全部已完成执行合并净化，LLM 润色（无密钥退回模板）——
 async function fromConversationAsSkill() {
   if (!active.value) { alert("先选一个会话"); return; }
   try {
@@ -3954,8 +3934,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <span class="lib-count">{{ runList.length }} 次执行</span>
           <span class="td-row-btns">
             <button class="help" title="把本会话所有已完成的执行合并净化成一篇技能——
-只保留每个动作修正后的最终做法"
-                    @click="fromConversationAsSkill">✦ 沉淀整个会话</button>
+失败重试与问询不计入,每个动作只保留你修正后的最终做法"
+                    @click="fromConversationAsSkill">✦ 沉淀为技能</button>
             <button class="help" @click="loadRuns" :disabled="loadingRuns">
               {{ loadingRuns ? "刷新中…" : "刷新" }}
             </button>
@@ -3993,8 +3973,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             <span v-if="run.has_plan_cards" class="ru-plan" title="这条规划 run 产出了待确认的候选计划">
               🗂 有候选计划
             </span>
-            <button class="help" title="把这条执行的流程提炼成一篇可复用的技能"
-                    @click.stop="fromRunAsSkill(run)">✦ 沉淀为技能</button>
+
             <span v-if="auditCount(run.plan_audit || {})" class="ru-audit">
               ⚖ 计划外 {{ (run.plan_audit.extra || []).length }} · 未履行 {{ (run.plan_audit.unfulfilled || []).length }}
             </span>
