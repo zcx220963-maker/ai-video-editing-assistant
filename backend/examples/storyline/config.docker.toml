@@ -1,0 +1,78 @@
+# Storyline 本地 MCP Server 配置样例（对应设计文档 [local_mcp_server]）。
+# 本仓库不发起网络：video_editing.load_storyline_config 仅用标准库 tomllib 解析此文件，
+# 供 build_node_registry(allowed=storyline_available_nodes(cfg)) 做节点白名单，
+# 真实接入时再把 server_url 交给 mcp 模块建 StreamableHttp 传输。
+[local_mcp_server]
+server_name = "storyline"
+server_cache_dir = ".storyline/.server_cache"
+server_transport = "streamable-http"
+url_scheme = "http"
+connect_host = "editor"
+inline_media = "auto"
+port = 8001
+path = "/mcp"
+json_response = true
+stateless_http = false
+timeout = 600
+
+# 暴露给 Agent 的剪辑节点白名单（这里用工具名，与 Node.name 对齐；对应流程图节点全集）。
+available_nodes = [
+    "search_media", "load_media",
+    "split_shots", "understand_clips", "filter_clips", "group_clips",
+    "asr", "correct_transcript", "speech_rough_cut",
+    "script_template_rec", "generate_script", "generate_ai_transition",
+    "transition_rec", "text_rec", "generate_voiceover", "select_BGM",
+    "plan_timeline", "plan_timeline_pro", "plan_timeline_ai_transition",
+    "render_video", "render_web",
+    # 控制面工具（非 DAG 节点）：read_node_history 读 Store，render_status 轮询渲染任务。
+    # 少了 render_status，模型收到「去轮询」的指示却没有可轮询的工具，等于没改。
+    "read_node_history", "render_status",
+]
+
+# ---------------------------------------------------------------------------
+# [storage]：上线存储层（PG 元数据 + MinIO 媒体字节，设计文档 §1/§6/§8）
+# 密钥与端点五项（PG_DSN / MINIO_ENDPOINT / MINIO_ACCESS_KEY / MINIO_SECRET_KEY /
+# MINIO_BUCKET）只从环境变量或 .env 读，绝不写进本文件（本文件随仓库发布）。
+# backend 仅接受 "pg_minio"（生产）与 "memory"（离线测试替身）。
+# 下面两个目录是可丢弃缓存，不是数据：cache_root 是 localize 的 sha256 内容寻址**根**
+# （对象存储层在其下再开 objects/{sha} 子目录，此处勿带 objects 段，否则会落成双层前缀），
+# workspace_root 是渲染期临时工作区（抽帧/抽音/配音/转场/成片中转），成片终点即整目录
+# 回收、崩溃残留按 workspace_ttl_sec 过期清扫，内容缓存超容量按最后访问时间 LRU 逐出。
+# 素材与 BGM 一律查 materials 表；成片字节在 MinIO renders/，播放走 presigned URL。
+# ---------------------------------------------------------------------------
+[storage]
+backend = "pg_minio"
+workspace_root = ".storyline/workspace"
+cache_root = ".storyline/cache"
+workspace_max_gb = 20.0
+workspace_ttl_sec = 21600.0
+
+# ---------------------------------------------------------------------------
+# [capabilities]：真实节点的外部能力与剪辑参数
+# 这里只写环境变量名，绝不写值。视觉理解默认与主 LLM 同源（DeepSeek 的
+# deepseek-flash 实测能吃 image_url）——**一个 key 用到底**，不必再注册第二家服务商。
+# key 的来路按优先级：页面「设置」（PG app_secrets，按用户）→ vl_key_env 指的变量 →
+# 主 LLM 的 key 源；understand_clips 每轮解析一次后显式传给 vision()，所以改完不用重启。
+# 网络能力（VL/TTS）失败时节点走降级路径，不阻断整链出片。
+# ---------------------------------------------------------------------------
+[capabilities]
+vl_base = "https://api.deepseek.com"
+vl_model = "deepseek-flash"      # 需支持 image_url；deepseek-v4-pro 不支持（实测丢图）
+vl_key_env = "OPENAI_API_KEY"    # 第二层回落；前端配过 key 时这一项用不上
+vl_max_tokens = 1024             # 思考型模型：预算太小 content 会空（256 实测稳定空返回）
+vl_thinking = false              # 默认关思考：逐镜一次请求，实测快约 2 倍、省约 4 倍输出 token
+asr_model = "small"        # faster-whisper 权重（本地 GPU）
+asr_device = "auto"        # auto→cuda，失败回落 cpu+int8
+# 单次外部能力调用上限（ASR/文案 LLM/TTS）：卡死的第三方超时降级，不冻住整条链
+provider_timeout_sec = 180.0
+tts_voice = "zh-CN-XiaoxiaoNeural"
+scene_threshold = 0.3
+max_pause_sec = 1.0
+bgm_volume = 0.2
+# 字幕字体搜索目录，按序尝试；Linux/macOS 部署时改成本机字体目录即可
+font_dirs = ["C:/Windows/Fonts", "/usr/share/fonts", "/System/Library/Fonts"]
+# 渲染改成「提交 + 轮询」（不写这三行即用下列默认值）：
+#   render_grace_sec = 20.0    —— render_video 的内联等待，短片一次调用即拿到成片
+#   render_wait_max_sec = 300.0 —— 调用方显式要 wait_sec 的上限，须明显小于上面的 timeout
+#   render_max_concurrent = 2  —— 同时在跑的渲染数（ffmpeg/MoviePy 是 CPU 密集型）
+# 超过内联等待仍未跑完时，render_video 回 status=queued/running，由 render_status 轮询。

@@ -770,9 +770,12 @@ def parse_args() -> argparse.Namespace:
                    help="本实例标识（多副本崩溃恢复认领权用）；默认 hostname-pid")
     p.add_argument("--approve-tools", default="",
                    help="执行前需人工审批的工具名（逗号分隔，HITL 断点）；空=不启用")
-    p.add_argument("--quota-limit", type=int, default=0,
-                   help="每用户配额上限（token 数，按 --quota-window 统计）；0=不限")
-    p.add_argument("--quota-window", type=int, default=86400,
+    p.add_argument("--quota-limit", type=int,
+                   default=int(os.getenv("QUOTA_LIMIT", "0")),
+                   help="每用户配额上限（token 数，按 --quota-window 统计）；0=不限。"
+                        "默认读 env QUOTA_LIMIT——公开部署必须设为正数")
+    p.add_argument("--quota-window", type=int,
+                   default=int(os.getenv("QUOTA_WINDOW", "86400")),
                    help="配额统计窗口（秒），默认 86400=24 小时")
     p.add_argument("--mcp-config", default=None,
                    help="通用 MCP 配置文件（默认 mcp.json，存在即接入）")

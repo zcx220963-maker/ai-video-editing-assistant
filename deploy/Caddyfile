@@ -1,0 +1,13 @@
+# Caddy 反向代理:把 80/443 的流量转给主服务(:8000,含 WebSocket)。
+#
+# 自用/内网(当前生效):
+:80 {
+	reverse_proxy app:8000
+}
+#
+# 公网域名 + 自动 HTTPS(签发/续期全自动):
+#   1) 在 .env 里设 SITE_DOMAIN=video.example.com(域名 A 记录指到本机,放行 80/443)
+#   2) 把下面块的注释打开、把上面 :80 块注释掉,docker compose up -d caddy
+# video.example.com {
+# 	reverse_proxy app:8000
+# }

@@ -1,0 +1,39 @@
+# 智能创作助手 · 单镜像多阶段构建
+# 构建:  docker build -t creation-app:latest .
+# 运行:  docker compose --profile app up -d     (app/editor/caddy 三个服务共用本镜像)
+#
+# 阶段 1:前端构建(node)→ dist
+# 阶段 2:后端(python:3.12-slim + ffmpeg + 中文字体)→ 直接跑两个服务
+
+FROM node:20-alpine AS web
+WORKDIR /web
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build                      # 产物:/web/dist
+
+FROM python:3.12-slim
+
+# ffmpeg/ffprobe:渲染与素材元数据;fonts-noto-cjk:字幕渲染的 CJK 字体
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY backend/requirements.txt backend/requirements-storyline.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-storyline.txt
+
+COPY backend/ ./
+# 前端产物放进 REPO_ROOT/frontend/dist(run_server 的静态目录锚点在容器内=/frontend/dist)
+COPY --from=web /web/dist /frontend/dist
+
+# 可选:构建期预置 whisper 模型(约 460MB,预置后首次 ASR 不用现下载)
+#   docker build --build-arg WHISPER_PRELOAD=1 -t creation-app:latest .
+ARG WHISPER_PRELOAD=0
+RUN if [ "$WHISPER_PRELOAD" = "1" ]; then \
+        python -c "from faster_whisper import WhisperModel; WhisperModel('small')"; \
+    fi
+
+EXPOSE 8000 8001
+# 默认命令 = 主服务;剪辑服务由 compose 以 command 覆写共用同一镜像
+CMD ["python", "run_server.py", "--port", "8000"]

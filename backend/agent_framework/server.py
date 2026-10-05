@@ -991,7 +991,11 @@ def create_app(
 
     @app.post("/auth/register")
     async def auth_register(req: AuthCredentials) -> dict[str, str]:
-        """账号密码注册：创建身份并直接签发 JWT（与登录同形，省一次往返）。"""
+        """账号密码注册：创建身份并直接签发 JWT（与登录同形，省一次往返）。
+
+        REGISTER_OPEN=0 时关闭自助注册——已有账号登录不受影响。"""
+        if os.environ.get("REGISTER_OPEN", "1") in ("0", "false", "no"):
+            raise HTTPException(403, "自助注册已关闭（REGISTER_OPEN=0）；请联系管理员开通账号")
         username, password = _check_credentials(req.username, req.password)
         try:
             uid = await auth.register_user(username, password)
@@ -1012,6 +1016,8 @@ def create_app(
 
     @app.post("/register")
     async def register(req: RegisterRequest | None = None) -> dict[str, str]:
+        if os.environ.get("REGISTER_OPEN", "1") in ("0", "false", "no"):
+            raise HTTPException(403, "匿名注册通道已关闭（REGISTER_OPEN=0）；请使用账号登录")
         """签发新身份：明文 token 只在这一次响应里出现，PG 里只有它的 sha256。
 
         这是（连同 /health）唯一不鉴权的端点——否则新客户端无从取得第一份凭证。
