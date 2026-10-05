@@ -1169,6 +1169,27 @@ async function delSkillFromModal() {
   if (!skillsMsg.value.startsWith("失败")) itemModal.value = null;
 }
 
+// —— 执行流水沉淀为技能：后端从 checkpoint 链提取步骤，LLM 润色（无密钥退回模板）——
+async function fromRunAsSkill(run) {
+  try {
+    await ensureIdentity();
+    const r = await fetch("/skills/from_run", {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: run.run_id }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    await loadSkillsAdmin();
+    skillsMsg.value = "已沉淀：" + j.name + "（" + j.steps + " 步" +
+      (j.llm_polished ? "，模型润色" : "，模板") + "）";
+    await openSkillModal(j.name);
+    editSkillForm(false);       // 直接进编辑态：用户检查/改名后保存
+  } catch (e) {
+    alert("沉淀失败：" + e.message);
+  }
+}
+
 function msgs(cid) {
   if (!histories[cid]) histories[cid] = [];
   return histories[cid];
@@ -3946,6 +3967,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             <span v-if="run.has_plan_cards" class="ru-plan" title="这条规划 run 产出了待确认的候选计划">
               🗂 有候选计划
             </span>
+            <button class="help" title="把这条执行的流程提炼成一篇可复用的技能"
+                    @click.stop="fromRunAsSkill(run)">✦ 沉淀为技能</button>
             <span v-if="auditCount(run.plan_audit || {})" class="ru-audit">
               ⚖ 计划外 {{ (run.plan_audit.extra || []).length }} · 未履行 {{ (run.plan_audit.unfulfilled || []).length }}
             </span>

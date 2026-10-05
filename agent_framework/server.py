@@ -72,7 +72,8 @@ from .mq import MessageQueue
 from .tools.mcp import MCPServerConfig
 from .storage import IntegrityConflict, Storage
 from .tool import is_tool_error
-from .checkpoint import STATUS_AWAITING_APPROVAL
+from .checkpoint import STATUS_AWAITING_APPROVAL, CheckpointManager
+from .skill_flows import draft_body, extract_steps, first_user_request, pick_skill_name
 
 
 def _mask_credentials_in_access_logs() -> None:
@@ -512,6 +513,14 @@ class SkillUpsertRequest(BaseModel):
     body: str = ""
 
 
+class SkillFromRunRequest(BaseModel):
+    """POST /skills/from_run 请求体：把一条执行流水沉淀为技能。"""
+
+    run_id: str
+    name: str = ""
+    display: str = ""
+
+
 def create_app(
     agent: Agent,
     mq: MessageQueue,
@@ -790,6 +799,49 @@ def create_app(
                                     frontmatter=fm, files=files)
         await _sync_skill_catalog()
         return {"saved": name, "attachments_kept": len(files)}
+
+    @app.post("/skills/from_run")
+    async def skill_from_run(req: SkillFromRunRequest,
+                             user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """把一条执行流水沉淀为 WORKFLOW SKILL。
+
+        数据源是该 run 的 checkpoint 消息链（工具调用按序配对结果）；有模型密钥时
+        由 LLM 润色成文，失败退回确定性模板。生成的技能可在前端弹窗里继续编辑。
+        """
+        if skill_loader is None:
+            raise HTTPException(409, "技能库未启用（--no-skills）")
+        cm = CheckpointManager(storage)
+        cp = await cm.load(req.run_id)
+        if cp is None:
+            raise HTTPException(404, f"执行 {req.run_id!r} 不存在")
+        # 归属核对：别人的 run 一律按 404（不泄露存在性）
+        if not str(cp.session_id).startswith(f"u:{user_id}:"):
+            raise HTTPException(404, f"执行 {req.run_id!r} 不存在")
+        steps = extract_steps(cp.messages)
+        if not steps:
+            raise HTTPException(400, "这条执行没有可沉淀的工具调用")
+        user_request = first_user_request(cp.messages)
+
+        try:
+            llm = _runtime_llm()
+        except Exception:
+            llm = None
+        body, polished = await draft_body(steps, user_request, llm=llm)
+
+        base = (req.name or f"run_flow_{req.run_id[:6]}").strip()
+        existing = {sk.name for sk in await skill_loader.discover()}
+        name = pick_skill_name(base, existing)
+        display = (req.display or "会话流程沉淀").strip()
+        description = (f"【WORKFLOW SKILL】由执行 {req.run_id[:8]} 沉淀："
+                       f"{user_request[:80]}")
+        await storage.skills.upsert(name, body, description=description,
+                                    frontmatter={"name": name, "display": display,
+                                                 "description": description,
+                                                 "always": "false", "requires": ""},
+                                    files=[])
+        await _sync_skill_catalog()
+        return {"name": name, "display": display, "steps": len(steps),
+                "llm_polished": polished}
 
     @app.get("/skills-ui", response_class=None)
     async def skills_ui() -> HTMLResponse:
