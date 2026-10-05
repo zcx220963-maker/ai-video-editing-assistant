@@ -81,13 +81,22 @@ async def part1_extract() -> None:
 
 
 async def part2_fallback_draft() -> None:
-    print("\n[2] 无 LLM：确定性模板兜底")
+    print("\n[2] 无 LLM：泛化模板——流程讲意图,具体值降级为示例附录")
     steps = extract_steps(sample_messages())
     body, polished = await draft_body(steps, "把采访和空镜剪成 30 秒精华", llm=None)
     check(polished is False, "未走 LLM 润色")
-    check("执行流程" in body and "角色定义" in body, "模板结构完整（角色/流程/约束）")
+    check("执行流程" in body and "角色定义" in body, "模板结构完整")
     check("load_media" in body and "render_video" in body, "每步带工具名")
     check("把采访和空镜剪成 30 秒精华" in body, "原始诉求在「何时使用」里")
+    # 泛化:流程段讲意图,不焊死会话特定值
+    flow_part = body.split("本次执行参数示例")[0]
+    check("material_ids = 用户素材的 material_ids" in flow_part,
+          "易变参数改写为推导说明")
+    check("obj:users/" not in flow_part and "mat-0fe987" not in flow_part,
+          "流程段不再焊着对象键/素材 ID")
+    check("载入用户上传/检索到的素材" in flow_part, "每步带意图说明")
+    check("本次执行参数示例" in body and "m1" in body,
+          "具体值收进示例附录供参考")
 
 
 async def part3_name_pick() -> None:
@@ -155,12 +164,46 @@ async def part5_clean_and_merge() -> None:
     check(replaced == 2, f"被替换计数={replaced}")
 
 
+async def part6_generalization() -> None:
+    print("\n[6] 泛化守卫:LLM 产出焊死具体值时退回模板")
+    steps = extract_steps(sample_messages())
+
+    class FakeLLM:
+        async def complete(self, messages, tools=None):  # noqa: ANN001, ARG002
+            class R:
+                content = ("# 角色定义\n先载入素材 mat-0fe987 和 obj:users/u-x/c-y/mat-1.mp3\n"
+                           "# 执行流程\n1. 调用 load_media 载入上面那两个素材\n" * 3)
+            return R()
+
+    body, polished = await draft_body(steps, "剪一条精华", llm=FakeLLM())
+    check(polished is False, "焊死素材 ID 的 LLM 产出被判不合格")
+    check("obj:users/" not in body.split("本次执行参数示例")[0],
+          "退回的模板正文流程段干净")
+
+    class GoodLLM:
+        async def complete(self, messages, tools=None):  # noqa: ANN001, ARG002
+            class R:
+                content = ("# 角色定义 (Role)\n你是剪辑助手。\n" * 2
+                           + "# 何时使用 (When)\n同类再创作诉求。\n"
+                           + "# 执行流程 (Workflow)\n"
+                           + "1. **load_media** — 载入用户素材(material_ids=用户素材列表)\n"
+                           + "2. **render_video** — 按诉求渲染\n"
+                           + "# 参数如何随诉求变化\n全部来自当次诉求。\n"
+                           + "# 本次执行参数示例（仅参考）\n- load_media: m1\n"
+                           + "# 约束条件 (Constraints)\n按顺序执行。\n")
+            return R()
+
+    body2, polished2 = await draft_body(steps, "剪一条精华", llm=GoodLLM())
+    check(polished2 is True, "泛化合格的 LLM 产出被采用")
+
+
 async def main() -> None:
     await part1_extract()
     await part2_fallback_draft()
     await part3_name_pick()
     await part4_checkpoint_roundtrip()
     await part5_clean_and_merge()
+    await part6_generalization()
     print(f"\n==== {_checks} 项检查，{_fails} 项失败 ====")
     if _fails:
         sys.exit(1)

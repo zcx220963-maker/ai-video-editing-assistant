@@ -842,8 +842,9 @@ def create_app(
             cp = await cm.load(req.run_id)
             if cp is None:
                 raise HTTPException(404, f"执行 {req.run_id!r} 不存在")
-            # 归属核对：别人的 run 一律按 404（不泄露存在性）
-            if not str(cp.session_id).startswith(f"u:{user_id}:"):
+            # 归属核对（session_id = "{user_id}:{conv_id}"，与 _owned_run_row 同口径）：
+            # 别人的 run 一律按 404（不泄露存在性）
+            if not str(cp.session_id).startswith(f"{user_id}:"):
                 raise HTTPException(404, f"执行 {req.run_id!r} 不存在")
             raw = extract_steps(cp.messages)
             steps, dropped = clean_steps(raw)

@@ -140,6 +140,60 @@ def merge_runs(runs_steps: list[list[dict[str, Any]]]) -> tuple[list[dict[str, A
     return out, replaced
 
 
+# 每个节点在流程里的"意图"——技能讲的是这个,不是某次执行的参数回放
+NODE_INTENT = {
+    "search_media": "用户没有上传素材时,按关键词在素材库检索",
+    "load_media": "载入用户上传/检索到的素材(material_ids 来自会话附件或检索结果,不凭空编造)",
+    "split_shots": "按镜头切分素材",
+    "asr": "转写素材人声,得到带时间戳的语句",
+    "correct_transcript": "修正常见转写错字(只改文本,不动时间轴)",
+    "speech_rough_cut": "按语义选段做口播粗剪(keep_segments 保留完整语义段)",
+    "understand_clips": "为每个镜头生成画面描述",
+    "filter_clips": "按用户要求筛出符合的片段",
+    "group_clips": "把片段排序分组,组织叙事结构",
+    "script_template_rec": "推荐文案结构模板",
+    "generate_script": "生成分组文案(custom_script 可传入用户风格要求)",
+    "generate_voiceover": "按文案生成配音(用原声则跳过)",
+    "select_BGM": "按用户指定的曲目/风格选配乐(query 用曲目名或风格词)",
+    "generate_ai_transition": "在分组间生成转场片段",
+    "transition_rec": "推荐转场方式",
+    "text_rec": "推荐花字/字幕样式",
+    "plan_timeline": "把片段/文案/声音/BGM 编排成时间线(比例/时长等来自用户诉求)",
+    "plan_timeline_pro": "时间线编排(专业版,含转场与花字)",
+    "plan_timeline_ai_transition": "时间线编排(含 AI 转场)",
+    "render_video": "按时间线渲染出片",
+    "render_web": "把网页渲染成视频",
+}
+
+# 参数键 → 技能里的"推导说明"(这些值属于当次诉求,不该焊死在流程里)
+VOLATILE_PARAM_HINTS = {
+    "material_ids": "用户素材的 material_ids(见会话附件)",
+    "artifact_id": "当前产物作用域",
+    "target_duration_sec": "用户要求的目标时长",
+    "speaker_ratio": "用户要求的出镜占比",
+    "query": "用户指定的曲目或风格",
+    "keep_segments": "按语义选定的段落(以当次 ASR 结果为准)",
+    "keep_clips": "按用户要求筛出的片段(以当次 understand_clips 结果为准)",
+    "custom_groups": "按叙事逻辑设计的分组(以当次片段为准)",
+}
+
+
+def _generalize_args(args: dict[str, Any]) -> list[str]:
+    """把一次执行的参数改写成"这条该填什么"的说明:
+    易变键给推导提示;其余值原样列出但剥掉对象键/长 JSON——它们是示例,不是流程。"""
+    lines: list[str] = []
+    for k, v in list(args.items())[:6]:
+        if k in VOLATILE_PARAM_HINTS:
+            lines.append(f"{k} = {VOLATILE_PARAM_HINTS[k]}")
+            continue
+        text = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+        text = text.replace("\n", " ")
+        if "obj:users/" in text or len(text) > 90:
+            text = text[:60] + "…(本次执行示例值,按当次诉求替换)"
+        lines.append(f"{k} = {text}")
+    return lines
+
+
 def flow_lines(steps: list[dict[str, Any]]) -> list[str]:
     """给 LLM 看的流水原文（也是模板步骤的原料）。"""
     lines = []
@@ -157,27 +211,55 @@ def flow_lines(steps: list[dict[str, Any]]) -> list[str]:
 
 
 def _fallback_body(steps: list[dict[str, Any]], user_request: str) -> str:
-    lines = flow_lines(steps)
+    """无 LLM 的泛化模板:主流程只讲意图与参数推导;本次具体值收进示例附录。"""
+    lines = []
+    appendix: list[str] = []
+    for i, st in enumerate(steps[:_MAX_STEPS], 1):
+        tool = st["tool"]
+        intent = NODE_INTENT.get(tool, f"调用 {tool} 完成对应处理")
+        lines.append(f"{i}. **{tool}** — {intent}")
+        ga = _generalize_args(st["args"])
+        for g in ga:
+            lines.append(f"   - {g}")
+        example = _args_line(st["args"])
+        if example:
+            appendix.append(f"- {tool}: {example}")
+
+    appendix_text = ("\n".join(appendix) if appendix else "（无）")
     return (
         "# 角色定义 (Role)\n"
-        "你是一位能严格按既定流程完成同类任务的创作助手。以下流程沉淀自一次真实执行。\n\n"
+        "你是一位精通本系统剪辑工具链的创作助手。本技能沉淀自一次真实执行，"
+        "给出的是同类任务的**推荐流程与参数推导方式**——具体素材、时长、比例"
+        "永远以用户当次诉求为准。\n\n"
         "# 何时使用 (When)\n"
-        f"当用户诉求与下列原始诉求同类时使用：「{user_request or '（未记录）'}」。\n\n"
+        f"当用户诉求与下述原始诉求同类（同类型视频再创作）时：「{user_request or '（未记录）'}」。\n\n"
         "# 执行流程 (Workflow)\n"
         + "\n".join(lines)
+        + "\n\n# 参数如何随诉求变化\n"
+        "- 素材、时长、占比、曲目/风格全部来自用户当次诉求与当次素材的分析结果；\n"
+        "- 标注「按当次…」的参数禁止直接复用示例值；\n"
+        "- 依赖关系由工具声明（required_nodes），上游未执行会被拦截器自动补齐。\n\n"
+        "# 本次执行参数示例（仅参考，按当次诉求替换）\n"
+        + appendix_text
         + "\n\n# 约束条件 (Constraints)\n"
-        "- 严格按上述步骤顺序执行；上游已成功的产物不要重复执行。\n"
-        "- 每一步的参数只列了关键项，缺失参数按用户当次诉求补全。\n"
-        "- 执行中遇到与流水不符的现场，如实向用户说明，不要硬套流程。"
+        "- 严格按流程顺序执行；上游已成功的产物不要重复执行。\n"
+        "- 执行中遇到与流程不符的现场，如实向用户说明，不要硬套流程。"
     )
 
 
 _POLISH_SYSTEM = (
     "你是一名资深 Agent 工程师兼流程整理专家。把一次真实执行的工具调用流水，"
-    "提炼为一篇可复用的 WORKFLOW SKILL.md（中文）。只输出 markdown 正文，"
-    "不要 frontmatter、不要代码围栏。格式：# 角色定义 (Role)、# 何时使用 (When)、"
-    "# 执行流程 (Workflow)（逐步，标注工具名与关键参数，可跳过的步骤标注「可跳过」）、"
-    "# 约束条件 (Constraints)。执行流水的顺序就是步骤顺序，不要发明流水里没有的工具。"
+    "提炼为一篇**可复用**的 WORKFLOW SKILL.md（中文）。只输出 markdown 正文，"
+    "不要 frontmatter、不要代码围栏。\n"
+    "泛化是第一原则：素材 ID、片段 ID、ASR 段 id、具体时长/比例/曲目等"
+    "会话特定值，在流程正文里一律改写成「按用户当次诉求确定」的推导说明"
+    "（如 material_ids=用户素材列表；比例/时长=用户要求；BGM=用户指定曲目）；"
+    "工具结果里的 JSON 一律不要引用。流程正文讲**意图与顺序**"
+    "（每步先说什么目的，再列需要用户诉求决定的参数），不要发明流水里没有的工具，"
+    "步骤顺序即流水顺序。\n"
+    "结构：# 角色定义 (Role)、# 何时使用 (When)、# 执行流程 (Workflow)"
+    "（逐步，可跳过的步骤标注「可跳过」）、# 参数如何随诉求变化、"
+    "# 本次执行参数示例（仅参考，放流水里的具体值）、# 约束条件 (Constraints)。"
 )
 
 
@@ -193,8 +275,11 @@ async def draft_body(steps: list[dict[str, Any]], user_request: str, *,
                  "content": f"原始诉求：{user_request or '（未记录）'}\n\n执行流水：\n{flow_text}"},
             ])
             body = (getattr(resp, "content", "") or "").strip()
-            # 润色失败/输出过短/疑似只回了一句客气话：退回模板，不空手而归
-            if len(body) >= 120 and "执行流程" in body:
+            # 润色失败/输出过短/没做到泛化（流程段还焊着素材对象键）/疑似敷衍：
+            # 退回泛化模板，不空手而归
+            flow_part = body.split("本次执行参数示例")[0]
+            if (len(body) >= 120 and "执行流程" in body
+                    and "obj:users/" not in flow_part):
                 return body, True
         except Exception:
             pass
