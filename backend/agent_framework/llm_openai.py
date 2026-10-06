@@ -162,34 +162,43 @@ class OpenAICompatClient:
         return AsyncOpenAI(api_key=self.api_key or PLACEHOLDER_API_KEY,
                            base_url=self.base_url)
 
-    async def _client_for_request(self) -> Any:
-        """本次请求真正用的 client：前端改过 key 就换掉凭证，不改则复用缓存实例。
+    async def _resolve_request(self) -> tuple[Any, str]:
+        """本次请求真正用的 (client, model)：前端改过 key/模型/地址就换，不改则复用。
 
         注入的假客户端（离线单测）原样返回——测试验的是调用形态，不是密钥。
+        with_options 只在确有差异时才传参（openai SDK 的 None 会当覆盖值用）。
         """
         if self._injected:
-            return self._client
+            return self._client, self.model
         key, source = await runtime_secrets.resolve_api_key(fallback=self.api_key)
         if not key:
             raise RuntimeError(
                 "未配置模型密钥：在页面「设置」里填 API Key（或设环境变量 "
                 f"{' / '.join(runtime_secrets.ENV_KEY_NAMES)} 之一，按此优先级）。"
                 f"已尝试的来源：{source}。")
-        if key == self.api_key:
-            return self._client
-        return self._client.with_options(api_key=key)
+        model, base = await runtime_secrets.resolve_model_base(
+            fallback_model=self.model, fallback_base=self.base_url)
+        if key == self.api_key and model == self.model and base == self.base_url:
+            return self._client, self.model
+        opts: dict[str, Any] = {}
+        if key != self.api_key:
+            opts["api_key"] = key
+        if base != self.base_url and base:
+            opts["base_url"] = base
+        client = self._client.with_options(**opts) if opts else self._client
+        return client, (model or self.model)
 
     async def complete(
         self,
         messages: list[Message],
         tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
-        client = await self._client_for_request()
+        client, model = await self._resolve_request()
         last_err: Exception | None = None
         for attempt in range(2):
             try:
                 resp = await client.chat.completions.create(
-                    **self._kwargs(messages, tools), timeout=60
+                    **{**self._kwargs(messages, tools), "model": model}, timeout=60
                 )
                 return self._parse(resp)
             except Exception as e:
@@ -232,13 +241,14 @@ class OpenAICompatClient:
         tools: list[dict[str, Any]] | None = None,
     ):
         """流式：逐块下发文本 delta；tool_calls 在流里是分片到达的，按 index 聚合到末块。"""
-        client = await self._client_for_request()
+        client, model = await self._resolve_request()
         stream = None
         last_err: Exception | None = None
         for attempt in range(2):
             try:
                 stream = await client.chat.completions.create(
-                    **self._kwargs(messages, tools, stream=True), timeout=60
+                    **{**self._kwargs(messages, tools, stream=True), "model": model},
+                    timeout=60
                 )
                 break
             except Exception as e:

@@ -16,7 +16,12 @@ from typing import Any
 from .identity import current_identity
 from .storage.repositories import mask
 
-API_KEY_NAME = "model_api_key"          # app_secrets 里唯一的键名（一把 key 用到底）
+API_KEY_NAME = "model_api_key"          # 主模型密钥（一把 key 用到底）
+MAIN_MODEL_KEY = "model_name"           # 主模型名（按用户覆盖;空 = 默认 DeepSeek）
+MAIN_BASE_KEY = "base_url"              # 主模型地址（按用户覆盖;空 = 默认）
+JUDGE_BASE_KEY = "judge_base_url"       # 判断模型三件套(base_url/model/key)
+JUDGE_MODEL_KEY = "judge_model"
+JUDGE_API_KEY_NAME = "judge_api_key"
 ENV_KEY_NAME = "OPENAI_API_KEY"         # 前端没配时的回落环境变量（首选）
 # .env 里还留着 DEEPSEEK_API_KEY / SILICONFLOW_API_KEY 这两把历史名字。原先没有任何代码
 # 读它们——用户填了、静默无效，还以为「填了就生效」。现在把它们接成同一层的回落位，
@@ -116,3 +121,47 @@ __all__ = ["API_KEY_NAME", "CACHE_TTL_SEC", "ENV_KEY_NAME", "ENV_KEY_NAMES", "SO
            "SOURCE_ENV", "SOURCE_FALLBACK", "SOURCE_NONE", "bind_storage", "unbind_storage",
            "bound_storage", "current_user_id", "env_api_key", "invalidate",
            "resolve_api_key", "mask"]
+
+
+# ---- 主模型 model/base_url 的按用户覆盖（前端「设置」→ app_secrets）----
+
+
+async def resolve_model_base(*, fallback_model: str,
+                             fallback_base: str) -> tuple[str, str]:
+    """按当前身份解析主模型名与地址:前端存了就用,否则回落构造默认。
+
+    与 ``resolve_api_key`` 同一优先级:前端配置压过环境变量与构造默认。
+    """
+    user = current_user_id()
+    if _storage is None or not user:
+        return fallback_model, fallback_base
+    try:
+        model = (await _storage.secrets.get(user, MAIN_MODEL_KEY)) or ""
+        base = (await _storage.secrets.get(user, MAIN_BASE_KEY)) or ""
+    except Exception:  # noqa: BLE001 - 存储抖动退回默认,不阻塞模型调用
+        return fallback_model, fallback_base
+    return (model or fallback_model), (base or fallback_base)
+
+
+async def put_user_key(user_id: str, key_name: str, value: str) -> None:
+    if not value:
+        return
+    await _storage.secrets.put(user_id, key_name, value)
+
+
+async def get_user_key(user_id: str, key_name: str) -> str:
+    if _storage is None or not user_id:
+        return ""
+    try:
+        return (await _storage.secrets.get(user_id, key_name)) or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def drop_user_key(user_id: str, key_name: str) -> None:
+    if _storage is None or not user_id:
+        return
+    try:
+        await _storage.secrets.drop(user_id, key_name)
+    except Exception:  # noqa: BLE001
+        pass

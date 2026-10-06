@@ -24,6 +24,8 @@ import logging
 import os
 import urllib.error
 import urllib.request
+
+from .secrets import current_user_id
 from typing import Any
 
 logger = logging.getLogger("agent_framework")
@@ -32,8 +34,46 @@ _DEFAULT_TIMEOUT = 6.0
 _MIN_CONFIDENCE = 0.80
 
 
+async def _cfg_for(user_id: str) -> dict[str, str] | None:
+    """按用户解析判断模型配置:① 前端「设置」三件套 ② env 回落。
+
+    判断模型与主模型同一条优先级链——前端配置压过环境变量。
+    """
+    from .secrets import (JUDGE_API_KEY_NAME, JUDGE_BASE_KEY, JUDGE_MODEL_KEY,
+                          bound_storage, get_user_key)
+    if bound_storage() is not None and user_id:
+        try:
+            base = (await get_user_key(user_id, JUDGE_BASE_KEY)) or ""
+            model = (await get_user_key(user_id, JUDGE_MODEL_KEY)) or ""
+            key = (await get_user_key(user_id, JUDGE_API_KEY_NAME)) or ""
+        except Exception:  # noqa: BLE001
+            base = model = key = ""
+        if base and model and key:
+            return {"base": base.rstrip("/"), "model": model, "key": key}
+    return _cfg()
+
+
+async def test_judge() -> dict[str, Any]:
+    """设置页「测试连接」用:按当前身份解析配置,发一个最小裁决。"""
+    import time as _t
+    user_id = current_user_id()
+    cfg = await _cfg_for(user_id)
+    if cfg is None:
+        return {"ok": False, "error": "判断模型未配置（JUDGE_* 三项或设置页三件套）"}
+    t0 = _t.monotonic()
+    try:
+        v = await judge("连通性自检:1 + 1 是否等于 2?", text="2",
+                        facts={"ping": True})
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200]}
+    return {"ok": v is not None,
+            "latency_ms": int((_t.monotonic() - t0) * 1000),
+            "verdict": (v or {}).get("verdict"),
+            "confidence": (v or {}).get("confidence")}
+
+
 def _cfg() -> dict[str, str] | None:
-    """读判断模型配置;三项没配齐 → None(功能关闭,行为与旧版一致)。"""
+    """env 回落层;三项没配齐 → None(功能关闭,行为与旧版一致)。"""
     base = (os.environ.get("JUDGE_BASE_URL") or "").strip().rstrip("/")
     model = (os.environ.get("JUDGE_MODEL") or "").strip()
     key = (os.environ.get("JUDGE_API_KEY") or "").strip()
@@ -95,7 +135,8 @@ async def judge(question: str, *, text: str, facts: dict[str, Any],
     facts:   服务端核到的事实(如 {"plan_candidates": 0, "submit_plan_called": false})
     返回 {"verdict": bool, "confidence": float, "reason": str} 或 None(关闭/失败)。
     """
-    cfg = _cfg()
+    from .secrets import current_user_id
+    cfg = await _cfg_for(current_user_id())
     if cfg is None:
         return None
     messages = [

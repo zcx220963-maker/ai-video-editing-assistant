@@ -66,6 +66,7 @@ from .consumer import CHAT_TOPIC, SessionConsumer, session_key
 from .heartbeat import Heartbeat
 from .ingest import IngestRejected, ingest_bytes
 from .identity import storyline_session_id
+from . import judge as judge_mod
 from .llm_openai import (DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_THINKING,
                          get_default_llm)
 from .media_fetch import FetchPolicy, FetchRejected, fetch_media
@@ -532,6 +533,21 @@ def _check_credentials(username: str, password: str) -> tuple[str, str]:
         raise HTTPException(400, "密码至少 6 位（至多 128）")
     return username, password
 
+
+
+class MainModelRequest(BaseModel):
+    """POST /settings/model:主模型名与地址的按用户覆盖(空串 = 清除恢复默认)。"""
+
+    model: str = ""
+    base_url: str = ""
+
+
+class JudgeModelRequest(BaseModel):
+    """POST /settings/judge:判断模型(Jev 类)三件套。api_key 传空 = 清除。"""
+
+    base_url: str = ""
+    model: str = ""
+    api_key: str = ""
 
 
 class SkillFromRunRequest(BaseModel):
@@ -1816,6 +1832,12 @@ def create_app(
         key, source = await secrets.resolve_api_key(user_id,
                                                     fallback=getattr(llm, "api_key", ""))
         updated = (row or {}).get("updated_at")
+        main_model = await secrets.get_user_key(user_id, secrets.MAIN_MODEL_KEY)
+        main_base = await secrets.get_user_key(user_id, secrets.MAIN_BASE_KEY)
+        judge_base = await secrets.get_user_key(user_id, secrets.JUDGE_BASE_KEY)
+        judge_model = await secrets.get_user_key(user_id, secrets.JUDGE_MODEL_KEY)
+        judge_key_row = await storage.secrets.row(user_id, secrets.JUDGE_API_KEY_NAME)
+        judge_key = (judge_key_row or {}).get("value", "")
         return {
             "api_key": {
                 "configured": bool(stored),
@@ -1823,6 +1845,16 @@ def create_app(
                 "updated_at": updated.isoformat() if updated else "",
                 "effective": bool(key),
                 "source": source,
+            },
+            "main_override": {
+                "model": main_model or "",
+                "base_url": main_base or "",
+            },
+            "judge": {
+                "base_url": judge_base or "",
+                "model": judge_model or "",
+                "configured": bool(judge_base and judge_model and judge_key),
+                "masked": secrets.mask(judge_key) if judge_key else "",
             },
             "model": getattr(llm, "model", DEFAULT_MODEL),
             "base_url": getattr(llm, "base_url", DEFAULT_BASE_URL),
@@ -1860,8 +1892,51 @@ def create_app(
 
     @app.post("/settings/test")
     async def settings_test(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """连通性自检：拿当前解析到的 key 真发一次文本 + 一次带图，只回摘要与耗时。"""
-        return await model_probe.self_check(storage, user_id, _runtime_llm())
+        """连通性自检：主模型真发文本+带图两路;判断模型(若配置)真发一次裁决。"""
+        out = await model_probe.self_check(storage, user_id, _runtime_llm())
+        out["judge"] = await judge_mod.test_judge()
+        return out
+
+    @app.post("/settings/model")
+    async def settings_model(req: MainModelRequest,
+                             user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """主模型名/地址的按用户覆盖：空串 = 清除恢复默认。保存即生效(热读)。"""
+        for key, value in ((secrets.MAIN_MODEL_KEY, req.model.strip()),
+                           (secrets.MAIN_BASE_KEY, req.base_url.strip())):
+            if value:
+                await secrets.put_user_key(user_id, key, value)
+            else:
+                await secrets.drop_user_key(user_id, key)
+        secrets.invalidate(user_id)
+        return await _settings_view(user_id)
+
+    @app.post("/settings/judge")
+    async def settings_judge(req: JudgeModelRequest,
+                             user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """判断模型(Jev 类)三件套：base_url/model 必填成对;api_key 空串 = 清除。"""
+        base = req.base_url.strip().rstrip("/")
+        model = req.model.strip()
+        if bool(base) != bool(model):
+            raise HTTPException(400, "base_url 与 model 必须成对设置或成对清除")
+        if base:
+            await secrets.put_user_key(user_id, secrets.JUDGE_BASE_KEY, base)
+            await secrets.put_user_key(user_id, secrets.JUDGE_MODEL_KEY, model)
+            if req.api_key.strip():
+                await secrets.put_user_key(user_id, secrets.JUDGE_API_KEY_NAME,
+                                           req.api_key.strip())
+        else:
+            await secrets.drop_user_key(user_id, secrets.JUDGE_BASE_KEY)
+            await secrets.drop_user_key(user_id, secrets.JUDGE_MODEL_KEY)
+            await secrets.drop_user_key(user_id, secrets.JUDGE_API_KEY_NAME)
+        jbase = await secrets.get_user_key(user_id, secrets.JUDGE_BASE_KEY)
+        jmodel = await secrets.get_user_key(user_id, secrets.JUDGE_MODEL_KEY)
+        jrow = await storage.secrets.row(user_id, secrets.JUDGE_API_KEY_NAME)
+        jkey = (jrow or {}).get("value", "")
+        return {"judge": {"base_url": jbase, "model": jmodel,
+                          "configured": bool(jbase and jmodel and jkey),
+                          "masked": secrets.mask(jkey) if jkey else ""}}
+
+    @app.post("/settings/test2")
 
     @app.websocket("/ws/{conversation_id}")
     async def ws_endpoint(websocket: WebSocket, conversation_id: str) -> None:
