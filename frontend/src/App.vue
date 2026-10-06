@@ -3925,7 +3925,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         </p>
 
         <!-- 主模型覆盖:model/base_url(空 = 恢复默认) -->
-        <div class="set-line set-head">主模型覆盖 <span class="set-note">留空 = 默认 DeepSeek;仅影响你这个账号</span></div>
+        <div class="set-line set-head">主模型选型 <span class="set-note">与上方「模型密钥」配套：密钥 = 凭证，这里 = 用哪家哪个模型。留空 = 默认 DeepSeek</span></div>
         <div class="set-line">
           <input v-model.trim="modelDraft.model" placeholder="模型名,如 deepseek-chat / glm-4.7"
                  :disabled="savingModel" @keydown.enter.prevent="saveModelOverride" />
