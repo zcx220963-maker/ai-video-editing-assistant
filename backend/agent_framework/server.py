@@ -1894,8 +1894,13 @@ def create_app(
     async def settings_test(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
         """连通性自检：主模型真发文本+带图两路;判断模型(若配置)真发一次裁决。"""
         out = await model_probe.self_check(storage, user_id, _runtime_llm())
-        out["judge"] = await judge_mod.test_judge()
+        out["judge"] = await judge_mod.test_judge(user_id)
         return out
+
+    @app.post("/settings/judge/test")
+    async def settings_judge_test(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """判断模型连通性自检：真发一次裁决，返回 ok/latency/verdict/confidence。"""
+        return await judge_mod.test_judge(user_id)
 
     @app.post("/settings/model")
     async def settings_model(req: MainModelRequest,

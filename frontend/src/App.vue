@@ -2825,16 +2825,19 @@ async function fetchLink() {
 
 const settings = ref(null);
 const keyDraft = ref("");
-const savingKey = ref(false);
+
 const testingKey = ref(false);
 const testResult = ref(null);
 const keyError = ref("");
 // 主模型覆盖(model/base_url,空 = 恢复默认 DeepSeek)
 const modelDraft = ref({ model: "", base_url: "" });
-const savingModel = ref(false);
+
 // 判断模型(Jev 类)三件套
 const judgeDraft = ref({ base_url: "", model: "", api_key: "" });
 const savingJudge = ref(false);
+const savingLLM = ref(false);
+const testingJudge = ref(false);
+const testJudgeResult = ref(null);
 
 async function loadSettings() {
   await ensureIdentity();
@@ -2843,8 +2846,8 @@ async function loadSettings() {
   if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
   settings.value = j;
   modelDraft.value = {
-    model: j.main_override?.model || "",
-    base_url: j.main_override?.base_url || "",
+    model: j.main_override?.model || j.model || "",
+    base_url: j.main_override?.base_url || j.base_url || "",
   };
   judgeDraft.value = {
     base_url: j.judge?.base_url || "",
@@ -2866,49 +2869,60 @@ async function toggleSettings() {
   }
 }
 
-async function postApiKey(value) {
-  if (savingKey.value) return;
-  savingKey.value = true;
+async function saveLLM() {
+  if (savingLLM.value) return;
+  savingLLM.value = true;
+  keyError.value = "";
+  try {
+    await ensureIdentity();
+    if (keyDraft.value.trim()) {
+      const r1 = await fetch("/settings/api-key", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ api_key: keyDraft.value.trim() }),
+      });
+      const j1 = await r1.json().catch(() => ({}));
+      if (!r1.ok) throw new Error(j1.detail || ("HTTP " + r1.status));
+      settings.value = j1;
+      keyDraft.value = "";
+    }
+    const r2 = await fetch("/settings/model", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ model: modelDraft.value.model.trim(),
+                             base_url: modelDraft.value.base_url.trim() }),
+    });
+    const j2 = await r2.json().catch(() => ({}));
+    if (!r2.ok) throw new Error(j2.detail || ("HTTP " + r2.status));
+    settings.value = j2;
+    testResult.value = null;
+  } catch (e) {
+    keyError.value = "保存失败：" + e.message;
+  } finally {
+    savingLLM.value = false;
+  }
+}
+
+async function clearKey() {
+  if (savingLLM.value) return;
+  savingLLM.value = true;
   keyError.value = "";
   try {
     await ensureIdentity();
     const r = await fetch("/settings/api-key", {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ api_key: value }),
+      body: JSON.stringify({ api_key: "" }),
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
     settings.value = j;
     keyDraft.value = "";
-    testResult.value = null;          // 换 key 之后上一次自检结论就作废了
-  } catch (e) {
-    keyError.value = "保存失败：" + e.message;
-  } finally {
-    savingKey.value = false;
-  }
-}
-
-const saveKey = () => postApiKey(keyDraft.value.trim());
-const clearKey = () => postApiKey("");
-
-async function saveModelOverride() {
-  if (savingModel.value) return;
-  keyError.value = "";
-  try {
-    await ensureIdentity();
-    const r = await fetch("/settings/model", {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ model: modelDraft.value.model.trim(),
-                             base_url: modelDraft.value.base_url.trim() }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
-    settings.value = j;
     testResult.value = null;
   } catch (e) {
-    keyError.value = "主模型保存失败：" + e.message;
+    keyError.value = "清除失败：" + e.message;
+  } finally {
+    savingLLM.value = false;
   }
 }
 
@@ -2948,6 +2962,24 @@ async function testConn() {
     keyError.value = "自检没跑成：" + e.message;
   } finally {
     testingKey.value = false;
+  }
+}
+
+async function testJudgeConn() {
+  if (testingJudge.value) return;
+  testingJudge.value = true;
+  keyError.value = "";
+  testJudgeResult.value = null;
+  try {
+    await ensureIdentity();
+    const r = await fetch("/settings/judge/test", { method: "POST", headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    testJudgeResult.value = j;
+  } catch (e) {
+    keyError.value = "Jev 自检没跑成：" + e.message;
+  } finally {
+    testingJudge.value = false;
   }
 }
 
@@ -3883,60 +3915,42 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       </div>
 
       <div v-if="activePanel === 'settings'" class="settings">
-        <div class="set-line">
-          <span class="set-k">模型密钥</span>
+        <!-- LLM 主模型:密钥 + 模型名/地址(可选),一个保存按钮 -->
+        <div class="set-line set-head">
+          LLM 主模型
           <span v-if="settings && settings.api_key.configured" class="set-v">
-            已配置 · {{ settings.api_key.masked }} · 生效来源：{{ settings.api_key.source }}
-          </span>
-          <span v-else-if="settings && settings.api_key.effective" class="set-v">
-            本机未配置，正在用 {{ settings.api_key.source }}
+            已配置 · {{ settings.model }} @ {{ settings.base_url }}
           </span>
           <span v-else class="set-v bad">未配置 —— 视觉理解与文案会整链降级</span>
         </div>
         <div class="set-line">
-          <input
-            v-model="keyDraft"
-            type="password"
-            autocomplete="off"
-            spellcheck="false"
-            placeholder="粘贴 API Key（sk-…），只存进本机 PG"
-            :disabled="savingKey"
-            @keydown.enter.prevent="saveKey"
-          />
-          <button class="clip" :disabled="!keyDraft.trim() || savingKey" @click="saveKey">
-            {{ savingKey ? "保存中…" : "保存" }}
+          <input v-model="keyDraft" type="password" autocomplete="off" spellcheck="false"
+            :placeholder="settings && settings.api_key.configured
+              ? '新密钥(不改则留空)' : '粘贴 API Key（sk-…），只存进本机 PG'"
+            :disabled="savingLLM" @keydown.enter.prevent="saveLLM" />
+        </div>
+        <div class="set-line">
+          <input v-model.trim="modelDraft.model" placeholder="模型名,留空 = 默认 deepseek-flash"
+            :disabled="savingLLM" @keydown.enter.prevent="saveLLM" />
+          <input v-model.trim="modelDraft.base_url" placeholder="API 地址,留空 = 默认"
+            :disabled="savingLLM" @keydown.enter.prevent="saveLLM" />
+        </div>
+        <div class="set-line">
+          <button class="clip" :disabled="savingLLM" @click="saveLLM">
+            {{ savingLLM ? "保存中…" : "保存" }}
           </button>
-          <button
-            v-if="settings && settings.api_key.configured"
-            class="clip ghost"
-            :disabled="savingKey"
-            @click="clearKey"
-          >清除</button>
+          <button v-if="settings && settings.api_key.configured" class="clip ghost"
+            :disabled="savingLLM" @click="clearKey">清除密钥</button>
           <button class="clip" :disabled="testingKey" @click="testConn">
             {{ testingKey ? "自检中…" : "测试连接" }}
           </button>
         </div>
         <p v-if="settings" class="set-note">
-          当前通道 {{ settings.model }} @ {{ settings.base_url }}；保存即生效，剪辑服务最多
-          {{ settings.hot_reload_sec }} 秒后跟上，两个服务都不用重启。
+          保存即生效，剪辑服务最多 {{ settings.hot_reload_sec }} 秒后跟上，两个服务都不用重启。
           模型思考模式当前为<b>{{ settings.thinking ? "开" : "关" }}</b
           >（关掉时答复更快，长推理任务才需要开：环境变量 OPENAI_THINKING=on）。
           <template v-if="settings.api_key.updated_at">上次修改 {{ settings.api_key.updated_at.slice(0, 19).replace("T", " ") }}。</template>
         </p>
-
-        <!-- 主模型覆盖:model/base_url(空 = 恢复默认) -->
-        <div class="set-line set-head">主模型选型 <span class="set-note">与上方「模型密钥」配套：密钥 = 凭证，这里 = 用哪家哪个模型。留空 = 默认 DeepSeek</span></div>
-        <div class="set-line">
-          <input v-model.trim="modelDraft.model" placeholder="模型名,如 deepseek-chat / glm-4.7"
-                 :disabled="savingModel" @keydown.enter.prevent="saveModelOverride" />
-        </div>
-        <div class="set-line">
-          <input v-model.trim="modelDraft.base_url" placeholder="API 地址,留空 = 默认"
-                 :disabled="savingModel" @keydown.enter.prevent="saveModelOverride" />
-          <button class="clip" :disabled="savingModel" @click="saveModelOverride">
-            保存
-          </button>
-        </div>
 
         <!-- 判断模型(Jev 类):三件套 -->
         <div class="set-line set-head">
@@ -3949,25 +3963,34 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
              : "未配置——守卫只用词面判据" }}</span>
         </div>
         <div class="set-line">
-          <input v-model.trim="judgeDraft.base_url" placeholder="判断模型 API 地址(OpenAI 兼容)"
+          <input v-model.trim="judgeDraft.base_url" placeholder="判断模型 API 地址"
                  :disabled="savingJudge" />
         </div>
         <div class="set-line">
-          <input v-model.trim="judgeDraft.model" placeholder="模型名,如 jev-1"
+          <input v-model.trim="judgeDraft.model" placeholder="模型名,如 jev-latest"
                  :disabled="savingJudge" />
           <input v-model="judgeDraft.api_key" type="password" autocomplete="off"
-                 :placeholder="settings && settings.judge && settings.judge.masked
-                   ? `已存 ${settings.judge.masked}(不动则留空)`
-                   : 'API Key'" :disabled="savingJudge" />
+                 placeholder="API Key(不改则留空)" :disabled="savingJudge" />
           <button class="clip" :disabled="savingJudge
                   || !judgeDraft.base_url || !judgeDraft.model" @click="saveJudge">
             保存
+          </button>
+          <button class="clip" :disabled="testingJudge" @click="testJudgeConn">
+            {{ testingJudge ? "自检中…" : "测试连接" }}
           </button>
         </div>
         <p class="set-note">
           判断模型用于收尾守卫的第二意见(假称完成/散文式提问的复核)——
           只下判断不生成,成本约为生成模型的百分之一。不配置则守卫只用词面判据。
         </p>
+        <div v-if="testJudgeResult" class="probe">
+          <div>
+            <b :class="testJudgeResult.ok ? 'ok' : 'bad'">{{ testJudgeResult.via || "Jev" }}</b>
+            {{ testJudgeResult.ok
+               ? "连通 · " + (testJudgeResult.latency_ms || "?") + "ms · 置信度 " + (testJudgeResult.confidence ?? "—")
+               : "不通 · " + (testJudgeResult.error || "未知错误") }}
+          </div>
+        </div>
         <div v-if="testResult" class="probe">
           <div>
             <b :class="testResult.text && testResult.text.ok ? 'ok' : 'bad'">文本</b>
@@ -5341,7 +5364,14 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 
 /* —— 设置:双模型 —— */
-.set-head { font-weight: 600; margin-top: 6px; }
+.set-head {
+  font-family: var(--serif); font-size: 13px; letter-spacing: 3px; color: var(--vermilion-deep);
+  margin: 14px 0 6px; padding-bottom: 4px; border-bottom: 1px solid var(--line);
+  width: 100%;
+}
+.set-head .set-v, .set-head .set-note, .set-head .bad {
+  font-family: var(--sans); letter-spacing: 0; font-size: 12px;
+}
 
 /* —— 登录门禁 —— */
 .login-mask {
