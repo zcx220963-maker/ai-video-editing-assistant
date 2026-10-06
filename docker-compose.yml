@@ -48,8 +48,8 @@ services:
     # 与上面 minio 绕开 docker.io 是同一类问题。
     image: public.ecr.aws/docker/library/redis:7-alpine
     container_name: creation-redis
-    ports:
-      - "127.0.0.1:6379:6379"
+    # 不映射宿主机端口:redis 仅作可选的多副本广播,compose 网络内以 redis:6379 访问;
+    # 本机若有原生 Redis 服务占用 6379 也不冲突(真要用宿主机访问再临时加映射)。
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
