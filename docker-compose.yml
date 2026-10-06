@@ -12,7 +12,7 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD:-creation_dev_pw}
       POSTGRES_DB: ${PG_DB:-creation}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"   # 只绑本机:公网部署不暴露数据库
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -31,8 +31,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-creationdev}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-creation_dev_pw_8chars}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - miniodata:/data
     healthcheck:
@@ -49,7 +49,7 @@ services:
     image: public.ecr.aws/docker/library/redis:7-alpine
     container_name: creation-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
