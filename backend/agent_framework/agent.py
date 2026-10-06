@@ -20,6 +20,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
+from . import judge as judge_mod
 from .ask_gate import (NO_POPUP_NOTE, PLAN_CARD_NUDGE, looks_like_asking_user,
                        looks_like_plan_invite, popup_nudge)
 from .checkpoint import Checkpoint, CheckpointManager
@@ -946,7 +947,85 @@ class AgentOnceRun:
             r.messages.append(system(PLAN_CARD_NUDGE))
             r.iteration += 1
             return True
+
+        # —— 判断模型第二意见(可选,如 Jev 类"系统一"模型)——
+        # 词面判据零成本但认不出绕开措辞;配置了 JUDGE_* 环境变量时,词面没拦的
+        # 收尾答复交给判断模型裁决:高置信判违规 → 与词面拦截同一处理(吃同一份预算)。
+        # 未配置/超时/低置信一律 None = 维持现状,绝不阻塞交付。
+        verdict = await self._judge_second_opinion(r, resp)
+        if verdict is not None:
+            kind, nudge_text, note = verdict
+            if kind == "card":
+                r.card_nudges -= 1
+            elif kind == "step":
+                r.step_nudges -= 1
+            else:
+                r.popup_nudges -= 1
+            r.messages.append(assistant(resp.content))
+            r.messages.append(system(nudge_text + note))
+            r.iteration += 1
+            return True
         return False
+
+    async def _judge_second_opinion(self, r: "_Round", resp: LLMResponse):
+        """判断模型复核:词面判据没拦时,把收尾答复交给判断模型裁决。
+
+        预算用尽就不调(省一次注定无效的调用);判定违规返回 (类别, 打回文案, 依据注),
+        否则 None。事实由服务端提供,判断模型只做"文本 vs 事实"的一致性裁决。
+        """
+        judge = judge_mod.get_judge()
+        if judge is None:
+            return None
+
+        if (r.planning and not r.state.plan_candidates and r.card_nudges > 0):
+            try:
+                v = await judge(
+                    "这条收尾答复是否向用户声称:已经生成/提交了候选计划卡,或给出了"
+                    "可供挑选确认的剪辑方案?(事实上本轮没有任何计划卡提交成功)",
+                    text=resp.content,
+                    facts={"plan_candidates": len(r.state.plan_candidates),
+                           "submit_plan_called": False})
+            except Exception as exc:  # noqa: BLE001 - 判断模型故障不阻塞交付
+                logger.warning("判断模型裁决失败(退回词面判据):%s", exc)
+                v = None
+            if judge_mod.actionable(v):
+                return ("card", NO_CARD_NUDGE_TEXT,
+                        f"\n(判断模型置信 {v['confidence']:.2f}:{v.get('reason', '')})")
+
+        approved = r.state.approved_plan
+        if (approved and _no_step_called(approved, r.state.calls_attempted)
+                and r.step_nudges > 0):
+            try:
+                v = await judge(
+                    "这条收尾答复是否声称:剪辑步骤/渲染已经执行或完成?"
+                    "(事实上本轮一次计划内的步骤工具都没有被调用)",
+                    text=resp.content,
+                    facts={"plan_steps": len(approved.get("steps", approved) or [])
+                           if isinstance(approved, dict) else 0,
+                           "step_tool_calls": 0})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("判断模型裁决失败(退回词面判据):%s", exc)
+                v = None
+            if judge_mod.actionable(v):
+                first = (approved.get("steps") or [{}])[0].get("node") or "?"
+                return ("step", STEP_NUDGE_TEXT.replace("{first}", str(first)),
+                        f"\n(判断模型置信 {v['confidence']:.2f}:{v.get('reason', '')})")
+
+        if (self.config.require_popup_questions and r.popup_nudges > 0
+                and not r.asked_this_run):
+            try:
+                v = await judge(
+                    "这条收尾答复是否在向用户索要信息/决策,需要用户回复才能继续?"
+                    "(事实上本轮没有调用弹窗提问工具,用户界面上不会出现任何选项卡)",
+                    text=resp.content,
+                    facts={"ask_user_called": False})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("判断模型裁决失败(退回词面判据):%s", exc)
+                v = None
+            if judge_mod.actionable(v):
+                return ("popup", popup_nudge(r.planning),
+                        f"\n(判断模型置信 {v['confidence']:.2f}:{v.get('reason', '')})")
+        return None
 
     async def _deliver(self, r: "_Round", message: str) -> str:
         """收尾：终答定形 → 三条「核对用尽后补事实」→ 指针行落终态 → 回会话历史落库。"""
