@@ -316,7 +316,7 @@ class MaterialsRepo(_Repo):
     async def list_visible(self, user_id: str, conv_id: str | None = None, *,
                            origin: str | None = None,
                            kinds: Sequence[str] = ()) -> list[dict[str, Any]]:
-        """本人可见的素材。``origin='bgm'`` 直接回全量（曲库是共享资源）。
+        """本人可见的素材。
 
         可见性过滤在**内存里一次做完**，但会话归属只查一次：
         原先逐行 ``await self._visible(...)``，每行撞到「不是本人所有」就再发一次
@@ -329,8 +329,6 @@ class MaterialsRepo(_Repo):
         if kinds:
             where["kind"] = in_(list(kinds))
         rows = await self.db.select(self.table, where=where, order_by=["-created_at"])
-        if origin == "bgm":
-            return list(rows)
         owns = bool(conv_id) and await self._owns_conv(str(conv_id), user_id)
         return [r for r in rows if self._visible_with(r, user_id, conv_id, owns)]
 
@@ -1126,9 +1124,11 @@ class SkillsRepo(_Repo):
 
     async def upsert(self, name: str, body: str, *, description: str = "",
                      frontmatter: Mapping[str, Any] | None = None,
-                     files: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
+                     files: Sequence[Mapping[str, Any]] = (),
+                     owner_user_id: str | None = None) -> dict[str, Any]:
         row = await self.db.upsert(self.table, {
-            "name": name, "description": description, "body": body,
+            "name": name, "owner_user_id": owner_user_id,
+            "description": description, "body": body,
             "frontmatter": dict(frontmatter or {}), "updated_at": _now()})
         await self.db.delete("skill_files", where={"skill": name})
         for f in files:
@@ -1137,8 +1137,12 @@ class SkillsRepo(_Repo):
                                                  "bytes": f.get("bytes", 0)})
         return row
 
-    async def list(self) -> list[dict[str, Any]]:
+    async def list(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        """列技能。user_id 给了只返回系统内置(NULL) + 本人添加的；None 返回全部。"""
         rows = await self.db.select(self.table, order_by=["name"])
+        if user_id is not None:
+            rows = [r for r in rows
+                    if r.get("owner_user_id") is None or r.get("owner_user_id") == user_id]
         for r in rows:
             r["files"] = await self.db.select("skill_files", where={"skill": r["name"]},
                                               order_by=["relpath"])
@@ -1166,13 +1170,20 @@ class McpServersRepo(_Repo):
     table = "mcp_servers"
 
     async def upsert(self, name: str, config: Mapping[str, Any], *,
-                     enabled: bool = False) -> dict[str, Any]:
+                     enabled: bool = False,
+                     owner_user_id: str | None = None) -> dict[str, Any]:
         return await self.db.upsert(self.table, {
-            "name": name, "config": dict(config), "enabled": bool(enabled),
+            "name": name, "owner_user_id": owner_user_id,
+            "config": dict(config), "enabled": bool(enabled),
             "updated_at": _now()})
 
-    async def list(self) -> list[dict[str, Any]]:
-        return await self.db.select(self.table, order_by=["name"])
+    async def list(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        """列 MCP 服务。user_id 给了只返回系统部署期(NULL) + 本人添加的；None 返回全部。"""
+        rows = await self.db.select(self.table, order_by=["name"])
+        if user_id is not None:
+            rows = [r for r in rows
+                    if r.get("owner_user_id") is None or r.get("owner_user_id") == user_id]
+        return rows
 
     async def get(self, name: str) -> dict[str, Any] | None:
         return await self.db.get_by_pk(self.table, {"name": name})

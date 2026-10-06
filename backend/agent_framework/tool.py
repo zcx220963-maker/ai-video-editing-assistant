@@ -155,6 +155,10 @@ class Tool(ABC):
         """
         return False
 
+    # ---- 归属：None = 系统工具（所有用户共享）；填了 = 用户个人添加 ----
+
+    owner_user_id: str | None = None
+
     # ---- schema 导出 ----
 
     def to_schema(self) -> dict[str, Any]:
@@ -200,8 +204,16 @@ class ToolRegistry:
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
 
-    def get(self, name: str) -> Tool | None:
-        return self._tools.get(name)
+    def _visible(self, tool: Tool, user_id: str | None) -> bool:
+        """该工具对指定用户是否可见：系统工具(None)对所有人可见，个人工具仅本人可见。"""
+        owner = getattr(tool, "owner_user_id", None)
+        return owner is None or owner == user_id
+
+    def get(self, name: str, *, user_id: str | None = None) -> Tool | None:
+        tool = self._tools.get(name)
+        if tool is not None and not self._visible(tool, user_id):
+            return None
+        return tool
 
     def has(self, name: str) -> bool:
         return name in self._tools
@@ -211,8 +223,9 @@ class ToolRegistry:
         tool = self._tools.get(name)
         return bool(tool is not None and (tool.requires_approval or name in self._approve))
 
-    def get_definitions(self) -> list[dict[str, Any]]:
-        return [tool.to_schema() for tool in self._tools.values()]
+    def get_definitions(self, *, user_id: str | None = None) -> list[dict[str, Any]]:
+        return [tool.to_schema() for tool in self._tools.values()
+                if self._visible(tool, user_id)]
 
     def displays(self) -> dict[str, str]:
         """{机器名: 中文名}，只收声明了的（未声明的不进表，出口处退回机器名）。"""

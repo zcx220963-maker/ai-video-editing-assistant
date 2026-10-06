@@ -232,12 +232,14 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 
 -- 技能：正文进 PG（多实例一致分发），scripts/references/assets 进 MinIO
+-- owner_user_id 为 NULL = 系统内置（所有用户共享）；填了 = 用户个人添加（仅本人可见）
 CREATE TABLE IF NOT EXISTS skills (
-  name         text PRIMARY KEY,
-  description  text NOT NULL DEFAULT '',
-  frontmatter  jsonb NOT NULL DEFAULT '{}',
-  body         text NOT NULL DEFAULT '',
-  updated_at   timestamptz NOT NULL DEFAULT now()
+  name           text PRIMARY KEY,
+  owner_user_id  text REFERENCES users(id) ON DELETE CASCADE,
+  description    text NOT NULL DEFAULT '',
+  frontmatter    jsonb NOT NULL DEFAULT '{}',
+  body           text NOT NULL DEFAULT '',
+  updated_at     timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS skill_files (
   skill       text NOT NULL,
@@ -289,10 +291,12 @@ CREATE INDEX IF NOT EXISTS tk_run_idx ON token_usage (run_id);
 -- 动态 MCP Server 注册：配置与启停状态落库，运行时热连/热断（区别于部署期的 mcp.json）。
 -- config 是 MCPServerConfig 的字面量（type/command/args/env/url/headers/tool_timeout/
 -- enabled_tools）；headers 里可能带凭证，对外出口必须掩码后回显。
+-- owner_user_id 为 NULL = 系统部署期配置（共享）；填了 = 用户自己添加（仅本人可见）
 CREATE TABLE IF NOT EXISTS mcp_servers (
-  name        text PRIMARY KEY,
-  config      jsonb NOT NULL DEFAULT '{}',
-  enabled     boolean NOT NULL DEFAULT false,
-  created_at  timestamptz NOT NULL DEFAULT now(),
-  updated_at  timestamptz NOT NULL DEFAULT now()
+  name          text PRIMARY KEY,
+  owner_user_id text REFERENCES users(id) ON DELETE CASCADE,
+  config        jsonb NOT NULL DEFAULT '{}',
+  enabled       boolean NOT NULL DEFAULT false,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
 );

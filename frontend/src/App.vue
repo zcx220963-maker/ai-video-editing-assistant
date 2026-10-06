@@ -1,4 +1,4 @@
-<script setup>
+﻿<script setup>
 // 智能创作助手 · 前端主界面
 // 数据流严格对应后端文档链路：
 //   发送 → POST /chat（MQ InBound）；结果 → WS /ws/{conv}?token= 收
@@ -42,11 +42,12 @@ function authHeaders(extra = {}) {
 // 凭证是身份的唯一来源：token 丢了就是新身份（旧历史仍在服务端那个用户名下，只有原 token 能找回）。
 let identityPromise = null;
 // —— 登录门禁：未登录（或凭证失效）只显示登录/注册页，登录成功才进主界面 ——
-const loginView = ref(true);
+const loginView = ref(!token.value);    // 有 token 先不显示登录页（避免刷新闪现），whoami 401 再翻回 true
 const loginMode = ref("login");            // login | register
 const loginForm = reactive({ username: "", password: "" });
 const loginErr = ref("");
 const loginBusy = ref(false);
+const username = ref("");                 // 账号名：登录/whoami 时由服务端回，左下角展示
 
 function ensureIdentity() {
   if (userId.value) return Promise.resolve(userId.value);
@@ -75,6 +76,7 @@ async function submitAuth() {
     if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
     token.value = j.token;                 // JWT
     userId.value = j.user_id;
+    username.value = j.username || "";
     hadToken.value = true;
     localStorage.setItem(TOKEN_KEY, j.token);
     loginView.value = false;
@@ -101,7 +103,10 @@ async function whoami() {
     return null;
   }
   if (!r.ok) throw new Error("无法确认身份（HTTP " + r.status + "）");
-  userId.value = (await r.json()).user_id;
+  const j = await r.json();
+  userId.value = j.user_id;
+  username.value = j.username || "";
+  loginView.value = false;               // 凭证有效 → 进主界面（刷新后恢复登录态）
   return userId.value;
 }
 
@@ -966,7 +971,7 @@ async function ensureCatalog() {
 async function toggleHelp() {
   activePanel.value = activePanel.value === 'tools' ? null : 'tools';
   if (activePanel.value === 'tools') {
-    toolView.value = null;            // 每次打开都回到父列表
+    toolView.value = 'tools';         // 默认进入"工具"分类
     await loadTools();
     loadMcpAdmin();
     loadSkillsAdmin();
@@ -1237,6 +1242,7 @@ function forgetToken() {
   localStorage.removeItem(TOKEN_KEY);
   token.value = "";
   userId.value = "";
+  username.value = "";
   identityPromise = null;
   loginView.value = true;              // 凭证没了就回登录页
 }
@@ -2939,7 +2945,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   <!-- 登录/注册门禁:登录成功才进入主界面 -->
   <div v-if="loginView" class="login-mask">
     <div class="login-card">
-      <div class="seal login-seal">创</div>
+      <div class="seal login-seal"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/><line x1="16" y1="8" x2="2" y2="22"/><line x1="17.5" y1="15" x2="9" y2="15"/></svg></div>
       <h1>智能创作助手</h1>
       <p class="login-sub">一句话驱动「查资料 → 写文案 → 剪视频 → 出片」</p>
       <input v-model.trim="loginForm.username" placeholder="用户名（中英文/数字/_ -）"
@@ -2966,7 +2972,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       <button v-if="!railOpen" class="rail-open-btn" title="展开卷宗栏"
               @click="toggleRail">»</button>
       <div class="brand">
-        <div class="seal">创</div>
+        <div class="seal"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/><line x1="16" y1="8" x2="2" y2="22"/><line x1="17.5" y1="15" x2="9" y2="15"/></svg></div>
         <div class="brand-text">
           <b>智能创作助手</b>
           <span>纸上创作台</span>
@@ -2974,8 +2980,15 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         <button class="rail-toggle" title="收起卷宗栏" @click="toggleRail">«</button>
       </div>
 
-      <button class="new" @click="newConv">✚<span class="lbl"> 开一册新卷</span></button>
+      <button class="new" @click="newConv"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span class="lbl"> 开一册新卷</span></button>
 
+      <div class="rail-btns">
+        <button class="help" :class="{ on: activePanel === 'library' }" @click="toggleLibrary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg> 素材库</button>
+        <button class="help" :class="{ on: activePanel === 'bgm' }" @click="toggleBgm"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg> 音乐库</button>
+        <button class="help" :class="{ on: activePanel === 'tools' }" @click="toggleHelp"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg> 工具库</button>
+      </div>
+
+      <div class="conv-section-label">会话历史</div>
       <nav class="convs">
         <div
           v-for="c in convs"
@@ -2990,10 +3003,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         </div>
       </nav>
 
-      <footer class="who">
-        <span class="k">执笔人</span>
-        <span class="v">{{ userId || "身份签发中…" }}</span>
-      </footer>
+      <div class="rail-user-bar">
+        <span class="rail-username">{{ username || userId || "身份签发中…" }}</span>
+        <button class="rail-icon-btn" :class="{ on: activePanel === 'settings' }" @click="toggleSettings" title="设置"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+        <button class="rail-icon-btn" @click="forgetToken" title="登出"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></button>
+      </div>
     </aside>
 
     <!-- 右侧：稿纸区 -->
@@ -3001,12 +3015,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       <header class="head">
         <span class="rule"></span>
         <h2>{{ convs.find((c) => c.id === active)?.title || "—" }}</h2>
-        <button class="help" :class="{ on: activePanel === 'tools' }" @click="toggleHelp">工具库</button>
-        <button class="help" :class="{ on: activePanel === 'library' }" @click="toggleLibrary">素材库</button>
-        <button class="help" :class="{ on: activePanel === 'bgm' }" @click="toggleBgm">音乐库</button>
         <button class="help" :class="{ on: activePanel === 'timeline' }" @click="toggleTimeline">时间线</button>
         <button class="help" :class="{ on: activePanel === 'runs' }" @click="toggleRuns">执行记录</button>
-        <button class="help" :class="{ on: activePanel === 'settings' }" @click="toggleSettings">设置</button>
         <span class="ws" :class="{ on: connected[active] }">
           {{ connected[active] ? "回投已连接" : "回投未连接" }}
         </span>
@@ -3435,24 +3445,24 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             <div class="cat-row" :class="{ active: !toolView || toolView === 'tools' }" @click="toggleCat('tools')">
               <div class="cat-top">
                 <b>工具</b>
-                <button class="tt-copy pencil" title="增删工具（经 MCP 服务）"
-                        @click.stop="openCatManage('tools')">✎</button>
+                <button class="cat-manage" title="增删工具（经 MCP 服务）"
+                        @click.stop="openCatManage('tools')">管理</button>
               </div>
               <span class="cat-count">{{ toolCount }} 个</span>
             </div>
             <div class="cat-row" :class="{ active: toolView === 'skills' }" @click="toggleCat('skills')">
               <div class="cat-top">
                 <b>技能</b>
-                <button class="tt-copy pencil" title="新增 / 删除技能"
-                        @click.stop="openCatManage('skills')">✎</button>
+                <button class="cat-manage" title="新增 / 删除技能"
+                        @click.stop="openCatManage('skills')">管理</button>
               </div>
               <span class="cat-count">{{ skillsAdmin.length }} 个</span>
             </div>
             <div class="cat-row" :class="{ active: toolView === 'mcp' }" @click="toggleCat('mcp')">
               <div class="cat-top">
                 <b>MCP</b>
-                <button class="tt-copy pencil" title="新增 / 删除 MCP 服务"
-                        @click.stop="openCatManage('mcp')">✎</button>
+                <button class="cat-manage" title="新增 / 删除 MCP 服务"
+                        @click.stop="openCatManage('mcp')">管理</button>
               </div>
               <span class="cat-count">{{ mcpServers.length }} 个</span>
             </div>
@@ -3464,22 +3474,18 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                 <div class="td-group">{{ cat }}</div>
                 <div v-for="t in items" :key="'f-' + t.name" class="td-item">
                   <div class="td-title">
-                    <b>{{ toolLabel(t.name, t.name_display) }}</b>
-                    <button class="tt-copy pencil" title="详情 / 修改"
-                            @click="openToolModal(t, cat)">✎</button>
+                    <b class="td-clickable" @click="openToolModal(t, cat)">{{ toolLabel(t.name, t.name_display) }}</b>
                   </div>
                   <span class="td-intro">{{ t.desc }}</span>
                 </div>
               </template>
               <div class="td-group">技能（Skill）</div>
               <div v-for="sk in (toolLib.skills || [])" :key="'f-' + sk.name" class="td-item">
-                <div class="td-title">
-                  <b>{{ toolLabel(sk.name, sk.name_display) }}</b>
-                  <span v-if="sk.available !== '可用'" class="st-bad"
-                        :title="sk.available">⚠</span>
-                  <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
-                          @click="openSkillModal(sk.name)">✎</button>
-                </div>
+                  <div class="td-title">
+                    <b class="td-clickable" @click="openSkillModal(sk.name)">{{ toolLabel(sk.name, sk.name_display) }}</b>
+                    <span v-if="sk.available !== '可用'" class="st-bad"
+                          :title="sk.available">⚠</span>
+                  </div>
                 <span class="td-intro">{{ sk.desc }}</span>
               </div>
               <div class="td-group mcp-head">
@@ -3490,11 +3496,9 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               </div>
               <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
               <div v-for="s in mcpServers" :key="'f-' + s.name" class="td-item">
-                <div class="td-title">
-                  <b>{{ s.name }}</b>
-                  <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
-                          @click="openMcpModal(s)">✎</button>
-                </div>
+                  <div class="td-title">
+                    <b class="td-clickable" @click="openMcpModal(s)">{{ s.name }}</b>
+                  </div>
                 <span class="td-name">
                   <span :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
                   · {{ (s.tools || []).length }} 个工具
@@ -3511,9 +3515,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                 <div class="td-group">{{ cat }}</div>
                 <div v-for="t in items" :key="'t-' + t.name" class="td-item">
                   <div class="td-title">
-                    <b>{{ toolLabel(t.name, t.name_display) }}</b>
-                    <button class="tt-copy pencil" title="详情 / 修改"
-                            @click="openToolModal(t, cat)">✎</button>
+                    <b class="td-clickable" @click="openToolModal(t, cat)">{{ toolLabel(t.name, t.name_display) }}</b>
                   </div>
                   <span class="td-intro">{{ t.desc }}</span>
                 </div>
@@ -3521,13 +3523,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             </template>
             <template v-else-if="toolView === 'skills'">
               <div v-for="sk in (toolLib.skills || [])" :key="'s-' + sk.name" class="td-item">
-                <div class="td-title">
-                  <b>{{ toolLabel(sk.name, sk.name_display) }}</b>
-                  <span v-if="sk.available !== '可用'" class="st-bad"
-                        :title="sk.available">⚠</span>
-                  <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
-                          @click="openSkillModal(sk.name)">✎</button>
-                </div>
+                  <div class="td-title">
+                    <b class="td-clickable" @click="openSkillModal(sk.name)">{{ toolLabel(sk.name, sk.name_display) }}</b>
+                    <span v-if="sk.available !== '可用'" class="st-bad"
+                          :title="sk.available">⚠</span>
+                  </div>
                 <span class="td-intro">{{ sk.desc }}</span>
               </div>
             </template>
@@ -3538,11 +3538,9 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
               <div v-if="loadingMcp" class="lib-empty">加载中…</div>
               <div v-for="s in mcpServers" :key="'m-' + s.name" class="td-item">
-                <div class="td-title">
-                  <b>{{ s.name }}</b>
-                  <button class="tt-copy pencil" title="详情 / 编辑 / 删除"
-                          @click="openMcpModal(s)">✎</button>
-                </div>
+                  <div class="td-title">
+                    <b class="td-clickable" @click="openMcpModal(s)">{{ s.name }}</b>
+                  </div>
                 <span class="td-name">
                   <span :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
                   · {{ (s.tools || []).length }} 个工具
@@ -4221,8 +4219,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 /* ---------- 卷宗栏 ---------- */
 .rail {
   width: 264px; flex: none; display: flex; flex-direction: column;
-  background: linear-gradient(180deg, #2b2620, #211d18);
-  color: #e9e2d2; padding: 22px 16px 16px;
+  background: linear-gradient(180deg, #2a2a2a, #1f1f1f);
+  color: #f5f5f5; padding: 22px 16px 16px;
   border-right: 3px solid var(--vermilion);
   transition: margin-left .22s ease;
   overflow: visible;
@@ -4234,15 +4232,16 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .rail-toggle:hover { opacity: 1; background: rgba(255, 253, 247, .12); }
 .rail-open-btn {
-  position: absolute; left: 264px; top: 18px; z-index: 30;
-  border: none; border-radius: 0 8px 8px 0; cursor: pointer;
-  background: linear-gradient(180deg, #2b2620, #211d18); color: #e9e2d2;
+  position: fixed; left: 0; top: 22px; z-index: 50;
+  border: none; border-radius: 0 6px 6px 0; cursor: pointer;
+  background: #2a2a2a; color: #f5f5f5;
   border-right: 3px solid var(--vermilion); border-left: none;
-  padding: 10px 7px; font-size: 15px; opacity: .55;
+  padding: 4px 8px; font-size: 16px; opacity: .7;
+  box-shadow: 2px 0 8px rgba(0,0,0,.25);
 }
-.rail-open-btn:hover { opacity: 1; }
+.rail-open-btn:hover { opacity: 1; background: #333; }
 .rail.closed .brand, .rail.closed .new, .rail.closed .convs,
-.rail.closed .who { visibility: hidden; }
+.rail.closed .conv-section-label, .rail.closed .rail-user-bar { visibility: hidden; }
 .brand { display: flex; gap: 12px; align-items: center; padding: 0 4px 18px; }
 .seal {
   width: 46px; height: 46px; flex: none; display: grid; place-items: center;
@@ -4262,6 +4261,10 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .new:hover { border-color: var(--vermilion); color: #ffd9c9; background: rgba(200, 64, 31, 0.12); }
 
+.rail-btns { display: flex; flex-direction: column; gap: 2px; padding: 4px 0; }
+.rail-btns .help { font-size: 13px; padding: 8px 12px; border-radius: 6px; text-align: left; width: 100%; box-sizing: border-box; color: #f5f5f5; border-color: transparent; }
+.rail-btns .help:hover { background: rgba(255, 255, 255, .06); border-color: transparent; color: #fff; }
+.rail-btns .help.on { color: var(--vermilion); border-color: transparent; background: rgba(200, 64, 31, 0.18); }
 .convs { flex: 1; overflow-y: auto; margin: 0 -4px; padding: 0 4px; }
 .conv {
   display: flex; align-items: center; gap: 8px; padding: 9px 10px;
@@ -4290,6 +4293,27 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .who .k { font-family: var(--serif); letter-spacing: 3px; opacity: 0.5; }
 .who .v { opacity: 0.75; font-family: ui-monospace, monospace; }
+.conv-section-label {
+  font-size: 11px; color: rgba(245, 245, 245, 0.45);
+  text-transform: uppercase; letter-spacing: 2px;
+  padding: 14px 12px 6px; font-family: var(--serif);
+}
+.rail-user-bar {
+  display: flex; align-items: center; gap: 4px; padding: 12px 8px;
+  border-top: 1px solid rgba(245, 245, 245, 0.12);
+}
+.rail-username {
+  flex: 1; color: #fff; font-size: 12px; font-family: ui-monospace, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rail-icon-btn {
+  flex: none; border: none; background: transparent; color: #f5f5f5;
+  cursor: pointer; padding: 6px; border-radius: 6px; display: flex;
+  align-items: center; justify-content: center; opacity: .7;
+  transition: all 0.18s;
+}
+.rail-icon-btn:hover { opacity: 1; background: rgba(255, 255, 255, .08); }
+.rail-icon-btn.on { opacity: 1; color: var(--vermilion); }
 
 /* ---------- 稿纸区 ---------- */
 .desk { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -5208,7 +5232,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 
 @media (max-width: 760px) {
   .rail { width: 72px; padding: 16px 8px; }
-  .brand-text, .conv .t, .conv .x, .who .v, .new .lbl { display: none; }
+  .brand-text, .conv .t, .conv .x, .rail-username, .conv-section-label, .new .lbl { display: none; }
   .new { padding: 10px 0; font-size: 18px; }
   .paper, .head, .composer, .attach-bar, .link-bar { padding-left: 18px; padding-right: 18px; }
   .drawer { width: 100%; }
@@ -5258,6 +5282,14 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .tt-copy.pencil { color: #0969da; font-weight: 600; opacity: 0.85;
   font-size: 13px; line-height: 1; }
+.td-clickable { cursor: pointer; transition: color .15s, text-decoration-color .15s; }
+.td-clickable:hover { color: var(--vermilion-deep, #c8401f); text-decoration: underline; }
+.cat-manage {
+  font-size: 11px; color: var(--ink-soft, #6e7781); background: none;
+  border: none; cursor: pointer; padding: 2px 6px; border-radius: 4px;
+  transition: color .15s, background .15s;
+}
+.cat-manage:hover { color: var(--vermilion-deep, #c8401f); background: rgba(200,64,31,.08); }
 .td-intro {
   font-size: 11.5px; color: var(--ink-soft); opacity: 0.72; line-height: 1.5;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -5308,22 +5340,23 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .td-detail { flex: 1; min-width: 0; overflow-y: auto; padding: 10px 12px; }
 .cat-row {
-  border: 1px solid #d0d7de; border-radius: 8px;
-  padding: 8px; cursor: pointer; background: #fff;
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px; cursor: pointer; background: rgba(200, 64, 31, 0.05);
   display: flex; flex-direction: column; gap: 3px;
+  transition: background .15s, border-color .15s;
 }
-.cat-row:hover { border-color: #0969da; background: #f6f9fe; }
+.cat-row:hover { border-color: var(--vermilion-deep, #c8401f); background: rgba(200, 64, 31, 0.12); }
 .cat-row.active {
-  background: #e7eefb; border-color: #0969da;
-  box-shadow: inset 3px 0 0 #0969da;
+  background: rgba(200, 64, 31, 0.10); border-color: var(--vermilion-deep, #c8401f);
+  box-shadow: inset 3px 0 0 var(--vermilion-deep, #c8401f);
 }
-.cat-row.active b { color: #0550ae; }
+.cat-row.active b { color: var(--vermilion-deep, #c8401f); }
 .cat-top { display: flex; align-items: center; justify-content: space-between; gap: 4px; }
 .cat-top b { font-size: 13.5px; }
-.cat-count { color: #0969da; font-size: 12px; }
+.cat-count { color: var(--ink-soft, #6e7781); font-size: 12px; }
 .td-cats .cat-desc { display: none; }
 .cat-row b { font-size: 15px; }
-.cat-count { color: #0969da; font-size: 13px; white-space: nowrap; }
+.cat-count { color: var(--ink-soft, #6e7781); font-size: 13px; white-space: nowrap; }
 .cat-desc { color: #656d76; font-size: 12px; flex: 1; }
 .cat-back { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .cat-back b { font-size: 15px; }

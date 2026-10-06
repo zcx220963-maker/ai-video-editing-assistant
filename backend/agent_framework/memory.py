@@ -120,7 +120,7 @@ class MemoryContextSource:
         kept = content[-limit:]
         return f"（更早的记忆已省略 {len(content) - limit} 字）\n{kept}"
 
-    async def render(self, query: str) -> str | None:  # noqa: ARG002 (query 预留给 RAG)
+    async def render(self, query: str, *, user_id: str | None = None) -> str | None:  # noqa: ARG002 (query 预留给 RAG; user_id 由 MemoryStore 自身绑定)
         entries = await self._store.entries(self._categories)
         if not entries:
             return None

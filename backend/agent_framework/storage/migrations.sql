@@ -82,3 +82,7 @@ CREATE INDEX IF NOT EXISTS ck_lease_idx ON checkpoints(status, lease_expires_at)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS username text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text;
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_uidx ON users (username);
+-- skills/mcp_servers 加 owner_user_id:技能与动态 MCP 注册按用户隔离
+-- (系统预置为 NULL 对所有人可见,用户添加的仅本人可见,删账号级联清理)。
+ALTER TABLE skills ADD COLUMN IF NOT EXISTS owner_user_id text REFERENCES users(id) ON DELETE CASCADE;
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS owner_user_id text REFERENCES users(id) ON DELETE CASCADE;

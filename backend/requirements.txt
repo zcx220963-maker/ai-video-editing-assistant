@@ -1,9 +1,9 @@
-# 主框架依赖（Storyline 真实节点的增量见 requirements-storyline.txt）
+﻿# 主框架依赖（Storyline 真实节点的增量见 requirements-storyline.txt）
 # 安装：pip install -r requirements.txt
 
 # --- 模型与协议 ---
 openai>=2.38          # DeepSeek 走 OpenAI 兼容接口（agent_framework/llm_openai.py）
-mcp>=1.28             # MCP 客户端 + StreamableHttp 传输，连 Storyline server
+mcp>=1.28,<2          # MCP 客户端 + StreamableHttp 传输（2.x API 不兼容，暂锁定 1.x）
 
 # --- Web 层 ---
 fastapi>=0.136        # agent_framework/server.py：/chat /upload /history /ws

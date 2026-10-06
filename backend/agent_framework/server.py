@@ -1,4 +1,4 @@
-"""Web 接口层（FastAPI）：架构图最上方的「Web 接口层 ↔ Message Queue ↔ 会话」。
+﻿"""Web 接口层（FastAPI）：架构图最上方的「Web 接口层 ↔ Message Queue ↔ 会话」。
 
 create_app 把 Agent + MQ（+ 可选 Heartbeat）装配成一个 FastAPI 应用：
   - POST /register    签发身份：回 user_id + 一次性明文 token（库里只存 sha256）
@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import urllib.parse
@@ -169,8 +170,7 @@ class ApiKeyRequest(BaseModel):
 
 
 GD_MUSIC_API = "https://music-api.gdstudio.xyz/api.php"
-BGM_LIBRARY_USER = "u-bgm-library"
-BGM_LIBRARY_CONV = "c-bgm-library"
+
 
 
 def _gd_music_get(params: dict, timeout: float = 15.0) -> list | dict:
@@ -700,9 +700,10 @@ def create_app(
         skills_list: list[dict[str, str]] = []
         if skill_loader is not None:
             try:
-                for sk in await skill_loader.discover():
+                for sk in await skill_loader.discover(user_id):
                     skills_list.append({
                         "name": sk.name,
+                        "name_display": sk.display or "",
                         "desc": sk.description or "",
                         "always": "是" if sk.always else "否",
                         "available": "可用" if sk.available else f"不可用：{sk.unavailable_reason or ''}",
@@ -729,8 +730,9 @@ def create_app(
 
     @app.get("/skills")
     async def skills_list(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """技能库清单：名称/中文名/描述/常驻/可用性，供管理面板展示。"""
-        skills = await skill_loader.discover() if skill_loader else []
+        """技能库清单：名称/中文名/描述/常驻/可用性，供管理面板展示。
+        只返回系统内置(NULL) + 本人添加的技能。"""
+        skills = await skill_loader.discover(user_id) if skill_loader else []
         return {"skills": [
             {"name": s.name, "display": s.display, "description": s.description,
              "always": s.always, "available": s.available,
@@ -763,7 +765,8 @@ def create_app(
             raise HTTPException(409, "技能库未启用（--no-skills）")
         data = await request.body()
         try:
-            imported = await skill_loader.import_zip(filename, data)
+            imported = await skill_loader.import_zip(filename, data,
+                                                     owner_user_id=user_id)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         except Exception as exc:  # noqa: BLE001 - 坏包统一 400，不泄漏栈
@@ -776,13 +779,15 @@ def create_app(
                             user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
         """删除技能：删行的同时清附件对象（best-effort，删不掉不阻断删行）。
 
-        注：出口词表只增不撤，被删技能的中文名残留到下次重启——仅影响界面标签，
-        不影响任何执行语义。
+        只能删本人添加的技能（owner_user_id = 当前用户），不能删系统内置的。
         """
         if skill_loader is None:
             raise HTTPException(409, "技能库未启用（--no-skills）")
-        if await skill_loader.get(name) is None:
+        row = await storage.skills.get(name)
+        if row is None:
             raise HTTPException(404, f"技能 {name!r} 不存在")
+        if row.get("owner_user_id") != user_id:
+            raise HTTPException(403, "系统内置技能不能删除")
         await skill_loader.drop(name)
         return {"deleted": name}
 
@@ -905,10 +910,11 @@ def create_app(
 
     @app.get("/mcp/servers")
     async def mcp_servers_list(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """动态 MCP Server 清单：配置（凭证掩码）+ 启停状态 + 在线工具名。"""
+        """动态 MCP Server 清单：配置（凭证掩码）+ 启停状态 + 在线工具名。
+        只返回系统部署期(NULL) + 本人添加的 MCP 服务。"""
         if mcp_manager is None:
             raise HTTPException(409, "MCP 动态注册未启用")
-        rows = await storage.mcp_servers.list()
+        rows = await storage.mcp_servers.list(user_id)
         live = mcp_manager.live_servers()
         servers: list[dict[str, Any]] = []
         for r in rows:
@@ -944,7 +950,8 @@ def create_app(
             raise HTTPException(400, f"配置形状不对：{exc}")
         if not cfg.url and not cfg.command:
             raise HTTPException(400, "url 与 command 至少给一个")
-        await storage.mcp_servers.upsert(name, req.config, enabled=req.enabled)
+        await storage.mcp_servers.upsert(name, req.config, enabled=req.enabled,
+                                         owner_user_id=user_id)
         return {"saved": name, "enabled": req.enabled,
                 "live": mcp_manager.is_live(name), "tools": mcp_manager.tool_names(name)}
 
@@ -954,8 +961,11 @@ def create_app(
         """热连：按库里配置连接并注册工具（幂等；撞名/连不上如实报错，不落半截状态）。"""
         if mcp_manager is None:
             raise HTTPException(409, "MCP 动态注册未启用")
-        if await storage.mcp_servers.get(name) is None:
+        row = await storage.mcp_servers.get(name)
+        if row is None:
             raise HTTPException(404, f"MCP server {name!r} 未注册")
+        if row.get("owner_user_id") != user_id:
+            raise HTTPException(403, "只能操作本人添加的 MCP 服务")
         try:
             names = await mcp_manager.connect(name)
         except McpManagerError as exc:
@@ -971,8 +981,11 @@ def create_app(
         """热断：注销该 server 的全部工具并关闭连接（配置行保留）。"""
         if mcp_manager is None:
             raise HTTPException(409, "MCP 动态注册未启用")
-        if await storage.mcp_servers.get(name) is None:
+        row = await storage.mcp_servers.get(name)
+        if row is None:
             raise HTTPException(404, f"MCP server {name!r} 未注册")
+        if row.get("owner_user_id") != user_id:
+            raise HTTPException(403, "只能操作本人添加的 MCP 服务")
         removed = await mcp_manager.disconnect(name)
         await storage.mcp_servers.set_enabled(name, False)
         return {"name": name, "live": False, "removed": removed}
@@ -980,11 +993,14 @@ def create_app(
     @app.delete("/mcp/servers/{name}")
     async def mcp_servers_delete(name: str,
                                  user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """删除：先断开（若在线）再删配置行。"""
+        """删除：先断开（若在线）再删配置行。只能删本人添加的。"""
         if mcp_manager is None:
             raise HTTPException(409, "MCP 动态注册未启用")
-        if await storage.mcp_servers.get(name) is None:
+        row = await storage.mcp_servers.get(name)
+        if row is None:
             raise HTTPException(404, f"MCP server {name!r} 未注册")
+        if row.get("owner_user_id") != user_id:
+            raise HTTPException(403, "只能删除本人添加的 MCP 服务")
         await mcp_manager.disconnect(name)
         await storage.mcp_servers.drop(name)
         return {"deleted": name}
@@ -1028,7 +1044,9 @@ def create_app(
     @app.get("/whoami")
     async def whoami(user_id: str = Depends(auth.http_user_id)) -> dict[str, str]:
         """这张凭证是谁：前端不再自存 user_id（spec §7 废弃 ca.user），需要显示时问服务端。"""
-        return {"user_id": user_id}
+        row = await auth._users.get(user_id)
+        username = (row or {}).get("username") or ""
+        return {"user_id": user_id, "username": username}
 
     @app.post("/chat", response_model=ChatQueuedResponse)
     async def chat(req: ChatRequest,
@@ -1599,7 +1617,7 @@ def create_app(
     @app.get("/bgm")
     async def list_bgm(q: str | None = None,
                        user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """BGM 曲库搜索（音乐库面板用）：共享资源，所有用户可见。"""
+        """BGM 曲库列表（音乐库面板用）：只返回本人导入的歌曲。"""
         rows = await storage.materials.list_visible(
             user_id, None, origin="bgm", kinds=("audio",))
         if q:
@@ -1620,18 +1638,19 @@ def create_app(
     @app.delete("/bgm/{material_id}")
     async def delete_bgm(material_id: str,
                          user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """删除 BGM 曲库中的一首歌（共享资源，任意登录用户可删）。"""
+        """删除本人导入的 BGM 曲库中的一首歌。"""
         rows = await storage.materials.db.select(
-            storage.materials.table, where={"id": material_id, "origin": "bgm"})
+            storage.materials.table,
+            where={"id": material_id, "origin": "bgm", "owner_user_id": user_id})
         if not rows:
-            raise HTTPException(404, "曲库中没有这首歌")
+            raise HTTPException(404, "曲库中没有这首歌或不属于你")
         object_key = rows[0].get("object_key")
         if object_key:
             try:
                 await storage.objects.delete(object_key)
             except Exception:  # noqa: BLE001
                 pass
-        n = await storage.materials.drop(BGM_LIBRARY_USER, material_id)
+        n = await storage.materials.drop(user_id, material_id)
         return {"deleted": n, "material_id": material_id}
 
     # 音乐源优先级：joox 首选，netease 降级，bilibili 兜底
@@ -1721,7 +1740,10 @@ def create_app(
     @app.post("/bgm/import")
     async def bgm_import(request: Request,
                          user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """下载一首曲子并导入 BGM 曲库（自动多源降级获取播放链接）。"""
+        """下载一首曲子并导入本人的 BGM 曲库（自动多源降级获取播放链接）。
+
+        导入后的歌曲归属当前用户，其他用户不可见。
+        """
         body = await request.json()
         track_id = body.get("track_id", "")
         source = body.get("source", "joox")
@@ -1743,13 +1765,12 @@ def create_app(
         async def _chunks():
             yield raw
 
-        await storage.users.provision(BGM_LIBRARY_USER)
         try:
             result = await ingest_bytes(
                 storage, _chunks(),
                 filename=filename,
-                user_id=BGM_LIBRARY_USER,
-                conversation_id=BGM_LIBRARY_CONV,
+                user_id=user_id,
+                conversation_id=None,
                 origin="bgm",
             )
         except IngestRejected as e:

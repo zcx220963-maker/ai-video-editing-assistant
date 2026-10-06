@@ -62,6 +62,7 @@ class McpManager:
         if row is None:
             raise McpManagerError(f"MCP server {name!r} 未注册")
         config = MCPServerConfig.from_dict(name, row.get("config") or {})
+        owner_user_id = row.get("owner_user_id")
         transport = self._transport_factory(config) if self._transport_factory else None
         client = await connect_server(config, transport)
         try:
@@ -75,7 +76,10 @@ class McpManager:
                     f"MCP server {name!r} 的工具与现有工具撞名：{clashes}——"
                     f"请改名或调整 enabled_tools 后重试")
             for n in names:
-                self._registry.register(scratch.get(n))
+                tool = scratch.get(n)
+                if tool is not None:
+                    tool.owner_user_id = owner_user_id
+                self._registry.register(tool)
         except Exception:
             await client.close()
             raise
@@ -96,14 +100,18 @@ class McpManager:
         return names
 
     async def connect_enabled(self) -> dict[str, list[str]]:
-        """启动期入口：把库里所有 enabled 的 server 连起来。
+        """启动期入口：把库里所有 enabled 的**系统部署期** server 连起来。
 
+        只连 owner_user_id IS NULL 的（系统部署期配置，所有用户共享）。
+        用户个人添加的 MCP 不在启动时连——由用户 enable 时按需连。
         单个失败只告警跳过（与 mcp.json 接入同一口径），返回 {name: 工具名}。
         """
         connected: dict[str, list[str]] = {}
         for row in await self._storage.mcp_servers.list():
             if not row.get("enabled"):
                 continue
+            if row.get("owner_user_id") is not None:
+                continue  # 用户个人的 MCP 不在启动时连
             name = row["name"]
             try:
                 connected[name] = await self.connect(name)

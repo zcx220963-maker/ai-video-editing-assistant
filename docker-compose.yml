@@ -1,4 +1,4 @@
-# 上线存储层的本地依赖：PostgreSQL 16（元数据）+ MinIO（媒体字节）。
+﻿# 上线存储层的本地依赖：PostgreSQL 16（元数据）+ MinIO（媒体字节）。
 # 起停：docker compose up -d / docker compose down
 # 凭证是本机开发用的默认值；.env 里可覆盖，生产请用部署平台的密钥注入。
 # name 必须显式给出：项目目录名含非 ASCII 字符时 compose 无法从路径推导项目名。
@@ -86,7 +86,7 @@ services:
   app:
     image: creation-app:latest
     container_name: creation-app
-    command: python run_server.py --port 8000
+    command: python run_server.py --host 0.0.0.0 --port 8000
     environment: *app-env
     volumes:
       - whisper-cache:/root/.cache

@@ -665,7 +665,8 @@ class AgentOnceRun:
                     r.ctx.iteration = r.iteration
                     await self.hooks.before_iteration(r.ctx)
 
-                    resp = await self._invoke(r.ctx, r.messages, r.reg.get_definitions(),
+                    resp = await self._invoke(r.ctx, r.messages,
+                                              r.reg.get_definitions(user_id=r.ctx.session.user_id),
                                               stream, resuming)
                     if resp.wants_tools:
                         pause = await self._tool_round(r, resp)
@@ -1235,7 +1236,7 @@ class AgentOnceRun:
 
         def _resolve(name: str) -> Any:
             # 只有既安全又可并发的才补：写工具若没声明读写集，concurrency_safe=False
-            return reg.get(name)
+            return reg.get(name, user_id=ctx.session.user_id)
 
         def _make(name: str) -> ToolCall | None:
             # 参数留空：剪辑节点的公共入参（session_id/artifact_id/…）由拦截器
@@ -1309,7 +1310,8 @@ class AgentOnceRun:
             return r
 
         results: dict[str, object] = {}
-        for batch in plan_batches(tool_calls, reg.get):
+        _uid = ctx.session.user_id
+        for batch in plan_batches(tool_calls, lambda n: reg.get(n, user_id=_uid)):
             gathered = await asyncio.gather(*(_exec_one(tc) for tc in batch))
             results.update({tc.id: r for tc, r in zip(batch, gathered)})
         # 记下本 run 已执行过的节点：下一轮的 _expand_ready_siblings 据此判断

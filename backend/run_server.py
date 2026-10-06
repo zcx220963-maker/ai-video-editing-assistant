@@ -73,7 +73,7 @@ from agent_framework.llm import LLMClient
 from agent_framework.llm_openai import get_default_llm
 from agent_framework.memory import MemoryContextSource, MemoryStore, register_memory_tools
 from agent_framework.mq import MessageQueue, build_message_queue
-from agent_framework.server import BGM_LIBRARY_USER, create_app
+from agent_framework.server import create_app
 from agent_framework.session import SessionManager
 from agent_framework.storage import Storage, build_storage
 from agent_framework.skill import (
@@ -185,8 +185,9 @@ def bgm_enum_source(storage: Storage):
     async def _options(node: str, key: str) -> list[str]:
         if "bgm" not in (node or "").lower() or (key or "").strip() != "query":
             return []
-        rows = await storage.materials.list_visible(
-            BGM_LIBRARY_USER, None, origin="bgm", kinds=("audio",))
+        rows = await storage.materials.db.select(
+            storage.materials.table, where={"origin": "bgm"},
+            order_by=["-created_at"])
         stems: list[str] = []
         for r in rows[:BGM_ENUM_MAX_ITEMS]:
             name = Path(str(r.get("filename") or "")).stem.strip()

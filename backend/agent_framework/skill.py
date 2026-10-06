@@ -144,8 +144,8 @@ class SkillLoader:
             display=str(fm.get("display", "") or ""),
         )
 
-    async def discover(self) -> list[Skill]:
-        return [self._to_skill(r) for r in await self._skills.list()]
+    async def discover(self, user_id: str | None = None) -> list[Skill]:
+        return [self._to_skill(r) for r in await self._skills.list(user_id)]
 
     async def get(self, name: str) -> Skill | None:
         row = await self._skills.get(name)
@@ -166,10 +166,12 @@ class SkillLoader:
         entry = next(f for f in skill.files if f["relpath"] == relpath)
         return await self._objects.presign_get(entry["object_key"], ttl_sec=ttl_sec)
 
-    async def sync_from_dir(self, skills_dir: str | Path) -> list[str]:
+    async def sync_from_dir(self, skills_dir: str | Path,
+                            *, owner_user_id: str | None = None) -> list[str]:
         """导入源 → 库里一份：正文 upsert 进 skills，SKILL.md 以外的文件进对象存储。
 
         幂等：同名技能整体覆盖（附件清单以最新一次导入为准）。
+        owner_user_id 为 None 表示系统内置（共享），填了表示用户个人添加（私有）。
         """
         root = Path(skills_dir)
         if not root.is_dir():
@@ -199,7 +201,8 @@ class SkillLoader:
                 files.append({"relpath": rel, "object_key": key, "bytes": len(data)})
             await self._skills.upsert(name, body,
                                       description=meta.get("description", ""),
-                                      frontmatter=meta, files=files)
+                                      frontmatter=meta, files=files,
+                                      owner_user_id=owner_user_id)
             # 附件生命周期随 skill_files（spec §4）：新清单没沿用的旧对象要清掉
             keep = {f["relpath"] for f in files}
             for stale in (previous or {}).get("files") or []:
@@ -209,12 +212,14 @@ class SkillLoader:
         return imported
 
     async def import_zip(self, filename: str, data: bytes,
-                         *, max_bytes: int = 20 * 1024 * 1024) -> list[str]:
+                         *, max_bytes: int = 20 * 1024 * 1024,
+                         owner_user_id: str | None = None) -> list[str]:
         """上传技能包（zip）→ 解到临时目录 → 走同一份 sync_from_dir（幂等覆盖）。
 
         包形状两种都收：根上直接 SKILL.md，或若干顶层目录各含 SKILL.md。
         安装面做三道防线：大小上限、条目数上限、zip-slip（压缩包内路径越界）拒收。
         返回导入的技能名清单。
+        owner_user_id 填了归属本人（私有），None 表示系统内置（共享）。
         """
         if not (filename or "").lower().endswith(".zip"):
             raise ValueError("技能包必须是 .zip 文件")
@@ -241,7 +246,7 @@ class SkillLoader:
                 for p in list(root.iterdir()):
                     if p != sub:
                         shutil.move(str(p), str(sub / p.name))
-            return await self.sync_from_dir(root)
+            return await self.sync_from_dir(root, owner_user_id=owner_user_id)
 
     async def drop(self, name: str) -> int:
         """删技能：删行的同时清掉它的附件对象，否则对象成为永不被引用的孤儿字节。
@@ -278,8 +283,8 @@ class SkillManifestContextSource:
     def __init__(self, loader: SkillLoader) -> None:
         self._loader = loader
 
-    async def render(self, query: str) -> str | None:  # noqa: ARG002 (query 预留给未来匹配)
-        skills = await self._loader.discover()
+    async def render(self, query: str, *, user_id: str | None = None) -> str | None:  # noqa: ARG002 (query 预留给未来匹配)
+        skills = await self._loader.discover(user_id)
         if not skills:
             return None
         manifest = "<skills>\n" + "\n".join(s.manifest_lines() for s in skills) + "\n</skills>"

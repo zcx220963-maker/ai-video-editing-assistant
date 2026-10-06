@@ -91,8 +91,11 @@ class ContextSource(Protocol):
 
     name: str
 
-    async def render(self, query: str) -> str | None:
-        """返回要注入的一段文本；返回 None / 空串表示本轮不注入。"""
+    async def render(self, query: str, *, user_id: str | None = None) -> str | None:
+        """返回要注入的一段文本；返回 None / 空串表示本轮不注入。
+
+        user_id 为当前会话用户，用于按用户隔离的 ContextSource（如技能清单）。
+        """
         ...
 
 
@@ -233,7 +236,7 @@ class ContextBuilder:
                 parts.append(f"<runtime>\n{rt}\n</runtime>")
 
         for source in self.context_sources:
-            section = await source.render(current_input)
+            section = await source.render(current_input, user_id=session.user_id)
             if section:
                 parts.append(f"<{source.name}>\n{section.strip()}\n</{source.name}>")
 
