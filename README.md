@@ -684,10 +684,14 @@ docker compose --profile app up -d --build    # + editor(:8001) + app(:8000) + c
   `artifacts` / `checkpoints` 只按 `sess-*` 连接会话记账,schema 里**没有身份列也没有外键**,删身份带不走它们。
   2026-10-09 按「只留一个真实账号」的口径清了能归属的那半:**3140 个身份 / 连带 4257 行 / 桶里 138 个对象 5.2 GB**,
   系统内置的 6 条技能与 1 条 MCP(`owner_user_id` 为 NULL)不在级联范围内,清完仍在。
-  **剩下的堆积仍是 `sess-*` 那批**:artifacts 1329、checkpoints 869 + checkpoint_entries 2745、render_jobs 853、
-  tasks 606、subagents 303,以及桶里不认身份的顶层前缀 `renders/` 2.0 GB、`motion-shots/` 22.8 MB、`derived/` 3.4 MB
+  **剩下的堆积是 `sess-*` 那批**：artifacts、checkpoints + checkpoint_entries、render_jobs、subagents、tasks、
+  task_edges，以及桶里不认身份的顶层前缀 `renders/`、`motion-shots/`、`derived/`
   —— 这批**没有任何字段能对回账号**(实测 0 行命中 `conversations.id`),所以「只保留某账号的」这个口径表达不出来,
-  只有全留与全删两个选项,目前没有自动收口入口。
+  只有全留与全删两个选项。2026-10-09 选了全删，入口是新加的 `scripts/wipe_session_tables.py`
+  （同样默认 dry-run，`--apply` 才动手；本机当天清掉 6.9k 行 + 293 个对象 / 2.05 GB，桶里只剩内置技能与一个账号）。
+  **但这是清账不是修好**：这些表按 run 只增不减，没有 TTL 也没有自动回收，跑一阵就会重新涨回来。
+  两条口径记在这里：`scheduled_jobs` 里那行 `heartbeat` 是系统自己的 30 秒任务，**不属于历史产物**，
+  清理名单故意不含它；`default` / `cron` 两个内部身份删了会在下次启动自检时重新登记，不算数据丢失。
   落地时踩到的两点:`purge_identities.py` 刻意只认逐个点名的 id(批量口径要自己生成清单再喂 `xargs`);
   删完桶里会留下**0 字节的目录标记**——`objects.head(前缀/)` 仍然打得开而 `list_prefix` 不列它,
   拿 head 判「对象还在不在」会误判成没删干净。
