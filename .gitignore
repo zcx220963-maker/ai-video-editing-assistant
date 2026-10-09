@@ -65,7 +65,8 @@ backend/pytest.ini
 backend/start.bat
 
 # ---- 本地参考件与别的 CLI 的配置（不入库）----
-# openchatcut/Dockerfile 在构建时自己 git clone 上游，这 121 MB 只是本地翻代码用的参考克隆
+# OpenChatCut 已从本项目摘除（compose 里没有它的服务，构建它的 Dockerfile 也删了）；
+# 这 121 MB 是摘除之前留在本地翻代码用的上游克隆，留着不碍事，进库才是碍事
 openchatcut-src/
 # 另一个 CLI 的忽略文件，内容由本文件同步出去，再入库就是两份互相抄
 .zcodeignore

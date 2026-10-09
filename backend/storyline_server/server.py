@@ -41,7 +41,7 @@ HANGING_TIMEOUT_SEC = 30 * 60   # spec §9：running 超 30 分钟视为进程�
 # 出片与局部改都在这一集合里——局部差的那一版通常只重烧几镜，但「几镜」也可能是
 # 全部（用户改了全局字号那类），按最坏耗时归类。后续若 ASR/VL 批也顶不住，加进来即可。
 LONG_RUNNING_NODES = frozenset({"render_video", "render_motion_video",
-                                "patch_motion_video"})
+                                "patch_motion_video", "patch_video"})
 
 _JSON_TYPE_MAP = {"string": str, "integer": int, "number": float,
                   "boolean": bool, "array": list, "object": dict}

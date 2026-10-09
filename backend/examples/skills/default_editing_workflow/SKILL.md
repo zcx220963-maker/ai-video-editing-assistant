@@ -45,3 +45,22 @@ description: 【WORKFLOW SKILL】通用剪辑流程。适用于任何视频剪�
 - 给 plan_timeline* 传 keep_original_audio=true。
 - 该模式下：时间线总长由口播决定，字幕直接用 ASR 原文，配音环节自动跳过，空镜循环铺底。
 - 素材里必须包含带人声的视频（asr → speech_rough_cut 会产出口播段）。
+
+# 出片之后要改哪里：局部改（patch_video）
+
+片已经出来了，用户说的是「第二句字幕错一个字」「这截画面往后挪两秒拿」「这个盖层换成那张图」
+「这段配音换一条」——这些都不该重跑流程，更不该重渲整片。**只有**要改段数、顺序、总长或整条
+叙事结构时才重走 plan_timeline* → render_video（那几件一改，画面就挪到别的口播句子底下了，
+那不叫局部改）。
+
+- `edits`：逐格改值，每条 `{pointer, value, segment_id}`。**pointer 必须原样取自那一版成片
+  自带的命中表**（形如 `/subtitles/7/text`、`/events/2/src_end`）——不要自己拼字段名，也不要拿
+  另一版的表来读。表在渲染回执顶层 `hitmap` 那个对象键里，HTTP 侧走
+  `GET /timeline/hitmap?artifact_id=<那一版>`。带上 `segment_id` 后，指针与段号对不上就整批拒收；
+  不报错地改到别的段上，是这条链路最贵的失败。
+- 必须带 `base_artifact_id`（上一版返回体顶层的 `artifact_id`）。它自带的命中表指纹要与所改的
+  那版时间线一致；不一致就是「拿着旧表改新片」，会被拒收，此时唯一出路是重新出片（顺带重新量表）。
+- **产出一条新版本**：新的 `artifact_id`、新的成片，旧版一个字节都不动，可以直接播回去或对比。
+- 渲染是分钟级任务：返回 `status=queued/running` 就继续调 `render_status`，别在提交那一轮就宣布改完了。
+- 返回里的 `segment_cache` 会写明这次真烧了哪几窗、哪几窗直接复用上一版字节（`patch` 里还有
+  「应当重烧哪几窗」的比对账）。那句话是给用户看的账，照它说，别替它加「已全面复核」。

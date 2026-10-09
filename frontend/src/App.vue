@@ -184,10 +184,9 @@ async function loadHistory(cid, force) {
       }
     }
     histories[cid] = list;
-    if (hasMedia && cid === active.value) {
-      activePanel.value = 'timeline';
-      showChatcutEditor.value = true;
-    }
+    // 重放只是把旧会话摆出来，不是「刚剪完一条」——这里只切到时间线面板，
+    // 不自动弹任何编辑器（弹模态会盖住用户本来要看的对话）。
+    if (hasMedia && cid === active.value) activePanel.value = 'timeline';
     scrollDown();
   } catch (_) {
     /* 回填失败不打断使用：新会话本来就还没有历史 */
@@ -380,8 +379,6 @@ const loadingTimeline = ref(false);
 const renderingTimeline = ref(false);
 const renderProgress = ref(null);
 const timelineError = ref("");
-const showChatcutEditor = ref(false);
-const chatcutUrl = `${window.location.protocol}//${window.location.hostname}:5199`;
 
 function libSelCount() {
   return Object.keys(libSelected).filter((k) => libSelected[k]).length;
@@ -698,7 +695,6 @@ async function importLatestTimeline() {
 
 async function openTimeline(tl) {
   timelineError.value = "";
-  showChatcutEditor.value = false;
   try {
     await ensureIdentity();
     const r = await fetch(`/timelines/${tl.id}`, { headers: authHeaders() });
@@ -1369,13 +1365,27 @@ const PLAN_VALUE_TEXT = { true: "开", false: "关" };
 // 计划确认弹窗：待确认的计划卡自动弹出，用户操作后收起；消息流里留一条轻量状态行。
 const planModal = ref(null);
 
-// 「选区改」编辑器：只在成片卡带命中表时才开（图形科普片那条路的产物才有这张表）。
+// 「选区改」编辑器：只在成片卡带命中表时才开（两条剪辑链出片时都会量这张表）。
 const motionEditor = ref(null);
 function openMotionEditor(card) {
   if (!card || !card.hitmap || !card.artifactId) return;
   motionEditor.value = card;
 }
 function closeMotionEditor() { motionEditor.value = null; }
+// 当前会话最后一条成片卡：时间线面板那个按钮开得起来与否，只看它带没带命中表。
+const latestMediaCard = computed(() => {
+  const cid = active.value;
+  if (!cid) return null;
+  const list = msgs(cid) || [];
+  for (let i = list.length - 1; i >= 0; i--) if (list[i].kind === "media") return list[i];
+  return null;
+});
+// 唯一的编辑入口：带命中表的成片都开自研编辑器——表单由表自己声明形态
+// （图形科普片有空间框能框选；口播/素材片没有，就在按轨道的时间线上点一段）。
+// 没有命中表 = 这一版出片时没量到，按区域选着改无从谈起，这里就是空操作。
+function openEditorFor(card) {
+  if (card && card.hitmap && card.artifactId) motionEditor.value = card;
+}
 // 局部改出来的新版本也是一张成片卡：推进消息流，刷新后由 /convs/{id}/messages 重放接手续。
 function onMotionPatched(p) {
   const cid = active.value;
@@ -2172,18 +2182,19 @@ function onFrame(cid, p) {
     // 成片回投：MediaCardHook 从 render_video 工具结果捕获 media_url → 播放卡片
     if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
     closeRenderBar(cid, { state: "done", percent: 100, stage: "done" });
-    msgs(cid).push({
+    const card = {
       role: "assistant", kind: "media", state: "done",
       text: p.title || "成片已渲染",
       url: p.media_url, duration: p.duration, evidence: p.evidence || [],
-      // 「选区改」的开关：判据从产物里带出来（只有图形科普片那条路的终态带命中表），
+      // 「选区改」的开关：判据从产物里带出来（两条剪辑链的终态都带命中表键），
       // 不由前端猜——按钮摆上去点了却 404，等于骗用户这一版能选着改。
       artifactId: p.artifact_id, hitmap: !!p.hitmap,
-    });
+    };
+    msgs(cid).push(card);
     scrollDown();
     if (cid === active.value) {
       activePanel.value = 'timeline';
-      showChatcutEditor.value = true;
+      openEditorFor(card);
     }
   } else if (p.type === "tool_call") {
     if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
@@ -3230,7 +3241,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                   <a :href="m.url" download>下载成片</a>
                   <!-- 开关来自产物自己带的命中表：没有表就只能整片重做，按钮摆上去点了也是 404 -->
                   <button v-if="m.hitmap && m.artifactId" class="clip mc-patch"
-                          title="在画面上框住要改的那块，只重烧受影响的那几镜"
+                          title="点住要改的那处，只重烧受影响的那几段：图形科普片在画面上框，口播/素材片在轨道上点"
                           @click="openMotionEditor(m)">✂ 选区改</button>
                   <span v-else class="mc-nopatch">这一版不能选着改（出片时没量到命中表）</span>
                 </div>
@@ -4151,31 +4162,23 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       </div>
 
       <div v-if="activePanel === 'timeline'" class="timeline-panel">
-        <div v-if="timelineError && !showChatcutEditor" class="set-v bad">{{ timelineError }}</div>
+        <div v-if="timelineError" class="set-v bad">{{ timelineError }}</div>
 
-        <template v-if="showChatcutEditor">
-          <div class="tl-edit-toolbar">
-            <button class="clip ghost" @click="showChatcutEditor = false">← 返回列表</button>
-            <span class="td-desc" style="margin-left:auto">OpenChatCut 可视化编辑器</span>
-          </div>
-          <iframe
-            :src="chatcutUrl"
-            class="chatcut-iframe"
-            allow="clipboard-read; clipboard-write; fullscreen"
-            sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-presentation allow-downloads"
-          ></iframe>
-        </template>
-
-        <template v-if="!editingTimeline && !showChatcutEditor">
+        <template v-if="!editingTimeline">
           <div class="tl-toolbar">
-            <button class="clip" @click="showChatcutEditor = true">🎬 可视化编辑</button>
+            <button class="clip" :disabled="!latestMediaCard || !latestMediaCard.hitmap"
+                    :title="latestMediaCard
+                             ? (latestMediaCard.hitmap ? '' : '这一版出片时没量到命中表：只能整片重做')
+                             : '当前会话还没有成片卡'"
+                    @click="openEditorFor(latestMediaCard)">✂ 可视化编辑（选区改）</button>
             <button class="clip ghost" @click="importLatestTimeline">从当前会话导入</button>
             <button class="clip ghost" @click="loadTimelineList" :disabled="loadingTimeline">
               {{ loadingTimeline ? "刷新中…" : "刷新" }}
             </button>
           </div>
           <div v-if="!timelineList.length && !loadingTimeline" class="lib-empty">
-            还没有保存的时间线。点击「从当前会话导入」获取 AI 生成的最新时间线，或点击「可视化编辑」打开 OpenChatCut 编辑器。
+            还没有保存的时间线。点击「从当前会话导入」获取 AI 生成的最新时间线；
+            出片后点「可视化编辑」直接进选区改（成片带命中表时才开得了，两条剪辑链都一样）。
           </div>
           <div v-for="tl in timelineList" :key="tl.id" class="tl-item" @click="openTimeline(tl)">
             <b>{{ tl.name }}</b>
@@ -4397,7 +4400,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 
     <!-- 统一提问卡已改为内嵌在对话流里（见上方消息列表末尾），不再用弹窗挡住上下文 -->
 
-    <!-- 成片卡上的「✂ 选区改」：在画面上框住要改的那块，只重烧受影响的那几镜 -->
+    <!-- 成片卡上的「✂ 选区改」：表单形态由那张命中表自己声明——有空间框就框选，
+         只有段落就在按轨道的时间线上点。两条链共用这一个编辑器，故不传形态提示。 -->
     <MotionEditor v-if="motionEditor" :artifact-id="motionEditor.artifactId"
                   :conv-id="active" :media-url="motionEditor.url" :title="motionEditor.text"
                   @close="closeMotionEditor" @patched="onMotionPatched" />
@@ -4977,13 +4981,6 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 .pipe-step em { font-style: normal; font-size: 10.5px; }
 
 .timeline-panel { padding: 12px 16px; overflow-y: auto; }
-.chatcut-iframe {
-  width: 100%;
-  height: calc(100vh - 120px);
-  border: 1px solid var(--ink20, rgba(0,0,0,.12));
-  border-radius: 6px;
-  display: block;
-}
 .tl-toolbar, .tl-edit-toolbar {
   display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;
 }

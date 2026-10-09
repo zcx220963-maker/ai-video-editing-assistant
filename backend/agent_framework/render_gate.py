@@ -32,12 +32,13 @@ WEB_NODE = "render_web"
 #: 它不是 submit+poll 的长任务，所以只有门覆盖它，进度条那一路仍按长任务节点认。
 RENDER_NODES = frozenset({RENDER_NODE, MOTION_NODE, WEB_NODE})
 
-#: 图形科普片的**局部改**通道。名字在这里出现但**不进** ``RENDER_NODES``，是有意的：
+#: **局部改那一族**：``patch_motion_video``（图形科普片）与 ``patch_video``（口播/素材片）。
+#: 名字在这里出现但**不进** ``RENDER_NODES``，是有意的：
 #: 门要拦的是「用户还没看过任何东西，模型就按下了一次几分钟、不可逆的算力」。
-#: 走到局部改时用户手里已经有一版成片，改哪一格是他自己点的（前端选区 → POST /motion/patch），
-#: 而且这一版只重烧受影响的那几镜——缓存命中的切片一个像素都不重烧。
-#: 要重做整片仍然只能走 ``render_motion_video``，那道门照旧开着。
-PATCH_MOTION_NODE = "patch_motion_video"
+#: 走到局部改时用户手里已经有一版成片，改哪一格是他自己点的（前端选区 → POST /motion/patch
+#: 或 /timeline/patch），而且这一版只重烧受影响的那几镜/那几个窗口——缓存命中的切片一个像素都不重烧。
+#: 要重做整片仍然只能走 ``render_motion_video`` / ``render_video``，那两道门照旧开着。
+PATCH_NODES = frozenset({"patch_motion_video", "patch_video"})
 
 # 渲染确认的选项。key 会作为 decision 回喂给服务端并进模型上下文，
 # 所以用自解释的短词而不是 opt1/opt2。

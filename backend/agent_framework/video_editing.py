@@ -423,6 +423,33 @@ class PatchMotionVideoNode(BaseNode):
         }
 
 
+class PatchVideoNode(BaseNode):
+    name = "patch_video"
+    display_name = "口播片局部改"
+    description = ("改一版已出片的口播/素材片：按命中表指针改某几段的字幕/画面取的区间/盖层/素材，"
+                   "只重烧受影响的窗口，产出一个新版本（旧版原样留着）")
+    # 与真节点同：没有 DAG 上游——要改的东西全在 base_artifact_id 那一版里
+    required_nodes: list[str] = []
+    require_explicit_call = True
+
+    async def process(self, state, inputs):
+        # 与真节点（storyline_server/nodes/core_nodes.py PatchVideoNode）同形状：
+        # strictly mock——不读编辑包、不验指纹、不烧像素，离线只验「口播链的局部改也在白名单里、
+        # 且不会被拦截器当成 render_video 的下游自动补齐」。
+        artifact = state.artifact_id or "_default"
+        object_key = f"renders/{_safe(state.session_id)}/{_safe(artifact)}.mp4"
+        edits = inputs.get("edits") or []
+        return {
+            "video": object_key,
+            "media_url": f"memory://creation-assets/{object_key}?ttl=3600",
+            "duration": 0.0, "width": 0, "height": 0, "title": "口播片",
+            "patch": {"base_artifact_id": str(inputs.get("base_artifact_id") or ""),
+                      "changed_ids": [str(e.get("segment_id") or "") for e in edits
+                                      if isinstance(e, dict)],
+                      "removed_ids": [], "reordered": False},
+        }
+
+
 ALL_NODE_CLASSES = [
     # 输入阶段 → 素材处理层 → 逻辑与脚本层 → 时间轴规划层 → 最终输出
     SearchMediaNode, LoadMediaNode,
@@ -432,7 +459,7 @@ ALL_NODE_CLASSES = [
     TransitionRecNode, TextRecNode, GenerateVoiceoverNode, SelectBGMNode,
     PlanTimelineNode, PlanTimelineProNode, PlanTimelineAITransitionNode,
     RenderVideoNode, RenderWebNode, PlanMotionNode, RenderMotionVideoNode,
-    PatchMotionVideoNode,
+    PatchMotionVideoNode, PatchVideoNode,
 ]
 
 

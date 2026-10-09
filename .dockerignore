@@ -10,6 +10,7 @@ backend/.smoke
 backend/.tmp
 backend/.runtime
 frontend/dist
-openchatcut
-openchatcut-src
+# 构建上下文是仓库根(compose 里 editor: build: .)。OpenChatCut 虽然摘除了，
+# 这份 121 MB 的上游参考克隆还在本地没删——不忽略它，每次 build 就白传一遍。
+openchatcut-src/
 *.tar

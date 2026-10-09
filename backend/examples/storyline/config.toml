@@ -24,8 +24,8 @@ available_nodes = [
     "transition_rec", "text_rec", "generate_voiceover", "select_BGM",
     "plan_timeline", "plan_timeline_pro", "plan_timeline_ai_transition",
     "render_video", "render_web", "plan_motion", "render_motion_video",
-    # 局部改：只对已出片的某一版重烧受影响的镜，不重做整片。
-    "patch_motion_video",
+    # 局部改：只对已出片的某一版重烧受影响的镜/窗口，不重做整片。
+    "patch_motion_video", "patch_video",
     # 控制面工具（非 DAG 节点）：read_node_history 读 Store，render_status 轮询渲染任务。
     # 少了 render_status，模型收到「去轮询」的指示却没有可轮询的工具，等于没改。
     "read_node_history", "render_status",

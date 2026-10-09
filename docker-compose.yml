@@ -136,24 +136,12 @@ services:
         condition: service_started
     profiles: ["app"]
 
-  openchatcut:
-    build: ./openchatcut
-    container_name: creation-openchatcut
-    ports:
-      - "127.0.0.1:5199:5199"
-    environment:
-      OPENCHATCUT_MCP_TOKEN: occ-mcp-token-2026
-    volumes:
-      - openchatcut-data:/root/.openchatcut
-    profiles: ["app"]
-
 volumes:
   pgdata:
   miniodata:
   whisper-cache:   # faster-whisper 模型缓存(容器化部署时,首次下载持久化)
   caddy-data:      # Caddy 证书与配置
   app-runtime:     # 应用运行时(工作区/对象缓存,跨容器重启保留)
-  openchatcut-data: # OpenChatCut 项目与媒体数据
 
 # ---- 生产部署:应用栈(profiles: app)----
 # 默认 `docker compose up -d` 只起存储层(本地开发);

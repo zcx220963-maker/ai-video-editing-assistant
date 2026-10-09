@@ -498,27 +498,30 @@ class AgentOnceRun:
         ``interactive=False``（到点自动跑的定时任务）：所有「拦下来问用户」的门
         一概跳过，否则没人能来点确认，run 会永久挂起。
         """
-        ids = [str(m) for m in attachments if str(m).strip()]
-        rows, rejected = await self._resolve_attachments(session, ids)
-        messages = await self.context_builder.build(
-            session, message, attachments=rows, rejected_attachments=rejected,
-            extra_sections=extra_sections,
-        )
-        # 附件随 user 行入库（spec §5 步骤 7）：先落库再进循环，崩溃恢复时这轮信息不丢。
-        await self._persist_user_message(session, message, ids)
-        cp: Checkpoint | None = None
-        if self.checkpoint is not None:
-            cp = await self.checkpoint.begin(
-                session.session_id, message, messages, run_id,
-                scope={"storyline_session": storyline_session_id(
-                    session.user_id, session.conversation_id), "artifact_id": "",
+        # 身份要覆盖整条 await 链，**建上下文也算在内**：素材按 owner 过滤靠它，而历史超过
+        # 压缩阈值时 context_builder 里的摘要同样是一次 LLM 调用——密钥按当前身份从
+        # app_secrets 热读，绑定晚一步就取到空值，整轮死在「未配置模型密钥」上
+        # （真机 run=95ebb22a2be6：规划轮历史短没触发压缩，确认后的执行轮一上来就压）。
+        with use_identity_or_inherit(session.user_id, session.conversation_id):
+            ids = [str(m) for m in attachments if str(m).strip()]
+            rows, rejected = await self._resolve_attachments(session, ids)
+            messages = await self.context_builder.build(
+                session, message, attachments=rows, rejected_attachments=rejected,
+                extra_sections=extra_sections,
+            )
+            # 附件随 user 行入库（spec §5 步骤 7）：先落库再进循环，崩溃恢复时这轮信息不丢。
+            await self._persist_user_message(session, message, ids)
+            cp: Checkpoint | None = None
+            if self.checkpoint is not None:
+                cp = await self.checkpoint.begin(
+                    session.session_id, message, messages, run_id,
+                    scope={"storyline_session": storyline_session_id(
+                        session.user_id, session.conversation_id), "artifact_id": "",
                     # 轮次身份必须**落盘**：续跑（提问作答 / 审批 / 崩溃恢复）时没人再传
                     # ``planning`` 这个形参，只能从快照里读（见 ``_planning_run``）。
                     "planning": bool(planning)},
-                plan_run_id=plan_run_id,
-            )
-        # 身份对整条 await 链生效：素材按 owner 过滤要靠它，不能让模型自报
-        with use_identity_or_inherit(session.user_id, session.conversation_id):
+                    plan_run_id=plan_run_id,
+                )
             return await self._drive(
                 session, message, messages, 0, cp, stream, resuming=False, run_id=run_id,
                 registry=registry, approved_plan=approved_plan, planning=planning,

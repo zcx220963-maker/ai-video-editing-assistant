@@ -1,12 +1,20 @@
 <script setup>
-// 图形科普片的「选区改」编辑器（S3 轨道 + 命中层 + 框选，S5 局部改）。
+// 两条剪辑链共用的「选区改」编辑器（S3 轨道 + 命中层 + 框选，S5 局部改）。
 //
 // 为什么自己画这一层而不是嵌第三方剪辑器：要的是「鼠标框住屏幕上这一块，改的就是这一块」，
 // 而这件事只有我们的命中表（出片时量好的 元素框 ↔ 分镜字段 凭据）说得出对应关系。
 // 第三方剪辑器只认时间线与素材，框不出「这一格字属于 /shots/0/panel/编号」。
 //
-// 全部改动拼成一次 POST /motion/patch（不重做整片：后端只重烧受影响的那几镜），
-// 提交后轮询 GET /render_status——拒绝也落在轮询端的 error 正文里，HTTP 状态码不作判据。
+// 两种形态由**表自己声明**，不靠前端猜：
+// * 图形科普片（motion-hitmap/1）量的是浏览器里的框 → 画面上能框选、有整镜表单；
+// * 口播/素材片（segment-hitmap/1 + hit_mode=track）没有版式可量，每一段本来就是
+//   「第 s 秒到第 e 秒」→ 没有空间命中层，选段只能在时间线上点，表单是那一段的字段。
+// 两条链的口实现同一份（/motion/* 与 /timeline/* 落到同一个读表/取帧/提交函数），
+// 差别只在提交时的键：那条链收 edits/shot_sets/remove_shots/reorder，这条只收 edits
+// ——它的合同不改总长也不换序（画面与口播句子的对应是基准）。
+//
+// 全部改动拼成一次 POST，提交后轮询 GET /render_status——拒绝也落在轮询端的 error
+// 正文里，HTTP 状态码不作判据。
 import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
 
 const props = defineProps({
@@ -32,14 +40,21 @@ const chain = reactive([{ id: props.artifactId, url: props.mediaUrl }]);
 const hm = ref(null);
 const loadErr = ref("");
 const loading = ref(true);
+// 两个读表口在服务器端是同一份 bundle，先打哪个都拿得到；表一到手就以 hit_mode 定
+// 形态与写口——真正分岔的是提交补丁（那条链收 edits/shot_sets/remove_shots/reorder，
+// 这条只收 edits）与取帧的段号口径。
+const api = ref("/motion");
+const isTrack = computed(() => hm.value?.hit_mode === "track");
 
 async function loadHitmap(id) {
   loading.value = true; loadErr.value = ""; hm.value = null;
   try {
-    const r = await fetch(`/motion/hitmap?${qs({ artifact_id: id, conv_id: props.convId })}`,
+    const r = await fetch(`${api.value}/hitmap?${qs({ artifact_id: id,
+                                                      conv_id: props.convId })}`,
                           { headers: hdr() });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
     hm.value = await r.json();
+    api.value = isTrack.value ? "/timeline" : "/motion";
     resetEdits();
     await loadFrames(id, hm.value);
   } catch (e) {
@@ -56,8 +71,9 @@ async function frameUrl(aid, sid) {
   const key = `${aid}|${sid}`;
   if (key in frameUrls || key in frameMiss) return frameUrls[key] || "";
   try {
-    const r = await fetch(`/motion/frame?${qs({ artifact_id: aid, shot: sid,
-                                               conv_id: props.convId })}`, { headers: hdr() });
+    const r = await fetch(`${api.value}/frame?${qs({ artifact_id: aid, shot: sid,
+                                                    conv_id: props.convId })}`,
+                          { headers: hdr() });
     if (!r.ok) { frameMiss[key] = true; return ""; }
     frameUrls[key] = URL.createObjectURL(await r.blob());
     return frameUrls[key];
@@ -67,7 +83,10 @@ async function frameUrl(aid, sid) {
   }
 }
 async function loadFrames(aid, table) {
-  await Promise.all((table.timeline || []).map((t) => frameUrl(aid, t.id)));
+  // 口播链只有画面段有代表帧（表里那行的 frame 键为空就是没有）；图形科普片每镜都有。
+  const rows = table.timeline || [];
+  const want = table.hit_mode === "track" ? rows.filter((t) => t.frame) : rows;
+  await Promise.all(want.map((t) => frameUrl(aid, t.id)));
 }
 
 // ---- 指针：与后端 hitmap._segs 同口径（先解 ~1 再解 ~0）----
@@ -84,8 +103,15 @@ const timeline = computed(() => hm.value?.timeline || []);
 const shots = computed(() => hm.value?.shots || {});
 const baseIds = computed(() => timeline.value.map((t) => t.id));
 const idxOf = (sid) => baseIds.value.indexOf(sid);
-const shotBase = (sid) => (hm.value?.spec?.shots || [])[idxOf(sid)] || {};
-const baseValue = (p) => resolvePath(hm.value?.spec, segs(p));
+// 指针的根：那条链指向分镜 spec，这条指向表里嵌的那一版时间线（doc）。
+const docRoot = computed(() => (isTrack.value ? hm.value?.doc : hm.value?.spec) || {});
+const rowOf = (sid) => timeline.value.find((t) => t.id === sid) || null;
+const shotBase = (sid) => {
+  if (!isTrack.value) return (hm.value?.spec?.shots || [])[idxOf(sid)] || {};
+  const r = rowOf(sid);
+  return r ? ((docRoot.value[r.track] || [])[r.index] || {}) : {};
+};
+const baseValue = (p) => resolvePath(docRoot.value, segs(p));
 // 类型按原值收：图示的 value/x/y 契约上必须是数字，别等闸门把中文数字打回来。
 function coerce(p, raw) {
   const t = typeof baseValue(p);
@@ -99,19 +125,39 @@ const stageEl = ref(null), videoEl = ref(null), trackEl = ref(null);
 const playUrl = ref(props.mediaUrl);
 const cur = ref(0), playing = ref(false), muted = ref(true);
 const aspect = computed(() => (hm.value ? `${hm.value.width} / ${hm.value.height}` : "9 / 16"));
+// 「第几镜」在两种形态下指的是不同东西：那条链整条表就是镜序；这条链同一秒上
+// 画面/声音/字幕各有一行，跟着整条表跳会让标题来回换段，所以只看画面轨。
+const laneRows = computed(() => (isTrack.value
+  ? timeline.value.filter((r) => r.track === "events") : timeline.value));
 const curIdx = computed(() => {
-  const tl = timeline.value;
+  const tl = laneRows.value;
   if (!tl.length) return 0;
   let i = 0;
   tl.forEach((t, k) => { if (cur.value + 0.001 >= (t.start_sec || 0)) i = k; });
   return i;
 });
-const curSid = computed(() => timeline.value[curIdx.value]?.id || "");
-const entries = computed(() => (shots.value[curSid.value] || {}).entries || []);
+const curSid = computed(() => laneRows.value[curIdx.value]?.id || "");
+// 右侧面板对谁说话：轨道形态是用户点上的那一段，框选形态是播放头那一镜。
+const focusSid = computed(() => (isTrack.value ? selectedRow.value : curSid.value));
+const entries = computed(() => (shots.value[focusSid.value] || {}).entries || []);
 const headPct = computed(() => {
   const d = hm.value?.duration || 0;
   return d ? `${Math.min(100, (cur.value / d) * 100)}%` : "0%";
 });
+// ---- 轨道形态的时间线：每轨一行，块摆在自己的 start/时长上 ----
+// 那条链按镜序铺块（等宽 flex 就够了），这一条必须按**时间**铺：同一秒上画面/声音/
+// 字幕各有一段，只有按秒定位才看得出「这句字幕压在哪个画面上」。
+const lanes = computed(() => (hm.value?.tracks || [])
+  .map((t) => ({ ...t, rows: timeline.value.filter((r) => r.track === t.key) }))
+  .filter((l) => l.rows.length));
+const secPct = (v) => {
+  const d = Number(hm.value?.duration) || 0;
+  return d ? Math.max(0, Math.min(100, (Number(v) || 0) / d * 100)) : 0;
+};
+const barStyle = (r) => ({ left: `${secPct(r.start_sec)}%`,
+                          width: `${Math.max(1.6, secPct(r.sec))}%` });
+const rowIsNow = (r) => cur.value + 0.001 >= (r.start_sec || 0)
+  && cur.value < (r.start_sec || 0) + (r.sec || 0);
 function onTime() { if (videoEl.value) cur.value = videoEl.value.currentTime; }
 function toggle() {
   const v = videoEl.value; if (!v) return;
@@ -124,10 +170,19 @@ function seek(sec) {
 }
 
 // ---- 框选 / 点选：命中判定走 JS 盒，与框选同一条码路（不靠 DOM 事件）----
+// 轨道形态（口播/素材）没有这一层：那一版的段本来就是「第 s 秒到第 e 秒的一整幅画面」
+// 或「底部一条字幕带」，画面上没有任何一块可以框——选段改成在时间线上点。
 const selected = ref([]);
+const selectedRow = ref("");           // 轨道形态：点中的是哪一段
 const marquee = ref(null);
 const tab = ref("cells");
 let dragStart = null;
+function pickRow(sid) {
+  selectedRow.value = sid;
+  // 一段能改的字段全在那一行的条目里（timeline_edit 每条可改字段一条），一次选上
+  selected.value = ((shots.value[sid] || {}).entries || []).map((e) => e.id);
+  tab.value = "cells";
+}
 const norm = (ev) => {
   const r = stageEl.value.getBoundingClientRect();
   return { x: (ev.clientX - r.left) / r.width, y: (ev.clientY - r.top) / r.height,
@@ -143,7 +198,7 @@ const overlap = (a, b) => !(a.x + a.w < b.x || b.x + b.w < a.x
                             || a.y + a.h < b.y || b.y + b.h < a.y);
 
 function onStageDown(ev) {
-  if (ev.button !== 0 || !stageEl.value) return;
+  if (ev.button !== 0 || !stageEl.value || isTrack.value) return;
   dragStart = { ...norm(ev), moved: false };
   window.addEventListener("pointermove", onStageMove);
   window.addEventListener("pointerup", onStageUp, { once: true });
@@ -176,8 +231,9 @@ function onStageUp(ev) {
   selected.value = hit.length ? [hit[0].e.id] : [];
   tab.value = "cells";
 }
-// 换镜即清选区：选中的是「这一帧上的这一块」，跳到别的镜还留着就是拿旧框改新字
-watch(curSid, () => { selected.value = []; });
+// 换镜即清选区：选中的是「这一帧上的这一块」，跳到别的镜还留着就是拿旧框改新字。
+// 轨道形态不清：那里的选区是点段点出来的，播放头路过别的时间不改变「在改哪一段」。
+watch(curSid, () => { if (!isTrack.value) selected.value = []; });
 
 // 选中条目 → 按字段指针归组（一行的 key 与 value 常常同指一个 panel 键）
 const groups = computed(() => {
@@ -206,7 +262,16 @@ function resetEdits() {
   removals.value = [];
   order.value = [...baseIds.value];
   selected.value = [];
+  selectedRow.value = "";
 }
+// 指针 → 表里那条条目：轨道形态提交时要照它的 segment_id 一起交（闸门拿段号核对
+// 这张表量的是不是当前这一版），字段标签也从这里取。
+const entryByPointer = computed(() => {
+  const m = {};
+  Object.values(shots.value || {}).forEach((s) =>
+    (s.entries || []).forEach((e) => { if (e.field) m[e.field] = e; }));
+  return m;
+});
 function overrideFor(sid) {
   if (!overrides[sid]) {
     const s = shotBase(sid) || {};
@@ -217,6 +282,7 @@ function overrideFor(sid) {
   return overrides[sid];
 }
 function setEdit(p, value) {
+  if (isTrack.value) { deepEdits[p] = value; return; }
   const ss = segs(p);
   const sid = baseIds.value[Number(ss[1])];
   const field = ss[2];
@@ -232,6 +298,7 @@ function setEdit(p, value) {
 }
 function editValue(p) {
   if (p in deepEdits) return deepEdits[p];
+  if (isTrack.value) return baseValue(p);
   const ss = segs(p);
   const sid = baseIds.value[Number(ss[1])];
   const o = sid ? overrides[sid] : null;
@@ -254,6 +321,14 @@ function setFor(sid) {
 }
 const changedShots = computed(() => {
   const touched = new Set();
+  if (isTrack.value) {
+    // 轨道形态的指针中段是「该轨内的下标」，不能拿整条表的镜序去查——那是别的段
+    Object.keys(deepEdits).forEach((p) => {
+      const sid = String(entryByPointer.value[p]?.segment_id || "");
+      if (sid) touched.add(sid);
+    });
+    return touched;
+  }
   Object.keys(deepEdits).forEach((p) => {
     const sid = baseIds.value[Number(segs(p)[1])];
     if (sid) touched.add(sid);
@@ -379,6 +454,17 @@ const progress = reactive({ status: "", stage: "", percent: 0 });
 let pollAbort = false;
 
 function payload() {
+  if (isTrack.value) {
+    // 这条链只收指针补丁：段号逐字取自表，闸门拿它对「这张表量的是不是当前这一版」，
+    // 对不上就整批拒收。没有 shot_sets/remove_shots/reorder——那条合同不改总长也不换序。
+    const edits = Object.entries(deepEdits).map(([p, value]) => ({
+      pointer: p, value,
+      segment_id: String(entryByPointer.value[p]?.segment_id ?? ""),
+    }));
+    const body = { base_artifact_id: artifact.value, conv_id: props.convId, wait_sec: 0 };
+    if (edits.length) body.edits = edits;
+    return body;
+  }
   const edits = Object.entries(deepEdits).map(([p, value]) => ({
     pointer: p, value, shot: baseIds.value[Number(segs(p)[1])] || "",
   }));
@@ -399,6 +485,7 @@ function payload() {
 const planBits = computed(() => {
   const p = payload();
   const bits = [];
+  if (isTrack.value) return p.edits ? [`逐段 ${p.edits.length} 处`] : bits;
   if (p.edits) bits.push(`逐格 ${p.edits.length} 处`);
   if (p.shot_sets) bits.push(`整镜 ${p.shot_sets.length} 镜`);
   if (p.remove_shots) bits.push(`删 ${p.remove_shots.length} 镜`);
@@ -407,6 +494,11 @@ const planBits = computed(() => {
 });
 const plan = computed(() => (planBits.value.length ? planBits.value.join(" · ") : "还没有改动"));
 const rebakeNote = computed(() => {
+  if (isTrack.value) {
+    // 具体几窗由后端按「这一窗的输入清单变没变」点名（一句跨两窗的字幕要重烧两窗），
+    // 前端不替它猜数字，只说改动的段落在哪几段画面上。
+    return `改到 ${changedShots.value.size} 段 · 只重烧这些段压着的窗口`;
+  }
   const p = payload();
   const n = changedShots.value.size;
   if (!p.reorder || n) return `预计重烧 ${n} 镜`;
@@ -418,7 +510,7 @@ async function submit() {
   busy.value = "submitting"; failMsg.value = ""; done.value = null;
   progress.status = "queued"; progress.percent = 0; progress.stage = "提交中";
   try {
-    const r = await fetch("/motion/patch", {
+    const r = await fetch(`${api.value}/patch`, {
       method: "POST", headers: hdr({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload()),
     });
@@ -471,9 +563,15 @@ function finish(view, id) {
   const patch = view.patch || {};
   const base = String(patch.base_artifact_id || artifact.value);
   const before = patch.before_frames || {};
+  const cache = view.segment_cache || {};
   done.value = {
     id, base, url: view.media_url || "", duration: view.duration ?? null,
-    changed: patch.changed_shots || [], removed: patch.removed_shots || [],
+    // 对比帧摆的是**这次真重烧的那些窗**：轨道形态下改一句字幕，画面跟着变的
+    // 是它压着的那一到两窗，被点名的段 id 自己根本没有帧。
+    changed: isTrack.value ? (cache.rebuilt || []) : (patch.changed_shots || []),
+    segs: isTrack.value ? (patch.changed_ids || []) : (patch.changed_shots || []),
+    reused: cache.reused || [],
+    removed: patch.removed_ids || patch.removed_shots || [],
     reordered: !!patch.reordered, hadBefore: Object.keys(before).length,
     evidence: view.evidence || [],
   };
@@ -517,7 +615,7 @@ loadHitmap(props.artifactId);
   <div class="me-mask" @click.self="emit('close')">
     <div class="me-panel">
       <header class="me-head">
-        <b>✂ 选区改 · {{ title || "图形科普片" }}</b>
+        <b>✂ 选区改 · {{ title || (isTrack ? "口播 / 素材片" : "图形科普片") }}</b>
         <span class="me-art">在改版本 {{ artifact }}</span>
         <span v-if="dirty" class="me-dirty">未提交：{{ plan }} · {{ rebakeNote }}</span>
         <button class="me-x" @click="emit('close')">✕ 关闭</button>
@@ -526,24 +624,30 @@ loadHitmap(props.artifactId);
       <div v-if="loading" class="me-note pad">正在读这一版的命中表…</div>
       <div v-else-if="loadErr" class="me-err">
         {{ loadErr }}
-        <div class="me-sub">没有命中表就只能整片重做——屏幕上这一块对不回分镜的哪一格。
+        <div class="me-sub">没有命中表就只能整片重做——选中的这一块/这一段对不回时间线的哪一条。
           要让这一版可改，请重新出片一次（出片时顺手量表）。</div>
       </div>
 
       <template v-else-if="hm">
         <div class="me-body">
           <section class="me-left">
-            <div ref="stageEl" class="me-stage" :style="{ aspectRatio: aspect }"
-                 @pointerdown="onStageDown">
+            <div ref="stageEl" class="me-stage" :class="{ pick: isTrack }"
+                 :style="{ aspectRatio: aspect }" @pointerdown="onStageDown">
               <video ref="videoEl" :src="playUrl" :muted="muted" preload="metadata"
                      @timeupdate="onTime" @ended="playing = false"></video>
-              <div class="me-layer">
+              <div v-if="!isTrack" class="me-layer">
                 <span v-for="b in visibleBoxes" :key="b.id" class="me-hit"
                       :class="{ on: b.on, dead: b.dead }" :style="b.style"
                       :title="b.field || '量到了字，但回指不到分镜字段'"><i v-if="b.on">✎</i></span>
               </div>
               <div v-if="marquee" class="me-marquee" :style="boxStyle(marquee)"></div>
-              <div class="me-hint">在画面上<b>按住拖</b>框住要改的那块字/图，点一下选单格</div>
+              <div v-if="!isTrack" class="me-hint">
+                在画面上<b>按住拖</b>框住要改的那块字/图，点一下选单格
+              </div>
+              <div v-else class="me-hint">
+                这一版的段就是「第 s 秒到第 e 秒的一整幅画面」，画面上没有可框的格子：
+                <b>在下面按轨道点一段</b>
+              </div>
             </div>
 
             <div class="me-ctrl">
@@ -552,36 +656,70 @@ loadHitmap(props.artifactId);
                       @click="muted = !muted; videoEl && (videoEl.muted = muted)">
                 {{ muted ? "🔇 静音" : "🔊 有声" }}</button>
               <span class="me-time">{{ cur.toFixed(1) }}s / {{ (hm.duration || 0).toFixed(1) }}s
-                · 第 {{ curIdx + 1 }}/{{ timeline.length }} 镜（{{ curSid }}）</span>
+                · {{ isTrack ? "画面段" : "镜" }} {{ curIdx + 1 }}/{{ laneRows.length }}
+                （{{ curSid }}）</span>
               <span class="me-old">放着的是<b>这一版的原片</b>，改动要提交之后才看得见</span>
             </div>
 
-            <div ref="trackEl" class="me-track">
-              <div v-for="(b, i) in blocks" :key="b.sid" class="me-block"
-                   :class="{ del: b.removed, hot: b.sid === curSid }"
-                   :style="{ flexGrow: b.grow, flexBasis: 0 }"
-                   @pointerdown="onBlockDown($event, b.sid, i)">
-                <img v-if="b.thumb" :src="b.thumb" alt="" />
-                <div class="me-bk">
-                  <b>{{ i + 1 }} · {{ b.sid }}</b>
-                  <span>{{ b.sec.toFixed(1) }}s</span>
-                  <em v-if="b.want < b.floor" class="me-floor">拖到 {{ b.floor.toFixed(1) }}s
-                    以下无效：这一镜的时钟归配音</em>
+            <template v-if="!isTrack">
+              <div ref="trackEl" class="me-track">
+                <div v-for="(b, i) in blocks" :key="b.sid" class="me-block"
+                     :class="{ del: b.removed, hot: b.sid === curSid }"
+                     :style="{ flexGrow: b.grow, flexBasis: 0 }"
+                     @pointerdown="onBlockDown($event, b.sid, i)">
+                  <img v-if="b.thumb" :src="b.thumb" alt="" />
+                  <div class="me-bk">
+                    <b>{{ i + 1 }} · {{ b.sid }}</b>
+                    <span>{{ b.sec.toFixed(1) }}s</span>
+                    <em v-if="b.want < b.floor" class="me-floor">拖到 {{ b.floor.toFixed(1) }}s
+                      以下无效：这一镜的时钟归配音</em>
+                  </div>
+                  <button class="me-del" @click.stop="toggleRemove(b.sid)">
+                    {{ b.removed ? "↺ 恢复" : "✕ 删镜" }}</button>
+                  <span class="me-edge" @pointerdown="onResizeDown($event, b.sid)"></span>
                 </div>
-                <button class="me-del" @click.stop="toggleRemove(b.sid)">
-                  {{ b.removed ? "↺ 恢复" : "✕ 删镜" }}</button>
-                <span class="me-edge" @pointerdown="onResizeDown($event, b.sid)"></span>
+                <div class="me-playline" :style="{ left: headPct }"></div>
               </div>
-              <div class="me-playline" :style="{ left: headPct }"></div>
-            </div>
-            <div class="me-track-note">
-              块宽 ∝ 秒数 · 拖块身换序 · 拖右边缘改 min_duration_sec · 点块定位到那一镜 ·
-              改完合计约 {{ estTotal.toFixed(1) }}s（原来 {{ (hm.duration || 0).toFixed(1) }}s）
-            </div>
+              <div class="me-track-note">
+                块宽 ∝ 秒数 · 拖块身换序 · 拖右边缘改 min_duration_sec · 点块定位到那一镜 ·
+                改完合计约 {{ estTotal.toFixed(1) }}s（原来 {{ (hm.duration || 0).toFixed(1) }}s）
+              </div>
+            </template>
+
+            <template v-else>
+              <div class="me-lanes">
+                <div v-for="l in lanes" :key="l.key" class="me-lane">
+                  <div class="me-lanegd">{{ l.label }}<em>{{ l.rows.length }} 段</em></div>
+                  <div class="me-lanebody">
+                    <button v-for="r in l.rows" :key="r.id" class="me-seg"
+                            :class="{ on: r.id === selectedRow, now: rowIsNow(r) }"
+                            :style="barStyle(r)"
+                            :title="`${r.id} · ${r.start_sec}s 起 ${r.sec}s · ${r.label}`"
+                            @click="pickRow(r.id); seek(r.start_sec)">
+                      <img v-if="frameUrls[`${artifact}|${r.id}`]"
+                           :src="frameUrls[`${artifact}|${r.id}`]" alt="" />
+                      <b>{{ r.label }}</b>
+                      <span>{{ r.start_sec.toFixed(1) }}–{{ (r.start_sec + r.sec).toFixed(1) }}s</span>
+                    </button>
+                    <div class="me-playline" :style="{ left: headPct }"></div>
+                  </div>
+                </div>
+              </div>
+              <div class="me-track-note">
+                每行一条轨，块摆在这一段真实的起止秒上 · 点一段就在右侧改它的字段 ·
+                改字与换素材只重烧它压着的窗口。<b>改时长、删段、换序不在这张表里</b>：
+                那会打乱画面与口播句子的对应，请回计划卡重新出片。
+              </div>
+            </template>
 
             <div v-if="done" class="me-done">
               <b>✓ 新的一版：{{ done.id }}</b>
-              <span>改了 {{ done.changed.length }} 镜{{ done.changed.length
+              <span v-if="isTrack">改了 {{ done.segs.length }} 段{{ done.segs.length
+                     ? `（${done.segs.join("、")}）` : "" }}
+                · 重烧 {{ done.changed.length }} 窗（{{ done.changed.join("、") }}）
+                · 复用 {{ done.reused.length }} 窗没动过的字节
+                · 基于 {{ done.base }}，旧版字节原位还在</span>
+              <span v-else>改了 {{ done.changed.length }} 镜{{ done.changed.length
                      ? `（${done.changed.join("、")}）` : "" }}
                 · 删 {{ done.removed.length }} 镜{{ done.reordered ? " · 换过序" : "" }}
                 · 基于 {{ done.base }}，旧版字节原位还在</span>
@@ -593,9 +731,9 @@ loadHitmap(props.artifactId);
               <video class="me-new" :src="done.url" controls preload="metadata"></video>
               <div v-if="compare.length" class="me-cmp">
                 <div v-for="c in compare" :key="c.sid" class="me-cmpcol">
-                  <div class="me-cmphd">{{ c.sid }} 改前</div>
+                  <div class="me-cmphd">{{ c.sid }} 改前{{ isTrack ? "（那一窗）" : "（这一镜）" }}</div>
                   <img v-if="c.base" :src="c.base" alt="" />
-                  <div v-else class="me-noimg">旧版没留这一镜的代表帧</div>
+                  <div v-else class="me-noimg">旧版没留这一{{ isTrack ? "窗" : "镜" }}的代表帧</div>
                   <div class="me-cmphd">{{ c.removed ? "（已删，没有改后）" : "改后" }}</div>
                   <img v-if="c.after" :src="c.after" alt="" />
                   <div v-else-if="!c.removed" class="me-noimg">取帧失败</div>
@@ -611,8 +749,10 @@ loadHitmap(props.artifactId);
 
           <aside class="me-right">
             <div class="me-tabs">
-              <button :class="{ on: tab === 'cells' }" @click="tab = 'cells'">选中格</button>
-              <button :class="{ on: tab === 'shot' }" @click="tab = 'shot'">整镜 {{ curSid }}</button>
+              <button :class="{ on: tab === 'cells' }" @click="tab = 'cells'">
+                {{ isTrack ? "选中段的字段" : "选中格" }}</button>
+              <button v-if="!isTrack" :class="{ on: tab === 'shot' }"
+                      @click="tab = 'shot'">整镜 {{ curSid }}</button>
             </div>
 
             <div class="me-vers">
@@ -626,8 +766,14 @@ loadHitmap(props.artifactId);
 
             <div v-if="tab === 'cells'" class="me-cells">
               <div v-if="!selected.length" class="me-note">
-                还没框到东西。当前这一镜（{{ curSid }}）量到 {{ entries.length }} 格，
-                其中 {{ entries.filter((e) => e.field).length }} 格能回指到分镜字段。
+                <template v-if="isTrack">
+                  还没点段。在下面按轨道点一段——每一段能改的就是它的素材路径、进出点或文字。
+                  改完只重烧那一段压着的窗口，其余窗复用上一版字节。
+                </template>
+                <template v-else>
+                  还没框到东西。当前这一镜（{{ curSid }}）量到 {{ entries.length }} 格，
+                  其中 {{ entries.filter((e) => e.field).length }} 格能回指到分镜字段。
+                </template>
                 <div v-if="(shots[curSid] || {}).error" class="me-dead">
                   这一镜的表没量成：{{ (shots[curSid] || {}).error }}
                 </div>
@@ -640,9 +786,14 @@ loadHitmap(props.artifactId);
                       class="me-maybe">按文字近似对上，请核对</em>
                   <em v-else-if="g.hits.some((h) => h.ambiguous)" class="me-maybe">多处同字</em>
                 </div>
-                <div class="me-cellt">画面上是：{{ g.hits[0].text }}</div>
+                <div class="me-cellt">
+                  {{ isTrack ? g.hits[0].label : `画面上是：${g.hits[0].text}` }}
+                </div>
                 <template v-if="g.pointer">
-                  <input class="me-in" :value="editValue(g.pointer) ?? ''"
+                  <input class="me-in"
+                         :type="isTrack && typeof baseValue(g.pointer) === 'number' ? 'number' : 'text'"
+                         :step="isTrack ? '0.01' : undefined"
+                         :value="editValue(g.pointer) ?? ''"
                          @input="setEdit(g.pointer, coerce(g.pointer, $event.target.value))" />
                   <div class="me-sub">原值：{{ JSON.stringify(baseValue(g.pointer)) }}</div>
                 </template>
@@ -652,7 +803,7 @@ loadHitmap(props.artifactId);
               </div>
             </div>
 
-            <div v-else class="me-form">
+            <div v-else-if="!isTrack" class="me-form">
               <div class="me-frow">
                 <label>文案 text（字幕与配音同源，改这里等于换这一镜说的话）</label>
                 <textarea class="me-in" rows="2" :value="overrideFor(curSid).text ?? ''"
@@ -750,6 +901,7 @@ loadHitmap(props.artifactId);
 .me-left { min-width: 0; }
 .me-stage { position: relative; background: #141210; border-radius: 8px; overflow: hidden;
   max-height: 54vh; margin: 0 auto; cursor: crosshair; touch-action: none; }
+.me-stage.pick { cursor: default; }
 .me-stage video { width: 100%; height: 100%; display: block; object-fit: fill; }
 .me-layer { position: absolute; inset: 0; pointer-events: none; }
 .me-hit { position: absolute; border: 1px dashed transparent; border-radius: 2px; }
@@ -787,6 +939,23 @@ loadHitmap(props.artifactId);
 .me-playline { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--vermilion);
   pointer-events: none; }
 .me-track-note { font-size: 11px; color: var(--ink-soft); margin: 6px 0 0; }
+.me-track-note b { color: var(--vermilion); }
+.me-lanes { display: grid; gap: 4px; }
+.me-lane { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 6px; align-items: center; }
+.me-lanegd { font-size: 11px; color: var(--ink-soft); text-align: right; }
+.me-lanegd em { font-style: normal; display: block; font-size: 10px; opacity: .75; }
+.me-lanebody { position: relative; height: 34px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--paper-deep); overflow: hidden; }
+.me-seg { position: absolute; top: 2px; bottom: 2px; padding: 0 4px; border: 1px solid var(--line);
+  border-radius: 4px; background: #fff; overflow: hidden; cursor: pointer; text-align: left;
+  font: inherit; line-height: 1.25; white-space: nowrap; }
+.me-seg img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
+  opacity: .35; }
+.me-seg b, .me-seg span { position: relative; display: block; font-size: 10px; }
+.me-seg b { font-weight: 600; text-overflow: ellipsis; overflow: hidden; }
+.me-seg span { color: var(--ink-soft); }
+.me-seg.now { border-color: var(--gold); }
+.me-seg.on { border-color: var(--vermilion); background: rgba(200, 64, 31, .12); }
 .me-done { margin-top: 12px; border: 1px solid var(--gold); border-radius: 8px; padding: 10px;
   background: rgba(185, 138, 47, .08); font-size: 12px; display: grid; gap: 6px; }
 .me-done-act { display: flex; gap: 6px; flex-wrap: wrap; }

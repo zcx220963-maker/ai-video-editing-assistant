@@ -142,6 +142,7 @@ _ARTIFACT_HINTS = {
     "group_clips": "镜头分组",
     "select_BGM": "配乐选取",
     "render_video": "渲染成片",
+    "patch_video": "口播片局部改（只重烧改到的那几个窗口，不重做整片）",
     "plan_motion": "分镜 spec（每镜文案/版式/高亮词/出处）",
     "render_motion_video": "图形科普片成片",
     "patch_motion_video": "图形科普片局部改（只重烧改到的那几镜）",

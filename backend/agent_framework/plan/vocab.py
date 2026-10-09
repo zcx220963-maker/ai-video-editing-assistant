@@ -30,6 +30,9 @@ _IMPLICIT_SKILLS: dict[str, tuple[str, ...]] = {
     # 局部改改的就是同一份归一后的分镜（字段名与必填项一字不差），
     # 少了这份技能，模型会按 render_motion_video 的入参形状提交 edits，闸在入库前退它。
     "patch_motion_video": ("motion_explainer_skill",),
+    # 口播链的 patch_video **不挂**技能：它的 edits 是「命中表指针 + 值」，指针形状与可改字段
+    # 白名单全写在节点的 input_schema 里（执行轮模型本来就看得到），没有第二份需要随身带着的
+    # 字段字典。motion 那一路要带技能，是因为改的就是同一份归一后的分镜字段名。
 }
 
 

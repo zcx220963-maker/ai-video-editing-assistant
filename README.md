@@ -26,9 +26,11 @@
 - **必须先起 :8001 再起 :8000**:主服务在启动阶段建立 MCP 连接并拉取节点清单与 DAG 契约,连不上就是
   "无剪辑能力"(启动日志会明说),而不是运行到一半才失败;
 - Redis 是**可选服务**:单副本不带 `--broadcast-redis-url` 是设计口径,不是欠账。
-- **第三方剪辑器是并存的另一条编辑口**:`creation-openchatcut` 容器只监听 `127.0.0.1:5199`,数据在自己的卷
-  `openchatcut-data` 上,前端从「时间线」面板的「🎬 可视化编辑」以内嵌 iframe 打开它——它管**有素材那条链**的
-  整片重排;图形科普片的「按格局部改」走自己的选区改(§17),两边并存,不是一个替代另一个。
+- **编辑口只有一条,是自研的那条**:成片卡与「时间线」面板上的「🎬 可视化编辑」开的都是同一个
+  `MotionEditor` 选区改(§17)——它按成片自己带的命中表切形态:图形科普片露**画面上的框**
+  (`motion-hitmap/1`,有空间命中层),素材 / 口播片露**轨道上的段**(`segment-hitmap/1`,
+  `hit_mode="track"`,没有空间层);两者都只重烧受影响的那几块像素,第三方剪辑器已全部摘除,
+  也没有内嵌的外部编辑会话。
 
 ## 目录结构
 
@@ -39,7 +41,7 @@ backend/                  后端(Python 3.12+)
     plan/                 计划门(12 个模块:gate·vocab·validate·compile·prompt·reconcile·…)
     tools/                内置工具与 MCP 桥(mcp.py 把远程节点包成本地 Tool)
     storage/              PG 仓储 + MinIO 对象存储 + schema.sql(22 张表)
-  storyline_server/       MCP 剪辑服务:24 个节点、渲染分发器、看门狗、能力配置
+  storyline_server/       MCP 剪辑服务:25 个节点、渲染分发器、看门狗、能力配置
                           (motion/ 子包 = 零素材出片的契约·净化·图示·排版·出片五层)
   prompts/                提示词库(8 份 markdown,改文案不改代码)
   examples/               剪辑服务配置(config.toml / config.docker.toml)+ 6 个示例技能
@@ -79,11 +81,12 @@ Dockerfile                两阶段:node:20-alpine 出 dist → python:3.12-slim
 | 15 | 成片由 `MediaCardHook` 发 `media` 帧;卡片带五级证据账本(哪些机器验过、哪些只能人眼人耳) | `hooks.MediaCardHook` + `core_nodes.evidence_ledger` |
 | 16 | 收尾前:四条假称硬保证 + 判断模型第二意见;渲染未达终态**不许**结束本轮 | `agent._nudge_back` + `_follow_inflight_renders` |
 | 17 | 终答落 `messages`(含媒体部件),指针行置 `completed`;刷新后按 `qa.parts` 重放成片卡 | `agent._deliver` + `media_replay` |
-| 18 | **交付之后还有第二条回路**:成片卡带「✂ 选区改」→ 编辑器读命中表 → 鼠标框出一格得到字段指针 → `POST /motion/patch` fork 新版本(只重烧受影响那几镜)→ 新版本又成一张卡 | `MotionEditor.vue` + `server.motion_patch`(`@app.post("/motion/patch")`) + `nodes.PatchMotionVideoNode`,详见"核心机制 17" |
+| 18 | **交付之后还有第二条回路**:成片卡带「✂ 选区改」→ 编辑器读这一版自带的命中表 → 零素材片在画面上框出一格、口播片在轨道上点住一段,拿到的都是**字段指针** → `POST /motion/patch` / `POST /timeline/patch` fork 新版本(**只重烧受影响的那几镜 / 那几窗**)→ 新版本又成一张卡 | `MotionEditor.vue` + `server.motion_patch` / `server.timeline_patch` + `nodes.PatchMotionVideoNode` / `nodes.PatchVideoNode`,详见"核心机制 17" |
 
 **出片有两条终点通道**:素材在库里(或随消息给)走 `render_video`;用户只给一个**选题**、没有任何素材,
 走 `plan_motion` → `render_motion_video`——画面是排版画出来的,详见"核心机制 15"。**一条片子只走一条通道**,
-但"一个终点"不等于"一份产物":选区改会在零素材那个终点上继续 fork 出版本链(§17)。
+但"一个终点"不等于"一份产物":两条通道**都**能被选区改继续 fork 出版本链(§17),区别只在命中表
+是画面上的框还是轨道上的段。
 
 **回投帧的类型**(后端产出、前端消费):
 `connected` · `delta` / `stream_end` · `tool_call` / `tool_result`(带 `call_id`,并行同名调用靠它配对)·
@@ -340,10 +343,13 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
 记账与查询 `backend/agent_framework/retrieval.py`,设置页读写 `backend/agent_framework/server.py`
 (`/settings/search` 写、`/settings/search/test` 让页面当场拿一条查询试这路后端通不通),前端在「设置」页的检索后端区块。
 
-### 17. 选区改:框住画面上的一块,只重烧受影响的那几镜
+### 17. 选区改:框住画面上的一块 / 点住轨道上的一段,只重烧受影响的那几块
 
-零素材那条路出片后,用户想改的往往只是**屏幕上某一格的数字**。整片重做要再把几百帧截一遍,
-这不是「编辑」,是「重新出片」。这一节是那条回路。
+两条出片通道共用**同一个编辑器**(`frontend/src/MotionEditor.vue`),差别只在命中表的形态:
+零素材那条认的是**屏幕这一块**(`motion-hitmap/1`,带空间盒),素材 / 口播那条认的是
+**轨道这一段**(`segment-hitmap/1`,`hit_mode="track"`,没有空间层)。用户想改的往往只是某一格的数字
+或某一段的字幕——整片重做要再把几百帧截一遍、把没动的窗口重编一次,这不是「编辑」,是「重新出片」。
+这一节是那条回路。
 
 - **凭据先于交互**:出片时顺手量一张**元素命中表**(`nodes/motion_nodes.py` 的 `_publish_hitmap`),
   落 `renders/{会话}/{产物}/hitmap.json`——元素在画面上的盒(`x,y,w,h` 归一到 0..1)
@@ -360,7 +366,16 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
   行的 `qa.parts` 重放(`server.py::_render_media_views`)③执行轮还停在待确认、messages 里**还没有**
   assistant 行时从 `artifacts` 表兜底补卡(`server.py::_orphan_render_media`)。第三条真机栽过:
   兜底那段只拼了 `media_url/title/duration/evidence`,于是刷新一次,刚刚还能选着改的那一版按钮凭空消失
-  ——卡片看起来「不能改」会被用户读成「这一版坏了」,所以两个字段一个都不能省;
+  ——卡片看起来「不能改」会被用户读成「这一版坏了」,所以两个字段一个都不能省。
+  同一条兜底路还查出两处**只有盯着渲染出来的界面才会发现**的静默失真,已一并修:
+  ① 它把 artifacts 里的 `evidence` **原样**透给卡片,而卡片只认 `{claim,label,verified}` 这一份形状,
+  库里存的是节点原始出账(`status` 字段)——不折算就等于把验过的全显示成没验:那张中子星的卡片刷新后
+  读成「0 项有证据 · 14 项没验」,而它自己的账里明明有 9 条 `verified`。现在第三条路也过
+  `hooks._evidence_view` 折一次,三条路同一形状(证据分级是「这条片子说到什么程度」的唯一凭据,
+  把它显示成全没验,等于让用户白担心或白信);
+  ② 「✂ 选区改」的悬停提示写死了「在画面上框住要改的那块」,那句对**口播 / 素材片是错的**
+  (那条是在轨道上点住一段)。现在提示两条链各说一句——按钮的说明按链路形态给,不然用户照着提示去框,
+  在轨道形态下什么也框不出来;
 - **为什么不嵌第三方剪辑器**:第三方只认时间线与素材,框不出「屏幕这一块属于 `/shots/0/panel/编号`」。
   要的是「鼠标选中的那块就是待改的那格」,这件事只有自己的命中表说得出对应关系,所以编辑器自己画
   (`frontend/src/MotionEditor.vue`:命中层 + 框选 + 轨道 + 表单 + 对比帧);
@@ -385,11 +400,19 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
   改后在下——只改一镜时看到的就是上下两张,不是左右一对)。**帧字节走 fetch + Bearer 再转 blob**,
   因为 `<img>` 的 src 挂不上凭证。
 
-代码位:命中表 `backend/storyline_server/motion/hitmap.py`、切片缓存与代表帧
+代码位——**图形科普片那条**：命中表 `backend/storyline_server/motion/hitmap.py`、切片缓存与代表帧
 `backend/storyline_server/nodes/motion_nodes.py`(缓存键 `motion/render.py::shot_cache_key`,
-对象前缀 `motion-shots/{会话}/{镜头键}/`)、补丁校验 `motion/patch.py`、出片回投
-`backend/agent_framework/hooks.py`(`MediaCardHook`)、
-HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/motion/patch`),
+对象前缀 `motion-shots/{会话}/{镜头键}/`)、补丁校验 `motion/patch.py`;
+**素材 / 口播那条**：段 id 与命中表 `nodes/core_nodes.py`(`_seg_id` / `assign_segment_ids` /
+`_publish_segment_map`)+ `backend/storyline_server/timeline_edit.py`(窗口切分 `windows`、
+输入清单 `window_inputs`、缓存键 `segment_cache_key`、应重烧判定 `expected_rebuild_ids`、
+补丁指针 `read_pointer`),逐窗缓存与按窗渲染 `nodes/core_nodes.py::SegmentSliceCache` /
+`render_windowed`(前缀 `render-windows/{会话}/{窗口键}/`);
+**两条共用**:出片回投 `backend/agent_framework/hooks.py`(`MediaCardHook`)、
+HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/motion/patch` ·
+`/timeline/hitmap` `/timeline/frame` `/timeline/patch`——**读表与取帧两对是同一份实现**
+(`_hitmap_bundle` / `_frame_png` 只按会话 + 产物 + id 取字节,两条链的差别全在表里有没有空间层),
+只有 `/patch` 各走各的节点,
 前端 `frontend/src/MotionEditor.vue`(成片卡上的入口在 `App.vue` 的媒体气泡里)。
 真机验收 `.smoke/s3_ui_cdp.mjs`:本机 Chrome headless 经 CDP 驱动真实页面,注册一次性身份 →
 模型自己出分镜 → 等成片卡 → **鼠标按住拖出框选** → 改值 → 提交 → 轮询到新版本 → 看改前/改后帧 →
@@ -402,22 +425,69 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 「接着改这一版」把基线换成 A → 切「整镜」改文案 → 出版本 B(基于 A)→ **故意把文案换成不含高亮词
 的一句,闸门原话贴在面板上且一帧都没开始渲** → 「清空改动」收干净清单 → 拖块换序只记顺序账"。
 
-- **两条编辑口并存,各答各的问题**:`时间线` 面板里的「🎬 可视化编辑」内嵌 OpenChatCut(:5199,自己的卷
-  `openchatcut-data`),它认的是**时间线与素材**——有素材那条链要整片重排、逐轨微调用它。零素材图形科普片的
-  「屏幕上这一格数字改一下」它答不了:它拿不到分镜 spec,也就画不出「这块像素 ↔ `/shots/0/panel/编号`」,
-  所以那一侧走本节的选区改。**不是替代关系**,也不共享登录态(iframe 里是它自己的会话)。
+口播 / 素材那条的真机验收是**两半**:
+① 后端半边 `.smoke/t5_track_patch_smoke.py --user <身份>`——现造一条 6s/3×2s 带音轨的测试素材、
+手写一份三窗时间线(一条字幕**故意横跨两窗**)落进 `_default` 作用域、经 **MCP 通道**走
+`load_media` → `render_video(render_mode="segments")` → 轮询到终态,再断言:命中表有字节且
+`schema=segment-hitmap/1` / `hit_mode=track`、逐窗代表帧 3 张全可 HEAD、首渲账
+`segment_cache.windows=3` 且三窗全 `rebuilt`、表里 8 行(画面 3 / 声音 3 / 字幕 2)带 23 条可改字段、
+每条标了 `box_precision`。**为什么手写时间线**:这个验证身份没有可用模型密钥,而这一节要验的是
+「表 + 帧 + 逐窗缓存 + 补丁」这四件事,与谁来排时间线无关——预置一份 `plan_timeline` 产物正合
+`render_video` 的 `required_nodes`,拦截器不会自动补齐,也就不会去敲模型的门槛。
+**它不验证**「模型自己排出口播时间线」那一路,那一路由 §核心机制 12 的拦截器与既有真机用例覆盖。
+宿主机没有到 :8000/:8001 的路由,所以这套夹具是 `docker cp` 进 `creation-app` 里跑的
+(MCP 地址在容器内是 `http://editor:8001/mcp`)。最新一轮:**OK(0 failures)**。
+② 界面半边在真实页面上走完:卡片「✂ 选区改」开编辑器 → 三条轨道按秒铺块、段 id 与表一致 →
+点住那条横跨两窗的字幕(播放头落到 2.5s,当场写明落在画面段 `ev-22f922cf3f`)→ 表单给出
+`/subtitles/1/{text,style,start,end}`,数值字段是数字输入框 → 改文本提交 → 出版本 `c5bd33d3`,
+回执「改了 1 段(su-74c0c6a417) · 重烧 2 窗(ev-22f922cf3f、ev-11cd757080) · 复用 1 窗没动过的字节 ·
+基于 `_default`,旧版字节原位还在」→ 改前/改后**成对**贴帧,且改后那两张肉眼可见带着
+「第二句改过了:横跨两窗」——重烧范围与改动等价这件事,在这儿是看得见的。
+
+- **两条链,两种命中形态,一个编辑器**:编辑器读表里的 `schema` 与 `hit_mode` 决定给不给空间层——
+  `motion-hitmap/1` 画框、鼠标在画面上按住拖出即选中 `/shots/N/字段`;`segment-hitmap/1`
+  (`hit_mode="track"`)不画框,选中的是**轨道上那一段**,指针形如 `/subtitles/1/text`、`/video/2/start`。
+  两张表的键名刻意一致(`timeline` 排行、`shots/{id}.entries` 回指字段),所以前端只有一套面板代码,
+  差别是"用鼠标框"还是"在轨道上点"。表由 `nodes/core_nodes.py::_publish_segment_map` 在成片发布之后
+  顺手量出来,落 `renders/{会话}/{产物}/hitmap.json` + 逐窗 `frames/{窗口id}.png`;
+  **口播链的段 id 跟内容走、不跟位置走**(`_seg_id` / `assign_segment_ids`):按下标寻址的东西
+  会在用户拖一次顺序或改一句字幕后集体错位,结果是「改一处、重烧全片」;
+- **口播链的重烧按「窗」算**:`render_mode="segments"` 时成片被切成固定窗口,每窗一份输入清单
+  (`timeline_edit.py::window_inputs`)算出一个缓存键(`segment_cache_key`,键里带窗口 id 好让表和日志
+  按行找回自己),切片由 `nodes/core_nodes.py::render_windowed` 烧、存进
+  `SegmentSliceCache`(`render-windows/{会话}/{窗口键}/clip.mp4`)。补丁落笔后**逐窗比对输入清单**
+  (`timeline_edit.py::expected_rebuild_ids`)决定哪些窗非重烧不可——判据不是"哪些段被点名改过",
+  所以改一句字幕给出的是它压在的那一(跨边界就两)个画面窗。没动的窗按两级取字节:缓存命中直接取,
+  否则从上一版成片里切(`from=base_cut`)。**重烧范围与改动等价**是可核对的事实,不是话术:
+  真机改一条横跨两窗的字幕,回执「改了 1 段(su-74c0c6a417) · 重烧 2 窗(ev-22f922cf3f、ev-11cd757080)
+  · 复用 1 窗没动过的字节」,账本在产物 `output.segment_cache`(`ledger/reused/rebuilt/windows`),
+  `base_cut` 也计入复用,不谎称重烧;
+
+- **两条链的「另起版号」是同一条规则**:局部改分叉时,传入的版号是空、是 `_default`、
+  **或恰好等于本次的 base**,都得换一个新号——第三种最容易漏(前端「接着改这一版」把基线换成 A 之后
+  传回来的就是 A 自己的号),沿用即把 A 覆盖掉,而 A 那一版字节是这次改动唯一的退路;
+  已经是别的版本号则沿用,好让「接着改同一版」连续叠代。两条链的 `_fork` 各有一份离线用例钉它:
+  图形科普片那份用桩存储把四种输入各钉一次(`tests/test_motion_channel.py`),
+  口播那份直调 `_fork` 并回头核对 `v1` 的渲染任务行与成片字节都原位没动
+  (`tests/test_patch_video_render.py` 的 ⑤);
 
 **边界(不粉)**:① 服务端还没有「列出某会话全部版本」的口子,跨刷新找回旧版要在对话里报产物号;
-② `motion-shots/*` 的切片与代表帧**没有保留期**,一次改一版就多存一份,清理策略没定;
-③ 命中表只覆盖排版画出来的那几族版式,`custom` 自画里的文字同样能回指,但**框选精度取决于排版落点**;
-④ 画面上改了数字不会重跑配音——文案 `text` 与画面 `panel` 是两处,只改画面那一处时旁白仍念原话,
+② `motion-shots/*` 与 `render-windows/*` 的切片、代表帧**都没有保留期**,一次改一版就多存一份,
+清理策略没定;
+③ 零素材那条的命中表只覆盖排版画出来的那几族版式,`custom` 自画里的文字同样能回指,但**框选精度取决于排版落点**;
+④ 口播那条的表**带着框但不画框**:字幕条的框是按排版公式**估**出来的(`timeline_edit.subtitle_box`,
+`box_precision="estimated"`),其余轨道给整画布框(`derived`)——这张框只用来"万一以后要按空间点"时
+标明自己有多可信,当前 `hit_mode="track"` 下前端不画空间层,字段指针直接从 `doc` 取,与框无关;
+⑤ 画面上改了数字不会重跑配音——文案 `text` 与画面 `panel` 是两处,只改画面那一处时旁白仍念原话,
 这是选区改的语义,不是 bug,界面上两栏分开摆着。
 
-## 剪辑节点(24 个 DAG 节点)
+## 剪辑节点(25 个 DAG 节点)
 
-`available_nodes` 白名单里是 **24 个 DAG 节点**(`core_nodes.py` 的 20 个 + `web_nodes.py` 的 `render_web`
+`available_nodes` 白名单里是 **25 个 DAG 节点**(`core_nodes.py` 的 21 个 + `web_nodes.py` 的 `render_web`
 + `motion_plan.py`/`motion_nodes.py` 的 `plan_motion`、`render_motion_video`、`patch_motion_video`)
-**+ 2 个控制面工具** —— 走 MCP 暴露给模型的工具面共 **26 个**(启动日志那行报的就是这个数)。★ = 必须显式调用(不会被自动补齐)。
+**+ 2 个控制面工具**(`read_node_history`、`render_status`)—— 主服务那行启动日志报的
+「已接入 27 个剪辑节点」就是这 27 个。剪辑服务自己的 `nodes=25 tools=28` 多算了一个
+`dag_status`(编排预览用,没有包成模型工具)。★ = 必须显式调用(不会被自动补齐)。
 
 | 工具名 | 界面名 | 干什么 |
 |---|---|---|
@@ -441,12 +511,13 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 | `plan_timeline_pro` | 时间线编排·专业版 | 更细的编排策略 |
 | `plan_timeline_ai_transition` | 时间线编排·AI转场 | 带 AI 转场的编排 |
 | `render_video` | 成片渲染 | 出片(含 `dry_run` / `overlay_events` / `wait_sec`) |
+| `patch_video` | 口播片局部改 | 选区改的后端:读那一版自带的分段命中表 → 按指针改几段 → fork 新版本 → **只重烧受影响的那几窗**(其余按输入清单比对,从切片缓存直接取字节),`POST /timeline/patch` 提交的就是它 |
 | `render_web` | 网页渲染出片 | 浏览器侧出片路径 |
 | `plan_motion` | 图形科普片分镜 | 零素材通道第一站:校验/归一分镜 spec 并入库,回时长估算与偏离提醒(**不渲染**) |
 | `render_motion_video` | 图形科普片出片 | 逐帧截图出片(长耗时,提交后由 `render_status` 续问;支持顶层六开关覆盖) |
 | `patch_motion_video` | 图形科普片局部改 | 选区改的后端:fork 基线 spec → 按命中表指针改几格 → **只重烧受影响的那几镜**(其余从切片缓存直接取),`POST /motion/patch` 提交的就是它 |
 | `read_node_history` | 读取节点产物 | 控制面(非 DAG 节点):按节点名读该节点已产出的 Store 结果 |
-| `render_status` | 渲染进度查询 | 控制面:轮询出片与局部改提交的任务(`render_video` / `render_motion_video` / `patch_motion_video`),回 `status/stage/percent`,`done` 时同批回成片。**选区改的判决也走这里**——闸门退回的话在 `error` 正文里 |
+| `render_status` | 渲染进度查询 | 控制面:轮询出片与局部改提交的任务(`render_video` / `render_motion_video` / `patch_motion_video` / `patch_video`),回 `status/stage/percent`,`done` 时同批回成片。**选区改的判决也走这里**——闸门退回的话在 `error` 正文里 |
 
 ## 数据模型(22 张表)
 
@@ -478,8 +549,13 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
   **2026-10-08 真机复验**(`backend/.smoke/bgm_ui_cdp.mjs`,11/11):容器里搜到 20 首、导入 7.2MB/187s 落进曲库并挂上可播直链、
   把 `/bgm/search` 打成 502 时面板显式报「音乐源均无响应:…」而不是退回"没这首歌"的空状态
 - **渲染**:`POST /render_direct`(支持 `wait_sec` / `dry_run`) · `GET /render_status` · `/timelines*` · `GET /latest_timeline`
-- **图形科普片的选区改**:`GET /motion/hitmap`(这一版的元素命中表) · `GET /motion/frame`(按镜代表帧,回 PNG 字节) ·
-  `POST /motion/patch`(框选出来的补丁 → fork 新版本,只重烧受影响的那几镜)。**长任务,判据在轮询端的正文里**:
+- **选区改(两条链,各一对口)**:
+  图形科普片 `GET /motion/hitmap`(这一版的元素命中表,带空间盒) · `GET /motion/frame`(按镜代表帧,回 PNG 字节) ·
+  `POST /motion/patch`(框选出来的补丁 → fork 新版本,只重烧受影响的那几镜);
+  素材 / 口播 `GET /timeline/hitmap` · `GET /timeline/frame`(参数 `shot` 传的是**窗口 id**,与表里的行同名) ·
+  `POST /timeline/patch`(轨道上点住的那一段 → fork 新版本,只重烧受影响的那几窗)。
+  **读表与取帧两对共用同一份实现**(`server._hitmap_bundle` / `_frame_png`),只有 `/patch` 分头走
+  `patch_motion_video` 与 `patch_video`。**长任务,判据在轮询端的正文里**:
   闸门退回也表现为一路 200 + `status=failed` + `error`,HTTP 状态码不作判据
 - **扩展管理**:`/tools` · `/skills*`(含 .zip 技能包) · `/mcp/servers*`(热连热断)
 - **设置**:`/settings*`(模型密钥、主模型选型、判断模型三件套 + `POST /settings/judge/test` 连通性自检;

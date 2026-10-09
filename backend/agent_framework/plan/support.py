@@ -37,6 +37,11 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 两者都不是入参键，schema 扫不出来，不收就是假告警——技能正文教模型「拖镜头长度
     # 改的是 min_duration_sec」，被拦下来模型只能换个说法，读者反而看不到真字段名。
     "min_duration_sec", "before_frames",
+    # 口播 / 素材片那一路（patch_video）：segment_cache 是产物里的逐窗账
+    # （windows/rebuilt/reused/ledger 那一整块的顶层键名），segment_id 是补丁条目里
+    # 与指针交叉核对的段号。两者都不是入参键也不是工具名，不收就是假告警——
+    # 技能正文教模型「照 segment_cache 那份账说话」，被拦下来读者反而看不到真字段名。
+    "segment_cache", "segment_id",
 })
 
 MCP_PREFIX = "storyline_"

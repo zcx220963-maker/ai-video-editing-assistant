@@ -64,6 +64,7 @@ from .consumer import CHAT_TOPIC, SessionConsumer, session_key
 from .heartbeat import Heartbeat
 from .ingest import IngestRejected, ingest_bytes
 from .identity import storyline_session_id
+from .hooks import _evidence_view
 from .orchestration import _safe
 from . import judge as judge_mod
 from .llm_openai import (DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_THINKING,
@@ -249,7 +250,7 @@ async def _orphan_render_media(
             "artifacts",
             where=[Cond("session_id", "eq", sid),
                    Cond("node", "in", ["render_motion_video", "patch_motion_video",
-                                       "render_video"])],
+                                       "render_video", "patch_video"])],
             order_by=["-updated_at"], limit=5)
     except Exception:  # noqa: BLE001
         return []
@@ -279,7 +280,9 @@ async def _orphan_render_media(
             # 还没有 assistant 行），刷新一次按钮就凭空消失——而它刚刚还能用。
             "artifact_id": row.get("artifact_id") or payload.get("artifact_id"),
             "hitmap": bool(payload.get("hitmap")),
-            "evidence": list(payload.get("evidence") or []),
+            # 卡片只认 {claim,label,verified} 这一份形状，而 artifacts 里存的是节点原始
+            # 出账（status 字段）——不折算就等于把「验过的」全显示成「没验」。
+            "evidence": _evidence_view(payload.get("evidence")),
         })
     return out
 
@@ -2179,16 +2182,17 @@ def create_app(
                     break
         return {"timeline": payload, "source": node}
 
-    @app.get("/motion/hitmap")
-    async def motion_hitmap(artifact_id: str, conv_id: str = "",
-                            user_id: str = Depends(auth.http_user_id)
-                            ) -> dict[str, Any]:
-        """图形科普片的元素命中表（前端画选区、局部改验指纹都读这一份）。
+    async def _hitmap_bundle(artifact_id: str, conv_id: str, user_id: str) -> dict[str, Any]:
+        """产物作用域里的命中表（两条剪辑链共用同一份对象键布局）。
 
         为什么走本服务读字节而不发 presigned 直链：那是第二个 origin，CORS 与
         「一小时后读不通」都得在前端再处理一遍，而直链一旦进浏览器历史就等于把
         会话作用域的对象键交给了别人；这份 JSON 只在打开编辑器时读一次，几百 KB，
         直投更省事。对象键按调用者身份拼，别人会话里的表在这里同样是 404。
+
+        两条路径同实现：``render_motion_video`` 与 ``render_video`` 都把表写在
+        ``renders/{会话}/{产物}/hitmap.json``，表里的 ``schema`` 字段告诉前端这是
+        哪一种（``motion-hitmap/1`` 有空间框，``segment-hitmap/1`` 只有段与字段）。
         """
         sid = storyline_session_id(user_id, conv_id)
         key = f"renders/{_safe(sid)}/{_safe(artifact_id)}/hitmap.json"
@@ -2200,12 +2204,11 @@ def create_app(
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise HTTPException(500, f"命中表读出来不是合法 JSON：{exc}") from exc
 
-    @app.get("/motion/frame")
-    async def motion_frame(artifact_id: str, shot: str, conv_id: str = "",
-                           user_id: str = Depends(auth.http_user_id)) -> Response:
-        """某镜的代表帧（时间线缩略图与「改前 / 改后」对比都取这一张）。
+    async def _frame_png(artifact_id: str, shot: str, conv_id: str,
+                         user_id: str) -> Response:
+        """某一段（或某一键）的代表帧：时间线缩略图与「改前 / 改后」对比都取这一张。
 
-        与 ``/motion/hitmap`` 同一口径：对象键按调用者身份拼，别人的产物在这里是 404；
+        与 ``_hitmap_bundle`` 同一口径：对象键按调用者身份拼，别人的产物在这里是 404；
         发直链会把会话作用域的键漏进浏览器历史。为什么单独一口而不让前端从成片抽帧：
         那要每个缩略图开一次 ffmpeg/一次 seek，而代表帧在出片时就量好了——
         它和命中表是同一时刻的像素，正是点选与对比需要的那个时刻。
@@ -2213,37 +2216,55 @@ def create_app(
         sid = storyline_session_id(user_id, conv_id)
         key = f"renders/{_safe(sid)}/{_safe(artifact_id)}/frames/{_safe(shot)}.png"
         if await storage.objects.head(key) is None:
-            raise HTTPException(404, "没有这一镜的代表帧（这片子出片时没留，或产物已过期）")
+            raise HTTPException(404, "没有这一段的代表帧（这片子出片时没留，或产物已过期）")
         raw = b"".join([c async for c in storage.objects.get_stream(key)])
         return Response(content=raw, media_type="image/png")
 
-    @app.post("/motion/patch")
-    async def motion_patch(request: Request,
-                           user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """图形科普片的局部改：前端按命中表下补丁，只重烧受影响的那几镜。
+    @app.get("/motion/hitmap")
+    async def motion_hitmap(artifact_id: str, conv_id: str = "",
+                            user_id: str = Depends(auth.http_user_id)
+                            ) -> dict[str, Any]:
+        """图形科普片的元素命中表（前端画选区、局部改验指纹都读这一份）。"""
+        return await _hitmap_bundle(artifact_id, conv_id, user_id)
 
-        为什么单开一口而不是让模型转达：选区是鼠标框出来的，指针、镜号与新值浏览器全都
-        知道，绕模型一圈等于把「用户点的是哪一格」重新猜一遍——而猜错的指针会改到别的字
-        上，且不报错。走的仍是同一个节点（``reg.execute`` → MCP → submit+poll），所以闸、
-        缓存、产物形状与模型自己调这次局部改完全一致。
+    @app.get("/timeline/hitmap")
+    async def timeline_hitmap(artifact_id: str, conv_id: str = "",
+                              user_id: str = Depends(auth.http_user_id)
+                              ) -> dict[str, Any]:
+        """口播/素材片的分段命中表（``segment-hitmap/1``：段 + 可改字段，没有空间框）。"""
+        return await _hitmap_bundle(artifact_id, conv_id, user_id)
 
-        body：``base_artifact_id`` 必填，外加 edits / shot_sets / remove_shots / reorder /
-        bgm / target_duration_sec / wait_sec（语义见节点 input_schema）。返回体是工具回执：
-        顶层的 ``artifact_id`` 是**新版本**的号（轮询与播它都用这一个），``status`` 为
-        queued/running 时前端改轮询 ``GET /render_status?artifact_id=…``；done 时那里的
-        ``patch.before_frames`` 就是改前代表帧，可直接摆对比。
+    @app.get("/motion/frame")
+    async def motion_frame(artifact_id: str, shot: str, conv_id: str = "",
+                           user_id: str = Depends(auth.http_user_id)) -> Response:
+        """某一键的代表帧（图形科普片按镜号）。"""
+        return await _frame_png(artifact_id, shot, conv_id, user_id)
 
-        **拒绝也在 200 里**：本节点是长任务，闸门的话落在轮询端的 ``status=failed`` +
+    @app.get("/timeline/frame")
+    async def timeline_frame(artifact_id: str, shot: str, conv_id: str = "",
+                             user_id: str = Depends(auth.http_user_id)) -> Response:
+        """某一段的代表帧（口播链按窗口 id，与 ``/timeline/hitmap`` 里的行同名）。"""
+        return await _frame_png(artifact_id, shot, conv_id, user_id)
+
+    async def _patch_submit(node: str, body: dict[str, Any], user_id: str,
+                            keys: tuple[str, ...]) -> dict[str, Any]:
+        """局部改的提交：拼 args → 走同一个节点（MCP 注册表）→ 原样透出回执。
+
+        为什么单开 HTTP 口而不是让模型转达：选区是鼠标框出来的，指针、段号与新值浏览器
+        全都知道，绕模型一圈等于把「用户点的是哪一格」重新猜一遍——而猜错的指针会改到
+        别的字上，且不报错。走的仍是同一个节点（``reg.execute`` → MCP → submit+poll），
+        所以闸、缓存、产物形状与模型自己调这次局部改完全一致。
+
+        **拒绝也在 200 里**：这些节点是长任务，闸门的话落在轮询端的 ``status=failed`` +
         ``error`` 正文（真机验过：POST 立刻 200 queued，几秒后 error 说「请重新出片」）。
         所以前端认的是那份正文，不是 HTTP 状态码——下面那两条 422/500 只在**提交前**
         （注册表同进程、且异常是 ValueError）才可能走到，别把它们当判据。
         """
-        body = await request.json()
         base = str(body.get("base_artifact_id") or "").strip()
         if not base:
             raise HTTPException(400, "缺少 base_artifact_id（要改的是哪一版成片）")
         reg = getattr(getattr(agent, "runner", agent), "registry", None)
-        if reg is None or "patch_motion_video" not in reg:
+        if reg is None or node not in reg:
             raise HTTPException(503, "局部改工具不可用")
         conv_id = body.get("conv_id", "")
         try:
@@ -2258,14 +2279,11 @@ def create_app(
             "artifact_id": str(uuid.uuid4())[:8],
             "wait_sec": wait_sec,
         }
-        for k in ("edits", "shot_sets", "remove_shots", "reorder"):
-            if body.get(k):
-                args[k] = body[k]
-        for k in ("bgm", "target_duration_sec"):
+        for k in keys:
             if body.get(k) is not None:
                 args[k] = body[k]
         try:
-            raw = await reg.execute("patch_motion_video", args)
+            raw = await reg.execute(node, args)
         except ValueError as e:
             # 只有注册表在同进程时才会走到这里（隔 MCP 时已是工具错误）。
             # 消息本身就是一份「哪一格改成什么」的清单，原样透出，不另编文案。
@@ -2275,6 +2293,37 @@ def create_app(
         if is_tool_error(raw):
             raise HTTPException(500, str(raw))
         return json.loads(raw) if isinstance(raw, str) else raw
+
+    @app.post("/motion/patch")
+    async def motion_patch(request: Request,
+                           user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """图形科普片的局部改：前端按命中表下补丁，只重烧受影响的那几镜。
+
+        body：``base_artifact_id`` 必填，外加 edits / shot_sets / remove_shots / reorder /
+        bgm / target_duration_sec / wait_sec（语义见节点 input_schema）。返回体是工具回执：
+        顶层的 ``artifact_id`` 是**新版本**的号（轮询与播它都用这一个），``status`` 为
+        queued/running 时前端改轮询 ``GET /render_status?artifact_id=…``；done 时那里的
+        ``patch.before_frames`` 就是改前代表帧，可直接摆对比。
+        """
+        return await _patch_submit(
+            "patch_motion_video", await request.json(), user_id,
+            ("edits", "shot_sets", "remove_shots", "reorder", "bgm",
+             "target_duration_sec", "wait_sec"))
+
+    @app.post("/timeline/patch")
+    async def timeline_patch(request: Request,
+                             user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """口播/素材片的局部改：前端按分段命中表下指针补丁，只重烧受影响的那几个窗口。
+
+        body：``base_artifact_id`` 必填，外加 ``edits=[{pointer, value, segment_id}]`` 与
+        ``wait_sec``。这条链的合同是**不改总长也不改顺序**（段与口播句子的对应是基准），
+        所以没有 shot_sets / remove_shots / reorder 这些键——要那些请回计划卡重新规划。
+        回执形状与 ``/motion/patch`` 一致：顶层 ``artifact_id`` 是新版本号，``patch`` 里
+        有 ``expected_rebuild``（按输入比对应当重烧哪几窗）与 ``segment_cache.rebuilt``
+        （这次真烧了哪几窗），两者一致就是「只重烧受影响的段」的可核对说法。
+        """
+        return await _patch_submit("patch_video", await request.json(), user_id,
+                                   ("edits", "wait_sec"))
 
     # 前端构建产物（Vite → frontend/dist）存在时由本服务托管；
     # mount 放在最后：API 路由先匹配，其余路径落到静态站点（html=True 提供 index.html）。

@@ -542,8 +542,8 @@ class MediaCardHook(AgentHook):
                 "media_url": item["media_url"],
                 "title": item.get("title") or "",
                 "duration": item.get("duration"),
-                # 前端「选区改」按钮的开关：只有图形科普片那条路的终态带 hitmap
-                # （屏幕上这一块 ↔ 分镜那一格的凭据）。没有表就只能整片重做，
+                # 前端「选区改」按钮的开关：两条剪辑链的终态都带 hitmap（屏幕上这一块 /
+                # 时间线上这一段 ↔ 出片时量好的那份凭据）。没有表就只能整片重做，
                 # 按钮摆上去点了也是 404——所以判据从产物里带出来，不由前端猜。
                 "artifact_id": data.get("artifact_id") if isinstance(data, dict) else None,
                 "hitmap": bool(item.get("hitmap")),

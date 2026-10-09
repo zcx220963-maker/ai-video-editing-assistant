@@ -772,7 +772,9 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
         旧版片子自己不受影响：它的分镜存在自己那份编辑包里。
         """
         artifact = state.artifact_id or ""
-        if artifact in ("", "_default"):
+        if artifact in ("", "_default") or artifact == base:
+            # 等于 base 的那一种必须换号：沿用就是把旧版覆盖掉，而旧版留着才能
+            # 「改坏了直接播回去」——那一版片子是这次局部改唯一的退路。
             artifact = f"p{uuid.uuid4().hex[:8]}"
         payload = plan_payload(
             spec, target=target,

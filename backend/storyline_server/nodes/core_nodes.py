@@ -15,11 +15,13 @@ import hashlib
 import json
 import random
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 from collections.abc import Mapping
 
 from agent_framework.orchestration import (
+    ArtifactStore,
     BaseNode,
     NodeRegistry,
     NodeState,
@@ -28,6 +30,7 @@ from agent_framework.orchestration import (
 from agent_framework.storage import Storage, StorageUnavailable, to_ref
 
 from .. import mediaops
+from .. import timeline_edit as te
 from ..mediaops import MediaError
 from ..providers import ProviderError, Providers
 from ..settings import Settings
@@ -1964,6 +1967,70 @@ def render_plan(tl: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+SEG_ID_FIELDS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    # (列表键, id 前缀, 参与哈希的字段)  —— 刻意**不含** start/end：
+    ("events", "ev", ("path", "src_start", "src_end", "kind")),
+    ("audio_events", "au", ("path", "src_start", "src_end", "duration")),
+    ("subtitles", "su", ("text", "style")),
+    ("overlay_events", "ov", ("path", "text", "kind", "segments")),
+)
+
+
+def _seg_num(v: Any) -> str:
+    """把秒数归一成固定精度字符串：12 与 12.0 与 "12.000" 必须算同一段。"""
+    if isinstance(v, (list, tuple)):
+        return ",".join(_seg_num(x) for x in v)
+    if v is None:
+        return ""
+    try:
+        return f"{float(v):.3f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _seg_id(prefix: str, fields: tuple[str, ...], item: Mapping[str, Any]) -> str:
+    raw = "|".join(_seg_num(item.get(k)) for k in fields)
+    return f"{prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:10]}"
+
+
+def assign_segment_ids(tl: Any) -> int:
+    """给时间线每一段打上**稳定 id**（原地改写），返回打标条数。
+
+    为什么必须有它（口播链选区改的地基）：命中表要说「你点的这一块是哪一段」、切片缓存
+    要说「这一段的字节还能复用」、补丁指针要说「要改的是那一段的 src_end」——三者都
+    要一个**跨渲染认得出同一段**的名字。原先的 events 只有位置，没有身份：前端拖一次
+    顺序，按下标寻址的一切（缓存键、上一版补丁的指针、命中表的行）全部错位，改一句
+    字幕会把无关的段一起重烧。
+
+    所以 id 由**内容**算、不由位置算：path + 源区间（画面段）/ 文本（字幕段）。
+    推导出的区间：
+    · 拖拽改顺序 → 内容没变 → id 不变（缓存仍命中）。
+    · 改源区间或换素材 → 内容变了 → id 变了 → 那一段必然重烧，别的段不受牵连。
+    · 两段内容完全相同（空镜循环铺满会造出这种段）→ 加 #2/#3 后缀区分；它们字节相同，
+      后缀在两份相同内容之间怎么分配都不影响正确性。
+
+    必须在 `_localize_timeline` **之前**调用：本地化把对象键换成本机路径，之后再算
+    就和重启后/另一台实例算出的 id 不一致，缓存与指针都会失配。
+    """
+    if not isinstance(tl, dict):
+        return 0
+    total = 0
+    for key, prefix, fields in SEG_ID_FIELDS:
+        items = tl.get(key)
+        if not isinstance(items, list):
+            continue
+        seen: dict[str, int] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            base = _seg_id(prefix, fields, item)
+            n = seen.get(base, 0) + 1
+            seen[base] = n
+            item["id"] = base if n == 1 else f"{base}#{n}"
+            total += 1
+    return total
+
+
 def timeline_digest(tl: Any, *, max_drift: float, resynced: int) -> dict[str, Any]:
     """「实际被渲染的那一版」时间线的指纹，落进成片产物。
 
@@ -2147,7 +2214,11 @@ class RenderVideoNode(StoryNode):
         "render_mode": {
             "type": "string",
             "description": "渲染路径：auto（默认，先 MoviePy 失败再问用户）/ ffmpeg（直接用 ffmpeg 兜底渲染）/"
-                           "low_res（降分辨率重试 MoviePy）。auto 模式下 MoviePy 失败会返回可选方案让用户选，"
+                           "low_res（降分辨率重试 MoviePy）/"
+                           "segments（按窗口渲染：每一窗的字节单独进会话缓存，改过的窗重烧、"
+                           "没改的窗直接复用。第一次跑不比 auto 快——那时没有可复用的字节；"
+                           "它的价值从第二版起，也是 patch_video「选区改」走的那一条）/"
+                           "segmented（按 60 秒切段渲染再拼接）。auto 模式下 MoviePy 失败会返回可选方案让用户选，"
                            "不会静默兜底。",
         },
         "dry_run": {
@@ -2160,7 +2231,12 @@ class RenderVideoNode(StoryNode):
         },
     })
 
-    async def process(self, state, inputs):
+    async def process(self, state, inputs, *, base_film: Path | None = None,
+                      rebuild_ids: set[str] | None = None):
+        # ``base_film`` 只由 ``PatchVideoNode`` 传：那是「上一版成片的本机文件」，让没被
+        # 改动的窗口直接从旧片切，而不必回源片重烧。整片出片那一路永远是 None。
+        # ``rebuild_ids`` 是配套的「哪些窗口**不许**从旧片切」——旧片里那一窗烙的还是
+        # 改之前的字幕/画面，切过来就等于把用户的改动抹掉。
         store = state.store
         # 自定义时间线优先：agent 手写的时间线直接用，绕过规划工具
         tl = inputs.get("timeline")
@@ -2236,6 +2312,10 @@ class RenderVideoNode(StoryNode):
                      "所在的窗口，要么在它没有声音的位置改用空镜（不同源素材）。")
             await jobs.fail(sess, artifact, msg, attempt=attempt)
             raise ValueError(msg)
+        # 段 id 在**校准之后、本地化之前**打：校准可能改 src_start/src_end（那是段的
+        # 内容，改了就该是新 id），而本地化会把对象键换成本机路径（那不是段的内容，
+        # 换了不该让 id 漂移）。见 assign_segment_ids。
+        assign_segment_ids(tl)
         digest = timeline_digest(tl, max_drift=worst_drift, resynced=fixed)
         # 覆盖了哪几秒：锚点算出来的窗口只有这一份，写进产物才能事后核对
         # 「用户说盖了、到底盖在哪」（本地化之后 path 会变成本机路径，那时再取就没意义了）。
@@ -2263,6 +2343,10 @@ class RenderVideoNode(StoryNode):
         render_mode = (inputs.get("render_mode") or
                        (state.flags.get("render_mode") if getattr(state, "flags", None) else None) or
                        "auto")
+        # 本地化会把对象键换成本机路径，而缓存键与命中表要的是「这段片子指的是哪个对象」——
+        # 所以在**本地化之前**留住这一份。窗口键按它算，换台机器、换一次尝试都还能命中。
+        tl_canonical = copy.deepcopy(tl)
+        windowed: dict[str, Any] | None = None
         done = False
         try:
             tl = await _localize_timeline(tl, self.storage.workspace,
@@ -2278,6 +2362,13 @@ class RenderVideoNode(StoryNode):
                 await asyncio.to_thread(_render_with_moviepy, tl_low, dst, self.settings, probe)
             elif render_mode == "segmented":
                 await asyncio.to_thread(_render_segmented, tl, dst, self.settings, probe)
+            elif render_mode == "segments":
+                windowed = await render_windowed(
+                    tl, dst, self.settings, probe, canonical=tl_canonical,
+                    cache=SegmentSliceCache(self.storage.workspace, sess),
+                    base_film=base_film,
+                    rebuild_ids=rebuild_ids,
+                    work=self._work(state, "render", "win"))
             else:
                 try:
                     await asyncio.to_thread(_render_with_moviepy, tl, dst, self.settings, probe)
@@ -2321,6 +2412,12 @@ class RenderVideoNode(StoryNode):
             object_key = f"renders/{_safe(sess)}/{_safe(artifact)}.mp4"
             await self.storage.workspace.publish(
                 dst, object_key, content_type="video/mp4")
+            # 编辑用的附加产物：逐窗代表帧 + 命中表（见 _publish_segment_map）。
+            # 放在成片发布**之后**：这两样是给「选着改」用的，缺了只是这次不能选着改，
+            # 片子本身照发；反过来（先抽帧再发成片）会让一次抽帧异常拖掉这次出片。
+            seg_frames, hitmap_key, seg_notes = await self._publish_segment_map(
+                state, tl_canonical, dst, sess=sess, artifact=artifact,
+                windowed=windowed)
             await probe.drain()          # 迟到进度不能盖掉 done/100
             # 终态产物整份入库（不含会过期的 media_url）：提交 + 轮询的轮询端据此在
             # 任意实例、进程重启之后重建出与阻塞渲染同形状的结果。
@@ -2333,8 +2430,26 @@ class RenderVideoNode(StoryNode):
                        frame_reason=frame_reason),
                    "evidence_rule": "只有 status=verified 的条目能对用户声称验过；"
                                     "UNVERIFIED 的那几条要如实说没验过，别替它们背书"}
-            if overlay_notes:
-                out["notes"] = overlay_notes
+            if hitmap_key:
+                # 前端画选区、补丁那一头验指纹都直读这个对象键（不经模型上下文）
+                out["hitmap"] = hitmap_key
+            if seg_frames:
+                out["segment_frames"] = seg_frames
+            if windowed is not None:
+                out["segment_cache"] = {"windows": windowed["windows"],
+                                        "rebuilt": windowed["rebuilt"],
+                                        "reused": windowed["reused"],
+                                        "ledger": windowed["ledger"]}
+                out["evidence"].append(_ev(
+                    f"这次按窗口渲染：{len(windowed['rebuilt'])} 窗重烧、"
+                    f"{len(windowed['reused'])} 窗直接复用上一版字节",
+                    "machine", verified=True,
+                    proof="render_windowed 的逐窗台账（每一窗记 from=cached/base_cut/"
+                          "rendered 与它自己的 cache_key，可对回命中表）"))
+            notes = [*overlay_notes, *seg_notes,
+                     *((windowed or {}).get("degraded") or [])]
+            if notes:
+                out["notes"] = notes
             await jobs.succeed(sess, artifact, object_key, float(info["duration"]),
                                result=out, attempt=attempt or None)
             done = True
@@ -2351,6 +2466,69 @@ class RenderVideoNode(StoryNode):
         return {**out,
                 "media_url": await self.storage.objects.presign_get(object_key)}
 
+    async def _publish_segment_map(self, state, tl: dict[str, Any], film: Path, *,
+                                   sess: str, artifact: str,
+                                   windowed: Mapping[str, Any] | None
+                                   ) -> tuple[dict[str, str], str, list[str]]:
+        """逐窗代表帧 + 命中表 → 对象存储。回 ``({窗口 id: 帧对象键}, 命中表对象键, 账)``。
+
+        帧从**成片**抽（见 :func:`_window_frames`）：编辑器缩略图要给用户看的是「画面 +
+        字幕 + 覆盖层」叠完的结果，而缓存切片是叠字幕**之前**的字节——拿后者当缩略图，
+        「你看到的」和「你点到的」就对不上。
+
+        两份产物都发在**产物作用域**下而不是缓存键下：缓存键是内容哈希，改一个字就换
+        一条，拿它当缩略图地址等于用一条「下次就不存在」的引用。
+
+        命中表里带**这一版时间线本身与它的指纹**（见 timeline_edit.build_table）：局部改
+        那一头靠指纹判断这张表是不是当前这版量出来的，比对不上就拒收。
+
+        这一切失败都只记账，不改判这次渲染——缺了它只是这次不能选着改，片子照样能看。
+        """
+        say: list[str] = []
+        ledger = (windowed or {}).get("ledger") or []
+        cache_keys = {str(r.get("id")): str(r.get("cache_key") or "") for r in ledger}
+        cached = {str(r.get("id")): bool(r.get("cached")) for r in ledger}
+        marks = te.window_boundaries(tl)
+        ordered: list[str] = []
+        for s, _e in marks:
+            sid = te.window_id_at(tl, s)
+            if sid not in ordered:
+                ordered.append(sid)
+        if not ordered:
+            return {}, "", ["这份时间线排不出可点的窗口（画面轨是空的或全在同一秒）"]
+        try:
+            shots, frame_say = await asyncio.to_thread(
+                _window_frames, tl, film, ordered,
+                self._work(state, "render", "frames"))
+        except Exception as exc:  # noqa: BLE001 - 整批帧抽不成，命中表照出（没有缩略图）
+            shots, frame_say = {}, [f"逐窗代表帧整批没抽出来"
+                                   f"（{type(exc).__name__}: {str(exc)[:120]}）"]
+        say += frame_say
+        refs: dict[str, str] = {}
+        for sid, png in shots.items():
+            key = f"renders/{_safe(sess)}/{_safe(artifact)}/frames/{_safe(sid)}.png"
+            try:
+                await self.storage.workspace.publish(str(png), key,
+                                                     content_type="image/png")
+                refs[sid] = key
+            except Exception as exc:  # noqa: BLE001 - 缺一张缩略图不牵连整条片子
+                say.append(f"{sid}：代表帧没发布（{type(exc).__name__}: {str(exc)[:120]}）")
+        path = self._work(state, "render") / "hitmap.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(
+                te.build_table(tl, frames=refs, cached=cached, cache_keys=cache_keys,
+                               fade_styles=_fade_style_by_id(tl), errors=say),
+                ensure_ascii=False), encoding="utf-8")
+            key = f"renders/{_safe(sess)}/{_safe(artifact)}/hitmap.json"
+            await self.storage.workspace.publish(str(path), key,
+                                                 content_type="application/json")
+            return refs, key, say
+        except Exception as exc:  # noqa: BLE001 - 命中表是编辑用的附加产物
+            say.append(f"命中表没落进对象存储（{type(exc).__name__}: {str(exc)[:160]}）："
+                       "成片照常，但这次不能按段选着改")
+            return refs, "", say
+
     async def _dry_run(self, state, tl: dict[str, Any], *, artifact: str,
                        title: str) -> dict[str, Any]:
         """dry_run：把渲染前的每一道校验跑一遍，只回账、不出片。
@@ -2365,6 +2543,9 @@ class RenderVideoNode(StoryNode):
         work = copy.deepcopy(tl)
         fixed = resync_original_audio_timeline(work)
         worst, av_bad = av_sync_check(work)
+        # 与真渲染同一位置打标：dry-run 的 sha16 要能和真渲对上，
+        # 「看到的即是渲出来的」这条核对才成立。
+        assign_segment_ids(work)
         blocking = list(av_bad)
         try:
             await validate_timeline_objects(work, self.storage)
@@ -2672,11 +2853,10 @@ def _render_with_moviepy(tl: dict[str, Any], dst: Path, settings: Settings,
         handles.append(vc)
         vc = vc.subclipped(float(ev["src_start"]), float(ev["src_end"]))
         vc = vc.resized((w, h)).with_start(ev["start"])
-        style = None
-        if ev.get("kind") == "transition":
-            style = "fade"
-        elif i < len(styles):
-            style = styles[i]
+        style = ev.get("fade_style")
+        if style is None:
+            style = "fade" if ev.get("kind") == "transition" else (
+                styles[i] if i < len(styles) else None)
         if style in ("fade", "fadeblack", "dissolve"):
             vc = vc.with_effects([FadeIn(0.25), FadeOut(0.25)])
         layers.append(vc.with_position("center"))
@@ -2730,7 +2910,14 @@ def _render_with_moviepy(tl: dict[str, Any], dst: Path, settings: Settings,
             # 必须留住下面这个原始 clip，否则整条 BGM 的 wav 句柄没人能关。
             looped = AudioFileClip(bgm["path"])
             handles.append(looped)
-            bc = looped.with_effects([AudioLoop(duration=duration)])
+            # ``offset_sec`` 只有按窗口渲染时才写：这一段要播的是「整片第 off 秒起的
+            # 那一截配乐」。缺省 0 = 从头播，与整片渲染的行为逐字节一致。
+            off = float(bgm.get("offset_sec") or 0.0)
+            src_len = float(looped.duration or 0.0)
+            phase = off % src_len if src_len > 0 else 0.0
+            bc = looped.with_effects([AudioLoop(duration=phase + duration)])
+            if phase > 0:
+                bc = bc.subclipped(phase, phase + duration)
             bc = bc.with_effects([MultiplyVolume(bgm.get("volume", 0.2))])
             audio_items.append(bc)
         except Exception:
@@ -2789,34 +2976,628 @@ def _render_segmented(tl: dict[str, Any], dst: Path, settings: Settings,
                     "-c", "copy", str(dst))
 
 
-def _slice_timeline(tl: dict[str, Any], start: float, end: float) -> dict[str, Any]:
-    """从时间线中截取 [start, end) 区间的 events/audio_events/subtitles/overlay_events。"""
-    def _clip_events(events, key="events"):
+def _slice_window(tl: dict[str, Any], start: float, end: float) -> dict[str, Any]:
+    """时间线 → 只覆盖 ``[start, end)`` 这一窗口的**可独立渲染**副本（渲染期已本地化的路径）。
+
+    与老的 ``_slice_timeline`` 的差别只有一处，但那一处是致命的：配音段（``audio_events``
+    只有 ``path/start/duration``，没有源区间）跨过窗口边界时，旧写法把整段原样带进
+    两个窗口，于是**同一段配音在每个窗口里都从第一个字重播**。整片渲染看不见这个 bug
+    （只有一个窗口），按窗口切片渲染会把它变成「一句话讲两遍」。所以这里按窗口边界
+    显式算出源区间（``src_start/src_end``），``_render_with_moviepy`` 就只取该取的那一截。
+
+    配乐同理：每一段吃进去的是「这一窗口在整片时间里对应的那一截配乐」，用
+    ``bgm.offset_sec`` 表达（见 ``_render_with_moviepy``）。于是拼接出来的配乐是连续的，
+    而换配乐也如实进了缓存键。
+    """
+    def _clip(items: Any, *, audio: bool = False) -> list[dict[str, Any]]:
         out = []
-        for ev in events:
-            s, e = float(ev.get("start", 0)), float(ev.get("end", 0))
+        for ev in items or []:
+            if not isinstance(ev, Mapping) or ev.get("start") is None:
+                continue
+            s = round(float(ev.get("start") or 0.0), 3)
+            e = (round(float(ev["end"]), 3) if ev.get("end") is not None else
+                 round(s + float(ev.get("duration") or 0.0), 3))
             if e <= start or s >= end:
                 continue
             ns, ne = max(s, start), min(e, end)
-            offset = ns - s
+            shift = ns - s
             cut = {**ev, "start": round(ns - start, 3), "end": round(ne - start, 3)}
-            if "src_start" in ev and "src_end" in ev:
-                cut["src_start"] = round(float(ev["src_start"]) + offset, 3)
-                cut["src_end"] = round(float(ev["src_end"]) + offset, 3)
+            if ev.get("src_start") is not None:
+                cut["src_start"] = round(float(ev["src_start"]) + shift, 3)
+                if ev.get("src_end") is not None:
+                    cut["src_end"] = round(float(ev["src_end"]) + (ne - e), 3)
+                elif ev.get("src_end") is None and ev.get("src_start") is not None:
+                    cut["src_end"] = round(float(cut["src_start"]) + (ne - ns), 3)
+            elif audio:
+                # 没写源区间 = 「整文件从 start 播」：切片必须自己长出源区间
+                cut["src_start"] = round(shift, 3)
+                cut["src_end"] = round(shift + (ne - ns), 3)
+            if audio or "duration" in ev:
+                cut["duration"] = round(ne - ns, 3)
             out.append(cut)
         return out
+
     sliced = {
         "width": tl.get("width", 1280), "height": tl.get("height", 720),
         "fps": tl.get("fps", 25.0), "duration": round(end - start, 3),
-        "events": _clip_events(tl.get("events", [])),
-        "audio_events": _clip_events(tl.get("audio_events", [])),
-        "subtitles": _clip_events(tl.get("subtitles", [])),
-        "bgm": tl.get("bgm"), "transition_styles": tl.get("transition_styles", []),
+        "events": _clip(tl.get("events")),
+        "audio_events": _clip(tl.get("audio_events"), audio=True),
+        "subtitles": _clip(tl.get("subtitles")),
+        "bgm": tl.get("bgm"), "transition_styles": [],
         "mode": tl.get("mode", ""),
     }
+    # 转场样式原本按**整片**下标取（``transition_styles[i]``），切片之后下标全变了：
+    # 这里把它落进每一段自己身上（``fade_style``），渲染端按段读，窗口内外才一致。
+    styles = tl.get("transition_styles") or []
+    for i, ev in enumerate(tl.get("events") or []):
+        style = _fade_style_at(tl, styles, i)
+        for cut in sliced["events"]:
+            if cut.get("id") == ev.get("id") and style:
+                cut["fade_style"] = style
     if tl.get("overlay_events"):
-        sliced["overlay_events"] = _clip_events(tl["overlay_events"], "overlay_events")
+        sliced["overlay_events"] = _clip(tl["overlay_events"])
+    if sliced["bgm"]:
+        sliced["bgm"] = {**sliced["bgm"], "offset_sec": round(start, 3)}
     return sliced
+
+
+#: 老名字继续可用（分段渲染兜底路径与既有引用都在叫它）
+_slice_timeline = _slice_window
+
+
+def _fade_style_at(tl: Mapping[str, Any], styles: Any, i: int) -> str | None:
+    """第 i 段的转场样式：与 ``_render_with_moviepy`` **同一判据**，两处不能各写一份。"""
+    if str((tl.get("events") or [])[i].get("kind") or "") == "transition":
+        return "fade"
+    return styles[i] if styles and i < len(styles) else None
+
+
+def _fade_index_map(tl: Mapping[str, Any]) -> dict[int, str]:
+    styles = tl.get("transition_styles") or []
+    return {i: _fade_style_at(tl, styles, i) or ""
+            for i in range(len(tl.get("events") or []))}
+
+
+def _fade_style_by_id(tl: Mapping[str, Any]) -> dict[str, str]:
+    """窗口 id → 这一窗实际吃的转场样式（前端只认段 id，不认 events 的下标）。"""
+    by_id: dict[str, str] = {}
+    for i, ev in enumerate(tl.get("events") or []):
+        sid = str((ev or {}).get("id") or "")
+        style = _fade_style_at(tl, tl.get("transition_styles") or [], i)
+        if sid and style:
+            by_id[sid] = style
+    return by_id
+
+
+class SegmentSliceCache:
+    """按窗口的切片缓存：``render-windows/{会话}/{窗口键}/{clip.mp4,meta.json}``。
+
+    为什么键里带会话而不做全局共享：内容哈希相同的两段确实能复用，但对象键里带会话
+    才谈得上「这是谁的画面字节」——全局前缀等于把一条片子的帧交给任何算得出哈希的人。
+    复用真正发生的场景本来就在会话内：同一人同一对话里的重跑、以及选区改只重烧受影响段。
+
+    与图形科普片那条链的差别：那边一镜的像素是**浏览器逐帧截图**烧出来的（贵到必须缓存），
+    这边一段是从源片里剪出来的（MoviePy 一次合成）。缓存的价值不在省像素，而在
+    **让「只重烧受影响段」成为可核对的事实**。
+
+    读失败一律当未命中（重烧一遍即可），写失败由调用方记进 ``degraded``——
+    缓存坏了不该让出片失败。
+    """
+
+    FILES = ("clip.mp4", "meta.json")
+    _TYPES = {"clip.mp4": "video/mp4", "meta.json": "application/json"}
+
+    def __init__(self, workspace: Any, session_id: str) -> None:
+        self.ws = workspace
+        self.sess = session_id
+
+    def obj_key(self, key: str, name: str) -> str:
+        return f"render-windows/{_safe(self.sess)}/{key}/{name}"
+
+    async def fetch(self, key: str, dst_dir: Path) -> dict[str, Path] | None:
+        try:
+            if await self.ws.objects.head(self.obj_key(key, "meta.json")) is None:
+                return None
+        except Exception:                        # noqa: BLE001 - 探测失败当未命中
+            return None
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        out: dict[str, Path] = {}
+        for name in self.FILES:
+            try:
+                data = b"".join([c async for c in self.ws.objects.get_stream(
+                    self.obj_key(key, name))])
+            except Exception:                    # noqa: BLE001 - 缺一个文件即整体未命中
+                return None
+            if not data:
+                return None
+            (dst_dir / name).write_bytes(data)
+            out[name] = dst_dir / name
+        return out
+
+    async def store(self, key: str, src: dict[str, Path]) -> None:
+        for name in self.FILES:
+            p = src.get(name)
+            if p is None or not Path(p).exists():
+                raise FileNotFoundError(f"缓存缺文件：{name}")
+            await self.ws.publish(str(p), self.obj_key(key, name),
+                                  content_type=self._TYPES[name])
+
+
+#: 一次最多给多少个窗口抽代表帧（每帧一次 ffmpeg，几十秒的片子也就几十张）。
+MAX_SEGMENT_FRAMES = 200
+
+
+def _window_frames(tl: Mapping[str, Any], film: Path, sids: list[str],
+                   dst_dir: Path) -> tuple[dict[str, Path], list[str]]:
+    """从**渲好的成片**里按窗口取代表帧 → ({窗口 id: PNG}, 降级说明)。
+
+    为什么从成片抽而不是从缓存切片抽：成片里这一刻是「画面 + 字幕 + 覆盖层」叠完的
+    结果，编辑器的缩略图要给用户看的正是这个合成结果；而缓存切片是叠字幕**之前**的
+    一段，拿它当缩略图会让「你看到的」和「你点到的」对不上。
+    """
+    say = []
+    out: dict[str, Path] = {}
+    marks = te.window_boundaries(tl)
+    by_id = {te.window_id_at(tl, s): (s, e) for s, e in marks}
+    picked = [sid for sid in sids if sid in by_id][:MAX_SEGMENT_FRAMES]
+    if len(sids) > MAX_SEGMENT_FRAMES:
+        say.append(f"代表帧只取了前 {MAX_SEGMENT_FRAMES} 个窗口"
+                   f"（共 {len(sids)} 个），后面的行没有缩略图")
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for sid in picked:
+        s, e = by_id[sid]
+        mid = round(s + (e - s) / 2, 3)
+        try:
+            out[sid] = mediaops.extract_frame(film, mid, dst_dir / f"{_safe(sid)}.png")
+        except Exception as exc:  # noqa: BLE001 - 缺一张缩略图不该牵连整条片子
+            say.append(f"{sid}：代表帧没抽出来（{type(exc).__name__}: {str(exc)[:120]}）")
+    return out, say
+
+
+#: 窗口切片的编码口径。口径（分辨率/帧率/采样率/声道/封装参数）一变，让旧键整体
+#: 失效——旧字节不会报错，只会在拼接处给出对不上的时间戳。
+WINDOW_CLIP_FMT = "avc-aac44100st-1"
+
+
+def _canon_window(src: Path, dst: Path, *, fps: float | None, width: int,
+                  height: int, duration: float) -> Path:
+    """把一窗的字节改写成**全片统一口径**：同分辨率、同帧率、44.1k 立体声，并且**必有音轨**。
+
+    为什么每窗都要过这一道：末段拼接用的是 concat 解复用器 + ``-c copy``（只搬字节，
+    不再编码一次），它要求每一段的编码参数一致；而三级取材的来源天生不齐——MoviePy
+    刚烧的切片跟着源片走声道与采样率，上一版成片切出来的是那一片当时的参数，缓存里
+    还可能躺着更早的一份。参数不齐时 ``-c copy`` 要么直接报错，要么在接缝处花屏。
+
+    补静音轨是为了「一定对得上」而不是「大概有声音」：无声窗在渲染里是合法的（覆盖层
+    段、纯音乐段），缺音轨的那一段会让整条拼接失败。
+    """
+    has_audio = bool(mediaops.probe(src).get("has_audio"))
+    args: list[str] = ["-i", str(src)]
+    if not has_audio:
+        args += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                 "-t", f"{max(0.04, float(duration)):.3f}"]
+    args += ["-map", "0:v:0", "-map", "0:a:0" if has_audio else "1:a:0",
+             "-vf", f"scale={width}:{height}" + (f",fps={fps:g}" if fps else ""),
+             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-ar", "44100", "-ac", "2"]
+    if fps:
+        args += ["-r", f"{fps:g}", "-vsync", "cfr"]
+    # mp4 的时间刻度也要一致：concat 复制流时按每份文件自己的 timescale 重算 PTS，
+    # 两份 timescale 不同（MoviePy 与 ffmpeg 默认就不一样）接缝处就会漂移零点几秒。
+    args += ["-video_track_timescale", "30000", str(dst)]
+    mediaops.ffmpeg(*args, timeout=1800)
+    return dst
+
+
+def _cache_hit_is_our_format(got: dict[str, Path] | None) -> bool:
+    """缓存命中 → 这份切片是不是当前口径；不是就当没命中（重烧一次，覆盖同一个键）。"""
+    if not got:
+        return False
+    try:
+        meta = json.loads((got.get("meta.json") or Path("_")).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return meta.get("fmt") == WINDOW_CLIP_FMT
+
+
+async def render_windowed(tl: dict[str, Any], dst: Path, settings: Settings,
+                          notify, *, canonical: Mapping[str, Any],
+                          cache: SegmentSliceCache | None = None,
+                          base_film: Path | None = None,
+                          rebuild_ids: set[str] | None = None,
+                          work: Path) -> dict[str, Any]:
+    """按窗口渲染：命中的复用、未受影响的从上一版成片里切、只有改过的才重烧。
+
+    三级取材，顺序就是代价顺序：
+    ① 窗口缓存命中（这条会话以前烧过这一窗口）；
+    ② 上一版成片的对应窗口**没被改动**，就直接从成片里切那几秒——省下的正是
+       「第一次选区改」那一趟：以前整片只能重渲，未受影响的段不必再吃一遍源片；
+    ③ 都没有才用 MoviePy 从源片重烧这一段。
+
+    ②为什么成立：本链的补丁合同**不改总长**（见 timeline_edit 的模块说明），窗口边界
+    与上一版逐秒对齐，未改动的窗口在旧成片里就是它自己。一旦总长变了（重排、删段），
+    这个前提就不成立，调用方不该传 ``base_film``。
+
+    ②为什么还需要 ``rebuild_ids`` 才敢用：「缓存没命中」不等于「这一窗没改」——恰恰
+    相反，改过的窗口正是没命中的那些。旧片里那一窗烙的是**改之前**的字幕和画面，
+    切过来会把用户的改动原样抹掉，而且那份错字节还会被钉进缓存、从此每次命中都错。
+    所以点名要重烧的窗口一律跳过②，直接回源片重烧；不传（只有整片出片那一路）就
+    保守当作「全都得重烧」——宁可慢，不出错片。
+
+    不论来自哪一级，每一窗的字节最后都要过 :func:`_canon_window` 统一编码口径，
+    于是末段拼接只是搬字节（``-c copy``）而不是把整片再编码一遍——省的就是这一份。
+    缓存里存的也是统一之后的切片，所以命中的窗口不必再补一次转码。
+
+    ``cache_key`` 全部按**规范化时间线**（对象键，不是本机路径）算：本机路径每次尝试
+    都可能不同，拿它算键就等于每次都不命中。
+    """
+    say = notify or (lambda *_: None)
+    work.mkdir(parents=True, exist_ok=True)
+    wins = te.windows(canonical, fade=_fade_index_map(canonical))
+    marks = te.window_boundaries(tl)
+    if len(wins) != len(marks):
+        raise ValueError(
+            f"按窗口渲染：规范化时间线有 {len(wins)} 个窗口而渲染用的时间线有 "
+            f"{len(marks)} 个——两份时间线不是同一版，缓存与成片会错开")
+    must_rebuild = ({w[0] for w in wins} if rebuild_ids is None
+                    else set(rebuild_ids))
+    degraded: list[str] = []
+    ledger: list[dict[str, Any]] = []
+    parts: list[Path] = []
+    total = max(1, len(wins))
+    fps = float(tl.get("fps") or 0) or None
+    cw, ch = int(tl.get("width") or 1280), int(tl.get("height") or 720)
+    for n, (sid, s, e, _inputs, key) in enumerate(wins):
+        sec = round(e - s, 3)
+        win_dir = work / f"win{n:03d}"          # 每窗自己的目录：命中项绝不互相覆盖
+        win_dir.mkdir(parents=True, exist_ok=True)
+        clip = win_dir / "clip.mp4"             # 统一口径后的那一份（进缓存、进拼接）
+        whence = "rendered"
+        if cache is not None and _cache_hit_is_our_format(
+                await cache.fetch(key, win_dir)):
+            clip, whence = win_dir / "clip.mp4", "cached"
+        if (whence == "rendered" and base_film is not None
+                and sid not in must_rebuild and Path(base_film).is_file()):
+            try:
+                await asyncio.to_thread(
+                    mediaops.ffmpeg, "-ss", f"{s:.3f}", "-i", str(base_film),
+                    "-t", f"{sec:.3f}", str(win_dir / "raw.mp4"), timeout=1800)
+                await asyncio.to_thread(_canon_window, win_dir / "raw.mp4", clip,
+                                        fps=fps, width=cw, height=ch, duration=sec)
+                whence = "base_cut"
+            except Exception as exc:  # noqa: BLE001 - 切不动就重烧，别把这次渲染押在旧片上
+                degraded.append(f"{sid}：没能从上一版成片里切出来"
+                                f"（{type(exc).__name__}: {str(exc)[:120]}），改用源片重烧")
+        if whence == "rendered":
+            seg = _slice_window(tl, s, e)
+            if not seg.get("events"):
+                degraded.append(f"{sid}：这一窗口（{s}~{e}s）排不出画面段，跳过")
+                ledger.append({"id": sid, "sec": sec, "cache_key": key,
+                               "cached": False, "skipped": True})
+                say("segments", int(90 * (n + 1) / total))
+                continue
+            await asyncio.to_thread(
+                _render_with_moviepy, seg, win_dir / "raw.mp4", settings,
+                lambda stage, pct: say("segments",
+                                       int(90 * (n + (pct or 0) / 100) / total)))
+            await asyncio.to_thread(_canon_window, win_dir / "raw.mp4", clip,
+                                    fps=fps, width=cw, height=ch, duration=sec)
+        if whence != "cached" and cache is not None:
+            # 新烧出来的、以及从上一版成片切出来的窗口都钉进缓存：第二次选区改
+            # 既不必重烧，也不必再读旧片——缓存从此自足。
+            (win_dir / "meta.json").write_text(
+                json.dumps({"id": sid, "sec": sec, "cache_key": key,
+                            "from": whence, "fmt": WINDOW_CLIP_FMT},
+                           ensure_ascii=False), encoding="utf-8")
+            try:
+                await cache.store(key, {"clip.mp4": clip, "meta.json": win_dir / "meta.json"})
+            except Exception as exc:  # noqa: BLE001 - 存不进只让下次多烧一次
+                degraded.append(f"{sid}：切片没进缓存（{type(exc).__name__}: "
+                                f"{str(exc)[:120]}），下次这一窗口还要重烧")
+        parts.append(clip)
+        ledger.append({"id": sid, "sec": sec, "cache_key": key,
+                       "cached": whence in ("cached", "base_cut"), "from": whence})
+        say("segments", int(90 * (n + 1) / total))
+    if not parts:
+        raise MediaError("按窗口渲染：一个窗口都没排出来")
+    list_file = work / "_wlist.txt"
+    write_concat_list(list_file, parts)
+    try:
+        await asyncio.to_thread(
+            mediaops.ffmpeg, "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-c", "copy", str(dst), timeout=1800)
+    except Exception as exc:  # noqa: BLE001 - 参数不齐就重编码拼一次，慢但稳
+        degraded.append(f"窗口拼接用了重编码兜底（{type(exc).__name__}: "
+                        f"{str(exc)[:120]}）")
+        await asyncio.to_thread(mediaops.concat, parts, dst, fps=fps)
+    say("concat", 96)
+    return {"ledger": ledger, "degraded": degraded,
+            "rebuilt": [r["id"] for r in ledger if not r.get("cached")],
+            "reused": [r["id"] for r in ledger if r.get("cached")],
+            "windows": len(ledger)}
+
+
+class PatchVideoNode(RenderVideoNode):
+    """口播/素材片的「选区改」后端：按命中表给的指针改几格，只重烧受影响的窗口。
+
+    为什么继承出片节点而不是另写一条渲染路：局部改的全部价值在于**它走的是同一条
+    流水线**——同一套闸门（覆盖层锚点、音画同步硬闸、对象键存在性、抽帧证据）、同一种
+    产物形状、同一个按窗口切片缓存。另写一条必然出现「局部改出来的这一版少了某道校验」
+    这种漂移，而漂移只有抽帧才看得见，那时像素已经烧完。
+
+    真正的差异只有三处，全在这一层：
+    * **读哪一版时间线**：不读会话里的 ``plan_timeline*``（它可能已被后来的规划覆盖），
+      读那一版成片**自己带的编辑包**——命中表里嵌着它所量的那一版时间线与指纹；
+    * **落在哪个产物号**：分叉成一个新作用域，旧版的成片/表/代表帧一个字节都不动，
+      所以「改坏了回去」不需要重渲，直接播旧版；
+    * **多出来的那份账**：改了哪几段、按输入比对**应当**重烧哪几窗、**实际**重烧了哪几窗、
+      旧版成片还在不在原位。
+    """
+
+    name = "patch_video"
+    display_name = "口播片局部改"
+    description = (
+        "改一版**已经出过片**的口播/素材片，不重新规划也不整片重渲：edits 按命中表给的指针"
+        "改某几格——字幕文案与样式、某段画面取源片的哪一截、盖层素材与它的窗口、某段配音"
+        "换成哪条声音。只有受影响的那几个窗口重新烧像素，其余窗口直接复用上一版字节，"
+        "产出一条**新版本**（新 artifact_id），旧版原样留着可以对比或直接回去。"
+        "必须带 base_artifact_id（上一版返回体顶层的 artifact_id），且它自带的命中表指纹"
+        "要与所改的那版时间线一致；不一致就是「拿着旧表改新片」，会被拒收，"
+        "此时唯一出路是重新出片（顺带重新量表）。"
+        "**本工具不改总长也不改顺序**：段与口播句子的对应是这条链的基准，重排、删段、"
+        "改段长都会把画面挪到别的口播句子底下，那是重新规划（plan_timeline* → render_video），"
+        "不是选区改。改完照样过出片前的每一道闸（音画同步、对象键、覆盖层窗口）。"
+        "渲染是分钟级：返回 status=queued/running 时须继续调 render_status"
+        "（同 artifact_id）直到 done/failed")
+    # 没有 DAG 上游：要改的东西全在 base_artifact_id 指向的那一版里，而 required_nodes
+    # 一旦写了 render_video，补齐依赖时会**重跑一次整片出片**。
+    required_nodes: list[str] = []
+    require_explicit_call = True
+    ephemeral = ("media_url",)
+    input_schema = _obj("口播/素材片局部改（只重烧受影响的窗口）", {
+        "base_artifact_id": {
+            "type": "string",
+            "description": "要改的那一版成片的产物号（render_video 或 patch_video 返回体顶层的"
+                           " artifact_id）。这一版必须带命中表——没有表就不知道屏幕上这一块"
+                           "对回时间线的哪一段",
+        },
+        "edits": {
+            "type": "array",
+            "description": "逐格改值。每条 {pointer, value[, segment_id]}：pointer **必须原样"
+                           "取自命中表条目的 field**（形如 /subtitles/7/text、/events/2/src_end），"
+                           "不自己拼字段名；value 是这一格的新值；segment_id 建议带上该条目的段号"
+                           "（带了指针与段号不符就整批拒收，防止拿旧表改新片）。"
+                           "只认白名单里的已有字段：改段长、改顺序、删段都不在本工具范围内",
+            "items": {"type": "object",
+                      "properties": {
+                          "pointer": {"type": "string"},
+                          "value": {"description": "这一格的新值（数字字段传数字或数字串；"
+                                                   "path 传素材的 obj: 引用或对象键）"},
+                          "segment_id": {"type": "string"}},
+                      "required": ["pointer", "value"]},
+        },
+        "wait_sec": {
+            "type": "number",
+            "description": "本次调用内联等待的秒数（缺省用 [capabilities].render_grace_sec，"
+                           "上限 render_wait_max_sec）。传 0 表示只提交不等",
+        },
+    }, required=["base_artifact_id"])
+
+    async def process(self, state, inputs):
+        sess = state.session_id
+        base = str(inputs.get("base_artifact_id") or "").strip()
+        if not base:
+            raise ValueError(
+                "局部改：必须指定 base_artifact_id——要改的是哪一版成片"
+                "（render_video 返回体顶层的 artifact_id）。不指定就等于凭空造一版，"
+                "那条路叫重新出片，不叫局部改")
+
+        bundle = await self._bundle(sess, base)
+        doc, whence, fp = await self._base_timeline(sess, base, bundle)
+        patched, report = te.plan_patch(doc, edits=inputs.get("edits") or ())
+        # 改完照样按内容重打段 id：改了 src 区间的画面段、改了字的字幕段都会拿到**新 id**，
+        # 于是新命中表里的指针指向的确实是这一版，而旧 id 不会冒充还在。
+        assign_segment_ids(patched)
+        expected = te.expected_rebuild_ids(
+            doc, patched, fade=_fade_index_map(doc), new_fade=_fade_index_map(patched))
+        artifact = await self._fork(state, sess=sess, base=base, doc=patched)
+        film = await self._base_film(state, sess, base)
+
+        jobs = self.storage.render_jobs
+        # 出片那条链已经开了这一版（新作用域）的任务行，失败也由它写 failed 行；
+        # 这里只把补丁账叠到终态之后，让轮询端与刷新重放拿到的就是本次返回的那份事实。
+        out = await super().process(
+            state, {"timeline": patched, "render_mode": "segments",
+                    "wait_sec": inputs.get("wait_sec")},
+            base_film=film, rebuild_ids=set(expected))
+
+        before, base_video, extra = await self._ledger(
+            sess, base, report, out, whence=whence, fp=fp, expected=expected)
+        out["evidence"][0:0] = extra
+        out["patch"] = {"base_artifact_id": base, "doc_fingerprint": fp,
+                        "doc_source": whence, "expected_rebuild": expected,
+                        "before_frames": before, "base_video": base_video,
+                        **report}
+        await jobs.succeed(sess, artifact, out["video"], float(out["duration"]),
+                           result=out, attempt=None)
+        return out
+
+    # ---- 那一版成片自己带的编辑包 ----
+
+    async def _bundle(self, sess: str, base: str) -> dict[str, Any]:
+        """读 base 那一版的命中表包（段与字段 + 它所量的时间线 + 指纹）。
+
+        读不到表就拒这次局部改，而不是退化成「按字段名猜」：命中表是屏幕上这一块与
+        时间线那一段之间唯一的凭据，没有它时指针就只能由调用方编，而编错的指针会改到
+        另一个字段上——**改错了地方还不报错**是这条链最贵的失败模式。
+        """
+        key = f"renders/{_safe(sess)}/{_safe(base)}/hitmap.json"
+        try:
+            if await self.storage.objects.head(key) is None:
+                raise ValueError(
+                    f"局部改：{base} 这一版没有命中表（{key} 读不到：出片时没量到，"
+                    "或产物已过期）。没有表就不知道屏幕上这一块对应时间线的哪一段，"
+                    "指针只能靠猜——请重新出片（render_video 会顺带重新量表）")
+            raw = b"".join([c async for c in self.storage.objects.get_stream(key)])
+            bundle = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 读不出来与读不到是同一件事
+            raise ValueError(
+                f"局部改：{base} 的命中表读不成（{type(exc).__name__}: "
+                f"{str(exc)[:160]}）——请重新出片") from exc
+        if not isinstance(bundle, dict):
+            raise ValueError(f"局部改：{base} 的命中表不是一个对象")
+        return bundle
+
+    async def _base_timeline(self, sess: str, base: str,
+                             bundle: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
+        """→ (那一版渲的时间线, 从哪儿读到的, 指纹)。
+
+        只认编辑包自带的 ``doc``：会话里的 ``plan_timeline`` 会被后来的规划覆盖，拿它
+        冒充旧版就是拿新时间线去配旧命中表，指针落下去改的就是别的段。所以指纹比不上
+        就直接拒，没有「退到会话产物再试一下」这一路。
+        """
+        fp = str(bundle.get("doc_fingerprint") or "")
+        embedded = bundle.get("doc")
+        if not (isinstance(embedded, Mapping) and embedded):
+            raise ValueError(
+                f"局部改：{base} 的命中表里没有嵌时间线（那是量表时用的旧版格式或写坏了）。"
+                "重新出片（render_video）会按当前时间线重新量一份带底稿的表")
+        doc = dict(embedded)
+        got_fp = te.fingerprint(doc)
+        if not fp or fp != got_fp:
+            raise ValueError(
+                f"局部改：{base} 的命中表量的是另一版时间线（表指纹 {fp or '没有'}、"
+                f"表里那份底稿的指纹 {got_fp}）——中间时间线被改过，指针会把新版的段认错。"
+                "重新出片（render_video，会按当前时间线重新量表）是唯一出路")
+        return doc, "这一版成片自带的编辑包（命中表里的 doc）", fp
+
+    async def _base_film(self, state: NodeState, sess: str, base: str) -> Path | None:
+        """把上一版成片取到本机；取不到就回 None（那只是这次不能借旧字节省一趟重烧）。"""
+        row = await self.storage.render_jobs.get(sess, base)
+        key = str((row or {}).get("video_object_key") or "")
+        if not key:
+            return None
+        try:
+            return await self.storage.workspace.localize_ref(
+                f"obj:{key}", self._work(state, "render", "base"))
+        except Exception:  # noqa: BLE001 - 旧字节取不回，segments 路径自会逐窗重烧
+            return None
+
+    # ---- 换一份产物作用域 ----
+
+    async def _fork(self, state: NodeState, *, sess: str, base: str,
+                    doc: dict[str, Any]) -> str:
+        """分叉出新产物作用域并把改动同步成「会话当前时间线」；→ 新产物号。
+
+        为什么必须换作用域：渲染任务行、成片字节、命中表、代表帧全都按 artifact_id 落位，
+        沿用 base 的号等于把旧版覆盖掉——那样「改坏了回去」只能重渲一次。
+
+        为什么同时把改动写回当前作用域的 ``plan_timeline*``：那一份是**模型**下一次调
+        render_video 时读的。不写，就会出现「用户已经局部改过三处，而模型换配乐重渲时
+        把三处改动全丢了」——那是把用户的编辑当草稿。旧版片子自己不受影响：它的底稿
+        存在自己那份编辑包里。
+        """
+        artifact = state.artifact_id or ""
+        if artifact in ("", "_default") or artifact == base:
+            # 等于 base 的那一种必须换号：沿用就是把旧版覆盖掉，而旧版留着才能
+            # 「改坏了直接播回去」——那一版片子是这次局部改唯一的退路。
+            artifact = f"p{uuid.uuid4().hex[:8]}"
+        repo = self.storage.artifacts(sess, artifact)
+        try:
+            await repo.clone_from(self.storage.artifacts(
+                sess, base if base and base != "_default" else "_default"))
+        except Exception as exc:  # noqa: BLE001 - 带不上上游不影响本次出片，如实记一笔
+            state.summary.notes.append(
+                f"局部改：上游产物没带进新作用域 {artifact}"
+                f"（{type(exc).__name__}: {str(exc)[:120]}）——本次照常出片，"
+                "后续若要接着这一版跑别的节点，可能要重跑那些上游")
+        hint = ("这一版局部改已入库：继续改请带**本次返回的 artifact_id** 再调 patch_video；"
+                "要加段、删段、改顺序或改段长，请重走 plan_timeline* → render_video")
+        for scope in (artifact, ""):
+            target = self.storage.artifacts(sess, scope)
+            written = False
+            for key, field in (("plan_timeline_ai_transition", "timeline_ai"),
+                               ("plan_timeline_pro", "timeline_pro"),
+                               ("plan_timeline", "timeline")):
+                payload = await target.get(key)
+                if isinstance(payload, Mapping) and payload.get(field) is not None:
+                    await target.put(key, {**payload, field: doc, "next_hint": hint})
+                    written = True
+            if not written:
+                await target.put("plan_timeline", {"timeline": doc, "next_hint": hint})
+        state.artifact_id = artifact
+        state.store = await ArtifactStore.open(repo, sess, artifact)
+        return artifact
+
+    # ---- 那份多出来的账 ----
+
+    async def _ledger(self, sess: str, base: str, report: dict[str, Any],
+                      out: dict[str, Any], *, whence: str, fp: str,
+                      expected: list[str]) -> tuple[dict[str, str], str, list[dict[str, Any]]]:
+        """改前的代表帧 + 旧成片是否还在 + 三条局部改专属证据（插在通用证据前面）。"""
+        # 对比帧按**要重烧的那几窗**取，不按被点名的段 id：改了字幕，用户要比的是
+        # 「这一窗的画面跟着变了没有」，而出片时留的帧是按窗口（画面段 id）抽的——
+        # 拿 su-*/ov-* 去取只会次次取空，那条「改前长什么样」的账就此形同虚设。
+        want = [x for x in expected if x]
+        before: dict[str, str] = {}
+        for sid in want:
+            key = f"renders/{_safe(sess)}/{_safe(base)}/frames/{_safe(sid)}.png"
+            try:
+                if await self.storage.objects.head(key) is not None:
+                    before[sid] = key
+            except Exception:  # noqa: BLE001 - 对比帧读不到只说明帧没留住，不说明改动没发生
+                continue
+
+        base_row = await self.storage.render_jobs.get(sess, base)
+        base_video = str((base_row or {}).get("video_object_key") or "")
+        still_there = False
+        if base_video:
+            try:
+                still_there = await self.storage.objects.head(base_video) is not None
+            except Exception:  # noqa: BLE001
+                still_there = False
+
+        if not want:
+            before_note = "本次没有一格内容变化，所以没有对比帧"
+        else:
+            missing = sorted(set(want) - set(before))
+            before_note = (f"要重烧的 {len(want)} 窗在旧片里的代表帧取到了 {len(before)}"
+                           + (f"，缺 {missing}（base 那一版没留住这些窗的帧）" if missing else ""))
+
+        cache = out.get("segment_cache") or {}
+        rebuilt = [str(x) for x in (cache.get("rebuilt") or [])]
+        reused = [str(x) for x in (cache.get("reused") or [])]
+        # 判据是「应当重烧的窗」= 逐窗比对输入清单算出来的那一份（与渲染器算缓存键用的是
+        # 同一个函数）。窗口 id 与被点名的段 id 不同一套名字：改一句字幕要重烧的是它压在
+        # 的那个**画面窗口**，所以这里比的是窗口，不是 changed_ids。
+        extra = [
+            _ev(f"局部改读的是「这一版片子自己的底稿」（{whence}，指纹 {fp}），"
+                "不是会话里可能被后来规划覆盖过的那一份",
+                "machine", verified=True,
+                proof="命中表包里的 doc 与 doc_fingerprint 由同一份字节写出，"
+                      "落笔前又按表里的 doc 复算了一遍指纹"),
+            _ev(f"只重烧受影响窗口：点名 {len(report['changed_ids'])} 段，"
+                f"按输入比对应当重烧 {len(expected)} 窗（{'、'.join(expected) or '没有'}），"
+                f"这次真烧的是 {len(rebuilt)} 窗（{'、'.join(rebuilt) or '没有'}），"
+                f"其余 {len(reused)} 窗直接复用已有字节",
+                "machine", verified=set(rebuilt) <= set(expected),
+                proof="窗口缓存键 = 这一窗真正吃进去的全部输入（画面段 + 压在它时间区间里的"
+                      "字幕/声音/盖层 + 配乐相位 + 转场，见 timeline_edit.window_inputs），"
+                      "没被改动的窗口逐字相同，于是整窗跳过"
+                if set(rebuilt) <= set(expected) else
+                f"没改动的窗口里有 {sorted(set(rebuilt) - set(expected))} 被重烧了——"
+                "缓存键漏算了某个影响画面的输入，或把不该算的算进去了",
+            ),
+            _ev(f"旧版本没有被覆盖：{base} 的成片"
+                + ("仍在原位" if still_there else "字节已不在")
+                + f"（{base_video or '没有记录对象键'}）；{before_note}",
+                "machine", verified=still_there,
+                proof="新版本落在分叉出来的新作用域，写的是另一组对象键"
+                if still_there else "旧版成片不在了：回不去旧版，只能重渲"),
+        ]
+        return before, base_video, extra
 
 
 def _attempt_dir(dst: Path, tag: str) -> Path:
@@ -3006,7 +3787,7 @@ REAL_NODE_CLASSES = [
     ScriptTemplateRecNode, GenerateScriptNode, GenerateAITransitionNode,
     TransitionRecNode, TextRecNode, GenerateVoiceoverNode, SelectBGMNode,
     PlanTimelineNode, PlanTimelineProNode, PlanTimelineAITransitionNode,
-    RenderVideoNode,
+    RenderVideoNode, PatchVideoNode,
 ]
 
 
