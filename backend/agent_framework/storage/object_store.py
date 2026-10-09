@@ -128,7 +128,17 @@ class ContentCache:
             tmp_path.unlink(missing_ok=True)
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(tmp_path, dst)
+            # 下载中的临时文件在 /tmp，缓存卷可能压根不是同一个文件系统（容器里
+            # / 是 overlay、.runtime 是挂载卷）→ 直接 rename 必然 EXDEV。
+            # 先挪进目标目录里的同名 .part 再 replace：这一步永远同卷，且不留半成品
+            # 被后来的命中当成完整文件。
+            staged = dst.with_name(dst.name + ".part")
+            try:
+                os.replace(tmp_path, staged)
+            except OSError:
+                await asyncio.to_thread(shutil.copyfile, tmp_path, staged)
+                tmp_path.unlink(missing_ok=True)
+            os.replace(staged, dst)
         self.touch(dst)
         await asyncio.to_thread(self.evict)
         return dst
@@ -160,6 +170,11 @@ class ContentCache:
             if total <= self.max_bytes:
                 break
         return dropped
+
+
+def _strip_scheme(endpoint: str) -> str:
+    """SDK 的 endpoint 只吃 host:port，配置里常带 scheme —— 剥掉。"""
+    return endpoint.removeprefix("https://").removeprefix("http://")
 
 
 def _safe_basename(key: str) -> str:
@@ -297,7 +312,9 @@ class MinioObjectStore(ObjectStore):
     def __init__(self, endpoint: str, access_key: str, secret_key: str, bucket: str,
                  *, cache_root: str | Path = Path(".runtime/object_cache"),
                  secure: bool = False, region: str | None = None,
-                 cache_max_bytes: int = 20 * 1024 ** 3) -> None:
+                 cache_max_bytes: int = 20 * 1024 ** 3,
+                 public_endpoint: str | None = None,
+                 public_secure: bool | None = None) -> None:
         if not (endpoint and access_key and secret_key):
             raise ValueError("MinioObjectStore 需 endpoint/access_key/secret_key"
                              "（全部来自环境变量，不落盘不打印）")
@@ -307,9 +324,22 @@ class MinioObjectStore(ObjectStore):
         self.bucket = bucket
         self.secure = secure
         self._S3Error = S3Error
-        self._client = Minio(endpoint.removeprefix("https://").removeprefix("http://"),
+        self._client = Minio(_strip_scheme(endpoint),
                              access_key=access_key, secret_key=secret_key,
                              secure=secure, region=region)
+        # public_endpoint：给**浏览器**签直链用的主机名。容器内的 endpoint 是 Docker
+        # 网络里的服务名，浏览器解析不到；而 presigned URL 的签名含 Host
+        # （SignedHeaders=host），事后替换主机名会得到 403——只能按浏览器那边的
+        # 主机名重新签。签名是纯本地计算，这个地址从容器内可达与否都不影响。
+        # region 必须显式给：否则 SDK 会为了查桶区域去连这个公网地址。
+        self._presign_client = self._client
+        if public_endpoint:
+            self._presign_client = Minio(
+                _strip_scheme(public_endpoint), access_key=access_key,
+                secret_key=secret_key,
+                secure=(public_secure if public_secure is not None
+                        else public_endpoint.lower().startswith("https")),
+                region=region or "us-east-1")
         self.cache = ContentCache(cache_root, max_bytes=cache_max_bytes)
 
     # ---- SDK 包装 ----
@@ -405,8 +435,8 @@ class MinioObjectStore(ObjectStore):
         def _p() -> str:
             from datetime import timedelta
 
-            return self._client.presigned_get_object(self.bucket, key,
-                                                     expires=timedelta(seconds=ttl_sec))
+            return self._presign_client.presigned_get_object(
+                self.bucket, key, expires=timedelta(seconds=ttl_sec))
         return await asyncio.to_thread(_p)
 
     async def delete(self, key: str) -> None:

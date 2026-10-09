@@ -54,6 +54,7 @@ from .repositories import (
     MemoriesRepo,
     MessagesRepo,
     RenderJobsRepo,
+    RetrievalRepo,
     SecretsRepo,
     TimelinesRepo,
     SkillsRepo,
@@ -129,6 +130,7 @@ class Storage:
         self.secrets = SecretsRepo(db)
         self.timelines = TimelinesRepo(db)
         self.mcp_servers = McpServersRepo(db)
+        self.retrieval = RetrievalRepo(db)
 
     def artifacts(self, session_id: str, artifact_id: str = "") -> ArtifactsRepo:
         """FileStore 的落点：一次渲染一份，(session_id, artifact_id) 定作用域。"""
@@ -260,6 +262,12 @@ def build_storage(backend: str = "pg_minio", **kwargs: Any) -> Storage:
             cache_root=cache_root,
             secure=_env("MINIO_SECURE", "0") in ("1", "true", "yes"),
             cache_max_bytes=max_bytes,
+            # 直链要落在**浏览器解析得到**的主机名上：MINIO_ENDPOINT 在容器编排里是
+            # 网络内的服务名（如 minio:9000），宿主机/浏览器看不见它。留空 = 不启用，
+            # 与只用 MINIO_ENDPOINT 的旧行为一致。
+            public_endpoint=_env("MINIO_PUBLIC_ENDPOINT") or None,
+            public_secure=(_env("MINIO_PUBLIC_SECURE", "0") in ("1", "true", "yes"))
+            if _env("MINIO_PUBLIC_SECURE") else None,
         )
         db = PgDatastore(
             cfg["PG_DSN"],

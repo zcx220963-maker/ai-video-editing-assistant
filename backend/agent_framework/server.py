@@ -37,19 +37,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
-import sys
 import urllib.parse
+import urllib.request
 import re
 import uuid
 
-_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Mapping
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -66,6 +64,7 @@ from .consumer import CHAT_TOPIC, SessionConsumer, session_key
 from .heartbeat import Heartbeat
 from .ingest import IngestRejected, ingest_bytes
 from .identity import storyline_session_id
+from .orchestration import _safe
 from . import judge as judge_mod
 from .llm_openai import (DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_THINKING,
                          get_default_llm)
@@ -172,21 +171,28 @@ class ApiKeyRequest(BaseModel):
 
 GD_MUSIC_API = "https://music-api.gdstudio.xyz/api.php"
 
+# 浏览器 UA 是这条链的必要组成部分，不是装饰：该站按 UA 黑名单挡默认 python 客户端（403），
+# 与 SSL 无关。外站访问也不许退化成 shell 子进程——镜像里没有外部下载器，
+# 子进程抛的 FileNotFoundError 会被逐源 except 吞掉，表现为「搜不到歌」而不是「服务坏了」。
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+def _gd_http_get(url: str, timeout: float) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
 
 
 def _gd_music_get(params: dict, timeout: float = 15.0) -> list | dict:
-    """通过 curl 调 GD Studio 音乐 API（Python urllib SSL 与 Cloudflare 不兼容，用 curl 绕过）。"""
+    """调 GD Studio 音乐 API，返回解析好的 JSON（搜索是列表，取链是字典）。"""
     url = f"{GD_MUSIC_API}?{urllib.parse.urlencode(params)}"
-    r = subprocess.run(["curl", "-s", url], capture_output=True, timeout=timeout,
-                       creationflags=_NO_WINDOW)
-    return json.loads(r.stdout.decode("utf-8"))
+    return json.loads(_gd_http_get(url, timeout).decode("utf-8"))
 
 
 def _gd_download(url: str, timeout: float = 60.0) -> bytes:
-    """同步下载音频字节（curl）。"""
-    r = subprocess.run(["curl", "-sL", url], capture_output=True, timeout=timeout,
-                       creationflags=_NO_WINDOW)
-    return r.stdout
+    """下载音频字节（与搜索同一条出口、同一个 UA）。"""
+    return _gd_http_get(url, timeout)
 
 
 async def _attachment_views(storage: Storage, user_id: str, conv_id: str,
@@ -221,8 +227,59 @@ async def _render_media_views(storage: Storage, qa: Any) -> list[dict[str, Any]]
             "title": p.get("title") or "",
             "duration": p.get("duration"),
             "artifact_id": p.get("artifact_id"),
+            # 刷新重放也要说得出「这一版能选着改」——判据与当轮 WS 帧同一份
+            "hitmap": bool(p.get("hitmap")),
             # 证据分级随卡片一起持久在片段里：刷新后这张卡仍然说得出「哪几条验过」
             "evidence": list(p.get("evidence") or []),
+        })
+    return out
+
+
+async def _orphan_render_media(
+    storage: Storage, user_id: str, conv_id: str, seen_keys: set[str],
+) -> list[dict[str, Any]]:
+    """执行轮还在 awaiting_approval 时 assistant 消息没落 messages 表，
+    但成片已在 artifacts 里——刷新后从这里补一张可播卡片，不让用户的成片"消失"。
+
+    只补 messages 里还没出现过的（按 video 对象键去重），避免重复。
+    """
+    sid = storyline_session_id(user_id, conv_id)
+    try:
+        rows = await storage.db.select(
+            "artifacts",
+            where=[Cond("session_id", "eq", sid),
+                   Cond("node", "in", ["render_motion_video", "patch_motion_video",
+                                       "render_video"])],
+            order_by=["-updated_at"], limit=5)
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = row.get("payload")
+        if isinstance(payload, str):
+            import json as _json
+            payload = _json.loads(payload)
+        if not isinstance(payload, dict):
+            continue
+        key = payload.get("video") or ""
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        try:
+            url = await storage.objects.presign_get(key)
+        except Exception:  # noqa: BLE001
+            continue
+        out.append({
+            "media_url": url,
+            "title": payload.get("title") or "成片已渲染",
+            "duration": payload.get("duration"),
+            # 这两个字段一个都不能省：前端「✂ 选着改」的开关是
+            # ``hitmap && artifact_id``，缺了就等于告诉用户这一版不能选着改。
+            # 真机事故：执行轮停在待确认时成片只存在于 artifacts 表（messages 里
+            # 还没有 assistant 行），刷新一次按钮就凭空消失——而它刚刚还能用。
+            "artifact_id": row.get("artifact_id") or payload.get("artifact_id"),
+            "hitmap": bool(payload.get("hitmap")),
+            "evidence": list(payload.get("evidence") or []),
         })
     return out
 
@@ -917,7 +974,7 @@ def create_app(
         return {"name": name, "display": display, "steps": len(steps),
                 "dropped": dropped, "llm_polished": polished}
 
-    @app.get("/skills-ui", response_class=None)
+    @app.get("/skills-ui")
     async def skills_ui() -> HTMLResponse:
         """技能管理页（免构建的独立小页）：列出/上传/重扫，凭证走 localStorage 的 ca.token。"""
         return HTMLResponse(_SKILLS_UI_HTML)
@@ -1132,6 +1189,7 @@ def create_app(
         """回填某个会话的历史：非本人直接回空（不报 403，避免会话存在性探测）。"""
         rows = await storage.messages.history(user_id, conversation_id)
         out = []
+        seen_video_keys: set[str] = set()
         for r in rows:
             entry = {"role": r["role"], "text": r["content"],
                      "attachments": await _attachment_views(
@@ -1139,6 +1197,10 @@ def create_app(
             media = await _render_media_views(storage, r.get("qa"))
             if media:
                 entry["media"] = media
+                for m in media:
+                    k = m.get("artifact_id") or ""
+                    if k:
+                        seen_video_keys.add(k)
             plan_cards = _plan_views(r.get("qa"))
             if plan_cards:
                 entry["plan"] = plan_cards
@@ -1146,6 +1208,14 @@ def create_app(
             if audit:
                 entry["plan_audit"] = audit
             out.append(entry)
+        orphan_media = await _orphan_render_media(storage, user_id, conversation_id, seen_video_keys)
+        if orphan_media and out:
+            last_user = max((i for i, e in enumerate(out) if e["role"] == "user"), default=-1)
+            if last_user >= 0:
+                out.insert(last_user + 1, {
+                    "role": "assistant", "text": "",
+                    "attachments": [], "media": orphan_media,
+                })
         return {"messages": out}
 
     @app.get("/preview/{conversation_id}")
@@ -1719,22 +1789,27 @@ def create_app(
         q = (q or "").strip()
         if not q:
             return {"tracks": [], "total": 0, "hint": "请输入歌名或歌手名搜索"}
-        try:
-            all_tracks: list[dict[str, Any]] = []
-            for src in _BGM_SOURCES:
-                try:
-                    data = await asyncio.to_thread(_gd_music_get, {
-                        "types": "search", "source": src,
-                        "name": q, "count": 10, "pages": 1})
-                    all_tracks.extend(_gd_normalize_tracks(data, src))
-                except Exception:  # noqa: BLE001
-                    continue
-                if len(all_tracks) >= 20:
-                    break
-            return {"tracks": all_tracks[:20], "total": len(all_tracks[:20]),
-                    "hint": f"搜索「{q}」"}
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(502, f"搜索失败：{e}") from e
+        all_tracks: list[dict[str, Any]] = []
+        failures: list[str] = []
+        for src in _BGM_SOURCES:
+            try:
+                data = await asyncio.to_thread(_gd_music_get, {
+                    "types": "search", "source": src,
+                    "name": q, "count": 10, "pages": 1})
+                all_tracks.extend(_gd_normalize_tracks(data, src))
+            except Exception as e:  # noqa: BLE001
+                # 状态码单独记：403 是被挡（UA/风控），503 是源自己坏了，处置完全不同
+                code = getattr(e, "code", None)
+                failures.append(f"{src}: HTTP {code}" if code else f"{src}: {e}")
+            if len(all_tracks) >= 20:
+                break
+        if not all_tracks and failures:
+            raise HTTPException(502, f"音乐源均无响应：{'；'.join(failures)}") from None
+        hint = f"搜索「{q}」"
+        if failures:
+            hint += f"（部分源不可用：{'；'.join(failures)}）"
+        return {"tracks": all_tracks[:20], "total": len(all_tracks[:20]),
+                "hint": hint}
 
     @app.get("/bgm/url")
     async def bgm_url(track_id: str,
@@ -1941,8 +2016,6 @@ def create_app(
                           "configured": bool(jbase and jmodel and jkey),
                           "masked": secrets.mask(jkey) if jkey else ""}}
 
-    @app.post("/settings/test2")
-
     @app.websocket("/ws/{conversation_id}")
     async def ws_endpoint(websocket: WebSocket, conversation_id: str) -> None:
         """会话窗口长连接：注册进 Connection Manager，接收 OutBound 回投的流式结果。
@@ -2031,6 +2104,8 @@ def create_app(
         与工具面同一条路：请求不再等整部片子跑完，返回体是渲染任务视图
         （``render.status`` 为 queued/running 时前端改轮询 ``GET /render_status``）。
         body 可选 ``wait_sec``：短片想让一次请求直接拿到成片时，内联等这么久。
+        body 可选 ``dry_run``：true 时回「将要渲成什么样」的账（不编码、不落渲染任务行），
+        与工具面走同一条旁路。
         """
         body = await request.json()
         timeline = body.get("timeline")
@@ -2052,6 +2127,7 @@ def create_app(
                 "conversation_id": conv_id,
                 "artifact_id": artifact_id,
                 "wait_sec": wait_sec,
+                "dry_run": bool(body.get("dry_run", False)),
             })
         except Exception as e:
             raise HTTPException(500, f"渲染失败：{e}") from e
@@ -2102,6 +2178,103 @@ def create_app(
                     payload = payload[k]
                     break
         return {"timeline": payload, "source": node}
+
+    @app.get("/motion/hitmap")
+    async def motion_hitmap(artifact_id: str, conv_id: str = "",
+                            user_id: str = Depends(auth.http_user_id)
+                            ) -> dict[str, Any]:
+        """图形科普片的元素命中表（前端画选区、局部改验指纹都读这一份）。
+
+        为什么走本服务读字节而不发 presigned 直链：那是第二个 origin，CORS 与
+        「一小时后读不通」都得在前端再处理一遍，而直链一旦进浏览器历史就等于把
+        会话作用域的对象键交给了别人；这份 JSON 只在打开编辑器时读一次，几百 KB，
+        直投更省事。对象键按调用者身份拼，别人会话里的表在这里同样是 404。
+        """
+        sid = storyline_session_id(user_id, conv_id)
+        key = f"renders/{_safe(sid)}/{_safe(artifact_id)}/hitmap.json"
+        if await storage.objects.head(key) is None:
+            raise HTTPException(404, "没有这份命中表（这片子出片时没量到，或产物已过期）")
+        raw = b"".join([c async for c in storage.objects.get_stream(key)])
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(500, f"命中表读出来不是合法 JSON：{exc}") from exc
+
+    @app.get("/motion/frame")
+    async def motion_frame(artifact_id: str, shot: str, conv_id: str = "",
+                           user_id: str = Depends(auth.http_user_id)) -> Response:
+        """某镜的代表帧（时间线缩略图与「改前 / 改后」对比都取这一张）。
+
+        与 ``/motion/hitmap`` 同一口径：对象键按调用者身份拼，别人的产物在这里是 404；
+        发直链会把会话作用域的键漏进浏览器历史。为什么单独一口而不让前端从成片抽帧：
+        那要每个缩略图开一次 ffmpeg/一次 seek，而代表帧在出片时就量好了——
+        它和命中表是同一时刻的像素，正是点选与对比需要的那个时刻。
+        """
+        sid = storyline_session_id(user_id, conv_id)
+        key = f"renders/{_safe(sid)}/{_safe(artifact_id)}/frames/{_safe(shot)}.png"
+        if await storage.objects.head(key) is None:
+            raise HTTPException(404, "没有这一镜的代表帧（这片子出片时没留，或产物已过期）")
+        raw = b"".join([c async for c in storage.objects.get_stream(key)])
+        return Response(content=raw, media_type="image/png")
+
+    @app.post("/motion/patch")
+    async def motion_patch(request: Request,
+                           user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """图形科普片的局部改：前端按命中表下补丁，只重烧受影响的那几镜。
+
+        为什么单开一口而不是让模型转达：选区是鼠标框出来的，指针、镜号与新值浏览器全都
+        知道，绕模型一圈等于把「用户点的是哪一格」重新猜一遍——而猜错的指针会改到别的字
+        上，且不报错。走的仍是同一个节点（``reg.execute`` → MCP → submit+poll），所以闸、
+        缓存、产物形状与模型自己调这次局部改完全一致。
+
+        body：``base_artifact_id`` 必填，外加 edits / shot_sets / remove_shots / reorder /
+        bgm / target_duration_sec / wait_sec（语义见节点 input_schema）。返回体是工具回执：
+        顶层的 ``artifact_id`` 是**新版本**的号（轮询与播它都用这一个），``status`` 为
+        queued/running 时前端改轮询 ``GET /render_status?artifact_id=…``；done 时那里的
+        ``patch.before_frames`` 就是改前代表帧，可直接摆对比。
+
+        **拒绝也在 200 里**：本节点是长任务，闸门的话落在轮询端的 ``status=failed`` +
+        ``error`` 正文（真机验过：POST 立刻 200 queued，几秒后 error 说「请重新出片」）。
+        所以前端认的是那份正文，不是 HTTP 状态码——下面那两条 422/500 只在**提交前**
+        （注册表同进程、且异常是 ValueError）才可能走到，别把它们当判据。
+        """
+        body = await request.json()
+        base = str(body.get("base_artifact_id") or "").strip()
+        if not base:
+            raise HTTPException(400, "缺少 base_artifact_id（要改的是哪一版成片）")
+        reg = getattr(getattr(agent, "runner", agent), "registry", None)
+        if reg is None or "patch_motion_video" not in reg:
+            raise HTTPException(503, "局部改工具不可用")
+        conv_id = body.get("conv_id", "")
+        try:
+            wait_sec = float(body.get("wait_sec", 0) or 0)
+        except (TypeError, ValueError):
+            wait_sec = 0.0
+        args: dict[str, Any] = {
+            "base_artifact_id": base,
+            "user_id": user_id,
+            "conversation_id": conv_id,
+            # 新版本落进这个新作用域，base 那一版的字节一个不动（改坏了直接播旧版）
+            "artifact_id": str(uuid.uuid4())[:8],
+            "wait_sec": wait_sec,
+        }
+        for k in ("edits", "shot_sets", "remove_shots", "reorder"):
+            if body.get(k):
+                args[k] = body[k]
+        for k in ("bgm", "target_duration_sec"):
+            if body.get(k) is not None:
+                args[k] = body[k]
+        try:
+            raw = await reg.execute("patch_motion_video", args)
+        except ValueError as e:
+            # 只有注册表在同进程时才会走到这里（隔 MCP 时已是工具错误）。
+            # 消息本身就是一份「哪一格改成什么」的清单，原样透出，不另编文案。
+            raise HTTPException(422, str(e)) from e
+        except Exception as e:
+            raise HTTPException(500, f"局部改失败：{e}") from e
+        if is_tool_error(raw):
+            raise HTTPException(500, str(raw))
+        return json.loads(raw) if isinstance(raw, str) else raw
 
     # 前端构建产物（Vite → frontend/dist）存在时由本服务托管；
     # mount 放在最后：API 路由先匹配，其余路径落到静态站点（html=True 提供 index.html）。

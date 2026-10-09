@@ -9,6 +9,7 @@ const PREFIXES = [
   "/chat", "/convs", "/runs", "/sessions", "/settings", "/tools",
   "/register", "/whoami", "/health", "/materials", "/bgm", "/upload",
   "/fetch_media", "/timelines", "/render_direct", "/render_status", "/latest_timeline",
+  "/motion",
 ];
 
 export default defineConfig({

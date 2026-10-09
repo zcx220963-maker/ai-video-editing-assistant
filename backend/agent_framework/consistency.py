@@ -52,6 +52,10 @@ WATCHED = (
     "load_media", "split_shots", "understand_clips", "filter_clips", "group_clips",
     "generate_script", "generate_voiceover", "select_BGM", "plan_timeline",
     "render_video", "submit_plan", "load_skill",
+    # 零素材那一路：render_motion_video 极易写错（render_motion / motion_render_video），
+    # 而技能正文与提示词都点名了它——错了就是模型照着不存在的工具排计划。
+    # patch_motion_video 同一条命：名字一改就变成「局部改」这条功能在模型眼里不存在。
+    "plan_motion", "render_motion_video", "patch_motion_video",
 )
 
 # 方向 B 用：技能正文里这些词不是工具名（是栏目名/字段名/通用短语）。
@@ -82,13 +86,18 @@ _SKILL_NOT_TOOL_PATTERNS = (
 
 
 def schema_property_names(tools: Iterable[Any]) -> set[str]:
-    """把所有工具 JSON Schema 里出现过的 **properties 键名**全收出来（含嵌套层）。
+    """把所有工具 JSON Schema 里出现过的 **properties 键名**与**声明过的取值**全收出来（含嵌套层）。
 
     为什么必须递归：判据要能认出「技能正文里提到的字段名不是工具名」。
     ``PlanGate.param_keys()`` 只覆盖计划门那批节点的参数，而模型在技能正文里
     顺口提到的字段可能来自任何工具的嵌套结构——例如 ``submit_plan`` 的
     ``plans[].steps[].param_options``。只取顶层就会把 ``param_options`` 判成
     「臆造工具」，启动时挂一条假告警；假告警比不报更坏，它教人忽略这个检查。
+
+    为什么连 ``enum`` / ``const`` 的**取值**也收进来：技能正文讲参数怎么填时，
+    引用的是取值而不是键名（图形科普片那条路要说「版式选 dict_entry、字幕选
+    torn_highlight」）。这些词长得像工具名（小写下划线），却根本不是可调用的东西。
+    只在 schema 里明确列出的值才算，不做任何猜测——与 ``plan.support.enum_of`` 同一条口径。
 
     只放宽文案检查，不影响任何执行判定。
     """
@@ -97,6 +106,15 @@ def schema_property_names(tools: Iterable[Any]) -> set[str]:
     def walk(node: Any, depth: int = 0) -> None:
         if depth > 8 or not isinstance(node, Mapping):
             return
+        enum = node.get("enum")
+        if isinstance(enum, (list, tuple)):
+            # 脏 schema 可能把 enum 写成字符串：逐字符遍历会往豁免集里塞单字母
+            for value in enum:
+                if isinstance(value, str) and value:
+                    out.add(value)
+        const = node.get("const")
+        if isinstance(const, str) and const:
+            out.add(const)
         props = node.get("properties")
         if isinstance(props, Mapping):
             for key, sub in props.items():

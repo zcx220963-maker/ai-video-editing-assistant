@@ -27,7 +27,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from .catalog import get_catalog
 from .memory import CATEGORIES, MemoryStore
 from .plan.support import as_card_value, clean, neutralize, num
-from .render_gate import RENDER_NODE
+from .render_gate import RENDER_NODES
 
 logger = logging.getLogger(__name__)
 
@@ -144,17 +144,19 @@ def revise_line(feedback: str) -> tuple[str, str] | None:
 
 def rework_line(prior_nodes: Iterable[str], planned_nodes: Iterable[str],
                 reason: str = "") -> tuple[str, str] | None:
-    """成片退回：本会话此前已真渲染出过成片，本轮计划又排了 ``render_video``。
+    """成片退回：本会话此前已真渲染出过成片，本轮计划又排了**任一出片通道**。
 
     口径是「产物在不在」，不是「用户语气好不好」——dry-run 的回执不写产物表，
     所以「先看看会渲成什么样」不会被误记成退回。
+
+    认整族（剪素材 / 零素材图形科普片都算）：用户不满意的是成片，不是哪条管线。
     """
-    had = RENDER_NODE in set(prior_nodes or ())
-    again = RENDER_NODE in set(planned_nodes or ())
+    had = set(prior_nodes or ()) & RENDER_NODES
+    again = [n for n in (planned_nodes or ()) if n in RENDER_NODES]
     if not (had and again):
         return None
     line = (f"{_REWORK_PREFIX}：本会话此前已出过成片，本轮计划再次渲染"
-            f"「{_label(RENDER_NODE)}」——上一版未被接受")
+            f"「{_label(again[0])}」——上一版未被接受")
     text = _clip(neutralize(clean(reason)))
     if text:
         line += f"。当轮用户原话：{text}"

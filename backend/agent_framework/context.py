@@ -134,12 +134,23 @@ def render_attachments_section(rows: Sequence[Mapping[str, Any]],
     if rows:
         lines.append("本条消息附带以下素材（material_id 已通过归属校验，可直接使用）：")
         lines.extend(f"- {_fact_line(r)}" for r in rows)
-        lines.append(
-            "剪辑链路第一步请把以上全部 material_id 原样传给 load_media(material_ids=[…])；"
-            "不要改写、臆造，也不要把文件名当路径传入。"
-            "不同素材用途不同（如采访视频做 ASR、空镜做画面、短视频做风格参考），"
-            "全部加载后再按用户意图分配用途。"
-        )
+        video = [r for r in rows if str(r.get("kind") or "video") != "audio"]
+        audio = [r for r in rows if str(r.get("kind") or "video") == "audio"]
+        if video:
+            lines.append(
+                "剪辑链路第一步请把以上全部 material_id 原样传给 load_media(material_ids=[…])；"
+                "不要改写、臆造，也不要把文件名当路径传入。"
+                "不同素材用途不同（如采访视频做 ASR、空镜做画面、短视频做风格参考），"
+                "全部加载后再按用户意图分配用途。"
+            )
+        if audio:
+            # 曲库歌曲不挂会话、也不是画面：塞进 load_media 只会被判成"纯音频"丢掉，
+            # 所以单独给一条出路——出片节点的 bgm 参数直接收 material_id。
+            lines.append(
+                "其中音频（kind=audio）是配乐/曲目，**不要**当画面素材传给 load_media："
+                "零素材出片（render_motion_video）直接把它的 material_id 传给 bgm 参数即可；"
+                "有素材的剪辑链先调 select_BGM(query=歌名) 拿到引用，再交给渲染节点。"
+            )
     if rejected:
         lines.append("以下附件无法使用（不存在或无权访问），请向用户说明并忽略："
                      + ", ".join(str(m) for m in rejected))

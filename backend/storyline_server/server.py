@@ -38,8 +38,10 @@ SESSION_HEADER = "X-Storyline-Session-Id"
 DEFAULT_SESSION = "storyline:default"
 HANGING_TIMEOUT_SEC = 30 * 60   # spec §9：running 超 30 分钟视为进程崩溃遗留
 # 分钟级耗时的节点：改成「提交 + 轮询」，不让一次 JSON-RPC 往返等一部片子。
-# 目前只有渲染；后续若 ASR/VL 批也顶不住，加进这个集合即可（执行位是通用的）。
-LONG_RUNNING_NODES = frozenset({"render_video"})
+# 出片与局部改都在这一集合里——局部差的那一版通常只重烧几镜，但「几镜」也可能是
+# 全部（用户改了全局字号那类），按最坏耗时归类。后续若 ASR/VL 批也顶不住，加进来即可。
+LONG_RUNNING_NODES = frozenset({"render_video", "render_motion_video",
+                                "patch_motion_video"})
 
 _JSON_TYPE_MAP = {"string": str, "integer": int, "number": float,
                   "boolean": bool, "array": list, "object": dict}
@@ -179,7 +181,13 @@ class StorylineServer:
                 # 的节点体刻意不开任务行、也不推进度——那一行于是永远停在 queued（界面显示
                 # 「正在出片」、看门狗按停滞判死），而它真正该回的出片计划账被进度视图盖掉。
                 dry = args.get("dry_run")
-                if _flag_on(state.flags.get("dry_run") if dry is None else dry):
+                if dry is None and "dry_run" in (node.input_schema.get("properties") or {}):
+                    # 只有**声明了这个参数**的节点才认跨节点兜底：``state.flags`` 会累积
+                    # 本会话每一次调用的全部入参，先前一次 render_video(dry_run=true)
+                    # 留下的开关，不该让没有 dry_run 参数的出片节点也走内联执行——
+                    # 那条路不开后台执行位，一次调用等一部片子，等于把超时请回来。
+                    dry = state.flags.get("dry_run")
+                if _flag_on(dry):
                     result = await server.interceptor.invoke(node.name, state, **args)
                     return json.dumps(result, ensure_ascii=False)
                 return await server._invoke_long(node, state, args, wait_sec)
@@ -293,7 +301,9 @@ class StorylineServer:
         self.mcp.tool(
             name="render_status",
             title="渲染进度查询",
-            description=("查询 render_video 提交的渲染任务：返回 status/stage/percent，"
+            description=("查询出片节点（render_video / render_motion_video /"
+                         " patch_motion_video）提交的渲染任务："
+                         "返回 status/stage/percent，"
                          "status=done 时同批回成片对象键、现签播放直链与时长（与直接渲染同形状），"
                          "status=failed 时回错误原因。渲染未完成就接着轮询，不要提前收尾"))(
             render_status)

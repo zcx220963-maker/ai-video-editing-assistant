@@ -28,6 +28,15 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 渲染产物的账本与 dry_run 回执（技能正文按字段解释给模型看，不是可调用名）：
     "evidence", "evidence_rule", "render_plan", "blocking", "not_checked",
     "will_render", "timeline_digest", "src_start", "src_end",
+    # 零素材图形科普片那一路：plan_motion 的分镜账 + render_motion_video 的帧数回执
+    # （技能正文里「读 estimated_sec 与 target_warnings 对账」就是这些键）：
+    "motion_spec", "estimated_sec", "target_warnings", "target_duration_sec",
+    "plan_table", "char_count", "frames_total",
+    # 局部改那一路（patch_motion_video）：min_duration_sec 是归一后的镜头字段名
+    # （duration_sec 归一就成了它），before_frames 是补丁账里的改前代表帧。
+    # 两者都不是入参键，schema 扫不出来，不收就是假告警——技能正文教模型「拖镜头长度
+    # 改的是 min_duration_sec」，被拦下来模型只能换个说法，读者反而看不到真字段名。
+    "min_duration_sec", "before_frames",
 })
 
 MCP_PREFIX = "storyline_"
@@ -44,24 +53,47 @@ def num(value: Any) -> float | None:
 
 
 def enum_of(spec: Any) -> set[str]:
-    """一份参数声明里所有可能的取值（enum / const / oneOf 分支 / 默认值）。
+    """一份参数声明里所有可能的取值（enum / const / oneOf 分支 + 嵌套子字段里声明的取值）。
 
-    用于词表：计划文案里提到某个真实枚举取值（如模板 id ``tpl_vlog_3act``）
-    不该被判成「臆造的名字」。只在声明里明确列出的值才算，不做任何猜测。
+    用于词表：计划一旦真把带 enum 的节点写进 steps，模型就会在 why/expectation 里
+    顺口提它的取值（如 ``script_template_rec`` 的 ``tpl_vlog_3act``）。不收就会判成
+    「引用了不存在的名字」——真机实测：模型按提示补上了节点，紧接着因为文案里写了
+    模板 id 被判臆造，卡连着两轮出不来。
+
+    为什么要往 ``properties`` / ``items`` 里递归：像分镜这种「一个参数装整棵结构」的
+    节点，取值清单挂在子字段上（每镜的版式组件名在 ``shots[].card`` 的 enum 里）。
+    只看顶层就收不到它，而模型在计划文案里写「版式选 dict_entry」是完全正常的表达。
+
+    只在声明里明确列出的值才算，不做任何猜测。
     """
     out: set[str] = set()
-    if not isinstance(spec, Mapping):
-        return out
-    for key in ("enum", "examples"):
-        raw = spec.get(key)
-        if isinstance(raw, (list, tuple)):
-            out.update(str(v) for v in raw if isinstance(v, (str, int, float, bool)))
-    if "const" in spec:
-        out.add(str(spec["const"]))
-    for branch in spec.get("oneOf") or spec.get("anyOf") or ():
-        out |= enum_of(branch)
-    if spec.get("type") == "boolean":
-        out.update({"true", "false"})
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if depth > 8 or not isinstance(node, Mapping):
+            return
+        for key in ("enum", "examples"):
+            raw = node.get(key)
+            if isinstance(raw, (list, tuple)):
+                out.update(str(v) for v in raw if isinstance(v, (str, int, float, bool)))
+        if "const" in node:
+            out.add(str(node["const"]))
+        if node.get("type") == "boolean":
+            out.update({"true", "false"})
+        for branch in node.get("oneOf") or node.get("anyOf") or ():
+            walk(branch, depth + 1)
+        props = node.get("properties")
+        if isinstance(props, Mapping):
+            for sub in props.values():
+                walk(sub, depth + 1)
+        for key in ("items", "additionalProperties"):
+            sub = node.get(key)
+            if isinstance(sub, Mapping):
+                walk(sub, depth + 1)
+            elif isinstance(sub, (list, tuple)):
+                for item in sub:
+                    walk(item, depth + 1)
+
+    walk(spec)
     return out
 
 
@@ -122,6 +154,20 @@ def topology_view(contract: Any, steps: Any) -> list[dict[str, Any]]:
                     "requires": list(node_contract.requires)
                     if node_contract is not None else []})
     return out
+
+
+def add_implicit_skills(step: dict[str, Any], implicit: Sequence[str],
+                        skills: Mapping[str, Any]) -> None:
+    """把「这个节点离不开、模型却没写上卡」的技能补进步骤的 skills_hint（不重复、保序）。
+
+    只补清单里查得到且当前可用的：卡上挂一个点开是空的技能，比不补更坏。
+    """
+    hints = step["skills_hint"]
+    for name in implicit:
+        skill = skills.get(name)
+        if name in hints or skill is None or not getattr(skill, "available", True):
+            continue
+        hints.append(name)
 
 
 def coerce_plans(payload: Any) -> list[Mapping[str, Any]] | None:

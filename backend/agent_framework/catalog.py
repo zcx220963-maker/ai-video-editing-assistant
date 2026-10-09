@@ -86,6 +86,10 @@ PARAM_LABELS: dict[str, str] = {
     "highlight": "高光", "keep_original_audio": "保留原声",
     "keep_segments": "保留片段", "target_duration_sec": "目标时长（秒）",
     "wait_sec": "等待时长（秒）", "duration": "时长（秒）",
+    # 图形科普片（零素材出片）：这批键会原样出现在计划卡与工具气泡里
+    "spec": "分镜", "style": "版式", "aspect": "画幅", "fps": "帧率",
+    "narration": "人声朗读", "voice": "音色", "rate": "语速",
+    "subtitle_mode": "字幕形态", "title": "标题",
     # 检索与读写
     "query": "关键词", "text": "文本", "key": "键名", "pattern": "检索式",
     "glob": "文件通配", "path": "路径", "paths": "路径", "content": "内容",

@@ -38,8 +38,10 @@ from .plan import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_ste
 from .plan_retro import (PlanRetrospective, plan_card_lines, rework_line,
                          revise_line)
 from .render_gate import (ADJUST_OPTION, CONFIRM_OPTION, KEEP_FULL_OPTION,
-                          RENDER_NODE, TRUNCATE_OPTION, build_render_ask,
-                          decision_is_confirm, decision_text, should_gate_render)
+                          MOTION_KNOBS, MOTION_NODE, RENDER_NODE, RENDER_NODES,
+                          TRUNCATE_OPTION, build_render_ask,
+                          decision_is_confirm, decision_text,
+                          ungated_render_nodes)
 from .run_state import RunState, tool_names_in
 from .session import Session, SessionManager
 from .tool import ToolError, ToolRegistry, is_tool_error, plan_batches
@@ -426,6 +428,7 @@ class _Round:
     # 不能因为「这次 _drive 还没调过」就判它没用弹窗（真机实测：续跑的每一轮都吃一条
     # 「但你没有调用 ask_user」的假打回）。
     asked_this_run: bool = False
+    plan_submitted: bool = False
     # 「计划必须出卡」的打回预算。是否**已经**交过计划不看这里，看
     # ``state.plan_candidates``——那才是「submit_plan 真成功过」的权威记录，
     # 另加一个字段只会多一处可能与它不同步的状态。
@@ -449,6 +452,7 @@ class AgentOnceRun:
         config: AgentConfig | None = None,
         checkpoint: CheckpointManager | None = None,
         storage: Any | None = None,
+        plan_gate: Any | None = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -458,10 +462,17 @@ class AgentOnceRun:
         self.checkpoint = checkpoint
         # storage：附件鉴权与 messages 落库的入口；未注入时附件一律视为不可用（D1：无本地兜底）。
         self.storage = storage
-        # 已经过用户「确认渲染」的 run：同一条 run 内不再重复拦渲染。
-        # 放内存即可——它只影响「同一进程、同一条 run 内要不要再弹一次」，
+        # plan_gate：执行循环跑在这个实例上，门却挂在 Agent 上——想让 Runner 读词表
+        # （确认卡回显开关取值的人话标签）就必须显式递进来，靠 ``getattr(self, "plan_gate")``
+        # 是永远读不到的空读：静默回 {}，卡面就悄悄退回机器名。没接门时照旧为 None。
+        self.plan_gate = plan_gate
+        # 已经过用户「确认渲染」的 **(这条 run, 哪个出片通道)**：确认过的通道在同一条
+        # run 里不再重问、也不再重复提交（由 _suppress_repeat_render 回填「已经在渲了」）。
+        # 按通道记账而不是只记 run：用户批准剪素材那条路，不等于批准零素材那条路——
+        # 那是另一笔不可逆的算力。
+        # 放内存即可：它只影响「同一进程、同一条 run 内要不要再弹一次」，
         # 跨重启后重弹一次无害（用户顶多再看一眼同一份编排），不值得为它加一列。
-        self._render_confirmed: set[str] = set()
+        self._render_confirmed: set[tuple[str, str]] = set()
         # 渲染确认门「问过没有」记在 ``RunState.render_gate_asked``（随指针行落盘），
         # 不再放内存：内存版本会被进程重启与续跑换代打穿，
         # 真机实测因此又把同一道题问了两遍。见 _tool_round 里的完整说明。
@@ -673,6 +684,10 @@ class AgentOnceRun:
                         pause = await self._tool_round(r, resp)
                         if pause is not None:
                             return pause
+                        if r.plan_submitted:
+                            r.final = resp.content or ""
+                            r.reached_limit = False
+                            break
                         continue
 
                     if await self._nudge_back(r, resp):
@@ -771,20 +786,21 @@ class AgentOnceRun:
             if any(r.reg.needs_approval(tc.name) for tc in resp.tool_calls):
                 return await self._pause(r, resp.tool_calls,
                                          reason="以下操作需要你确认后才会执行")
-            # 渲染确认门：编排已就绪、马上要渲染时，先把编排结果给用户看，
-            # 等确认再渲。用户明确要求「不确认绝不渲染」。
-            # 确认过一次就整条 run 不再拦：同一个 run 里再拦一次只是重复打扰
-            # （模型收尾时偶尔会再调一次渲染）。
+            # 渲染确认门：马上要烧像素出片时，先把编排结果给用户看，等确认再渲。
+            # 用户明确要求「不确认绝不渲染」。
+            #
+            # 拦不拦、拦哪个通道，判据全在 ``ungated_render_nodes``（门开关、dry_run、
+            # 这条 run 答过没有）；这里只负责「按名单挂起」。
             #
             # 但 `interactive=False`（到点自动跑的定时任务）必须放行：
             # 那条 run 的 user_id 是 "cron"，浏览器身份永远过不了归属校验，
             # 而 awaiting_approval 刻意不在 _UNFINISHED 里、自动续跑也捞不到——
             # 拦下来就是**永久挂起**。它的投递方本来就已显式声明"直接执行"。
-            if (r.interactive
-                    and should_gate_render(resp.tool_calls, enabled=self.config.gate_render)
-                    and r.run_id not in self._render_confirmed
-                    and not r.state.render_gate_asked):
-                # 这道门题**对同一条 run 只问一次**，而且这一位要**落盘**。
+            gated = ungated_render_nodes(resp.tool_calls,
+                                         enabled=self.config.gate_render,
+                                         already_asked=r.state.render_gate_asked)
+            if r.interactive and gated:
+                # 这道门题**对同一条 run 的同一个通道只问一次**，而且这一位要**落盘**。
                 #
                 # 真机事故：用户看到同一道题被问了几十遍。机制是——
                 # ``decision_is_confirm`` 只认 ``confirm_render`` 这一个 key，
@@ -796,11 +812,37 @@ class AgentOnceRun:
                 # 用户的原则：「答了就是答了」。所以问过一次就记住，之后按用户的
                 # 选择继续走。**记在 state 而不是内存**：内存版本会被进程重启
                 # 和续跑换代打穿（真机实测正是这样又问了两次）。
-                r.state.render_gate_asked = True
-                ask = build_render_ask(await self._load_preview(r.ctx.session))
+                # 一批里若同时出现两个出片通道，**一次只问一条**：确认了时间线那条
+                # 不等于批准了图形科普片那条——那是另一笔不可逆的算力。没问到的那条
+                # 这一轮不执行（``_settle_pending`` 按 ask 上的通道名分账），下一轮单独过门。
+                first = gated[0]
+                r.state.note_render_gate_asked(first)
+                # 摘要按通道给：时间线预览就是 ``render_video`` 要渲的那份编排，拿它去问
+                # 「确认渲图形科普片吗」是让用户确认一个不是自己要渲的东西；图形科普片
+                # 那条路读的是分镜账（镜数/字数/估算时长/画幅/旁白/字幕/配乐）。
+                sess = r.ctx.session
+                preview = motion = None
+                if first == RENDER_NODE:
+                    preview = await self._load_preview(sess)
+                elif first == MOTION_NODE:
+                    motion = await self._load_motion_plan(sess, resp.tool_calls, first)
+                ask = build_render_ask(
+                    preview, motion=motion,
+                    labels=self._motion_value_labels() if motion else None,
+                    title="" if first == RENDER_NODE else
+                    f"接下来要出的是「{get_catalog().label(first)}」，确认开始渲染吗？")
+                ask["render_node"] = first
                 return await self._pause(r, resp.tool_calls, reason=ask["title"], ask=ask)
 
         await self._execute_tool_calls(r.ctx, resp.tool_calls, r.reg)
+
+        # submit_plan 成功后立即收尾：计划卡已回投给用户，轮次到此为止。
+        # 不收尾的话模型下一轮还会调 ask_user 弹提问卡，与计划卡叠在一起——
+        # 用户还没确认计划，不该再被问新问题。
+        if (any(tc.name == "submit_plan" for tc in resp.tool_calls)
+                and r.state.plan_candidates):
+            r.plan_submitted = True
+            return None
 
         # 主动提问：模型调了 ask_user 就把本轮停在这里，等问题卡片
         # 上用户点选之后从同一断点续跑（与审批共用挂起/续跑机制）。
@@ -828,17 +870,31 @@ class AgentOnceRun:
         return None
 
     async def _suppress_repeat_render(self, r: "_Round", resp: LLMResponse) -> bool:
-        """本轮里的重复渲染：逐条回填「已经在渲了」，不再走任何一道门。"""
+        """本轮里的重复渲染：逐条回填「已经在渲了」，不再走任何一道门。
+
+        认的是 **(这条 run, 这个通道)**：确认过 ``render_video`` 只压制它自己，
+        模型若改提另一个出片通道，那是一次未确认的新渲染，该交给门。
+        """
         repeat = [tc for tc in resp.tool_calls
-                  if tc.name == RENDER_NODE and r.run_id in self._render_confirmed]
+                  if tc.name in RENDER_NODES and (r.run_id, tc.name) in self._render_confirmed]
         if not repeat:
             return False
+        repeat_ids = {tc.id for tc in repeat}
         for tc in resp.tool_calls:
-            if tc.name == RENDER_NODE:
+            if tc.id in repeat_ids:
                 r.messages.append(tool_result(
                     tc.id, tc.name,
                     "本次编排已经确认并提交渲染，无需再次提交。"
                     "请直接向用户汇报渲染已开始。"))
+            elif tc.name in RENDER_NODES:
+                # 未确认过的另一个出片通道：**不能说它也已经提交**——它没有。
+                # 老实写 ToolError，模型下一轮重新提它时还会经过确认门。
+                r.messages.append(tool_result(
+                    tc.id, tc.name, ToolError(
+                        tc.name,
+                        "这一条**没有执行**：本轮已有一次确认过的渲染在跑，"
+                        "这个出片通道用户还没确认，不能顺带开渲。"
+                        "确实需要它请下一轮单独提出，届时会先请用户确认编排结果。")))
             else:
                 r.messages.append(tool_result(
                     tc.id, tc.name,
@@ -973,13 +1029,12 @@ class AgentOnceRun:
         预算用尽就不调(省一次注定无效的调用);判定违规返回 (类别, 打回文案, 依据注),
         否则 None。事实由服务端提供,判断模型只做"文本 vs 事实"的一致性裁决。
         """
-        judge = judge_mod.get_judge()
-        if judge is None:
-            return None
+        if await judge_mod.get_judge() is None:
+            return None             # 没有任何裁决通道：完全不启用，行为与词面判据一致
 
         if (r.planning and not r.state.plan_candidates and r.card_nudges > 0):
             try:
-                v = await judge(
+                v = await judge_mod.judge(
                     "这条收尾答复是否向用户声称:已经生成/提交了候选计划卡,或给出了"
                     "可供挑选确认的剪辑方案?(事实上本轮没有任何计划卡提交成功)",
                     text=resp.content,
@@ -996,7 +1051,7 @@ class AgentOnceRun:
         if (approved and _no_step_called(approved, r.state.calls_attempted)
                 and r.step_nudges > 0):
             try:
-                v = await judge(
+                v = await judge_mod.judge(
                     "这条收尾答复是否声称:剪辑步骤/渲染已经执行或完成?"
                     "(事实上本轮一次计划内的步骤工具都没有被调用)",
                     text=resp.content,
@@ -1014,7 +1069,7 @@ class AgentOnceRun:
         if (self.config.require_popup_questions and r.popup_nudges > 0
                 and not r.asked_this_run):
             try:
-                v = await judge(
+                v = await judge_mod.judge(
                     "这条收尾答复是否在向用户索要信息/决策,需要用户回复才能继续?"
                     "(事实上本轮没有调用弹窗提问工具,用户界面上不会出现任何选项卡)",
                     text=resp.content,
@@ -1229,9 +1284,29 @@ class AgentOnceRun:
                     ctx.messages.append(user(text))
                 return asked_now
             if decision_is_confirm(decision) and calls:
-                # 记下「这条 run 的渲染已确认」：之后再出现渲染调用不再拦。
-                self._render_confirmed.add(str(cp.run_id or ""))
-                await self._execute_tool_calls(ctx, remaining, reg)
+                # 记下「这条 run 的**这一个出片通道**已确认」：同通道再出现不再拦、
+                # 也不再重复提交；未确认过的其它通道照旧过门。
+                run_id = str(cp.run_id or "")
+                approved = str((asked or {}).get("render_node") or "")
+                batch: list[ToolCall] = []
+                deferred: list[ToolCall] = []
+                for tc in remaining:
+                    # 一次只批一条通道。ask 上带着这一道题问的是哪条；老 checkpoint
+                    # 没这一位（升级前挂起的），按整批处理，不让它卡死在确认不了的状态。
+                    if approved and tc.name in RENDER_NODES and tc.name != approved:
+                        deferred.append(tc)
+                    else:
+                        batch.append(tc)
+                self._render_confirmed.update(
+                    (run_id, tc.name) for tc in batch if tc.name in RENDER_NODES)
+                for tc in deferred:
+                    ctx.messages.append(tool_result(
+                        tc.id, tc.name, ToolError(
+                            tc.name,
+                            "这一条**没有执行**：用户刚才确认的是另一个出片通道的编排，"
+                            "这个通道还没有过确认门——那是另一笔不可逆的算力，不能顺带批准。"
+                            "确实需要它请下一轮单独提出，届时会先把它的编排结果交用户确认。")))
+                await self._execute_tool_calls(ctx, batch, reg)
                 return asked_now
             # ⚠️ 关键：这个 tool 结果**不是**工具的返回值，而是「本轮没执行、先把用户
             # 的话交给你」。真机事故：用户对渲染确认门选了「要改」并写了自由文本，
@@ -1295,7 +1370,7 @@ class AgentOnceRun:
         nodes = list(getattr(self, "_exec_plan_nodes", None) or ())
         if not nodes or not tool_calls:
             return tool_calls
-        contract = getattr(getattr(self, "plan_gate", None), "contract", None)
+        contract = getattr(self.plan_gate, "contract", None)
         try:
             required_map = contract.required_map() if contract is not None else {}
         except Exception:  # noqa: BLE001 - 取不到图就退化成原样（只是不并批）
@@ -1460,6 +1535,66 @@ class AgentOnceRun:
             logger.exception("读取编排预览失败（渲染确认门继续，只是少一块摘要）")
             return None
 
+    async def _load_motion_plan(self, session: Session, tool_calls: Sequence[Any],
+                                node: str) -> Mapping[str, Any] | None:
+        """图形科普片确认卡的账本：优先用 Store 里的分镜产物，其次用调用自带的手写 spec。
+
+        读**这次调用**的参数而不是 Store 的那一份，是因为模型可以跳过分镜直接出片；
+        两者都有时以参数为准——服务端用的就是它，摘要显示旧值就是骗人。
+        顶层开关（用户在计划卡上改的画幅/帧率/音色）最后盖上去，理由同一条。
+
+        读不到就回 None：门照样拦，只是弹窗少一块摘要（与 ``_load_preview`` 同口径）。
+        """
+        args: Mapping[str, Any] = {}
+        for tc in tool_calls or ():
+            if getattr(tc, "name", None) == node:
+                candidate = getattr(tc, "arguments", None)
+                if isinstance(candidate, Mapping):
+                    args = candidate
+                break
+        source: dict[str, Any] | None = None
+        spec = args.get("spec")
+        if isinstance(spec, Mapping) and spec:
+            source = dict(spec)
+        elif self.storage is not None:
+            try:
+                ident = current_identity()
+                sid = storyline_session_id(session.user_id, session.conversation_id)
+                art = (ident.artifact_id if ident is not None else "") or ""
+                row = (await self.storage.artifacts(sid, art)
+                       .snapshot()).get("plan_motion")
+                if isinstance(row, Mapping) and row:
+                    source = dict(row)
+            except Exception:  # noqa: BLE001 - 摘要读失败不该拦住确认流程
+                logger.exception("读取分镜产物失败（渲染确认门继续，只是少一块摘要）")
+        if source is None:
+            return None
+        return {**source, **{k: v for k, v in args.items()
+                              if k in MOTION_KNOBS and v not in (None, "")}}
+
+    def _motion_value_labels(self) -> dict[str, dict[str, str]]:
+        """确认卡回显开关取值时用的「人话」表：``{开关名: {取值: 标签}}``。
+
+        为什么从词表读而不是在主服务再抄一份对照表：这份标签的源在剪辑服务端的参数
+        声明里，随 DAG 契约一起带回来（``props_for`` 已经把契约的 params 并进工具声明）。
+        抄一份就是第三份名单，迟早和源不一致——而它错的后果是用户看见两张卡说两种话。
+        读不到（没连剪辑服务端、契约还没填）就回空表，确认卡退回它自带的小表。
+        """
+        gate = self.plan_gate
+        vocab = getattr(gate, "vocab", None)
+        if vocab is None:
+            return {}
+        try:
+            props = vocab.props_for(MOTION_NODE) or {}
+        except Exception:  # noqa: BLE001 - 标签只是好看，读不到不该拦住确认流程
+            return {}
+        out: dict[str, dict[str, str]] = {}
+        for key, spec in props.items():
+            labels = spec.get("value_labels") if isinstance(spec, Mapping) else None
+            if isinstance(labels, Mapping) and labels:
+                out[str(key)] = {str(k): str(v) for k, v in labels.items()}
+        return out
+
     def _take_asked_question(
         self, reg: ToolRegistry, tool_calls: Sequence[Any],
     ) -> dict[str, Any] | None:
@@ -1622,7 +1757,8 @@ class Agent:
             session_manager if session_manager is not None else SessionManager(storage)
         )
         self.runner = AgentOnceRun(
-            llm, registry, context_builder, hooks, config, checkpoint, storage=storage
+            llm, registry, context_builder, hooks, config, checkpoint,
+            storage=storage, plan_gate=plan_gate
         )
         self.storage = storage
         # 计划门（块 B）：没接上就是普通服务，plan() 如实退回 handle()。

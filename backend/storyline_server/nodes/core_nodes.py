@@ -2489,21 +2489,36 @@ def _subtitle_layers(tl: dict[str, Any], size: tuple[int, int],
     w, h = size
     font = str(_find_font(settings.caps.subtitle_font, settings.caps.font_dirs))
     layers = []
+    requested = 0
+    last_error: Exception | None = None
     for sub in tl.get("subtitles", []):
         try:
             text = sub.get("text", "")
             if not text:
                 continue
-            tc = TextClip(font=font, text=text[:40], font_size=max(20, h // 22),
+            requested += 1
+            fs = max(20, h // 22)
+            tc = TextClip(font=font, text=text[:40], font_size=fs,
                           method="caption", size=(int(w * 0.9), None),
+                          # moviepy 2.1.2 在 Pillow≥11 下反推 caption 高度时只取
+                          # textbbox 的 bottom-top，比真实字形矮一个 descent：量出来
+                          # 单行/换行的墨迹都正好顶到图最后一行（下留=0），字幕下沿
+                          # 被削平。垫半个字号才画得全，顺带给出底边安全距离。
+                          margin=(0, 0, 0, fs // 2),
                           text_align="center",
                           stroke_color="black",
                           stroke_width=1 if sub.get("style") != "subtitle_bold" else 2,
                           color="white")
             layers.append(tc.with_start(sub["start"]).with_duration(
                 max(0.2, sub["end"] - sub["start"])).with_position(("center", "bottom")))
-        except Exception:
-            continue  # MoviePy v2 TextClip 参数差异：丢字幕不丢成片
+        except Exception as exc:  # noqa: BLE001 - MoviePy 版本参数差异：丢字幕不丢成片
+            last_error = exc
+            continue
+    if requested and not layers:
+        # 整条字幕链一条都没生成不是「这条字幕没写好」，是字体/渲染体这类全局问题，
+        # 静默吞掉的代价是成片永远没有字幕而账面一切正常（容器里就栽过这一次）。
+        print(f"[storyline] 字幕 {requested} 条全部没能生成（字体={font}）："
+              f"{type(last_error).__name__}: {last_error}", flush=True)
     return layers
 
 
@@ -2966,12 +2981,20 @@ def _find_font(preferred: str, font_dirs: list[str]) -> Path:
                 f = d / f"{name}{ext}"
                 if f.exists():
                     return f
-    for d in dirs:            # 目录里没有偏好字体：退到该目录下任意 ttf/ttc
-        if d.is_dir():
+    # Debian 系（含本镜像的 fonts-noto-cjk）把字体装在 /usr/share/fonts/<类型>/<厂商>/
+    # 两层之下，font_dirs 填的 /usr/share/fonts 顶层一个字体文件都没有——只扫顶层就会
+    # 一路落到根本不存在的 "arial"，TextClip 抛错被上层 except 吞掉，整条字幕静默消失。
+    for d in dirs:
+        for name in names:
             for ext in (".ttf", ".ttc", ".otf"):
-                got = next(iter(sorted(d.glob(f"*{ext}"))), None)
+                got = next(iter(sorted(d.rglob(f"{name}{ext}"))), None)
                 if got:
                     return got
+    for d in dirs:            # 目录里没有偏好字体：退到该目录下任意 ttf/ttc
+        got = next(iter(sorted(p for ext in (".ttf", ".ttc", ".otf")
+                               for p in d.rglob(f"*{ext}"))), None)
+        if got:
+            return got
     return Path("arial")
 
 
@@ -2990,11 +3013,15 @@ REAL_NODE_CLASSES = [
 def build_real_registry(settings: Settings, providers: Providers, storage: Storage,
                         allowed: list[str] | None = None) -> NodeRegistry:
     """实例化真实节点；allowed 为 TOML available_nodes 白名单。"""
-    # 网页出片通道（Hyperframes 类）延迟到这里导入：web_nodes 反过来引本模块的
-    # StoryNode/_obj，模块级互相导入会因加载顺序炸掉其中一边。
+    # 网页出片、图形科普片出片与它的分镜节点三条通道延迟到这里导入：它们的模块反过来引
+    # 本模块的 StoryNode/_obj/_JobProgress，模块级互相导入会因加载顺序炸掉其中一边。
+    from .motion_nodes import PatchMotionVideoNode, RenderMotionVideoNode
+    from .motion_plan import PlanMotionNode
     from .web_nodes import RenderWebNode
     reg = NodeRegistry()
-    name_to_cls = {cls.name: cls for cls in [*REAL_NODE_CLASSES, RenderWebNode]}
+    name_to_cls = {cls.name: cls
+                   for cls in [*REAL_NODE_CLASSES, RenderWebNode, PlanMotionNode,
+                               RenderMotionVideoNode, PatchMotionVideoNode]}
     for nm in (allowed or list(name_to_cls)):
         cls = name_to_cls.get(nm)
         if cls is not None:

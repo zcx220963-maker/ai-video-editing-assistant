@@ -22,6 +22,15 @@ MAIN_BASE_KEY = "base_url"              # 主模型地址（按用户覆盖;空 
 JUDGE_BASE_KEY = "judge_base_url"       # 判断模型三件套(base_url/model/key)
 JUDGE_MODEL_KEY = "judge_model"
 JUDGE_API_KEY_NAME = "judge_api_key"
+# 联网检索的后端选择与密钥（前端「设置」→ app_secrets，与模型密钥同一套热读机制）。
+# 为什么要有 provider/base_url 两个非密钥项一起存：searxng 这类自建实例**没有 key**，
+# 只有地址；而 brave/tavily/serpapi 只有 key 没有地址。单独存 key 的话自建那条路走不通。
+SEARCH_PROVIDER_KEY = "search_provider"   # brave|tavily|serpapi|searxng（空 = 免 key 回落链）
+SEARCH_API_KEY_NAME = "search_api_key"
+SEARCH_BASE_KEY = "search_base_url"       # searxng 实例地址；填了才生效
+ENV_SEARCH_KEY_NAME = "SEARCH_API_KEY"
+ENV_SEARCH_PROVIDER = "SEARCH_PROVIDER"
+ENV_SEARCH_BASE = "SEARCH_BASE_URL"
 ENV_KEY_NAME = "OPENAI_API_KEY"         # 前端没配时的回落环境变量（首选）
 # .env 里还留着 DEEPSEEK_API_KEY / SILICONFLOW_API_KEY 这两把历史名字。原先没有任何代码
 # 读它们——用户填了、静默无效，还以为「填了就生效」。现在把它们接成同一层的回落位，
@@ -120,7 +129,9 @@ async def resolve_api_key(user_id: str = "", *, fallback: str = "") -> tuple[str
 __all__ = ["API_KEY_NAME", "CACHE_TTL_SEC", "ENV_KEY_NAME", "ENV_KEY_NAMES", "SOURCE_PG",
            "SOURCE_ENV", "SOURCE_FALLBACK", "SOURCE_NONE", "bind_storage", "unbind_storage",
            "bound_storage", "current_user_id", "env_api_key", "invalidate",
-           "resolve_api_key", "mask"]
+           "resolve_api_key", "resolve_search_config", "mask",
+           "SEARCH_PROVIDER_KEY", "SEARCH_API_KEY_NAME", "SEARCH_BASE_KEY",
+           "ENV_SEARCH_KEY_NAME", "ENV_SEARCH_PROVIDER", "ENV_SEARCH_BASE"]
 
 
 # ---- 主模型 model/base_url 的按用户覆盖（前端「设置」→ app_secrets）----
@@ -141,6 +152,33 @@ async def resolve_model_base(*, fallback_model: str,
     except Exception:  # noqa: BLE001 - 存储抖动退回默认,不阻塞模型调用
         return fallback_model, fallback_base
     return (model or fallback_model), (base or fallback_base)
+
+
+async def resolve_search_config(user_id: str = "") -> tuple[str, str, str, str]:
+    """联网检索后端的按身份热读，返回 (provider, api_key, base_url, 来源名)。
+
+    优先级与模型密钥一致：**前端「设置」压过环境变量**。provider 为空 = 没配后端，
+    调用方走免 key 回落链；searxng 是自建实例，**只有 base_url 就够**（无 key）。
+
+    来源名只写层名与 provider，绝不带出 key 值本身——展示侧任何一次泄漏都是事故。
+    """
+    uid = user_id or current_user_id()
+    provider = key = base = ""
+    if _storage is not None and uid:
+        try:
+            provider = ((await _storage.secrets.get(uid, SEARCH_PROVIDER_KEY)) or "").strip()
+            key = ((await _storage.secrets.get(uid, SEARCH_API_KEY_NAME)) or "").strip()
+            base = ((await _storage.secrets.get(uid, SEARCH_BASE_KEY)) or "").strip()
+        except Exception:  # noqa: BLE001 - 存储抖动退回环境变量层，不让检索整条挂掉
+            provider = key = base = ""
+        if provider or key or base:
+            return provider, key, base, SOURCE_PG
+    env_provider = os.environ.get(ENV_SEARCH_PROVIDER, "").strip()
+    env_key = os.environ.get(ENV_SEARCH_KEY_NAME, "").strip()
+    env_base = os.environ.get(ENV_SEARCH_BASE, "").strip()
+    if env_provider or env_key or env_base:
+        return env_provider, env_key, env_base, f"环境变量 {ENV_SEARCH_PROVIDER or ENV_SEARCH_KEY_NAME}"
+    return "", "", "", SOURCE_NONE
 
 
 async def put_user_key(user_id: str, key_name: str, value: str) -> None:

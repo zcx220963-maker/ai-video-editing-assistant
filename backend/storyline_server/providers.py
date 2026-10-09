@@ -205,15 +205,40 @@ class Providers:
 
     # ---- TTS（异步，edge-tts 免费服务）----
     async def tts(self, text: str, dst: Path) -> Path:
+        path, _words = await self.tts_timed(text, dst)
+        return path
+
+    async def tts_timed(self, text: str, dst: Path, *, voice: str = "",
+                        rate: str = "") -> tuple[Path, list[dict[str, Any]]]:
+        """→ (音频文件, 词级时间轴 `[{text,start_ms,duration_ms}…]`)。
+
+        词级时间是「逐词高亮」与「镜头时长由语音时长决定」的唯一可靠来源，所以这里
+        显式向 edge-tts 要 `boundary="WordBoundary"`——**它的默认值是 SentenceBoundary**，
+        不显式要就一个词都收不到（实测中文音色返回 0 词、音频正常）。
+        offset/duration 的单位是 100 纳秒，换算成毫秒后一律保留一位小数。
+        """
         dst = Path(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             import edge_tts
-            await edge_tts.Communicate(text, self.caps.tts_voice,
-                                       rate=self.caps.tts_rate).save(str(dst))
+            com = edge_tts.Communicate(text, voice or self.caps.tts_voice,
+                                       rate=rate or self.caps.tts_rate,
+                                       boundary="WordBoundary")
+            words: list[dict[str, Any]] = []
+            with dst.open("wb") as fh:
+                async for chunk in com.stream():
+                    kind = chunk.get("type")
+                    if kind == "audio":
+                        fh.write(chunk["data"])
+                    elif kind == "WordBoundary":
+                        words.append({
+                            "text": str(chunk.get("text") or ""),
+                            "start_ms": round(int(chunk["offset"]) / 10000, 1),
+                            "duration_ms": round(int(chunk["duration"]) / 10000, 1),
+                        })
             if not dst.exists() or dst.stat().st_size < 512:
                 raise RuntimeError("edge-tts 产物为空")
-            return dst
+            return dst, words
         except Exception as e:
             raise ProviderError(f"TTS 失败: {e}") from e
 

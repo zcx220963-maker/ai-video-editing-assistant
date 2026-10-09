@@ -3,7 +3,7 @@
 # 运行:  docker compose --profile app up -d     (app/editor/caddy 三个服务共用本镜像)
 #
 # 阶段 1:前端构建(node)→ dist
-# 阶段 2:后端(python:3.12-slim + ffmpeg + 中文字体)→ 直接跑两个服务
+# 阶段 2:后端(python:3.12-slim + ffmpeg + 中文字体 + headless chromium)→ 直接跑两个服务
 
 FROM node:20-alpine AS web
 WORKDIR /web
@@ -22,6 +22,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY backend/requirements.txt backend/requirements-storyline.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -r requirements-storyline.txt
+
+# chromium:图形科普片(motion)与网页出片(render_web)都靠 headless 逐帧截图。
+# 放在 pip 层之后——这层装包会撞本机代理偶发 502,Retries 让它自己能重试,
+# 也别让它的前面那层(pip)因为改上面而被拖着重跑。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends -o Acquire::Retries=5 chromium \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY backend/ ./
 # 前端产物放进 REPO_ROOT/frontend/dist(run_server 的静态目录锚点在容器内=/frontend/dist)

@@ -59,7 +59,7 @@ async def ingest_bytes(
     *,
     filename: str,
     user_id: str,
-    conversation_id: str,
+    conversation_id: str | None,
     origin: str = "upload",
     max_bytes: int = DEFAULT_MAX_BYTES,
     content_type: str | None = None,
@@ -69,6 +69,8 @@ async def ingest_bytes(
     `chunks` 是任意异步字节生成器（HTTP 请求体、本地临时文件都走这一条）；sha256 与
     字节数在收流过程中算出，因此**超上限是边收边断**，不会先把 20GB 落进桶里再拒。
     `origin` 进 materials 表（upload/url），用于以后区分「用户自己传的」与「爬来的」。
+    `conversation_id` 为空表示这条素材不挂任何会话（BGM 曲库）：跳过 conversations 行
+    登记，materials.conv_id 留 NULL，可见性只按 owner_user_id 判。
     """
     kind = kind_of(filename)
     if kind is None:
@@ -136,7 +138,8 @@ async def ingest_bytes(
         storage.workspace.cleanup(origin, "_normalize")
 
     try:
-        await storage.conversations.ensure(user_id, conversation_id)
+        if conversation_id:
+            await storage.conversations.ensure(user_id, conversation_id)
         row = await storage.materials.register(
             user_id, conversation_id, key, fname, kind,
             bytes_=info.bytes, sha256=info.sha256, mime=mime_of(fname),

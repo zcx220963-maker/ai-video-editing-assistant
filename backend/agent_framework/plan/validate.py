@@ -1,23 +1,21 @@
-"""①~④ 四重校验器：node 白名单 / 拓扑与依赖 / skills_hint / param_options，
-外加文本卫生与跳过规则。纯代码，一次 LLM 都不叫。
+"""①~④ 四重校验器的**步骤级**那一半：node 白名单 / skills_hint / param_options，
+外加逐步骤的 why/expectation 与 seq。纯代码，一次 LLM 都不叫。
+
+跨步骤的结构判据（拓扑、显式依赖、跳过规则、重复步骤、重复开关、文案卫生）在
+``structure.StructureChecks``——它拿的是一张完整的卡，不是单步。
 
 事实一律问 ``PlanVocabulary``（什么节点存在、参数有哪些枚举源），这一层只管判。
 """
 
 from __future__ import annotations
 
-import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
-from .support import (PLAN_MAX_CANDIDATES, PLAN_STEPS_MAX,
-                      PlanIssues, as_card_value, clean, coerce_plans, num,
-                      topology_view)
+from .support import (PLAN_MAX_CANDIDATES, PLAN_STEPS_MAX, PlanIssues,
+                      add_implicit_skills, as_card_value, clean, coerce_plans,
+                      num, topology_view)
+from .structure import StructureChecks
 from .vocab import PlanVocabulary
-
-# 词表外别名的形状：snake_case 标识符（至少一个下划线）。
-# 展示字段里出现**英文原名**不打回——块 A 的出口替换器会换轨成中文；
-# 只有引用了词表里根本没有的名字才属于正确性问题（臆造），替换器无能为力。
-_ALIAS = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+")
 
 
 class PlanValidator:
@@ -27,6 +25,8 @@ class PlanValidator:
                  skills: Any = None) -> None:
         self.vocab = vocab
         self._skills = skills
+        # 跨步骤的结构判据在 structure 那一半：这里只管一步一步地归一化并判它
+        self.structure = StructureChecks(vocab)
 
     # ---- ①~④ 计划校验 ----
 
@@ -88,19 +88,21 @@ class PlanValidator:
         # 与「group_clips 必须显式上卡」先后试出来：白烧一轮迭代，还半路撞上失败守卫
         # 被推去问用户「这轮没有剪辑工具怎么办」（那一轮就是死路）。
         view = norm_steps if ok else topology_view(self.vocab.contract, steps)
-        self._check_topology(tag, view, issues)
-        self._check_explicit_deps(tag, view, issues)
+        self.structure.topology(tag, view, issues)
+        self.structure.explicit_deps(tag, view, issues)
         if ok:
             # 跳过规则要写回步骤字段（skippable / skip_reason），只在归一化过的步骤上跑。
-            self._check_skip_rules(tag, view, issues)
-        self._check_duplicates(tag, view, issues)
+            self.structure.skip_rules(tag, view, issues)
+        self.structure.duplicates(tag, view, issues)
+        if ok:
+            self.structure.dup_param_options(tag, norm_steps, issues)
         # 文案卫生扫的是**原始** why/expectation：归一化只是 clean()，两处同文；
         # 用原始的还能覆盖到没归一化成功的步骤（它们同样会被替换器扫）。
-        self._check_hygiene(tag, [plan.get("label"), plan.get("goal"),
-                                  *[text for step in steps
-                                    if isinstance(step, Mapping)
-                                    for text in (step.get("why"),
-                                                 step.get("expectation"))]], issues)
+        self.structure.hygiene(tag, [plan.get("label"), plan.get("goal"),
+                                    *[text for step in steps
+                                      if isinstance(step, Mapping)
+                                      for text in (step.get("why"),
+                                                   step.get("expectation"))]], issues)
         if not ok:
             return None
         return {
@@ -184,6 +186,7 @@ class PlanValidator:
                              f"上卡会在界面露出机器名。")
                 continue
             norm["skills_hint"].append(key)
+        add_implicit_skills(norm, self.vocab.implicit_skills(norm["node"]), skills)
 
     # ④ param_options 的每个值可反查枚举源；节点没有的参数不许上卡
 
@@ -213,6 +216,9 @@ class PlanValidator:
                 issues.error(f"计划 {tag} 第 {index} 步的参数「{key}」没有可反查的枚举源"
                              f"（既不是枚举/开关/带界数值，曲库也没有这组标签）。")
                 continue
+            # 卡面文字优先模型写的 display；没写就回落到**参数声明里的标签**（``value_labels``
+            # 随契约从剪辑服务端带回来）——否则用户看到的是 portrait 这种机器名。
+            labels = spec.get("value_labels") or {}
             values: list[dict[str, str]] = []
             picked: set[str] = set()
             for opt in options:
@@ -225,11 +231,9 @@ class PlanValidator:
                 if text in picked:
                     continue
                 picked.add(text)
-                values.append({
-                    "value": text,
-                    "display": clean(opt.get("display")) if isinstance(opt, Mapping) else "",
-                    "kind": source[0],
-                })
+                own = clean(opt.get("display")) if isinstance(opt, Mapping) else ""
+                values.append({"value": text, "kind": source[0],
+                               "display": own or str(labels.get(text) or "")})
             if not values:
                 continue
             # 单值开关 = 没给用户选择权。用户的原话是「有需要的参数也弹窗式询问，
@@ -287,112 +291,3 @@ class PlanValidator:
             return ""
         joined = ", ".join(sorted(data))
         return f"反查不到枚举源（可用：{joined[:160] or '无'}）"
-
-    # ---- ② 拓扑相容 / 跳过规则 / 文本卫生 ----
-
-    def _check_topology(self, tag: str, steps: list[dict[str, Any]],
-                        issues: PlanIssues) -> None:
-        """步骤序与 dag_contract.requires 拓扑相容：前置排在后面就是错。
-
-        前置**没上卡**是允许的（拦截器会补齐），界面上画成虚边——
-        「乱序容忍但逼依赖显式化」里被禁的是顺序颠倒，不是省略。
-        """
-        seq_of = {s["node"]: s["seq"] for s in steps}
-        for step in steps:
-            for dep in step["requires"]:
-                if dep in seq_of and seq_of[dep] > step["seq"]:
-                    issues.error(f"计划 {tag} 第 {step['seq']} 步（{step['node']}）"
-                                 f"排在它的前置「{dep}」之前，与 DAG 契约冲突。")
-
-    def _check_explicit_deps(self, tag: str, steps: list[dict[str, Any]],
-                             issues: PlanIssues) -> None:
-        """卡上必须列出「不会自动补齐」的前置，否则执行轮跑到那一步必炸。
-
-        执行期拦截器**只**自动补齐没标 ``require_explicit_call`` 的依赖；标了的那几个
-        （``filter_clips`` / ``group_clips`` / ``script_template_rec`` / ``transition_rec``
-        / ``text_rec``）一旦缺失就抛 ValueError：
-
-            group_clips 需要你直接调用并传入创意决策参数，不能自动补齐。
-
-        真机实测：p1 卡只列了 ``group_clips`` 却漏了 ``script_template_rec``，
-        执行到 ``generate_script`` 被拦下——用户已经点过确认，却注定失败。
-
-        ``_check_topology`` 写明「前置没上卡是允许的（拦截器会补齐）」，
-        这对可自动补齐的依赖成立；对这几个不成立，所以补这一道。
-
-        查的是**传递闭包**，而且要**穿过没上卡的中间节点**：真机三张卡都是
-        ``select_BGM → generate_script → script_template_rec``（最后一个不可补齐），
-        中间那个自己不是，但它踩着一个是的。
-        """
-        explicit = self.vocab.explicit_call_nodes()
-        if not explicit:
-            return                  # 契约没接上／没有这类节点：退回原行为
-        present = {s["node"] for s in steps}
-        # 按**缺的那个节点**去重：一张卡漏一个 script_template_rec，下游三个步骤都会
-        # 撞上它，三条几乎一样的话只会把清单挤满（补一个节点三处都解决）。
-        # 取最先撞上的那一步当锚点——步骤序就是拓扑序，它排在那之前即可。
-        reported: set[str] = set()
-        for step in steps:
-            queue: list[str] = list(step["requires"])
-            seen: set[str] = set()
-            while queue:
-                dep = queue.pop(0)
-                if dep in seen:
-                    continue
-                seen.add(dep)
-                if dep not in present and dep in explicit and dep not in reported:
-                    reported.add(dep)
-                    issues.error(
-                        f"计划 {tag} 的步骤「{step['node']}」依赖「{dep}」，"
-                        f"但 {dep} 不会自动补齐（它需要你传入创意决策参数）。"
-                        f"请把 {dep} 也写进这张计划的 steps，排在 {step['node']} 之前。")
-                # 没上卡的中间节点**也要继续顺着它的前置查**：原先这里 `continue`
-                # 直接掐断，于是上面那种写法一路放行，卡面看着齐全，用户点完确认
-                # 跑到 select_BGM 才被执行期拦下。执行期的
-                # ``Interceptor._ensure_deps`` 是递归穿过没跑过的中间节点的，
-                # 校验必须与它同口径，否则等于没拦。
-                contract = self.vocab.contract.get(dep)
-                if contract is not None:
-                    queue.extend(contract.requires)
-
-    def _check_skip_rules(self, tag: str, steps: list[dict[str, Any]],
-                          issues: PlanIssues) -> None:
-        """skippable 只在没有下游依赖踩着时成立；否则降级为不可跳并给角标原因。"""
-        present = {s["node"] for s in steps}
-        for step in steps:
-            if not step["skippable"]:
-                continue
-            blocked = (self.vocab.contract.downstream(step["node"]) - {step["node"]}) & present
-            if blocked:
-                step["skippable"] = False
-                step["skip_reason"] = f"下游「{'、'.join(sorted(blocked))}」依赖它的产物"
-                issues.warn(f"计划 {tag} 第 {step['seq']} 步（{step['node']}）本可跳过，"
-                            f"但{step['skip_reason']}，已置为不可跳。")
-
-    def _check_duplicates(self, tag: str, steps: list[dict[str, Any]],
-                          issues: PlanIssues) -> None:
-        seen: set[str] = set()
-        for step in steps:
-            if step["node"] in seen:
-                issues.error(f"计划 {tag} 里节点「{step['node']}」出现了多次。")
-            seen.add(step["node"])
-
-    def _check_hygiene(self, tag: str, texts: Sequence[Any], issues: PlanIssues) -> None:
-        """只拦一种文本错误：词表里没有的别名/臆造工具名（英文原名由出口替换器处理）。
-
-        词表要含真实参数键：``material_id`` 这类名字是入参不是节点，模型在 why/expectation
-        里提它是正常表达，拦下来只会逼它换个说法重试一轮。
-
-        同理要含**节点产出字段名**（``asr_segments``/``clip_captions``/``groups``…）：
-        模型在为什么/预期里引用上游产物字段是最自然的写法，真机实测它连写三次
-        「引用不存在的名字「asr_segments」」，卡连着两轮出不来。产出字段不是臆造的工具名，
-        该放行。
-        """
-        vocab = (self.vocab.vocabulary() | self.vocab.param_keys() | self.vocab.enum_values()
-                 | self.vocab.output_keys())
-        for text in texts:
-            for token in _ALIAS.findall(clean(text or "")):
-                if token in vocab or self.vocab.resolve_tool(token) is not None:
-                    continue
-                issues.error(f"计划 {tag} 的文案引用了不存在的名字「{token}」"
-                             f"（词表里没有，界面换不成中文）。")

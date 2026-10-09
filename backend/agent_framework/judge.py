@@ -203,9 +203,26 @@ def actionable(verdict: dict[str, Any] | None) -> bool:
         return False
 
 
-def get_judge():
-    """供守卫层取用:已配置返回本模块(有 .judge),未配置返回 None。"""
-    return _self if _cfg() else None
+async def get_judge():
+    """供守卫层取用：有任一裁决通道时返回本模块（有 .judge），否则 None。
+
+    两条通道（与 ``judge()`` 内部的优先级一致）：
+
+    1. **Jev 通道**——env 的 ``JUDGE_*`` 三项，或当前用户在设置页配的三件套；
+    2. **主 LLM 兜底通道**——没有 Jev 但有能出网的模型密钥（``judge()`` 会走
+       ``_judge_with_llm``）。
+
+    为什么这条必须 await 且按身份解析：门禁原先只看 env（``_cfg()``），于是设置页配的
+    Jev 与「没配 Jev 回落主 LLM」这两条都不生效——守卫层拿到 None，整个第二意见层是死的。
+    没有密钥时才返回 None：那条通道跑不通，别白调一次。
+    """
+    from .secrets import resolve_api_key
+
+    uid = current_user_id()
+    if await _cfg_for(uid) is not None:
+        return _self
+    key, _source = await resolve_api_key(uid, fallback="")
+    return _self if key else None
 
 
 # 模块句柄(get_judge 返回它,调用方直接 await judge_mod.judge(...))

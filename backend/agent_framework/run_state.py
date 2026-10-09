@@ -47,15 +47,18 @@ class RunState:
     plan_candidates: list[dict[str, Any]] = field(default_factory=list)
     plan_warnings: list[str] = field(default_factory=list)
     plan_card_pushed: bool = False
-    # 渲染确认门：这条 run **已经问过**那道门题没有。
+    # 渲染确认门：这条 run 里**哪些出片通道**已经问过那道门题（节点名清单）。
     #
     # 为什么必须持久化（放内存不够）：真机实测同一道题被问了几十遍——
-    # 用户在弹窗里答了「保内容完整 / 音乐时长内」这类选项，但
-    # ``decision_is_confirm`` 只认 ``confirm_render`` 一个 key，于是门判定
-    # "你没确认" → 模型重渲 → 再拦 → 再问，无限循环。
-    # 放内存的版本还会被两件事打穿：进程重启（内存清零）、续跑换 run 身份。
-    # 落进 state 就跟着指针行走，重启与续跑都记得「这道题问过了」。
-    render_gate_asked: bool = False
+    # ``decision_is_confirm`` 只认 ``confirm_render`` 一个 key，用户在弹窗里答了
+    # 「保内容完整 / 音乐时长内」这类选项，门判定"你没确认" → 模型重渲 → 再拦 →
+    # 再问同一道题，无限循环。放内存的版本还会被两件事打穿：进程重启（内存清零）、
+    # 续跑换 run 身份。落进 state 就跟着指针行走，重启与续跑都记得「这道题问过了」。
+    #
+    # 为什么按**通道**而不是整条 run 一个布尔：用户确认了剪素材那条路
+    # （``render_video``），不等于批准了零素材那条路（``render_motion_video``）——
+    # 那是另一笔不可逆的算力，一位布尔会把第二道门直接放行。
+    render_gate_asked: list[str] = field(default_factory=list)
     # 对账：上一次推给前端的偏差（据此去重），以及终答时算出的完整结论
     audit_pushed: dict[str, Any] | None = None
     plan_audit: dict[str, Any] | None = None
@@ -71,7 +74,7 @@ class RunState:
             "calls_attempted": list(self.calls_attempted),
             "calls_executed": list(self.calls_executed),
             "plan_card_pushed": bool(self.plan_card_pushed),
-            "render_gate_asked": bool(self.render_gate_asked),
+            "render_gate_asked": list(self.render_gate_asked),
             "audit_pushed": (dict(self.audit_pushed)
                              if isinstance(self.audit_pushed, Mapping) else None),
             "plan_audit": (dict(self.plan_audit)
@@ -88,7 +91,8 @@ class RunState:
             calls_attempted=[str(x) for x in (d.get("calls_attempted") or [])],
             calls_executed=[str(x) for x in (d.get("calls_executed") or [])],
             plan_card_pushed=bool(d.get("plan_card_pushed")),
-            render_gate_asked=bool(d.get("render_gate_asked")),
+            render_gate_asked=[str(x) for x in (d.get("render_gate_asked") or [])
+                               if isinstance(x, str)],
             audit_pushed=(dict(d["audit_pushed"])
                           if isinstance(d.get("audit_pushed"), Mapping) else None),
             plan_audit=(dict(d["plan_audit"])
@@ -134,9 +138,9 @@ class RunState:
           · ``approved_plan`` —— 「编译后的那一份计划」在库里唯一的落点。
             从这条 run 的某个一致点分叉时，子 run 得继承同一个承诺，而不是退回
             「没有批准计划」——那道执行轮的硬保证和对账都会因此失效。
-          · ``render_gate_asked`` —— **「渲染确认门已经问过」这一位必须活过收尾**。
+          · ``render_gate_asked`` —— **「渲染确认门已经问过哪些通道」这份清单必须活过收尾**。
             真机事故（用户原话「为什么老是问我这个问题，我回答无数遍了」）：
-            run 撞迭代上限 → 收尾把这位置清掉 → 用户点「继续」→ 门认为"没问过"
+            run 撞迭代上限 → 收尾把这份清单清掉 → 用户点「继续」→ 门认为"没问过"
             → 又把同一道题问一遍，如此往复。它记的是"这条 run 已经问过用户"，
             与 approved_plan 同属「已认过的事实」，不是可丢的中间过程。
         """
@@ -147,7 +151,7 @@ class RunState:
         if isinstance(state.approved_plan, Mapping):
             keep["approved_plan"] = dict(state.approved_plan)
         if state.render_gate_asked:
-            keep["render_gate_asked"] = True
+            keep["render_gate_asked"] = list(state.render_gate_asked)
         if keep:
             plan[STATE_FIELD] = keep
         else:
@@ -160,6 +164,12 @@ class RunState:
 
     def note_executed(self, tool_name: str) -> None:
         self.calls_executed.append(tool_name)
+
+    def note_render_gate_asked(self, *nodes: str) -> None:
+        """记住「这几道出片门的题已经问过了」——同一通道同一条 run 只问一次。"""
+        for n in nodes:
+            if n and n not in self.render_gate_asked:
+                self.render_gate_asked.append(n)
 
 
 def tool_names_in(messages: Any) -> list[str]:

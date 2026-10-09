@@ -5,8 +5,12 @@
 适合把动态网页/数据大屏/图表动画直接出成片；时间线剪辑仍走 plan_timeline → render_video。
 
 实现要点：
-* 截帧用 headless 浏览器的 ``--virtual-time-budget``：把页面虚拟时钟快进到第 t 毫秒
-  再截图，requestAnimationFrame 动画因此是**确定性**的（逐帧回放不漂移）；
+* 截帧用 headless 浏览器的 ``--virtual-time-budget``：把页面虚拟时钟快进到第 t 毫秒再截图。
+  **但别指望 rAF 动画在这条路上是确定性的**——实测该预算下 Chrome 只发得出 1~2 个
+  ``requestAnimationFrame`` 回调就饿死（``--disable-gpu-vsync``、``--run-all-compositor-
+  stages-before-draw`` 都救不回来），且不报 JS 错误。所以动画必须做成「给定时刻的纯函数」：
+  时刻从 ``?t=毫秒`` 传进页面、解析期同步应用（motion/ 那条通道就是这么做的）；
+  靠 rAF 自走的页面在这里只会截到第一帧；
 * 新旧两种 headless 模式各试一次（老版 Chrome 只认 ``--headless``）；
 * 采集器做成**可注入**（``capture_backend`` 类属性）：离线测试用一个写纯色 PNG 的
   替身跑通「截图 → 合成 → probe → publish」整条管线，真浏览器路径留给真机；
@@ -74,6 +78,20 @@ def _find_chrome() -> str | None:
     return None
 
 
+def chrome_container_flags() -> list[str]:
+    """容器里跑 headless 的豁免参数——两条，一条都不多余。
+
+    * ``--disable-dev-shm-usage``：docker 默认给 ``/dev/shm`` 64MB，chromium 把页面
+      共享内存用满就直接 SIGBUS（表现为"截图没落盘"，不是代码错）。
+    * ``--no-sandbox``：只在 **root** 下补。非 root 一律留着沙箱——我们截的是模型
+      写的 SVG 和网上抓来的页面，沙箱是唯一那道隔离，能保就保。
+    """
+    flags = ["--disable-dev-shm-usage"]
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        flags.insert(0, "--no-sandbox")
+    return flags
+
+
 def _assemble(work: Path, n: int, fps: int, out: Path) -> None:
     """帧序列 → mp4（yuv420p + faststart，浏览器内联播放友好）。"""
     cmd = ["ffmpeg", "-y", "-framerate", str(fps), "-i", str(work / "f%04d.png"),
@@ -87,19 +105,37 @@ def _chrome_frame(chrome: str, target: str, t_ms: int, png: Path,
                   w: int, h: int) -> None:
     """截一帧：虚拟时钟快进到 t_ms 再截图（确定性动画帧）。"""
     png.parent.mkdir(parents=True, exist_ok=True)
-    base = [chrome, "--disable-gpu", "--hide-scrollbars",
+    base = [chrome, "--disable-gpu", "--hide-scrollbars", *chrome_container_flags(),
             f"--window-size={w},{h}", f"--screenshot={png}",
             f"--virtual-time-budget={max(1, t_ms)}",
             "--default-background-color=00000000"]
+    last = ""
     # 新 headless 优先；老内核不认 --headless=new 时退回旧参数再试一次
     for headless in ("--headless=new", "--headless"):
         cmd = [chrome, headless, *base[1:], target]
         try:
             _run(cmd, timeout=60.0)
-            return
-        except MediaError:
+        except MediaError as e:
+            last = str(e)
             continue
-    raise MediaError("headless 截图失败（新旧两种 headless 模式都试过）")
+        # 退出码 0 却没落盘是真会发生的：渲染进程崩了、/dev/shm 用满。不在这儿拦下来，
+        # 就是几分钟后 ffmpeg 读到一张不存在的 PNG，错误里连是哪个时刻都说不清。
+        if png.exists() and png.stat().st_size > 0:
+            return
+        last = f"{png.name} 没落盘（浏览器退出码 0）"
+    raise MediaError(f"headless 截图失败（新旧两种 headless 模式都试过）：{last}")
+
+
+def _with_t(target: str, t_ms: int) -> str:
+    """把「这一帧是第几毫秒」拼进 URL：``?t=`` 或 ``&t=``，有 #fragment 时插在它之前。
+
+    为什么必须显式给时刻而不只靠 ``--virtual-time-budget``：那个预算只喂得动
+    setTimeout/CSS 过渡，rAF 在预算下会饿死（见模块 docstring）——页面读不到 t，
+    就只能停在第一帧。
+    """
+    head, _, frag = target.partition("#")
+    sep = "&" if "?" in head else "?"
+    return f"{head}{sep}t={int(t_ms)}{('#' + frag) if frag else ''}"
 
 
 class RenderWebNode(StoryNode):
@@ -113,7 +149,12 @@ class RenderWebNode(StoryNode):
     input_schema = _obj(
         "网页出片", {
             "html": {"type": "string",
-                     "description": "完整 HTML 文档(内联 CSS/JS 动画);与 url 二选一"},
+                     "description": "完整 HTML 文档(内联 CSS/JS 动画);与 url 二选一。"
+                                    "**动画必须写成「给定时刻的纯函数」**：每帧的 URL 会带上 "
+                                    "?t=毫秒，页面要在解析期读 location.search 的 t 直接把画面"
+                                    "摆成那个时刻的样子；不要靠 requestAnimationFrame 自走——"
+                                    "headless 的虚拟时钟下 rAF 只回调一两次就饿死，那样整片会"
+                                    "停在第一帧"},
             "url": {"type": "string", "description": "网页地址(与 html 二选一)"},
             "duration_sec": {"type": "number", "description": "成片时长(秒),默认 5,0.5~60"},
             "fps": {"type": "integer", "description": "帧率,默认 10(1~30)"},
@@ -140,7 +181,8 @@ class RenderWebNode(StoryNode):
             raise MediaError(
                 "找不到 headless 浏览器（chrome/edge）："
                 "设 STORYLINE_CHROME 指到可执行文件后重试")
-        await asyncio.to_thread(_chrome_frame, chrome, target, t_ms, png, w, h)
+        await asyncio.to_thread(_chrome_frame, chrome, _with_t(target, t_ms),
+                                t_ms, png, w, h)
 
     async def process(self, state: NodeState, inputs: dict[str, Any]) -> dict[str, Any]:
         html = str(inputs.get("html") or "").strip()
@@ -160,7 +202,8 @@ class RenderWebNode(StoryNode):
         if html:
             page = work / "page.html"
             page.write_text(html, encoding="utf-8")
-            target = page.as_uri()
+            # 绝对化后才转 URI：workspace_root 在配置里可以是相对路径
+            target = page.resolve().as_uri()
         else:
             target = url
 

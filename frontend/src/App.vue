@@ -6,6 +6,7 @@
 // 身份（spec §7）：首次访问 POST /register 换一份 token，之后 HTTP 带 Bearer、
 //   WS 带 ?token=；请求里不再出现 user_id——它由服务端从 token 反查。
 import { computed, reactive, ref, nextTick, onMounted, onBeforeUnmount } from "vue";
+import MotionEditor from "./MotionEditor.vue";
 
 const TOKEN_KEY = "ca.token";
 // 浏览器只留凭证：身份由 token 反查，会话列表与历史都从服务端读。
@@ -151,6 +152,7 @@ async function loadHistory(cid, force) {
     if (!r.ok) return;
     const j = await r.json();
     const list = [];
+    let hasMedia = false;
     for (const m of (j.messages || [])) {
       list.push({
         role: m.role, text: m.text, state: "done", attachments: m.attachments || [],
@@ -162,7 +164,9 @@ async function loadHistory(cid, force) {
           role: "assistant", kind: "media", state: "done",
           text: card.title || "成片已渲染", url: card.media_url, duration: card.duration,
           evidence: card.evidence || [],
+          artifactId: card.artifact_id, hitmap: !!card.hitmap,
         });
+        hasMedia = true;
       }
       // 刷新后重放的计划卡：待确认的那一份存在 assistant 行的 qa.parts 里，
       // 带 plan_run_id 才知道确认帧该发往哪条规划 run。
@@ -180,6 +184,10 @@ async function loadHistory(cid, force) {
       }
     }
     histories[cid] = list;
+    if (hasMedia && cid === active.value) {
+      activePanel.value = 'timeline';
+      showChatcutEditor.value = true;
+    }
     scrollDown();
   } catch (_) {
     /* 回填失败不打断使用：新会话本来就还没有历史 */
@@ -189,6 +197,7 @@ async function loadHistory(cid, force) {
 async function openConv(cid) {
   // 让位排队只在会话内有效：切走就清（挂起态在服务端，`checkActiveRun` 进会话时补弹）
   parkedCards.value = [];
+  questionCard.value = null;
   active.value = cid;
   await loadHistory(cid);
   await checkActiveRun(cid);
@@ -229,6 +238,7 @@ async function checkActiveRun(cid) {
     // 所以这里只认「这个 run + 这道题」还没弹过才弹：
     // 同一 run 的同一个 ask 再进来一律跳过，把选择留在用户手上。
     if (j.run.status === "awaiting_approval" && j.run.approval) {
+      if (cid !== active.value) return;
       const ap = j.run.approval;
       const rid = String(ap.run_id || j.run.run_id || "");
       const title = String((ap.ask && ap.ask.title) || ap.reason || "");
@@ -370,6 +380,8 @@ const loadingTimeline = ref(false);
 const renderingTimeline = ref(false);
 const renderProgress = ref(null);
 const timelineError = ref("");
+const showChatcutEditor = ref(false);
+const chatcutUrl = `${window.location.protocol}//${window.location.hostname}:5199`;
 
 function libSelCount() {
   return Object.keys(libSelected).filter((k) => libSelected[k]).length;
@@ -686,6 +698,7 @@ async function importLatestTimeline() {
 
 async function openTimeline(tl) {
   timelineError.value = "";
+  showChatcutEditor.value = false;
   try {
     await ensureIdentity();
     const r = await fetch(`/timelines/${tl.id}`, { headers: authHeaders() });
@@ -1001,10 +1014,11 @@ function editMcp(s) {
     name: s.name,
     type: (s.config && s.config.type) || "streamableHttp",
     url: (s.config && s.config.url) || "",
+    headers: (s.config && s.config.headers) ? JSON.stringify(s.config.headers, null, 2) : "",
     command: (s.config && s.config.command) || "",
     args: ((s.config && s.config.args) || []).join(", "),
     tool_timeout: (s.config && s.config.tool_timeout) || 60,
-  } : { name: "", type: "streamableHttp", url: "", command: "", args: "", tool_timeout: 60 };
+  } : { name: "", type: "streamableHttp", url: "", headers: "", command: "", args: "", tool_timeout: 60 };
   mcpMsg.value = "";
 }
 
@@ -1018,6 +1032,14 @@ async function saveMcp() {
     config.args = f.args.split(",").map((x) => x.trim()).filter(Boolean);
   } else {
     config.url = f.url.trim();
+  }
+  if (f.headers && f.headers.trim()) {
+    try {
+      config.headers = JSON.parse(f.headers);
+    } catch (e) {
+      mcpMsg.value = "headers 不是合法 JSON：" + e.message;
+      return;
+    }
   }
   mcpBusy.value = true;
   try {
@@ -1346,6 +1368,25 @@ const PLAN_VALUE_TEXT = { true: "开", false: "关" };
 
 // 计划确认弹窗：待确认的计划卡自动弹出，用户操作后收起；消息流里留一条轻量状态行。
 const planModal = ref(null);
+
+// 「选区改」编辑器：只在成片卡带命中表时才开（图形科普片那条路的产物才有这张表）。
+const motionEditor = ref(null);
+function openMotionEditor(card) {
+  if (!card || !card.hitmap || !card.artifactId) return;
+  motionEditor.value = card;
+}
+function closeMotionEditor() { motionEditor.value = null; }
+// 局部改出来的新版本也是一张成片卡：推进消息流，刷新后由 /convs/{id}/messages 重放接手续。
+function onMotionPatched(p) {
+  const cid = active.value;
+  if (!cid || !p?.mediaUrl) return;
+  msgs(cid).push({
+    role: "assistant", kind: "media", state: "done",
+    text: p.title || "局部改后的成片", url: p.mediaUrl, duration: p.duration,
+    evidence: p.evidence || [], artifactId: p.artifactId, hitmap: true,
+  });
+  scrollDown();
+}
 
 function openPlanModal(card) {
   if (!card || card.state !== "waiting") return;
@@ -2135,8 +2176,15 @@ function onFrame(cid, p) {
       role: "assistant", kind: "media", state: "done",
       text: p.title || "成片已渲染",
       url: p.media_url, duration: p.duration, evidence: p.evidence || [],
+      // 「选区改」的开关：判据从产物里带出来（只有图形科普片那条路的终态带命中表），
+      // 不由前端猜——按钮摆上去点了却 404，等于骗用户这一版能选着改。
+      artifactId: p.artifact_id, hitmap: !!p.hitmap,
     });
     scrollDown();
+    if (cid === active.value) {
+      activePanel.value = 'timeline';
+      showChatcutEditor.value = true;
+    }
   } else if (p.type === "tool_call") {
     if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
     if (isRenderPoll(p.tool)) {         // 轮询进度不刷屏：喂进度条，不各推一条气泡
@@ -2222,6 +2270,7 @@ function onFrame(cid, p) {
     scrollDown();
   } else if (p.type === "approval") {
     // HITL 审批：撞上需人工确认的工具，弹审批卡等用户批准/拒绝
+    if (cid !== active.value) return;
     if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
     // **按题去重**——这就是「同一道题弹好几次」的成因。
     //
@@ -2988,6 +3037,8 @@ function newConv() {
   const c = freshConv();
   convs.value.unshift(c);
   histories[c.id] = [];
+  parkedCards.value = [];
+  questionCard.value = null;
   active.value = c.id;
   ensureSocket(c.id);
 }
@@ -3177,6 +3228,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                   <b>🎬 {{ m.text }}</b>
                   <span v-if="m.duration">时长 {{ Math.round(m.duration) }}s</span>
                   <a :href="m.url" download>下载成片</a>
+                  <!-- 开关来自产物自己带的命中表：没有表就只能整片重做，按钮摆上去点了也是 404 -->
+                  <button v-if="m.hitmap && m.artifactId" class="clip mc-patch"
+                          title="在画面上框住要改的那块，只重烧受影响的那几镜"
+                          @click="openMotionEditor(m)">✂ 选区改</button>
+                  <span v-else class="mc-nopatch">这一版不能选着改（出片时没量到命中表）</span>
                 </div>
                 <!-- 证据分级：渲染完成不等于每条都验过，这里把「有证据 / 没验」摊开 -->
                 <details v-if="(m.evidence || []).length" class="mc-ev">
@@ -3291,6 +3347,93 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <span class="txt"><template v-for="(s, j) in segs(m.text)" :key="j"><b v-if="s.b">{{ s.t }}</b><span v-else>{{ s.t }}</span></template></span>
               <span v-if="m.state === 'streaming'" class="caret">▍</span>
             </template>
+          </div>
+        </div>
+
+        <div v-if="questionCard" class="row assistant">
+          <div class="mark" aria-hidden="true"><span class="seal-mini">助</span></div>
+          <div class="bubble qc-inline">
+            <div class="pm-head qc-head">
+              <b class="qc-step">第 {{ questionCard.page + 1 }} / {{ questionCard.pages.length }} 题</b>
+              <div class="qc-pager">
+                <button class="qc-pg" :disabled="questionCard.page <= 0"
+                        title="上一题" @click="qPrev">‹</button>
+                <span class="qc-pgn">{{ questionCard.page + 1 }}/{{ questionCard.pages.length }}</span>
+                <button class="qc-pg" :disabled="qLastPage()"
+                        title="下一题" @click="qNext">›</button>
+              </div>
+              <button class="pm-x" :title="'收起（选择仍会保留，随时可再打开）'"
+                      @click="qClose">×</button>
+            </div>
+            <p class="qc-title">{{ qCurrentPage().title }}</p>
+            <p v-if="questionCard.reason && questionCard.reason !== qCurrentPage().title"
+               class="ap-reason">{{ questionCard.reason }}</p>
+            <div v-if="questionCard.previewSummary" class="qc-preview">
+              <span v-for="(v, k) in questionCard.previewSummary" :key="k" class="qc-pv">
+                <em>{{ k }}</em>{{ v }}
+              </span>
+            </div>
+            <ul class="qc-options">
+              <li v-for="o in qCurrentPage().options" :key="o.key"
+                  class="qc-opt"
+                  :class="{ on: qCurrentPage().multi
+                              ? qCurrentPage().picked.includes(o.key)
+                              : (questionCard.answers[questionCard.page] === o.key
+                                 && !qCurrentPage().customOpen) }"
+                  @click="qPick(questionCard.page, o.key)">
+                <span class="qc-num">{{ o.index }}</span>
+                <span class="qc-body">
+                  <span class="qc-label">
+                    {{ o.label }}
+                    <span v-if="o.recommended" class="qc-badge">{{ RECOMMEND_LABEL }}</span>
+                    <span v-if="o.badge" class="qc-badge soft">{{ o.badge }}</span>
+                  </span>
+                  <span v-if="o.description" class="qc-desc">{{ o.description }}</span>
+                </span>
+              </li>
+              <li v-if="qCurrentPage().allowCustom" class="qc-opt qc-custom-row"
+                  :class="{ on: qCurrentPage().customOpen }"
+                  @click="qToggleCustom(questionCard.page)">
+                <span class="qc-num qc-pencil">✎</span>
+                <span class="qc-body">
+                  <span class="qc-label">{{ qCurrentPage().customHint }}</span>
+                  <input v-if="qCurrentPage().customOpen"
+                         v-model="qCurrentPage().custom"
+                         class="qc-input" :placeholder="'在这里写你想要的做法…'"
+                         @click.stop />
+                </span>
+              </li>
+            </ul>
+            <details v-if="questionCard.approval && (questionCard.approval.calls || []).length"
+                     class="qc-details">
+              <summary>这一步会执行什么（{{ questionCard.approval.calls.length }} 个动作）</summary>
+              <ul class="ap-calls">
+                <li v-for="c in questionCard.approval.calls" :key="c.id">
+                  <b>{{ c.name }}</b>
+                  <span class="ap-args" v-if="Object.keys(c.arguments || {}).length">
+                    {{ JSON.stringify(c.arguments) }}
+                  </span>
+                </li>
+              </ul>
+            </details>
+            <div class="qc-actions">
+              <button class="clip" :disabled="questionCard.submitting"
+                      @click="qSubmit">
+                {{ questionCard.submitting ? "提交中…"
+                   : (qLastPage() ? questionCard.submitLabel : "下一题") }}
+              </button>
+              <button v-if="questionCard.pages.length > 1" class="clip ghost"
+                      :disabled="questionCard.submitting" @click="qNext">
+                跳过这题
+              </button>
+              <button class="clip ghost" :disabled="questionCard.submitting" @click="qClose">
+                稍后再说
+              </button>
+              <span class="qc-hint">
+                {{ qAnswered(questionCard.page) ? "" : "选一项，或用 ✎ 自己写" }}
+              </span>
+            </div>
+            <div v-if="questionCard.error" class="pc-error">✗ {{ questionCard.error }}</div>
           </div>
         </div>
       </div>
@@ -3749,6 +3892,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             </select>
             <input v-if="mcpForm.type === 'streamableHttp'"
                    v-model="mcpForm.url" placeholder="http://host:port/mcp" />
+            <textarea v-if="mcpForm.type === 'streamableHttp'" v-model="mcpForm.headers" rows="3"
+                      placeholder='请求头（JSON，选填），如 {"Authorization": "Bearer token"}'></textarea>
             <template v-else>
               <input v-model="mcpForm.command" placeholder="命令，如 npx" />
               <input v-model="mcpForm.args" placeholder="命令参数（逗号分隔）" />
@@ -4006,17 +4151,31 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       </div>
 
       <div v-if="activePanel === 'timeline'" class="timeline-panel">
-        <div v-if="timelineError" class="set-v bad">{{ timelineError }}</div>
+        <div v-if="timelineError && !showChatcutEditor" class="set-v bad">{{ timelineError }}</div>
 
-        <template v-if="!editingTimeline">
+        <template v-if="showChatcutEditor">
+          <div class="tl-edit-toolbar">
+            <button class="clip ghost" @click="showChatcutEditor = false">← 返回列表</button>
+            <span class="td-desc" style="margin-left:auto">OpenChatCut 可视化编辑器</span>
+          </div>
+          <iframe
+            :src="chatcutUrl"
+            class="chatcut-iframe"
+            allow="clipboard-read; clipboard-write; fullscreen"
+            sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-presentation allow-downloads"
+          ></iframe>
+        </template>
+
+        <template v-if="!editingTimeline && !showChatcutEditor">
           <div class="tl-toolbar">
-            <button class="clip" @click="importLatestTimeline">从当前会话导入</button>
+            <button class="clip" @click="showChatcutEditor = true">🎬 可视化编辑</button>
+            <button class="clip ghost" @click="importLatestTimeline">从当前会话导入</button>
             <button class="clip ghost" @click="loadTimelineList" :disabled="loadingTimeline">
               {{ loadingTimeline ? "刷新中…" : "刷新" }}
             </button>
           </div>
           <div v-if="!timelineList.length && !loadingTimeline" class="lib-empty">
-            还没有保存的时间线。点击「从当前会话导入」获取 AI 生成的最新时间线。
+            还没有保存的时间线。点击「从当前会话导入」获取 AI 生成的最新时间线，或点击「可视化编辑」打开 OpenChatCut 编辑器。
           </div>
           <div v-for="tl in timelineList" :key="tl.id" class="tl-item" @click="openTimeline(tl)">
             <b>{{ tl.name }}</b>
@@ -4236,105 +4395,12 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       </div>
     </aside>
 
-    <!-- 计划确认弹窗已改为：统一提问卡（见下方 questionCard），完整链路在右侧侧边栏 -->
+    <!-- 统一提问卡已改为内嵌在对话流里（见上方消息列表末尾），不再用弹窗挡住上下文 -->
 
-    <!-- 统一提问卡：编号选项 + 推荐徽标 + 截断描述 + 铅笔自定义 + 分页 + 下一题。
-         四种来源（模型提问 / 计划确认 / 渲染前确认 / 渲染兜底）共用这一个组件，
-         避免出现几套形态不一的问答 UI。 -->
-    <div v-if="questionCard" class="plan-modal-mask qc-mask">
-      <div class="plan-modal qc" :class="{ full: questionCard.fullscreen }">
-        <div class="pm-head qc-head">
-          <b class="qc-step">第 {{ questionCard.page + 1 }} / {{ questionCard.pages.length }} 题</b>
-          <div class="qc-pager">
-            <button class="qc-pg" :disabled="questionCard.page <= 0"
-                    title="上一题" @click="qPrev">‹</button>
-            <span class="qc-pgn">{{ questionCard.page + 1 }}/{{ questionCard.pages.length }}</span>
-            <button class="qc-pg" :disabled="qLastPage()"
-                    title="下一题" @click="qNext">›</button>
-            <button class="qc-pg" :title="questionCard.fullscreen ? '还原' : '放大'"
-                    @click="qFullscreen">⤢</button>
-          </div>
-          <button class="pm-x" :title="'收起（选择仍会保留，随时可再打开）'"
-                  @click="qClose">×</button>
-        </div>
-
-        <p class="qc-title">{{ qCurrentPage().title }}</p>
-        <p v-if="questionCard.reason && questionCard.reason !== qCurrentPage().title"
-           class="ap-reason">{{ questionCard.reason }}</p>
-
-        <!-- 编排预览摘要：用户在弹窗里也能看到关键数字，细节去侧边栏 -->
-        <div v-if="questionCard.previewSummary" class="qc-preview">
-          <span v-for="(v, k) in questionCard.previewSummary" :key="k" class="qc-pv">
-            <em>{{ k }}</em>{{ v }}
-          </span>
-        </div>
-
-        <ul class="qc-options">
-          <li v-for="o in qCurrentPage().options" :key="o.key"
-              class="qc-opt"
-              :class="{ on: qCurrentPage().multi
-                          ? qCurrentPage().picked.includes(o.key)
-                          : (questionCard.answers[questionCard.page] === o.key
-                             && !qCurrentPage().customOpen) }"
-              @click="qPick(questionCard.page, o.key)">
-            <span class="qc-num">{{ o.index }}</span>
-            <span class="qc-body">
-              <span class="qc-label">
-                {{ o.label }}
-                <span v-if="o.recommended" class="qc-badge">{{ RECOMMEND_LABEL }}</span>
-                <span v-if="o.badge" class="qc-badge soft">{{ o.badge }}</span>
-              </span>
-              <span v-if="o.description" class="qc-desc">{{ o.description }}</span>
-            </span>
-          </li>
-          <li v-if="qCurrentPage().allowCustom" class="qc-opt qc-custom-row"
-              :class="{ on: qCurrentPage().customOpen }"
-              @click="qToggleCustom(questionCard.page)">
-            <span class="qc-num qc-pencil">✎</span>
-            <span class="qc-body">
-              <span class="qc-label">{{ qCurrentPage().customHint }}</span>
-              <input v-if="qCurrentPage().customOpen"
-                     v-model="qCurrentPage().custom"
-                     class="qc-input" :placeholder="'在这里写你想要的做法…'"
-                     @click.stop />
-            </span>
-          </li>
-        </ul>
-
-        <!-- 工具调用明细：审批类才显示，折叠起来不干扰选择 -->
-        <details v-if="questionCard.approval && (questionCard.approval.calls || []).length"
-                 class="qc-details">
-          <summary>这一步会执行什么（{{ questionCard.approval.calls.length }} 个动作）</summary>
-          <ul class="ap-calls">
-            <li v-for="c in questionCard.approval.calls" :key="c.id">
-              <b>{{ c.name }}</b>
-              <span class="ap-args" v-if="Object.keys(c.arguments || {}).length">
-                {{ JSON.stringify(c.arguments) }}
-              </span>
-            </li>
-          </ul>
-        </details>
-
-        <div class="qc-actions">
-          <button class="clip" :disabled="questionCard.submitting"
-                  @click="qSubmit">
-            {{ questionCard.submitting ? "提交中…"
-               : (qLastPage() ? questionCard.submitLabel : "下一题") }}
-          </button>
-          <button v-if="questionCard.pages.length > 1" class="clip ghost"
-                  :disabled="questionCard.submitting" @click="qNext">
-            跳过这题
-          </button>
-          <button class="clip ghost" :disabled="questionCard.submitting" @click="qClose">
-            稍后再说
-          </button>
-          <span class="qc-hint">
-            {{ qAnswered(questionCard.page) ? "" : "选一项，或用 ✎ 自己写" }}
-          </span>
-        </div>
-        <div v-if="questionCard.error" class="pc-error">✗ {{ questionCard.error }}</div>
-      </div>
-    </div>
+    <!-- 成片卡上的「✂ 选区改」：在画面上框住要改的那块，只重烧受影响的那几镜 -->
+    <MotionEditor v-if="motionEditor" :artifact-id="motionEditor.artifactId"
+                  :conv-id="active" :media-url="motionEditor.url" :title="motionEditor.text"
+                  @close="closeMotionEditor" @patched="onMotionPatched" />
   </div>
 </template>
 
@@ -4579,6 +4645,14 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   letter-spacing: 2px; border-bottom: 1px dashed var(--vermilion);
 }
 .media-card .meta a:hover { color: var(--vermilion); }
+
+/* 「选区改」入口：只有产物带了命中表才出现；带不出的那条路给出解释而不是死按钮 */
+.media-card .meta .mc-patch {
+  margin-left: auto; padding: 2px 8px; font-size: 12px; letter-spacing: 1px;
+  color: var(--vermilion-deep); border-color: var(--vermilion-deep);
+}
+.media-card .meta:has(.mc-patch) a { margin-left: 0; }
+.mc-nopatch { font-size: 11.5px; opacity: .72; }
 
 /* 证据分级：一条主张一行，验过的实、没验的淡 —— 用户要看的正是这个区分 */
 .mc-ev { font-size: 12.5px; color: var(--ink-soft); }
@@ -4903,6 +4977,13 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 .pipe-step em { font-style: normal; font-size: 10.5px; }
 
 .timeline-panel { padding: 12px 16px; overflow-y: auto; }
+.chatcut-iframe {
+  width: 100%;
+  height: calc(100vh - 120px);
+  border: 1px solid var(--ink20, rgba(0,0,0,.12));
+  border-radius: 6px;
+  display: block;
+}
 .tl-toolbar, .tl-edit-toolbar {
   display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;
 }
@@ -5086,6 +5167,14 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   background: rgba(38, 34, 28, 0.45);
   display: flex; align-items: center; justify-content: center;
   padding: 24px; backdrop-filter: blur(2px);
+}
+/* 内嵌提问卡：不遮罩、不挡上下文，作为对话流里一条消息渲染 */
+.qc-inline {
+  display: flex; flex-direction: column; gap: 10px;
+  border: 1px solid var(--line); border-left: 4px solid var(--gold);
+  border-radius: 12px; background: var(--paper);
+  padding: 14px 16px; margin-top: 4px;
+  box-shadow: 0 4px 16px rgba(38, 34, 28, 0.12);
 }
 .plan-modal {
   display: flex; flex-direction: column; gap: 12px;

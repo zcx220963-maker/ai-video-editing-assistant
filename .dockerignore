@@ -1,0 +1,15 @@
+# 构建上下文里这些目录只会让 docker build 白读 1.6G：
+# .smoke/.tmp 是冒烟脚本的截图与中间产物（不进镜像也不需要），
+# .runtime 在 compose 里是具名卷挂载点，node_modules/dist 各有自己的构建阶段。
+.git
+.qoder
+**/__pycache__
+**/.pytest_cache
+**/node_modules
+backend/.smoke
+backend/.tmp
+backend/.runtime
+frontend/dist
+openchatcut
+openchatcut-src
+*.tar

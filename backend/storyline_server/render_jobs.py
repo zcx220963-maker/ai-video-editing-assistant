@@ -1,4 +1,4 @@
-"""长耗时节点（目前只有 render_video）的后端执行位：提交即回句柄，进度查 render_jobs 行。
+"""长耗时节点（出片一族：``render_video`` / ``render_motion_video``）的后端执行位：提交即回句柄，进度查 render_jobs 行。
 
 一次 1080p 渲染要跑几分钟，而 MCP 是一次阻塞的 JSON-RPC 往返：渲染留在请求线程里，
 客户端超时就是「一句话出片」稳定失败的那一面（历史上 tool_timeout 从 600s 一路抬到

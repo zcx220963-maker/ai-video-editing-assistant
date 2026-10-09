@@ -303,13 +303,16 @@ class MaterialsRepo(_Repo):
 
     async def resolve(self, material_ids: Sequence[str], *, user_id: str,
                       conv_id: str | None = None) -> tuple[list[dict[str, Any]], list[str]]:
-        """把 id 解析成可见素材：返回 (命中, 被拒的 id)。越权 id 不报错，只跳过并回报。"""
+        """把 id 解析成可见素材：返回 (命中, 被拒的 id)。越权 id 不报错，只跳过并回报。
+
+        这里**不给曲库素材开后门**：``_visible_with`` 对「本人所有」本来就放行，
+        所以额外按 origin 跳过归属校验换来的只有漏——material_id 是 6 位十六进制，
+        别人的曲目会被当成本人附件解析出来并签出可播直链。
+        """
         rows = await self.db.select(self.table, where={"id": in_(list(material_ids))})
         # 会话归属只可能涉及一个 conv_id，循环外查一次即可（原来是逐行查 → N+1）
         owns = bool(conv_id) and await self._owns_conv(str(conv_id), user_id)
-        ok = [r for r in rows
-              if r.get("origin") == "bgm"
-              or self._visible_with(r, user_id, conv_id, owns)]
+        ok = [r for r in rows if self._visible_with(r, user_id, conv_id, owns)]
         kept = {r["id"] for r in ok}
         return ok, [m for m in material_ids if m not in kept]
 
@@ -1276,3 +1279,40 @@ class TimelinesRepo(_Repo):
 
     async def drop_for_user(self, tl_id: str, user_id: str) -> int:
         return await self.db.delete(self.table, where={"id": tl_id, "user_id": user_id})
+
+
+# --------------------------------------------------------------------------
+# 检索账（出处闸的凭据）
+# --------------------------------------------------------------------------
+
+
+class RetrievalRepo(_Repo):
+    """``retrieval_hits``：这条会话真的查到过哪些页面。
+
+    闸要的只是「这个出处在本次会话里被打开过吗」。所以命中即插一行、按
+    ``(session_key, url)`` 去重、整条会话一把读——不建第二份影子状态。
+    """
+
+    table = "retrieval_hits"
+
+    async def note(self, session_key: str, user_id: str, url: str, *,
+                   title: str = "", backend: str = "") -> None:
+        if not session_key or not url:
+            return
+        await self.db.upsert(self.table, {
+            "session_key": session_key, "url": url, "user_id": user_id,
+            "title": (title or "")[:300], "backend": backend or "",
+            "checked_at": _now()})
+
+    async def ledger(self, session_key: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        """本会话的查过清单（新→旧）。"""
+        if not session_key:
+            return []
+        return await self.db.select(self.table, where={"session_key": session_key},
+                                    order_by=["-checked_at"], limit=limit)
+
+    async def count(self, session_key: str) -> int:
+        return len(await self.ledger(session_key))
+
+    async def drop_for_user(self, user_id: str) -> int:
+        return await self.db.delete(self.table, where={"user_id": user_id})

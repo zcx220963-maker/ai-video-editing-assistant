@@ -164,6 +164,35 @@ class SessionConsumer:
                         answer = await self.agent.resume(
                             cp.run_id, user_id, conversation_id, stream=True)
                     else:
+                        # 同会话有挂起审批（awaiting_approval）时不开新规划轮——
+                        # 否则新轮弹新卡把旧卡顶走，用户看到的就是"还没选完就跳了"。
+                        # parkedCards 能保住旧卡答案，但两张卡来回切仍然很乱。
+                        # 先把审批卡重弹一次（前端 dedup 会合并掉重复帧），
+                        # 再给一句提示，让用户先处理手头这张。
+                        ap_cp = None
+                        if cp_mgr is not None:
+                            try:
+                                ap_cp = await cp_mgr.awaiting_approval_for_session(sid)
+                            except Exception:
+                                ap_cp = None
+                        if ap_cp is not None:
+                            ap = getattr(ap_cp, "approval", None) or {}
+                            ap_frame: dict[str, Any] = {
+                                "type": "approval", "session_id": sid,
+                                "run_id": ap_cp.run_id,
+                                "calls": ap.get("pending_calls") or [],
+                                "reason": ap.get("reason") or "",
+                                "fallback_options": ap.get("fallback_options") or [],
+                            }
+                            if ap.get("ask"):
+                                ap_frame["ask"] = ap["ask"]
+                            await self.mq.publish(OUTBOUND_TOPIC, sid, ap_frame)
+                            await self.mq.publish(OUTBOUND_TOPIC, sid, {
+                                "type": "error", "session_id": sid,
+                                "run_id": effective_run_id,
+                                "error": "请先确认上方的选项卡，再发送新消息。",
+                            })
+                            return "ok"
                         answer = await self.agent.plan(
                             user_id, conversation_id, message, run_id=run_id,
                             stream=True, attachments=attachments)

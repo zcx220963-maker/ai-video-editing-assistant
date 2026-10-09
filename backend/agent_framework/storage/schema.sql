@@ -300,3 +300,19 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   created_at    timestamptz NOT NULL DEFAULT now(),
   updated_at    timestamptz NOT NULL DEFAULT now()
 );
+
+-- 检索账：这条会话「真的查到过」哪些页面，是出处闸的唯一凭据。
+-- 为什么单独一张表（而不是塞进 artifacts 的总线）：artifacts 的 node 名是 DAG 的节点名，
+-- 拿它当普通 KV 用会让「已执行节点」清单混进一个不存在的节点。
+-- 写入方是主服务的 web 工具（查到就算一条），读取方是 Storyline 侧的 plan_motion
+-- （另一个进程，所以必须落库而不是放进程内存）。
+CREATE TABLE IF NOT EXISTS retrieval_hits (
+  session_key text NOT NULL,
+  url         text NOT NULL,
+  user_id     text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title       text NOT NULL DEFAULT '',
+  backend     text NOT NULL DEFAULT '',
+  checked_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (session_key, url)
+);
+CREATE INDEX IF NOT EXISTS rh_session_idx ON retrieval_hits (session_key, checked_at DESC);

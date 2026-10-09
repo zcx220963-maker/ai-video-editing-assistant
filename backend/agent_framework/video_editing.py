@@ -344,6 +344,85 @@ class RenderWebNode(BaseNode):
         }
 
 
+class PlanMotionNode(BaseNode):
+    name = "plan_motion"
+    display_name = "图形科普片分镜"
+    description = ("校验并归一分镜 spec，存成本会话的 motion_spec"
+                   "（零素材出片的第一站，不渲染）")
+    required_nodes: list[str] = []
+
+    async def process(self, state, inputs):
+        # 与真节点（storyline_server/nodes/motion_plan.py）同形状：motion_spec 是
+        # render_motion_video 的唯一入参来源。strictly mock——不跑校验器与估算，
+        # 离线只验「分镜 → 出片」这两步在编排层是按依赖串起来的。
+        spec = inputs.get("spec") or {}
+        shots = [s for s in (spec.get("shots") or []) if isinstance(s, dict)]
+        return {"motion_spec": spec, "shot_count": len(shots),
+                "char_count": sum(len(str(s.get("text") or "")) for s in shots),
+                "estimated_sec": [0.0, 0.0], "target_warnings": [],
+                "plan_table": [{"id": s.get("id"), "card": s.get("card")} for s in shots]}
+
+
+class RenderMotionVideoNode(BaseNode):
+    name = "render_motion_video"
+    display_name = "图形科普片出片"
+    description = ("零素材出片：分镜 spec 的文案排成版式画面 + TTS 旁白 + 逐词字幕"
+                   "（独立终点节点，不依赖剪辑链）")
+    required_nodes: list[str] = []
+
+    async def process(self, state, inputs):
+        # 与真节点（storyline_server/nodes/motion_nodes.py）同形状的产物契约：
+        # strictly mock——不起 Chrome、不跑 TTS，离线只验「模型选了这条独立终点路径
+        # 后拿到的是成片卡形状」，以及白名单/编排层按节点名做事时它不掉队。
+        artifact = state.artifact_id or "_default"
+        object_key = f"renders/{_safe(state.session_id)}/{_safe(artifact)}/motion.mp4"
+        spec = inputs.get("spec") or {}
+        shots = spec.get("shots") or []
+        return {
+            "video": object_key,
+            "media_url": f"memory://creation-assets/{object_key}?ttl=3600",
+            "duration": 0.0, "width": 0, "height": 0, "fps": 0,
+            "title": spec.get("title") or "图形科普片",
+            "style": spec.get("style"),
+            "mix_mode": "voice_only", "frames_total": 0,
+            "motion_ledger": [{"id": s.get("id"), "sec": 0.0, "speech_sec": 0.0,
+                               "words": 0, "frames": 0, "captured_frames": 0}
+                              for s in shots if isinstance(s, dict)],
+            "degraded": [],
+        }
+
+
+class PatchMotionVideoNode(BaseNode):
+    name = "patch_motion_video"
+    display_name = "图形科普片局部改"
+    description = ("改一版已出片的图形科普片：按命中表指针改几格 / 整镜改写 / 删镜 / 重排，"
+                   "只重烧受影响的那几镜，产出一个新版本（旧版原样留着）")
+    # 与真节点同：没有 DAG 上游——要改的东西全在 base_artifact_id 那一版里
+    required_nodes: list[str] = []
+    require_explicit_call = True
+
+    async def process(self, state, inputs):
+        # 与真节点（storyline_server/nodes/motion_nodes.py PatchMotionVideoNode）同形状：
+        # strictly mock——不读编辑包、不验指纹、不烧像素，离线只验「局部改也在白名单里、
+        # 且不会被拦截器当成 render_motion_video 的下游自动补齐」。
+        artifact = state.artifact_id or "_default"
+        object_key = f"renders/{_safe(state.session_id)}/{_safe(artifact)}/motion.mp4"
+        edits = inputs.get("edits") or []
+        return {
+            "video": object_key,
+            "media_url": f"memory://creation-assets/{object_key}?ttl=3600",
+            "duration": 0.0, "width": 0, "height": 0, "fps": 0,
+            "title": "图形科普片", "style": None,
+            "mix_mode": "voice_only", "frames_total": 0,
+            "motion_ledger": [], "degraded": [],
+            "patch": {"base_artifact_id": str(inputs.get("base_artifact_id") or ""),
+                      "changed_shots": [str(e.get("shot") or "") for e in edits
+                                        if isinstance(e, dict)],
+                      "removed_shots": list(inputs.get("remove_shots") or []),
+                      "reordered": bool(inputs.get("reorder"))},
+        }
+
+
 ALL_NODE_CLASSES = [
     # 输入阶段 → 素材处理层 → 逻辑与脚本层 → 时间轴规划层 → 最终输出
     SearchMediaNode, LoadMediaNode,
@@ -352,7 +431,8 @@ ALL_NODE_CLASSES = [
     ScriptTemplateRecNode, GenerateScriptNode, GenerateAITransitionNode,
     TransitionRecNode, TextRecNode, GenerateVoiceoverNode, SelectBGMNode,
     PlanTimelineNode, PlanTimelineProNode, PlanTimelineAITransitionNode,
-    RenderVideoNode, RenderWebNode,
+    RenderVideoNode, RenderWebNode, PlanMotionNode, RenderMotionVideoNode,
+    PatchMotionVideoNode,
 ]
 
 

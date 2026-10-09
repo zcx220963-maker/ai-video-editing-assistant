@@ -41,7 +41,7 @@ def ffmpeg(*args: str, timeout: int = 1800) -> subprocess.CompletedProcess:
 
 
 def probe(path: str | Path) -> dict[str, Any]:
-    """ffprobe → {width,height,duration,fps,has_audio}（load_media 的契约字段）。
+    """ffprobe → {width,height,duration,fps,frames,has_audio}（load_media 的契约字段）。
 
     不回传 `path`：这是对**本机某份文件**的一次观测，把它的绝对路径顺手带进节点产物，
     就是持久化 payload 里工作区路径泄漏的源头（引用只由 storage 层的 obj: 引用落库）。
@@ -72,6 +72,8 @@ def probe(path: str | Path) -> dict[str, Any]:
         "height": int(v.get("height", 0)) if v else 0,
         "duration": round(duration, 3),
         "fps": round(fps, 3),
+        # 视频流自己的帧数：逐帧截图那条路拿它对账「计划帧数 vs 成片真有多少帧」
+        "frames": int(v.get("nb_frames") or 0) if v else 0,
         "has_audio": a is not None,
     }
 
@@ -150,8 +152,14 @@ def scene_ranges(src: str | Path, threshold: float = 0.3,
     return out
 
 
-def concat(clips: list[str | Path], dst: str | Path) -> Path:
-    """按顺序拼接片段（concat filter 统一重编码，避免参数不一致导致的流错误）。"""
+def concat(clips: list[str | Path], dst: str | Path, *,
+           fps: float | None = None) -> Path:
+    """按顺序拼接片段（concat filter 统一重编码，避免参数不一致导致的流错误）。
+
+    ``fps`` 锁输出帧率：逐帧截图那条路（motion）的片段是「每段各自的秒数 × 同一帧率」，
+    不锁帧率时 concat 会把段间时长差摊进时间戳，成片平均帧率掉到 9.7~9.84——
+    画面看不出，但「成片字节量到的 fps」与 spec 对不上，机器证据只能标 UNVERIFIED。
+    """
     if not clips:
         raise MediaError("concat 需要至少一个片段")
     dst = Path(dst)
@@ -164,7 +172,10 @@ def concat(clips: list[str | Path], dst: str | Path) -> Path:
     args += ["-filter_complex", f"{ins}concat=n={n}:v=1:a=1[v][a]",
              "-map", "[v]", "-map", "[a]",
              "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-             "-c:a", "aac", str(dst)]
+             "-c:a", "aac"]
+    if fps:
+        args += ["-r", str(fps), "-vsync", "cfr"]
+    args += [str(dst)]
     ffmpeg(*args)
     return dst
 

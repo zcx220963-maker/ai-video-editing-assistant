@@ -20,6 +20,18 @@ if False:  # TYPE_CHECKING：只为 planning_registry 的形参标注，避免�
 # 这些工具会改变执行状态（分叉重跑 / 起子 Agent），规划轮同样不给
 _MUTATING_TOOLS = frozenset({"rerun_from", "start_subagent"})
 
+# 节点 → 这一步干活必须随身的技能。零素材通道没有任何素材事实可依赖（没有 ASR 文本、
+# 没有镜头描述），怎么走、每镜写什么、哪些字段必填全在那份技能正文里；而真机实测
+# 模型交这张卡时 skills_hint 就是空的——只靠卡面声明，整轮都拿不到那份约束。
+# 于是这条对应关系由服务端记着，校验器据此把技能补进卡面，执行轮照卡预注入。
+_IMPLICIT_SKILLS: dict[str, tuple[str, ...]] = {
+    "plan_motion": ("motion_explainer_skill",),
+    "render_motion_video": ("motion_explainer_skill",),
+    # 局部改改的就是同一份归一后的分镜（字段名与必填项一字不差），
+    # 少了这份技能，模型会按 render_motion_video 的入参形状提交 edits，闸在入库前退它。
+    "patch_motion_video": ("motion_explainer_skill",),
+}
+
 
 class PlanVocabulary:
     """剪辑节点与参数的事实清单（白名单 / 词表 / 枚举源 / 开关清单）。"""
@@ -62,6 +74,10 @@ class PlanVocabulary:
         bare = self._registry.get(node.removeprefix(MCP_PREFIX)) if node else None
         return bare
 
+    def implicit_skills(self, node: str) -> tuple[str, ...]:
+        """这个节点干活必须随身的技能（见 ``_IMPLICIT_SKILLS``；卡上可能带 storyline_ 前缀）。"""
+        return _IMPLICIT_SKILLS.get((node or "").removeprefix(MCP_PREFIX), ())
+
     def whitelist(self) -> set[str]:
         """允许上卡的剪辑节点名 = Storyline 白名单 ∩ 已注册工具。
 
@@ -79,15 +95,11 @@ class PlanVocabulary:
                 | set(self.contract.names))
 
     def param_keys(self) -> set[str]:
-        """真实存在的工具入参键名 **与它们的合法枚举值**。
+        """真实存在的工具入参**键名**（顶层，含契约与注册表两侧）。
 
-        文案提到它们不算臆造——那是参数/取值，不是节点名。
-
-        枚举值必须一并收进来：计划一旦真把带 enum 的节点写进 steps，模型就会在
-        why/expectation 里顺口提它的取值（如 ``script_template_rec`` 的
-        ``tpl_vlog_3act``）。不收就会判成「引用了不存在的名字」——真机实测：
-        模型按提示补上了 script_template_rec，紧接着就因为文案里写了模板 id
-        被判臆造，卡连着两轮出不来卡。
+        取值不在这儿——那是 ``enum_values()``。为什么分成两个出口：计划卡反查只要
+        「这个参数有哪些可选值」，而文案豁免要的是「键名 + 取值都不是造的名字」，
+        两边要的粒度不一样，合成一份只会让调用方各自误用。
 
         按「注册表名字清单 + 契约节点名清单」当签名缓存：MCP/Storyline 的工具要到
         启动后才注册进来、契约要到连上后才填上，缓存不刷新就会一直把晚到的参数名
@@ -219,7 +231,13 @@ class PlanVocabulary:
                     names = sorted(str(v) for v in data)
                     values = "、".join(names[:8]) + ("…" if len(names) > 8 else "")
                 else:
-                    values = "、".join(sorted(str(v) for v in data))
+                    # 带上声明里的中文标签：模型「默认照抄」时抄到的是人话，
+                    # 而不是把 portrait 原样摆到用户面前
+                    labels = spec.get("value_labels") if isinstance(spec, Mapping) else None
+                    labels = labels if isinstance(labels, Mapping) else {}
+                    values = "、".join(
+                        f"{v} {labels.get(v, '')}".strip() for v in sorted(
+                            str(x) for x in data))
                 knobs.append({
                     "key": key, "kind": kind, "values": values,
                     "default": as_card_value(spec.get("default")),

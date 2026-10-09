@@ -658,8 +658,12 @@ def build_runtime(
             # 启动日志挂了一条假告警——假告警比不报更坏，它教人忽略这个检查本身。
             try:
                 from agent_framework.plan import ConfirmPlanTool, SubmitPlanTool
+                # 键名**与声明过的枚举取值**都要收：技能正文讲怎么填参数时引用的是取值
+                # （画幅 landscape、版式 dict_entry、字幕形态 torn_highlight），它们
+                # 长得像工具名（小写下划线）却不是可调用的东西——只收键名就挂假告警。
+                node_keys = plan_gate.param_keys() | plan_gate.enum_values()
                 param_keys = _cons.skill_field_names(
-                    node_param_keys=plan_gate.param_keys(),
+                    node_param_keys=node_keys,
                     tools=[registry.all_tools(),
                            [SubmitPlanTool(plan_gate), ConfirmPlanTool()]])
             except Exception as exc:  # noqa: BLE001 - 取不到就按原样检查

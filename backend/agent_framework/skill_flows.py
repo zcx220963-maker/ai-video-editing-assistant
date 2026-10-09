@@ -163,6 +163,13 @@ NODE_INTENT = {
     "plan_timeline_ai_transition": "时间线编排(含 AI 转场)",
     "render_video": "按时间线渲染出片",
     "render_web": "把网页渲染成视频",
+    "plan_motion": "零素材出片的第一站：把每镜文案/版式/高亮词写成分镜 spec 并校验入库"
+                   "（不烧像素，改文案只重调这一步）",
+    "render_motion_video": "把分镜 spec 排成版式画面逐帧截屏出片（镜头长度归真实语音时长，"
+                           "话没说完画面不切走）",
+    "patch_motion_video": "对已出片的那一版下补丁：按命中表指针改某几镜的字段/删镜/调序，"
+                          "只重烧受影响的镜，旧版本不动（要改全局版式或重做整片走 plan_motion → "
+                          "render_motion_video）",
 }
 
 # 参数键 → 技能里的"推导说明"(这些值属于当次诉求,不该焊死在流程里)
@@ -175,6 +182,9 @@ VOLATILE_PARAM_HINTS = {
     "keep_segments": "按语义选定的段落(以当次 ASR 结果为准)",
     "keep_clips": "按用户要求筛出的片段(以当次 understand_clips 结果为准)",
     "custom_groups": "按叙事逻辑设计的分组(以当次片段为准)",
+    "spec": "本轮的分镜 spec(文案按当次查到的资料重写,不复用历史 spec)",
+    "bgm": "配乐引用：消息附件/曲库歌曲的 material_id，或 select_BGM 返回的 obj: 引用"
+           "（曲库条目不挂会话，material_id 比 obj: 更稳）",
 }
 
 
