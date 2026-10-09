@@ -499,6 +499,19 @@ DIAGRAM_VISUAL_KEYS: dict[str, tuple[str, ...]] = {
     "orbit": ("parts", "planets", "center") + _HEAD_KEYS,
 }
 
+# 绘制 op 族（像素/粒子/连线/笔触）与内置图示在同一张画面带上画图，注册表也并到
+# 这里合并出去：spec 的卡型清单、templates 的 fill 判定、空壳闸读的都得是同一份，
+# 下游任何一处再抄一遍清单，就会出现「卡型能过校验却渲不出画面」的卡。
+# 放在文件底部导入：graphics 复用本模块的画法口径，写在顶部就成了循环导入。
+from . import graphics as _gfx  # noqa: E402
+
+BUILDERS.update(_gfx.BUILDERS)
+DIAGRAM_VISUAL_KEYS.update(_gfx.VISUAL_KEYS)
+
+#: 「这张卡的 visual 填得够画吗」——图示卡里只有绘制 op 族带这道检查（七个内置
+#: 图示的判断已经在 ``spec._LIST_FIELDS``/``_TEXT_FIELDS`` 那套表里写死了）。
+VALIDATORS: dict[str, Any] = dict(_gfx.CHECKS)
+
 #: 图示卡的坐标写死在 1000×560 的 viewBox 里，靠 preserveAspectRatio 适配任意画幅带。
 DIAGRAM_CSS = """
 .dg { width:100%; height:100%; }

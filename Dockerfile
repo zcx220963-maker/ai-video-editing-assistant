@@ -15,20 +15,29 @@ RUN npm run build                      # 产物:/web/dist
 FROM python:3.12-slim
 
 # ffmpeg/ffprobe:渲染与素材元数据;fonts-noto-cjk:字幕渲染的 CJK 字体
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg fonts-noto-cjk \
-    && rm -rf /var/lib/apt/lists/*
+#
+# 装三遍:个别 .deb 每轮都会被网络路丢包(502/500,每次失败的还不一样),单遍必炸
+# exit 100;失败的字节留在 apt 缓存里,后一遍只补没取到的那几个——实测第二遍就过。
+# 结尾的 ffmpeg/fc-list 是硬闸:装没装真上,层自己说话,不留「构建绿了但没有字体」。
+RUN apt-get update -o Acquire::Retries=3 \
+    && { apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk \
+         || apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk \
+         || apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk; } \
+    && rm -rf /var/lib/apt/lists/* \
+    && ffmpeg -version | head -1 && fc-list :lang=zh | head -1
 
 WORKDIR /app
 COPY backend/requirements.txt backend/requirements-storyline.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -r requirements-storyline.txt
 
 # chromium:图形科普片(motion)与网页出片(render_web)都靠 headless 逐帧截图。
-# 放在 pip 层之后——这层装包会撞本机代理偶发 502,Retries 让它自己能重试,
+# 放在 pip 层之后——它同样吃网络丢包,所以同样装三遍(理由见上面 ffmpeg 层),
 # 也别让它的前面那层(pip)因为改上面而被拖着重跑。
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends -o Acquire::Retries=5 chromium \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -o Acquire::Retries=3 \
+    && { apt-get install -y --no-install-recommends chromium \
+         || apt-get install -y --no-install-recommends chromium \
+         || apt-get install -y --no-install-recommends chromium; } \
+    && rm -rf /var/lib/apt/lists/* && chromium --version
 
 COPY backend/ ./
 # 前端产物放进 REPO_ROOT/frontend/dist(run_server 的静态目录锚点在容器内=/frontend/dist)

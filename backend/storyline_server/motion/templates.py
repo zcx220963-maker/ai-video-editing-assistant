@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from typing import Any
 
 from . import art as _art
@@ -48,6 +49,13 @@ _SCRATCH_SEEDS = ((120, 260, 60, 40), (820, 420, 70, 30), (260, 1500, 50, 60),
 SERIF = ('"Noto Serif SC","Source Han Serif SC","Songti SC","SimSun",'
          '"Microsoft YaHei",serif')
 MONO = '"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace'
+SANS = ('"Noto Sans SC","Source Han Sans SC","PingFang SC","Microsoft YaHei",'
+        "sans-serif")
+
+#: ``theme.font`` 的三档 → 真实字族栈。**值由这里单源**：spec 那一头只管认这三个名字，
+#: 这里管它们各自画出什么样。列第四个字族名前必须先确认镜像里装着它——
+#: 选一个没装的字体不是「回落」，是界面上改了、画面上不动，没人说得清。
+FONT_STACKS = {"serif": SERIF, "sans": SANS, "mono": MONO}
 
 
 # ---------------------------------------------------------------------------
@@ -352,30 +360,31 @@ def compile_art(shot: dict[str, Any], duration_sec: float) -> tuple[str, str]:
 
 _CSS = f'''
 * {{ margin:0; padding:0; box-sizing:border-box; }}
-html,body {{ width:100%; height:100%; overflow:hidden; background:#d8cdb6; }}
-body {{ font-family:{SERIF}; color:#23211c; }}
+html,body {{ width:100%; height:100%; overflow:hidden; background:var(--bg,#d8cdb6); }}
+body {{ font-family:var(--font,{SERIF}); color:var(--ink,#23211c); }}
 /* 设计空间 1080x1920 等比缩放；横屏时四周是同一张纸，不做第二套版式 */
 .stage {{ position:absolute; left:50%; top:50%; width:{DESIGN_W}px; height:{DESIGN_H}px;
          transform:translate(-50%,-50%) scale(var(--u)); transform-origin:center; }}
 .bg {{ position:absolute; inset:0;
       background:
+        var(--bg-paint,
         radial-gradient(120% 80% at 50% 0%, rgba(255,255,255,.30), transparent 60%),
         radial-gradient(140% 90% at 50% 100%, rgba(90,72,44,.22), transparent 62%),
-        linear-gradient(160deg,#e9ddc4 0%,#ded0b2 45%,#cdbb97 100%); }}
+        linear-gradient(160deg,#e9ddc4 0%,#ded0b2 45%,#cdbb97 100%)); }}
 .bg svg {{ position:absolute; inset:0; width:100%; height:100%; opacity:.5; }}
 .scratches {{ position:absolute; inset:0; opacity:.30; }}
 .scratches path {{ stroke:#8b7a5c; stroke-width:1.4; fill:none; }}
 
 /* 左上状态面板：整片唯一的"进度条"，靠跳变叙事 */
 .panel {{ position:absolute; left:44px; top:112px; display:flex; flex-direction:column; gap:8px; }}
-.panel .row {{ background:#f6f1e4; border:1.5px solid #23211c; padding:7px 14px 9px;
+.panel .row {{ background:var(--paper,#f6f1e4); border:1.5px solid var(--ink,#23211c); padding:7px 14px 9px;
               box-shadow:3px 4px 0 rgba(40,32,20,.16); }}
 .panel .k {{ font-family:{MONO}; font-size:15px; letter-spacing:.06em; color:#6c6455; }}
 .panel .v {{ font-size:31px; font-weight:700; letter-spacing:.02em; }}
 
 /* 右上时间地点标签 */
-.label {{ position:absolute; right:44px; top:120px; background:#f6f1e4;
-         border:1.5px solid #23211c; padding:9px 18px; font-size:26px; letter-spacing:.05em;
+.label {{ position:absolute; right:44px; top:120px; background:var(--paper,#f6f1e4);
+         border:1.5px solid var(--ink,#23211c); padding:9px 18px; font-size:26px; letter-spacing:.05em;
          box-shadow:3px 4px 0 rgba(40,32,20,.16); }}
 
 /* 中央版式区：artWrap 是画面带，里面按卡型二选一 */
@@ -390,10 +399,10 @@ body {{ font-family:{SERIF}; color:#23211c; }}
              justify-content:center; font-size:30px; color:#8b8371; }}
 
 .card.archive {{ width:640px; height:520px; }}
-.card.archive .frame {{ position:absolute; inset:0; background:#a8352c; padding:34px; }}
+.card.archive .frame {{ position:absolute; inset:0; background:var(--accent,#a8352c); padding:34px; }}
 .card.archive .inner {{ position:absolute; inset:34px; background:#d9b98c; }}
 .card.archive .tag {{ position:absolute; left:96px; top:120px; width:430px;
-                     background:#f3ecd9; padding:26px 30px 30px 74px;
+                     background:var(--paper,#f3ecd9); padding:26px 30px 30px 74px;
                      box-shadow:6px 8px 0 rgba(40,30,16,.22); transform:rotate(-1.4deg); }}
 .card.archive .tag-hole {{ position:absolute; left:26px; top:34px; width:26px; height:26px;
                           border:3px solid #6d6353; border-radius:50%; }}
@@ -401,15 +410,15 @@ body {{ font-family:{SERIF}; color:#23211c; }}
 .card.archive .meta {{ font-family:{MONO}; font-size:22px; color:#4a4438; margin-top:10px; }}
 .card.archive .meta.dim {{ color:#8b8371; }}
 
-.card.dict {{ width:660px; background:#f7f2e5; padding:34px 40px 44px;
+.card.dict {{ width:660px; background:var(--paper,#f7f2e5); padding:34px 40px 44px;
              box-shadow:7px 9px 0 rgba(40,30,16,.20); transform:translate(-50%,-50%) rotate(-.8deg); }}
 .dict-note {{ font-family:{MONO}; font-size:22px; color:#7a7263; letter-spacing:.08em; }}
 .dict-word {{ font-family:{MONO}; font-size:74px; font-weight:700; margin:14px 0 12px; }}
-.dict-rule {{ height:3px; background:#23211c; opacity:.8; }}
+.dict-rule {{ height:3px; background:var(--ink,#23211c); opacity:.8; }}
 
 .stamp {{ position:absolute; left:50%; top:46%; transform:translate(-50%,-50%) rotate(-9deg);
         width:max-content; }}
-.stamp-box {{ border:6px solid #b3271d; color:#b3271d; padding:16px 26px; text-align:center;
+.stamp-box {{ border:6px solid var(--accent,#b3271d); color:var(--accent,#b3271d); padding:16px 26px; text-align:center;
              opacity:.86; mix-blend-mode:multiply; }}
 .stamp-zh {{ font-size:62px; font-weight:800; letter-spacing:.08em; line-height:1.05; }}
 .stamp-en {{ font-family:{MONO}; font-size:22px; letter-spacing:.14em; margin-top:6px; }}
@@ -421,19 +430,19 @@ body {{ font-family:{SERIF}; color:#23211c; }}
 
 .book {{ position:absolute; left:50%; top:46%; transform:translate(-50%,-50%); width:640px; }}
 .book .svg {{ width:100%; }}
-.book .page path {{ stroke:#23211c; }}
+.book .page path {{ stroke:var(--ink,#23211c); }}
 
 .print {{ position:absolute; left:50%; top:44%; transform:translate(-50%,-50%); width:600px; height:640px; }}
 .print .block {{ position:absolute; left:60px; top:0; width:480px; height:250px;
                 background:#8a5a34; box-shadow:0 10px 0 rgba(40,30,16,.25); }}
 .print .block span {{ position:absolute; right:34px; top:26px; font-size:52px; color:#c99a6b; opacity:.85; }}
-.print .sheet {{ position:absolute; width:400px; height:300px; background:#f6f0e0;
-                border:2px solid #23211c; }}
+.print .sheet {{ position:absolute; width:400px; height:300px; background:var(--paper,#f6f0e0);
+                border:2px solid var(--ink,#23211c); }}
 .print .s1 {{ left:0; top:250px; transform:rotate(-4deg); }}
 .print .s2 {{ right:0; top:272px; transform:rotate(3deg); }}
 .print .s3 {{ left:100px; top:300px; display:flex; gap:26px; justify-content:center; padding-top:34px; }}
 .print .s3 i {{ width:74px; height:210px; background:#2f4f8f; border-radius:37px 37px 4px 4px; }}
-.print .s3 i + i {{ background:#a8352c; }}
+.print .s3 i + i {{ background:var(--accent,#a8352c); }}
 
 .theatre {{ position:absolute; inset:0; background:#07070a; }}
 .theatre .screen {{ position:absolute; left:50%; top:20%; transform:translate(-50%,0);
@@ -443,11 +452,11 @@ body {{ font-family:{SERIF}; color:#23211c; }}
 .theatre .seats path {{ stroke:#3a3a42; stroke-width:5; fill:none; }}
 
 .web {{ position:absolute; left:50%; top:44%; transform:translate(-50%,-50%); width:700px;
-       background:#c9c6c0; border:2px solid #23211c; box-shadow:8px 10px 0 rgba(40,30,16,.20); }}
+       background:#c9c6c0; border:2px solid var(--ink,#23211c); box-shadow:8px 10px 0 rgba(40,30,16,.20); }}
 .web .bar {{ background:#2f4f8f; color:#fff; font-family:{MONO}; font-size:24px; padding:12px 18px; }}
 .web-body {{ display:flex; gap:18px; padding:20px; background:#e8e6e1; }}
 .web .grid {{ display:grid; grid-template-columns:repeat(2,1fr); gap:14px; width:250px; }}
-.web .cell {{ width:112px; height:112px; border-radius:50%; background:#23211c; color:#fff;
+.web .cell {{ width:112px; height:112px; border-radius:50%; background:var(--ink,#23211c); color:#fff;
              display:flex; align-items:center; justify-content:center;
              font-family:{MONO}; font-size:26px; }}
 .web .chart {{ flex:1; background:#f7f5f1; border:1.5px solid #8d8a84; padding:14px 18px; }}
@@ -476,22 +485,33 @@ body {{ font-family:{SERIF}; color:#23211c; }}
 /* 底部手撕纸条字幕 */
 .caption {{ position:absolute; left:50%; bottom:150px; transform:translate(-50%,0);
            width:840px; }}
-.strip {{ position:relative; background:#f7f2e2; padding:30px 40px 34px;
+.strip {{ position:relative; background:var(--paper,#f7f2e2); padding:30px 40px 34px;
          clip-path:polygon(0% 12%, 3% 2%, 9% 9%, 16% 1%, 24% 8%, 33% 2%, 43% 9%, 53% 1%,
                            63% 8%, 73% 2%, 83% 9%, 92% 3%, 100% 11%,
                            100% 88%, 93% 98%, 84% 91%, 74% 99%, 63% 92%, 52% 99%,
                            41% 91%, 31% 98%, 21% 92%, 11% 99%, 3% 92%, 0% 90%);
          box-shadow:0 10px 24px rgba(40,30,16,.20); }}
-.strip p {{ font-size:44px; line-height:1.52; letter-spacing:.01em; }}
+.strip p {{ font-size:var(--cap,44px); line-height:1.52; letter-spacing:.01em; }}
 .strip .w {{ position:relative; z-index:1; opacity:.34; }}
 .strip .w.on {{ opacity:1; }}
 .strip .hl::after {{ content:""; position:absolute; left:-2px; right:-2px; bottom:2px;
-                    height:.44em; background:#f0b7bd; z-index:-1; opacity:0;
+                    height:.44em; background:var(--hl,#f0b7bd); z-index:-1; opacity:0;
                     transition:none; }}
 .strip .hl.on::after {{ opacity:1; }}
 .tape {{ position:absolute; left:-26px; top:-16px; width:96px; height:40px;
         background:rgba(226,214,180,.85); transform:rotate(-24deg);
         box-shadow:0 2px 6px rgba(0,0,0,.14); }}
+
+/* 自由叠加图层：盒用 0~1 归一化坐标（与命中表同一口径），落进设计空间像素 */
+.ovl {{ position:absolute; inset:0; pointer-events:none; }}
+.ov {{ position:absolute; box-sizing:border-box; }}
+.ov-text {{ display:flex; align-items:center; white-space:pre-wrap; word-break:break-word; }}
+.ov img {{ width:100%; height:100%; object-fit:contain; display:block; }}
+/* 取不到字节的图片层：画一个看得见的空位。留一个透明盒等于「加了东西但画面没变」，
+   那是最贵的一种失败——用户会以为功能坏了，而账上一切正常。 */
+.ov-missing {{ width:100%; height:100%; display:flex; align-items:center; justify-content:center;
+             border:2px dashed rgba(120,100,70,.7); color:#6c6455; font-size:26px;
+             background:rgba(246,241,228,.6); padding:8px; text-align:center; }}
 '''
 
 #: 图示卡的字号与配色单源在 diagrams.py（组件和它的样式漂了就画歪）
@@ -521,7 +541,7 @@ _CSS_WIDE = f'''
 .stage.wide .night .fig {{ height:600px; }}
 .stage.wide .caption {{ width:1500px; bottom:66px; }}
 .stage.wide .strip {{ padding:16px 46px 22px; }}
-.stage.wide .strip p {{ font-size:44px; line-height:1.34; text-align:center; }}
+.stage.wide .strip p {{ font-size:var(--cap,44px); line-height:1.34; text-align:center; }}
 .stage.wide .tape {{ left:-22px; top:-14px; width:84px; height:34px; }}
 '''
 
@@ -558,6 +578,7 @@ const NUM = (el, key, def) => {
 const ANIMS = Array.from(document.querySelectorAll('[data-anim]')).map(el => {
   const kind = el.getAttribute('data-anim');
   const a = {el, kind, at: NUM(el, 'at', 0), dur: Math.max(1, NUM(el, 'dur', 600)),
+             hold: Math.max(0, NUM(el, 'hold', 0)),
              dist: NUM(el, 'dist', kind === 'wipe' ? 100 : 40),
              to: NUM(el, 'count-to', 0), dp: NUM(el, 'dp', 0),
              unit: el.getAttribute('data-num-unit') || '',
@@ -602,6 +623,10 @@ function paint(a, t){
     } else {
       el.style.transform = `translateX(${(-ph * a.dist).toFixed(2)}px)`;
     }
+    return;
+  }
+  if (k === 'pose'){                                 // 关键帧轮播：只在区间内可见
+    el.style.opacity = (t >= a.at && (a.hold <= 0 || t < a.at + a.hold)) ? '1' : '0';
     return;
   }
   if (t < a.at){ before(a); return; }
@@ -732,6 +757,20 @@ _PROBE_JS = r'''
     }
     push('label', document.getElementById('label'));
     push('caption', document.querySelector('.caption .strip p'));
+    /* 页面自己写明「这一块的哪个字段是什么」的地方（样式栏与叠加图层）。
+       这些不需要按文本反查：反查的前提是画面上有字可对，而背景、色块、图片、
+       空盒恰恰没有字——它们是最该能被点中的东西，也是最没法靠字猜出来的东西。
+       一个字段一条条目：一个元素身上挂着纸色/墨色/字号/字体四个旋钮，
+       合成一条就只能问用户「这四个你要改哪个」，而分开四条前端才能各给一个输入框。*/
+    var marked = document.querySelectorAll('[data-fields]');
+    for (var m = 0; m < marked.length; m++){
+      var el = marked[m];
+      var list = String(el.getAttribute('data-fields') || '').split(/\s+/);
+      var ov = el.getAttribute('data-ov') || '';
+      for (var f = 0; f < list.length; f++){
+        if (list[f]) push('style', el, {field: list[f], ov: ov});
+      }
+    }
     var art = document.getElementById('artWrap');
     if (art){
       var nodes = art.querySelectorAll('*');
@@ -762,14 +801,24 @@ _PROBE_JS = r'''
 '''
 
 
-def _caption_html(shot: dict[str, Any], timed: list[dict[str, Any]]) -> str:
-    """字幕条：整句按字符切成词 span，逐词点亮，高亮词刷粉底。"""
+def _caption_html(shot: dict[str, Any], timed: list[dict[str, Any]],
+                  root: str = "") -> str:
+    """字幕条：整句按字符切成词 span，逐词点亮，高亮词刷粉底。
+
+    ``data-fields`` 挂在两个不同的元素上：纸条本体（``.strip``）的纸色归 ``theme.paper``，
+    里面的字（``.strip p``）的墨色、字号、字体归 ``theme.ink`` / ``caption_size`` / ``font``。
+    分成两条是因为它们的框几乎重合、在 spec 里却是四个不同的旋钮——合并成一条就得猜用户想改哪个。
+    """
     text = str(shot.get("text") or "")
     terms = [str(t) for t in (shot.get("highlight") or [])]
+    paper = f' data-fields="{root}/paper"' if root else ""
+    ink = (" data-fields=\"" + " ".join(f"{root}/{k}"
+                                        for k in ("ink", "caption_size", "font")) + '"') \
+        if root else ""
     if not timed:
         # 无旁白（纯字幕片）：整句在入场后一次给出，不做逐词点亮
-        return (f'<div class="strip"><div class="tape"></div>'
-                f'<p><span class="w on" data-at="0">{html.escape(text)}</span></p></div>')
+        return (f'<div class="strip"{paper}><div class="tape"></div>'
+                f'<p{ink}><span class="w on" data-at="0">{html.escape(text)}</span></p></div>')
     spans: list[str] = []
     cursor = 0
     for item in timed:
@@ -784,25 +833,190 @@ def _caption_html(shot: dict[str, Any], timed: list[dict[str, Any]]) -> str:
         cursor = item["char_end"]
     if cursor < len(text):
         spans.append(f'<span class="w on" data-at="0">{html.escape(text[cursor:])}</span>')
-    return ('<div class="strip"><div class="tape"></div>'
-            '<p>' + "".join(spans) + '</p></div>')
+    return (f'<div class="strip"{paper}><div class="tape"></div>'
+            f'<p{ink}>' + "".join(spans) + '</p></div>')
 
 
-def _panel_html(panel: dict[str, Any]) -> str:
+def _panel_html(panel: dict[str, Any], root: str = "") -> str:
+    fields = f' data-fields="{root}/paper"' if root else ""
     if not panel:
-        return '<div class="panel" id="panel"></div>'
+        return f'<div class="panel" id="panel"{fields}></div>'
     rows = []
     for key, val in panel.items():
         rows.append(f'<div class="row"><div class="k">{_esc(key)}</div>'
                     f'<div class="v">{_esc(val)}</div></div>')
-    return '<div class="panel" id="panel">' + "".join(rows) + '</div>'
+    return f'<div class="panel" id="panel"{fields}>' + "".join(rows) + '</div>'
 
 
-def _label_html(label: dict[str, Any]) -> str:
+def _label_html(label: dict[str, Any], root: str = "") -> str:
+    fields = f' data-fields="{root}/paper"' if root else ""
     if not label:
-        return '<div class="label" id="label" style="display:none"></div>'
+        return f'<div class="label" id="label" style="display:none"{fields}></div>'
     parts = [str(v) for v in label.values() if v]
-    return f'<div class="label" id="label">{_esc(" · ".join(parts))}</div>'
+    return f'<div class="label" id="label"{fields}>{_esc(" · ".join(parts))}</div>'
+
+
+# ---------------------------------------------------------------------------
+# 样式栏 → CSS 变量（整页可编辑的落笔处）
+# ---------------------------------------------------------------------------
+
+#: 会被拼进 ``<style>`` 的值的**最后一道**字符闸。``spec`` 那一头已经拦过一遍，
+#: 这里是第二遍：出片页只认经过两道的字节，将来谁多开一条路径（手写 spec、
+#: 别的调用方直接 build_shot_page）也不会把 ``}`` 或 ``<script>`` 带进 head。
+_SAFE_LIT = re.compile(r"^[\w#%(),.\s-]{1,160}$")
+
+
+def _safe_lit(value: Any) -> str:
+    text = str(value if value is not None else "").strip()
+    if not text or not _SAFE_LIT.match(text):
+        return ""
+    if text.count("(") != text.count(")"):
+        return ""
+    return text
+
+
+def theme_css(theme: dict[str, Any]) -> str:
+    """样式栏 → ``:root{…}``。**没给的键一条都不写**，让 _CSS 里那些带 fallback 的
+    ``var(--paper,#f6f1e4)`` 自己兜底——写一条空值（``--ink:;``）会把继承链上的
+    颜色变成「未定义」，画面直接掉回浏览器默认色，比不改更糟。
+
+    ``bg`` 同时改两件事：``--bg`` 是舞台四周留纸的颜色（letterbox 也吃它），
+    ``--bg-paint`` 是那张纸本身的画法（默认是一段渐变，给了值就整段换掉）。
+    """
+    src = theme if isinstance(theme, dict) else {}
+    decls: list[str] = []
+    bg = _safe_lit(src.get("bg"))
+    if bg:
+        decls.append(f"--bg:{bg}")
+        decls.append(f"--bg-paint:{bg}")
+    for key in ("paper", "ink", "accent", "hl"):
+        got = _safe_lit(src.get(key))
+        if got:
+            decls.append(f"--{key}:{got}")
+    try:
+        cap = float(src.get("caption_size") or 0)
+    except (TypeError, ValueError):
+        cap = 0.0
+    if 16 <= cap <= 140:
+        decls.append(f"--cap:{cap:g}px")
+    stack = FONT_STACKS.get(str(src.get("font") or ""))
+    if stack:
+        decls.append(f"--font:{stack}")
+    return ":root{" + ";".join(decls) + "}" if decls else ""
+
+
+# ---------------------------------------------------------------------------
+# 自由叠加图层：加在画面上任何东西都走这一条路，不开第二条通道
+# ---------------------------------------------------------------------------
+
+_ALIGN = {"left": "flex-start", "center": "center", "right": "flex-end"}
+
+
+def _ov_style(lay: dict[str, Any]) -> tuple[str, str]:
+    """一层的定位串 + 外观串。盒用归一化坐标（与命中表同一口径），落进百分比。"""
+    box = lay.get("box") or {}
+    st = lay.get("style") or {}
+
+    def num(key: str, default: float) -> float:
+        try:
+            return float(box.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    geom = [f"left:{num('x', 0) * 100:.3f}%", f"top:{num('y', 0) * 100:.3f}%",
+            f"width:{max(0.0, num('w', 0.1)) * 100:.3f}%",
+            f"height:{max(0.0, num('h', 0.1)) * 100:.3f}%"]
+    kind = str(lay.get("type") or "text")
+
+    # 一条线就是一块很扁的实心矩形：颜色取自 color 栏（线的「笔色」比「填充」直观）
+    fill = _safe_lit(st.get("background"))
+    if kind == "line":
+        fill = fill or _safe_lit(st.get("color")) or "#23211c"
+    paint: list[str] = []
+    if kind in ("rect", "ellipse", "line"):
+        if fill:
+            paint.append(f"background:{fill}")
+        paint.append("border-radius:50%" if kind == "ellipse"
+                     else f"border-radius:{max(0.0, _as_float(st.get('radius'), 0.0)):.0f}px")
+    border = _safe_lit(st.get("border"))
+    if border and kind != "line":
+        paint.append(f"border:2px solid {border}")
+    if kind == "text":
+        color = _safe_lit(st.get("color")) or "var(--ink,#23211c)"
+        size = max(8.0, min(400.0, _as_float(st.get("size"), 40.0)))
+        weight = max(100, min(900, int(_as_float(st.get("weight"), 700))))
+        align = str(st.get("align") or "center")
+        paint.append(f"color:{color};font-size:{size:g}px;font-weight:{weight};"
+                     f"justify-content:{_ALIGN.get(align, 'center')};"
+                     f"text-align:{align if align in _ALIGN else 'center'}")
+    try:
+        opacity = max(0.0, min(1.0, float(st.get("opacity", 1))))
+    except (TypeError, ValueError):
+        opacity = 1.0
+    if opacity < 1:
+        paint.append(f"opacity:{opacity:.3f}")
+    rot = _as_float(st.get("rotation"), 0.0)
+    if abs(rot) > 0.01:
+        geom.append(f"transform:rotate({rot:.2f}deg)")
+    return ";".join(geom), ";".join(paint)
+
+
+def _overlay_html(shot: dict[str, Any], index: int,
+                  assets: dict[str, str] | None = None
+                  ) -> tuple[str, str, list[str]]:
+    """一镜的叠加清单 → (背景层 HTML, 前景层 HTML, 取不到字节的 ref 清单)。
+
+    每层都挂 ``data-fields``：命中表的探针扫这些属性倒出 role=style 的条目，
+    于是「点一下这块东西」拿到的就是它自己的字段指针，不需要按文本反查——
+    反查靠字对上，空盒与图片没有字可对，只能显式写。
+
+    ``z="back"`` 的那几层落在 ``.bg`` 之后、状态面板之前：换背景就是加一层
+    铺满的画面，而不是新开一条背景通道（多一条通道就多一套指针、一套缓存键、
+    一套命中规则，而它和别的图层唯一的区别只是压在底下）。
+    """
+    layers = shot.get("overlay") or []
+    back: list[str] = []
+    front: list[str] = []
+    missing: list[str] = []
+    for n, lay in enumerate(layers):
+        if not isinstance(lay, dict):
+            continue
+        kind = str(lay.get("type") or "text")
+        fields = [f"/shots/{index}/overlay/{n}/box"]
+        if kind == "text":
+            fields += [f"/shots/{index}/overlay/{n}/text",
+                       f"/shots/{index}/overlay/{n}/style/color",
+                       f"/shots/{index}/overlay/{n}/style/size"]
+        elif kind == "image":
+            fields.append(f"/shots/{index}/overlay/{n}/ref")
+        else:
+            fields.append(f"/shots/{index}/overlay/{n}/style/background")
+        fields.append(f"/shots/{index}/overlay/{n}/style/opacity")
+
+        anim = str(lay.get("anim") or "none")
+        attrs = f' class="ov ov-{_esc(kind)}{" ov-text" if kind == "text" else ""}"' \
+                f' data-ov="{_esc(lay.get("id") or f"{n}")}"' \
+                f' data-fields="{" ".join(fields)}"'
+        if anim in ("fade", "rise", "pop", "wipe"):
+            attrs += (f' data-anim="{anim}" data-at="{_as_float(lay.get("at_ms"), 0):.0f}"'
+                      f' data-dur="{_as_float(lay.get("dur_ms"), 600):.0f}"')
+        geom, paint = _ov_style(lay)
+        inner = ""
+        if kind == "text":
+            inner = _esc(lay.get("text") or "")
+        elif kind == "image":
+            ref = str(lay.get("ref") or "")
+            src = (assets or {}).get(ref) or ""
+            inner = (f'<img src="{_esc(src)}" alt="">' if src else
+                     f'<div class="ov-missing">（图片没取到字节：{_esc(ref[:40])}）</div>')
+            if not src:
+                missing.append(ref or "（空 ref）")
+        (back if str(lay.get("z") or "") == "back" else front).append(
+            f'<div{attrs} style="{geom}{ ";" + paint if paint else "" }">{inner}</div>')
+
+    def wrap(items: list[str]) -> str:
+        return '<div class="ovl">' + "".join(items) + "</div>" if items else ""
+    return wrap(back), wrap(front), missing
 
 
 def stamp_at_ms(shot: dict[str, Any], duration_sec: float) -> float | None:
@@ -839,6 +1053,9 @@ def settle_ms(shot: dict[str, Any], timed: list[dict[str, Any]],
     所以内置图示卡的时值和模型自写 SVG 的时值走同一本账。连续动效（orbit/pulse/pan）
     **永不停止**，``anim_end_ms`` 直接给到镜头末尾：这类镜头每帧都是活帧，
     这是连续运动的成本，不是这里的保守估计。
+
+    叠加图层的入场动效同样计入：漏了这一笔，「第 3 秒才浮出来的那条标注」会被
+    停止时刻之前的末帧取代——用户加了东西，画面上永远看不到。
     """
     ends = [ENTER_MS, 120 + TEAR_MS]
     if timed:
@@ -846,6 +1063,10 @@ def settle_ms(shot: dict[str, Any], timed: list[dict[str, Any]],
     at = stamp_at_ms(shot, duration_sec)
     if at is not None:
         ends.append(at + 220)
+    for lay in (shot.get("overlay") or []):
+        if isinstance(lay, dict) and str(lay.get("anim") or "none") != "none":
+            ends.append(_as_float(lay.get("at_ms"), 0.0)
+                        + _as_float(lay.get("dur_ms"), 600.0))
     dur_ms = duration_sec * 1000
     inner = compile_art(shot, duration_sec)[0]
     anim_end = _art.anim_end_ms(inner, dur_ms)
@@ -856,17 +1077,24 @@ def settle_ms(shot: dict[str, Any], timed: list[dict[str, Any]],
 
 def build_shot_page(shot: dict[str, Any], *, spec: dict[str, Any],
                     timed: list[dict[str, Any]], duration_sec: float,
-                    width: int, height: int, fps: int) -> str:
+                    width: int, height: int, fps: int, index: int = 0,
+                    assets: dict[str, str] | None = None) -> str:
     """一镜 → 一页自播放 HTML（headless Chrome 逐帧截图的输入）。
 
     画幅决定设计空间：**只有横屏换第二套版式**，竖屏与方图共用那一张 1080×1920 的
     竖构图——方图不是方版式，只是把同一条竖片居中、四周多留纸（参考片的排版本来就
     是为竖构图画的，硬套成方图只会把字幕挤成三行）。
+
+    ``index`` 是这一镜在 ``spec.shots`` 里的下标：``data-fields`` 里的指针要按它写，
+    命中表才指得回这一镜。``assets`` 把叠加图片层的 ref 换成浏览器能直接取的
+    ``file://`` 地址（渲染前由出片节点从对象存储取到本地）。
     """
     wide = width > height
     dw, dh = (WIDE_W, WIDE_H) if wide else (DESIGN_W, DESIGN_H)
     inner, fit = compile_art(shot, duration_sec)
     wrap = "artBox" if fit == "box" else "artFill"
+    root = f"/shots/{index}/theme"
+    ov_back, ov_front, _missing = _overlay_html(shot, index, assets)
     payload = {
         "id": str(shot.get("id") or "shot"), "w": width, "h": height,
         "fps": fps, "dw": dw, "dh": dh,
@@ -874,19 +1102,23 @@ def build_shot_page(shot: dict[str, Any], *, spec: dict[str, Any],
         "settle_ms": settle_ms(shot, timed, duration_sec),
         "enter_ms": ENTER_MS, "tear_ms": TEAR_MS,
     }
-    styles = _CSS + _DIAGRAM_CSS + (_CSS_WIDE if wide else "")
+    # 主题变量必须在 _CSS 之后：同一条规则里后来者赢，写在前面等于没写。
+    styles = (_CSS + _DIAGRAM_CSS + (_CSS_WIDE if wide else "")
+              + theme_css(shot.get("theme") or {}))
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>{_esc(shot.get('id'))}</title>
 <style>{styles}</style></head>
 <body>
 <div class="stage{' wide' if wide else ''}" id="stage">
-  <div class="bg">
+  <div class="bg" data-fields="{root}/bg">
     <svg class="scratches" viewBox="0 0 {dw} {dh}" preserveAspectRatio="none">{_scratches(dw, dh)}</svg>
   </div>
-  {_panel_html(shot.get("panel") or {})}
-  {_label_html(shot.get("label") or {})}
+  {ov_back}
+  {_panel_html(shot.get("panel") or {}, root)}
+  {_label_html(shot.get("label") or {}, root)}
   <div class="art" id="artWrap"><div class="{wrap}">{inner}</div></div>
-  <div class="caption" id="caption">{_caption_html(shot, timed)}</div>
+  <div class="caption" id="caption">{_caption_html(shot, timed, root)}</div>
+  {ov_front}
 </div>
 <script>window.__SHOT__ = {json.dumps(payload, ensure_ascii=False)};</script>
 <script>{_JS}</script>

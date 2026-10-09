@@ -70,7 +70,8 @@ class PlanMotionNode(StoryNode):
         f"{', '.join(mspec.ASPECTS)}；帧率白名单：{mspec.FPS_CHOICES}；"
         f"字幕形态：{', '.join(mspec.SUBTITLE_MODES)}。"
         "有旁白时不要写每镜 duration_sec——镜头长度由真实语音时长决定，写了只会被当下限。"
-        "画幅/帧率/旁白开关/音色/语速/字幕形态同时提供**顶层入参**（计划卡给用户勾选的位），"
+        f"画幅/帧率/旁白开关/音色/语速/字幕形态/质感档同时提供**顶层入参**（计划卡给用户勾选的位），"
+        f"质感可选：{', '.join(mspec.TEXTURES)}（挂在母带一层，换它不重烧镜头）。"
         "传了会覆盖 spec 里的同名字段。")
     required_nodes: list[str] = []
     require_explicit_call = True
@@ -84,7 +85,8 @@ class PlanMotionNode(StoryNode):
                            "（版式不自动排它，要进画面得写进所选 card 的 visual 字段）。"
                            "**出处还要过一道账**：本会话被 web_search / fetch_url 真打开过的页面"
                            "才算查证过，对不上账的出处会被打回（没查到就写「未核实：…」）。"
-                           "aspect/fps/narration/voice/rate/subtitle_mode 也可以走下面的顶层开关，"
+                           "aspect/fps/narration/voice/rate/subtitle_mode/texture 也可以走下面的"
+                           "顶层开关，"
                            "顶层的优先（那是用户在计划卡上勾的，不是建议）",
         },
         **mspec.knob_props(),
@@ -164,6 +166,7 @@ def plan_payload(spec: dict[str, Any], *, target: float | None = None,
         "voice": spec["voice"] if spec["narration"] else "",
         "rate": spec["rate"] if spec["narration"] else "",
         "subtitle_mode": spec["subtitle_mode"],
+        "texture": spec.get("texture") or "none",
         "bgm": spec["bgm"],
         "title": spec["title"],
         "plan_table": [_row(s) for s in shots],

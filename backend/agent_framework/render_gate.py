@@ -167,12 +167,16 @@ def preview_summary(preview: Mapping[str, Any] | None) -> dict[str, str]:
 #: ``KNOB_FIELDS`` 同源；两份名单漂移由 tests/test_motion_channel.py 拦下）。
 #: 为什么不在这里 import 那个模块：主服务不装配剪辑服务端的实现，而这里读错的后果
 #: 只是摘要少显示一个字段——它不参与任何执行判定。
-MOTION_KNOBS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode")
+MOTION_KNOBS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode",
+                "texture")
 
 #: 卡面要给人看的词，不是枚举字面量（用户不需要背 portrait / torn_highlight）。
 _ASPECT_LABELS = {"portrait": "竖屏", "landscape": "横屏", "square": "方屏"}
 _SUBTITLE_LABELS = {"torn_highlight": "撕纸条·逐词点亮", "torn": "撕纸条",
                     "bottom": "底部字幕", "none": "不上字幕"}
+_TEXTURE_LABELS = {"none": "不加质感", "film": "老胶片·颗粒与暗角",
+                   "tv": "老电视·扫描线与色偏", "glow": "柔光·高光处泛开",
+                   "bleach": "漂白·硬对比低饱和"}
 
 
 def motion_summary(source: Mapping[str, Any] | None,
@@ -241,6 +245,9 @@ def motion_summary(source: Mapping[str, Any] | None,
     sub = word("subtitle_mode", src.get("subtitle_mode"), _SUBTITLE_LABELS)
     if sub:
         out["字幕"] = sub
+    texture = word("texture", src.get("texture"), _TEXTURE_LABELS)
+    if texture and str(src.get("texture") or "").lower() != "none":
+        out["质感"] = texture
     bgm = src.get("bgm") if isinstance(src.get("bgm"), Mapping) else {}
     ref = str(bgm.get("ref") or "") if bgm else ""
     out["配乐"] = Path(ref).name[:18] if ref else "纯人声（无配乐）"

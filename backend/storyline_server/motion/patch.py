@@ -22,14 +22,18 @@ import copy
 from typing import Any, Mapping, Sequence
 
 from . import hitmap as m_hit
+from . import spec as m_spec
 
 #: 整镜改写允许的字段 = ``validate_spec`` 归一之后的镜头键。
 #: 不含 ``id``：镜号是命中表、按镜缓存与改前改后对比帧共同的锚点，换掉它等于让这三样
 #: 各自去找一个新归属——那不叫改一镜，叫偷偷换成另一镜。
 #: 也不含 ``duration_sec``：归一结果里它已经叫 ``min_duration_sec``（有旁白时时钟归声音，
 #: 这一栏只剩「下限」的意思），时间线上拖镜头长度改的就是它。
+#: ``theme``/``overlay`` 在这里是**整份替换**的入口（样式表单一次给好几个旋钮，
+#: 图层列表一次给一整叠）；单改一格走指针（``/shots/0/theme/bg``）就够了，
+#: 两栏的每个键都由 ``spec._norm_theme``/``_norm_overlay`` 补齐过，指针永远落在已有字段上。
 EDITABLE_SHOT_FIELDS = ("card", "text", "highlight", "label", "panel", "stamp",
-                        "visual", "source", "min_duration_sec")
+                        "visual", "source", "min_duration_sec", "theme", "overlay")
 
 
 def shot_id(shot: Any, index: int = -1) -> str:
@@ -51,6 +55,23 @@ def _fail(errors: list[str]) -> None:
                         if len(errors) > 12 else ""))
 
 
+def _ensure_style_defaults(shots: list[Any]) -> None:
+    """就地给缺 ``theme``/``overlay`` 的镜头补上默认值（升级前那版片子没有这两栏）。
+
+    补的不是凭空想的值，而是**那一版画出来就是这个样子**：样式栏的默认值与模板 CSS
+    里那些 ``var(--paper,#f6f1e4)`` 的兜底同值，叠加层默认为空。不补齐的话，指针的
+    末端落在一个当时还不存在的字段上，``apply_patch`` 只能拒收——用户对着旧片子
+    点「换个背景色」，收到的却是「指针末端不是已有字段」。
+    """
+    for shot in shots:
+        if not isinstance(shot, dict):
+            continue
+        if "theme" not in shot:
+            shot["theme"] = copy.deepcopy(m_spec.DEFAULT_THEME)
+        if "overlay" not in shot:
+            shot["overlay"] = []
+
+
 def plan_patch(base: dict[str, Any], *,
                edits: Sequence[Mapping[str, Any]] = (),
                shot_sets: Sequence[Mapping[str, Any]] = (),
@@ -67,6 +88,11 @@ def plan_patch(base: dict[str, Any], *,
 
     errors: list[str] = []
     doc = copy.deepcopy(dict(base))
+    # 两边都要补：只补 doc 的话「补齐 theme/overlay 这一栏」本身就成了每镜都有的
+    # 一处差异，改一镜的样式会连带整片重烧（改动账比的是字典相等，不是像素）。
+    base_shots = copy.deepcopy(list(base["shots"]))
+    _ensure_style_defaults(doc["shots"])
+    _ensure_style_defaults(base_shots)
     base_ids = shot_ids(base["shots"])
 
     # ── ① 指针改值（命中表给的就是这一种）：按 base 的下标落笔 ──────────────
@@ -176,7 +202,7 @@ def plan_patch(base: dict[str, Any], *,
 
     # 改动账按「镜内容有没有变」算，而不是按调用方给了几条补丁算：值写回原样、
     # 或者两条补丁改同一格，都只该重烧一次像素——账必须与将要烧的东西一致。
-    before = {shot_id(s, i): s for i, s in enumerate(base["shots"])}
+    before = {shot_id(s, i): s for i, s in enumerate(base_shots)}
     changed = [sid for sid, s in
                zip(shot_ids(doc["shots"]), doc["shots"])
                if sid not in before or s != before[sid]]

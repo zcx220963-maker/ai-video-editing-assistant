@@ -89,7 +89,7 @@ PARAM_LABELS: dict[str, str] = {
     # 图形科普片（零素材出片）：这批键会原样出现在计划卡与工具气泡里
     "spec": "分镜", "style": "版式", "aspect": "画幅", "fps": "帧率",
     "narration": "人声朗读", "voice": "音色", "rate": "语速",
-    "subtitle_mode": "字幕形态", "title": "标题",
+    "subtitle_mode": "字幕形态", "texture": "整片质感", "title": "标题",
     # 检索与读写
     "query": "关键词", "text": "文本", "key": "键名", "pattern": "检索式",
     "glob": "文件通配", "path": "路径", "paths": "路径", "content": "内容",

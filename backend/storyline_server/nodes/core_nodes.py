@@ -28,6 +28,7 @@ from agent_framework.orchestration import (
     _safe,
 )
 from agent_framework.storage import Storage, StorageUnavailable, to_ref
+from agent_framework.render_library import register_render
 
 from .. import mediaops
 from .. import timeline_edit as te
@@ -1711,6 +1712,8 @@ def resync_original_audio_timeline(tl: Any) -> int:
     for ev in picture:
         if not isinstance(ev, dict):
             continue
+        if str(ev.get("manual") or "") == te.MANUAL_MARK:
+            continue                     # 用户亲手拧过取景/声音的段：不替他改回去
         path = str(ev.get("path") or "")
         s, e = ev.get("start"), ev.get("end")
         if s is None or e is None:
@@ -1836,6 +1839,66 @@ def resolve_overlay_anchors(tl: Any, anchors: Any, *, media_paths: Any = None) -
 SYNC_TOLERANCE_SEC = 0.25   # 音画同步闸值：证据账判「达标」用的就是这一个数，别在两处写两份
 
 
+def _av_spans(tl: Any) -> list[tuple[float, float, float, str]]:
+    """声音段的 (输出起, 输出止, 源起, 引用)——同步闸与手改记账共用这一份读数。
+
+    两处各写一遍的话，「闸判的」与「账上说的」迟早不是同一件事（真机栽过的老路）。
+    """
+    out: list[tuple[float, float, float, str]] = []
+    for a in (tl.get("audio_events") or []) if isinstance(tl, Mapping) else []:
+        if not isinstance(a, Mapping):
+            continue
+        s, e, ss = a.get("start"), a.get("end"), a.get("src_start")
+        if s is None or e is None or ss is None:
+            continue
+        out.append((float(s), float(e), float(ss), str(a.get("path") or "")))
+    return out
+
+
+def manual_sync_notes(tl: Any) -> list[str]:
+    """被用户亲手拧过、同步闸与自动校准因此**不再管**的段 → 一行行说明。
+
+    为什么单独成账：「闸不判」与「闸判过、没问题」是两句不同的话。混在一起就等于
+    替用户的手改背书，而下一次他听到的仍是那句「严格音画同步」。
+    """
+    if not isinstance(tl, Mapping):
+        return []
+    spans = _av_spans(tl)
+    voice_paths = {p for *_, p in spans if p}
+
+    def _voice_src_at(wall: float, path: str):
+        for s, e, ss, p in spans:
+            if p == path and s <= wall < e:
+                return ss + (wall - s)
+        return None
+
+    notes: list[str] = []
+    for label, key in (("画面", "events"), ("覆盖层", "overlay_events")):
+        for i, ev in enumerate(tl.get(key) or [], 1):
+            if not isinstance(ev, Mapping) or str(ev.get("manual") or "") != te.MANUAL_MARK:
+                continue
+            path = str(ev.get("path") or "")
+            if path not in voice_paths or ev.get("start") is None:
+                continue                     # 不同源（空镜/盖层素材）：本来就没有嘴可对
+            wall = float(ev["start"])
+            v = _voice_src_at(wall, path)
+            detail = (f"画面取源 {float(ev.get('src_start') or 0.0):.2f}s，"
+                      f"而该素材自己的声音在这一秒播到 {v:.2f}s，"
+                      f"差 {abs(float(ev.get('src_start') or 0.0) - v):.2f}s"
+                      if v is not None else "这一秒没有它自己的声音在播")
+            notes.append(f"第 {i} 段{label}按用户手改，同步闸与渲染前校准都不再管它"
+                         f"（{detail}）——嘴型对不对只能人眼验")
+    for i, a in enumerate(tl.get("audio_events") or [], 1):
+        if not isinstance(a, Mapping) or str(a.get("manual") or "") != te.MANUAL_MARK:
+            continue
+        rng = (f"源区间 {float(a.get('src_start') or 0.0):.2f}~"
+               f"{float(a.get('src_end') or 0.0):.2f}s"
+               if a.get("src_start") is not None else "没写源区间")
+        vol = f"、音量 {float(a.get('volume') or 1.0):.2f}×" if a.get("volume") is not None else ""
+        notes.append(f"第 {i} 段声音按用户手改（{rng}{vol}），画面会按它重新对齐")
+    return notes
+
+
 def av_sync_check(tl: Any, *, tolerance: float = SYNC_TOLERANCE_SEC) -> tuple[float, list[str]]:
     """渲染前的同步闸：返回 (最大偏差秒数, 违规说明清单)。
 
@@ -1847,24 +1910,20 @@ def av_sync_check(tl: Any, *, tolerance: float = SYNC_TOLERANCE_SEC) -> tuple[fl
 
     只判**有嘴型可言**的段：画面素材同时出现在声音段里（同源）才要求对齐；
     空镜（不同源）不动——它没有嘴可对。
+    用户亲手拧过的段（``manual`` = 按用户手改）也不动：那是 D4 拍板的「闸不再管它」，
+    它改由 :func:`manual_sync_notes` 如实记进证据账，而不是悄悄从判据里消失。
     """
     if not isinstance(tl, Mapping):
         return 0.0, []
     events = tl.get("events") or []
-    audios = tl.get("audio_events") or []
-    spans: list[tuple[float, float, float, str]] = []
-    for a in audios:
-        if not isinstance(a, Mapping):
-            continue
-        s, e, ss = a.get("start"), a.get("end"), a.get("src_start")
-        if s is None or e is None or ss is None:
-            continue
-        spans.append((float(s), float(e), float(ss), str(a.get("path") or "")))
+    spans = _av_spans(tl)
     voice_paths = {p for *_, p in spans if p}
 
-    def _oncam(items: Any, label: str) -> list[tuple[str, dict]]:
-        return [(label, ev) for ev in (items or [])
+    def _oncam(items: Any, label: str) -> list[tuple[int, str, dict]]:
+        """带上**原始序号**：跳过手改/不同源段之后重新从 1 数，用户就会按序号找不到那一段。"""
+        return [(i, label, ev) for i, ev in enumerate(items or [], 1)
                 if isinstance(ev, dict) and str(ev.get("path") or "") in voice_paths
+                and str(ev.get("manual") or "") != te.MANUAL_MARK
                 and ev.get("start") is not None and ev.get("src_start") is not None]
 
     oncam = _oncam(events, "画面") + _oncam(tl.get("overlay_events"), "覆盖层")
@@ -1883,21 +1942,21 @@ def av_sync_check(tl: Any, *, tolerance: float = SYNC_TOLERANCE_SEC) -> tuple[fl
 
     worst = 0.0
     bad: list[str] = []
-    for i, (label, ev) in enumerate(oncam, 1):
+    for idx, label, ev in oncam:
         s, e = float(ev["start"]), float(ev["end"])
         path = str(ev.get("path") or "")
         reported = False       # 同一段的起点/终点是同一个错位，只报一条，但两点都要测偏差
         for point, wall in (("起点", s), ("终点", max(s, e - 0.01))):
             v = voice_at(wall, path)
             if v is None:
-                bad.append(f"第 {i} 段{label}（输出 {s:.2f}–{e:.2f} 秒）用的是口播素材，"
+                bad.append(f"第 {idx} 段{label}（输出 {s:.2f}–{e:.2f} 秒）用的是口播素材，"
                            f"但{point} {wall:.2f} 秒处没有它自己的声音在播"
                            f"——画面与声音不同源，嘴型必然对不上")
                 break
             drift = abs(float(ev["src_start"]) + (wall - s) - v)
             worst = max(worst, drift)
             if drift > tolerance and not reported:
-                bad.append(f"第 {i} 段{label}（输出 {s:.2f}–{e:.2f} 秒）在{point} {wall:.2f} 秒处"
+                bad.append(f"第 {idx} 段{label}（输出 {s:.2f}–{e:.2f} 秒）在{point} {wall:.2f} 秒处"
                            f"比声音早/晚 {drift:.2f} 秒：画面取源时刻 "
                            f"{float(ev['src_start']) + (wall - s):.2f}，"
                            f"而此刻声音正播到源时刻 {v:.2f}")
@@ -1963,7 +2022,10 @@ def render_plan(tl: dict[str, Any]) -> dict[str, Any]:
         "transitions": sum(1 for e in (tl.get("events") or [])
                            if isinstance(e, Mapping) and e.get("kind") == "transition"),
         "bgm": ({"volume": round(float(bgm.get("volume") or 0), 2),
+                 "offset_sec": round(float(bgm.get("offset_sec") or 0), 3),
                  "asset": Path(str(bgm.get("path") or "")).name} if bgm else None),
+        # 手改段：闸「不判」的每一段都要在这里露出来，而不是从账上消失（见 manual_sync_notes）
+        "manual": manual_sync_notes(tl),
     }
 
 
@@ -2118,10 +2180,18 @@ def evidence_ledger(plan: Mapping[str, Any], *, worst_drift: float, resynced: in
             "machine", verified=abs(float(worst_drift)) <= tol,
             proof="av_sync_check 在渲染前对最终时间线算的数；"
                   "它验的是**时间码**，嘴型像不像仍要人看"),
+    ]
+    # 手改段一条一个 UNVERIFIED：闸对它「不判」，不是「判过没问题」。把这一条塞进
+    # verified 那一堆，就是替用户的手改背书。
+    for note in (plan.get("manual") or []):
+        led.append(_ev(note, "eyeball", verified=False,
+                       proof="按用户手改的段：同步闸与渲染前校准都让路，"
+                             "机器不再替它判断，只能人眼/人耳验"))
+    led.append(
         _ev("声音有静音空档：" + ("、".join(f"{a}~{b}s" for a, b in plan["voice"]["gaps"][:4])
                                   if plan["voice"]["gaps"] else "无（排满了）"),
             "machine", verified=True, proof="按 audio_events 的墙壁区间算"),
-    ]
+    )
     if plan["overlays"]:
         led.append(_ev(
             "覆盖层落点：" + "；".join(f"第 {i} 层盖 {o['at'][0]}~{o['at'][1]}s"
@@ -2232,11 +2302,15 @@ class RenderVideoNode(StoryNode):
     })
 
     async def process(self, state, inputs, *, base_film: Path | None = None,
-                      rebuild_ids: set[str] | None = None):
+                      rebuild_ids: set[str] | None = None,
+                      base_doc: Mapping[str, Any] | None = None):
         # ``base_film`` 只由 ``PatchVideoNode`` 传：那是「上一版成片的本机文件」，让没被
         # 改动的窗口直接从旧片切，而不必回源片重烧。整片出片那一路永远是 None。
         # ``rebuild_ids`` 是配套的「哪些窗口**不许**从旧片切」——旧片里那一窗烙的还是
         # 改之前的字幕/画面，切过来就等于把用户的改动抹掉。
+        # ``base_doc`` 是比它更可靠的同一件事：上一版成片**对应的那份时间线**。渲染前
+        # 还有校准与重新打段 id 两道（见下方 assign_segment_ids 的位置），改过的窗口
+        # 因此可能换个名字，按改前那份表点名的 id 就会漏掉它。
         store = state.store
         # 自定义时间线优先：agent 手写的时间线直接用，绕过规划工具
         tl = inputs.get("timeline")
@@ -2368,6 +2442,7 @@ class RenderVideoNode(StoryNode):
                     cache=SegmentSliceCache(self.storage.workspace, sess),
                     base_film=base_film,
                     rebuild_ids=rebuild_ids,
+                    base_doc=base_doc,
                     work=self._work(state, "render", "win"))
             else:
                 try:
@@ -2439,15 +2514,25 @@ class RenderVideoNode(StoryNode):
                 out["segment_cache"] = {"windows": windowed["windows"],
                                         "rebuilt": windowed["rebuilt"],
                                         "reused": windowed["reused"],
+                                        "planned_rebuild": windowed["planned_rebuild"],
+                                        "skipped": windowed["skipped"],
                                         "ledger": windowed["ledger"]}
                 out["evidence"].append(_ev(
                     f"这次按窗口渲染：{len(windowed['rebuilt'])} 窗重烧、"
-                    f"{len(windowed['reused'])} 窗直接复用上一版字节",
+                    f"{len(windowed['reused'])} 窗直接复用上一版字节"
+                    + (f"、{len(windowed['skipped'])} 窗排不出画面段被跳过"
+                       if windowed["skipped"] else ""),
                     "machine", verified=True,
                     proof="render_windowed 的逐窗台账（每一窗记 from=cached/base_cut/"
                           "rendered 与它自己的 cache_key，可对回命中表）"))
+            mat_id, mat_note = await register_render(
+                self.storage, sess, object_key, title=title,
+                duration_sec=float(info["duration"] or 0.0))
+            if mat_id:
+                out["material_id"] = mat_id
             notes = [*overlay_notes, *seg_notes,
-                     *((windowed or {}).get("degraded") or [])]
+                     *((windowed or {}).get("degraded") or []),
+                     *([mat_note] if mat_note else [])]
             if notes:
                 out["notes"] = notes
             await jobs.succeed(sess, artifact, object_key, float(info["duration"]),
@@ -2678,20 +2763,30 @@ def _subtitle_layers(tl: dict[str, Any], size: tuple[int, int],
             if not text:
                 continue
             requested += 1
-            fs = max(20, h // 22)
+            # 字号与命中表算框用的是同一个函数：用户在编辑器里点中的那一行字
+            # 必须就是渲出来的那一行，两处各写一遍 max(20, h//22) 迟早对不上。
+            # 夹顶用**真实画布**的尺寸：low_res 那次会把高度减半，读 tl 就会算大。
+            fs = int(te.subtitle_font_size({"width": w, "height": h}, sub))
+            # 入口只放行 #RRGGBB 与常见颜色名（见 timeline_edit._type_check），
+            # 所以这里不需要再防注入；缺省仍是白字黑边。
+            color = str(sub.get("color") or "white")
+            where = str(sub.get("position") or "bottom")
+            pos = {"top": ("center", "top"),
+                   "center": ("center", "center")}.get(where, ("center", "bottom"))
             tc = TextClip(font=font, text=text[:40], font_size=fs,
                           method="caption", size=(int(w * 0.9), None),
                           # moviepy 2.1.2 在 Pillow≥11 下反推 caption 高度时只取
                           # textbbox 的 bottom-top，比真实字形矮一个 descent：量出来
                           # 单行/换行的墨迹都正好顶到图最后一行（下留=0），字幕下沿
                           # 被削平。垫半个字号才画得全，顺带给出底边安全距离。
+                          # 这一条垫的是**字形**，与摆在屏幕哪一头无关，所以三种位置都留。
                           margin=(0, 0, 0, fs // 2),
                           text_align="center",
                           stroke_color="black",
                           stroke_width=1 if sub.get("style") != "subtitle_bold" else 2,
-                          color="white")
+                          color=color)
             layers.append(tc.with_start(sub["start"]).with_duration(
-                max(0.2, sub["end"] - sub["start"])).with_position(("center", "bottom")))
+                max(0.2, sub["end"] - sub["start"])).with_position(pos))
         except Exception as exc:  # noqa: BLE001 - MoviePy 版本参数差异：丢字幕不丢成片
             last_error = exc
             continue
@@ -2899,6 +2994,13 @@ def _render_with_moviepy(tl: dict[str, Any], dst: Path, settings: Settings,
             if ae.get("src_start") is not None and ae.get("src_end") is not None:
                 ac = ac.subclipped(float(ae["src_start"]), float(ae["src_end"]))
             ac = ac.with_start(ae["start"])
+            # 逐段音量：选区改里拧的那一格（0~2 倍，见 timeline_edit.EDITABLE）。
+            # 只有显式给了且不等于 1.0 才挂效果器——给没拧过的段挂一个 volume=1
+            # 会重排出不同的浮点字节，把「没改就不该重烧」那条缓存口径破掉。
+            vol = ae.get("volume")
+            if vol is not None and abs(float(vol) - 1.0) > 1e-3:
+                from moviepy.audio.fx import MultiplyVolume
+                ac = ac.with_effects([MultiplyVolume(float(vol))])
             audio_items.append(ac)
         except Exception:
             continue
@@ -3205,6 +3307,7 @@ async def render_windowed(tl: dict[str, Any], dst: Path, settings: Settings,
                           cache: SegmentSliceCache | None = None,
                           base_film: Path | None = None,
                           rebuild_ids: set[str] | None = None,
+                          base_doc: Mapping[str, Any] | None = None,
                           work: Path) -> dict[str, Any]:
     """按窗口渲染：命中的复用、未受影响的从上一版成片里切、只有改过的才重烧。
 
@@ -3241,6 +3344,19 @@ async def render_windowed(tl: dict[str, Any], dst: Path, settings: Settings,
             f"{len(marks)} 个——两份时间线不是同一版，缓存与成片会错开")
     must_rebuild = ({w[0] for w in wins} if rebuild_ids is None
                     else set(rebuild_ids))
+    if base_doc is not None:
+        # 补一遍点名：调用方那份 rebuild_ids 是按**改前那张表**的窗口名字算的，而本函数
+        # 之前还有两道会换名字的动作（音画校准改段的内容、段 id 按内容重打）。名字一漂，
+        # 那一窗就从点名清单上消失，于是它被当成「没改」直接从旧片切——真机踩过：拧了第一窗
+        # 的取源区间（画面段 id 就是按素材+取源区间算的，改它必改名），音画校准又把压在它
+        # 底下的画面段钉到新位置，那一窗的名字从 ev-52cea4bed2 变成 ev-12c33fa9e5；同一次还
+        # 拧了音量（音量只进缓存键、不改名，但那一窗没进名单就连音量也没重烧）。结果用户改的
+        # 字幕、拧的音量原样没进新片，那份旧字节还被钉进切片缓存冒充新输入（此后每次命中都错）。
+        # 所以这里按**秒区间**对齐两份时间线，逐窗比输入清单：区间对不上或输入不同就算改过。
+        prev_inputs = {(round(w[1], 3), round(w[2], 3)): w[3] for w in
+                       te.windows(base_doc, fade=_fade_index_map(base_doc))}
+        must_rebuild |= {sid for sid, s, e, inputs, _k in wins
+                         if inputs != prev_inputs.get((round(s, 3), round(e, 3)))}
     degraded: list[str] = []
     ledger: list[dict[str, Any]] = []
     parts: list[Path] = []
@@ -3311,9 +3427,18 @@ async def render_windowed(tl: dict[str, Any], dst: Path, settings: Settings,
                         f"{str(exc)[:120]}）")
         await asyncio.to_thread(mediaops.concat, parts, dst, fps=fps)
     say("concat", 96)
+    # planned_rebuild 是**渲染器自己认定应当重烧**的窗口名单（含 base_doc 按秒区间补点名
+    # 的那几个），与 rebuilt/reused/ledger 同一套 canonical 名字。局部改的账据此核对，而不
+    # 拿调用方改前那张表的名字（expected）来比——那套名字可能已被校准/重打 id 换掉。
     return {"ledger": ledger, "degraded": degraded,
-            "rebuilt": [r["id"] for r in ledger if not r.get("cached")],
+            "planned_rebuild": [r["id"] for r in ledger if r["id"] in must_rebuild],
+            # 跳过的窗**不算重烧**：它压根没画面，既没烧也没复用。混进 rebuilt 会让
+            # 局部改那条「真烧的窗 ⊆ 应当重烧的窗」判据假红（报成缓存键漏算输入），
+            # 而真实原因只是「这一窗排不出画面段」——那份账另有 degraded 与 skipped 记。
+            "rebuilt": [r["id"] for r in ledger
+                        if not r.get("cached") and not r.get("skipped")],
             "reused": [r["id"] for r in ledger if r.get("cached")],
+            "skipped": [r["id"] for r in ledger if r.get("skipped")],
             "windows": len(ledger)}
 
 
@@ -3364,10 +3489,17 @@ class PatchVideoNode(RenderVideoNode):
         "edits": {
             "type": "array",
             "description": "逐格改值。每条 {pointer, value[, segment_id]}：pointer **必须原样"
-                           "取自命中表条目的 field**（形如 /subtitles/7/text、/events/2/src_end），"
-                           "不自己拼字段名；value 是这一格的新值；segment_id 建议带上该条目的段号"
+                           "取自命中表条目的 field**（形如 /subtitles/7/text、/events/2/src_end、"
+                           "/audio_events/1/volume、/bgm/volume），不自己拼字段名；"
+                           "value 是这一格的新值；segment_id 建议带上该条目的段号"
                            "（带了指针与段号不符就整批拒收，防止拿旧表改新片）。"
-                           "只认白名单里的已有字段：改段长、改顺序、删段都不在本工具范围内",
+                           "能改的：字幕文字与样式（style/color/font_size/position）、"
+                           "某段画面或声音取源片的哪一截（src_start/src_end，成对生效、"
+                           "输出长度不变）、某段声音的音量（volume，0~2 倍）、配乐整条的"
+                           "音量与起播偏移（/bgm/volume、/bgm/offset_sec）、盖层素材与它的窗口。"
+                           "用户亲手拧过声音或取景的那几段会被标成「按用户手改」，"
+                           "渲染前的自动校准与音画同步闸从此不管它们（改动静默被钉回去才是 bug）。"
+                           "只认白名单里的字段：改段长、改顺序、删段都不在本工具范围内",
             "items": {"type": "object",
                       "properties": {
                           "pointer": {"type": "string"},
@@ -3409,14 +3541,16 @@ class PatchVideoNode(RenderVideoNode):
         out = await super().process(
             state, {"timeline": patched, "render_mode": "segments",
                     "wait_sec": inputs.get("wait_sec")},
-            base_film=film, rebuild_ids=set(expected))
+            base_film=film, rebuild_ids=set(expected), base_doc=doc)
 
-        before, base_video, extra = await self._ledger(
-            sess, base, report, out, whence=whence, fp=fp, expected=expected)
+        before, base_video, extra, base_shot = await self._ledger(
+            sess, base, report, out, whence=whence, fp=fp, expected=expected,
+            base_doc=doc)
         out["evidence"][0:0] = extra
         out["patch"] = {"base_artifact_id": base, "doc_fingerprint": fp,
                         "doc_source": whence, "expected_rebuild": expected,
-                        "before_frames": before, "base_video": base_video,
+                        "before_frames": before, "before_frame_shots": base_shot,
+                        "base_video": base_video,
                         **report}
         await jobs.succeed(sess, artifact, out["video"], float(out["duration"]),
                            result=out, attempt=None)
@@ -3535,18 +3669,51 @@ class PatchVideoNode(RenderVideoNode):
 
     async def _ledger(self, sess: str, base: str, report: dict[str, Any],
                       out: dict[str, Any], *, whence: str, fp: str,
-                      expected: list[str]) -> tuple[dict[str, str], str, list[dict[str, Any]]]:
-        """改前的代表帧 + 旧成片是否还在 + 三条局部改专属证据（插在通用证据前面）。"""
+                      expected: list[str],
+                      base_doc: Mapping[str, Any] | None = None
+                      ) -> tuple[dict[str, str], str, list[dict[str, Any]],
+                                 dict[str, str]]:
+        """改前的代表帧 + 旧成片是否还在 + 三条局部改专属证据（插在通用证据前面）。
+
+        第四个返回值是「这一版的新窗口名 → base 那一版的旧窗口名」：取帧口只认
+        ``(artifact_id, shot)`` 去拼对象键，而改过的窗口在新版里换了名字，前端拿新名配
+        base 去取就整块取空——那份映射得由算得出它的人（这里）发出去。
+        """
         # 对比帧按**要重烧的那几窗**取，不按被点名的段 id：改了字幕，用户要比的是
         # 「这一窗的画面跟着变了没有」，而出片时留的帧是按窗口（画面段 id）抽的——
         # 拿 su-*/ov-* 去取只会次次取空，那条「改前长什么样」的账就此形同虚设。
-        want = [x for x in expected if x]
+        #
+        # 取哪几窗用**渲染器自己算出的 planned_rebuild**，不取调用方改前那份名字点名的
+        # expected：渲染前还有音画校准与重打段 id 两道，改过的窗口可能因此换个名字（真机
+        # 踩过 ev-52cea4bed2 → ev-12c33fa9e5），expected 用的是改前那套名字，与 rebuilt
+        # （渲染器台账，也是校准后的名字）不是同一套，拿来比会误判。planned_rebuild 与
+        # rebuilt 同源同名才可比，也正是从旧片取对比帧的那几窗。取不到时退回 expected。
+        planned = ([x for x in (out.get("segment_cache") or {}).get("planned_rebuild") or []
+                    if x]
+                   or [x for x in expected if x])
+        want = planned
+        # 窗口名在渲染前会被校准/重打段 id 改掉（见 assign_segment_ids）：改过的窗口从 base
+        # 的 ev-X 漂成 patched 的 ev-Y，而 base 的代表帧是按**旧名**存的——拿 planned 里的
+        # 新名直接去 base 取会整块取空，前端「改前/改后」摆的改前那一帧就此消失（真机踩过：
+        # 改了第一窗音量，before_frames 全空，对比区只剩改后）。但补丁合同不改画面段的
+        # start/end（见 timeline_edit.EDITABLE：events 没有 start/end），两代窗口的**边界与
+        # 顺序逐一对齐**：于是按渲染台账顺序把新名映射回 base 同位置的旧名去取帧，键仍用新名
+        # ——前端按窗口 id 对齐改前/改后，读的还是漂移后的这一套名字，只是字节取自 base 那一版。
+        ledger_ids = [str(r.get("id")) for r in
+                      ((out.get("segment_cache") or {}).get("ledger") or [])
+                      if r.get("id")]
+        base_sids = ([sid for sid, _s, _e, _i, _k in te.windows(base_doc)]
+                     if base_doc is not None else [])
+        frame_of = dict(zip(ledger_ids, base_sids)) if len(ledger_ids) == len(base_sids) else {}
         before: dict[str, str] = {}
+        base_shot: dict[str, str] = {}
         for sid in want:
-            key = f"renders/{_safe(sess)}/{_safe(base)}/frames/{_safe(sid)}.png"
+            base_sid = frame_of.get(sid, sid)
+            key = f"renders/{_safe(sess)}/{_safe(base)}/frames/{_safe(base_sid)}.png"
             try:
                 if await self.storage.objects.head(key) is not None:
                     before[sid] = key
+                    base_shot[sid] = base_sid
             except Exception:  # noqa: BLE001 - 对比帧读不到只说明帧没留住，不说明改动没发生
                 continue
 
@@ -3579,15 +3746,15 @@ class PatchVideoNode(RenderVideoNode):
                 proof="命中表包里的 doc 与 doc_fingerprint 由同一份字节写出，"
                       "落笔前又按表里的 doc 复算了一遍指纹"),
             _ev(f"只重烧受影响窗口：点名 {len(report['changed_ids'])} 段，"
-                f"按输入比对应当重烧 {len(expected)} 窗（{'、'.join(expected) or '没有'}），"
+                f"按输入比对应当重烧 {len(planned)} 窗（{'、'.join(planned) or '没有'}），"
                 f"这次真烧的是 {len(rebuilt)} 窗（{'、'.join(rebuilt) or '没有'}），"
                 f"其余 {len(reused)} 窗直接复用已有字节",
-                "machine", verified=set(rebuilt) <= set(expected),
+                "machine", verified=set(rebuilt) <= set(planned),
                 proof="窗口缓存键 = 这一窗真正吃进去的全部输入（画面段 + 压在它时间区间里的"
                       "字幕/声音/盖层 + 配乐相位 + 转场，见 timeline_edit.window_inputs），"
                       "没被改动的窗口逐字相同，于是整窗跳过"
-                if set(rebuilt) <= set(expected) else
-                f"没改动的窗口里有 {sorted(set(rebuilt) - set(expected))} 被重烧了——"
+                if set(rebuilt) <= set(planned) else
+                f"没改动的窗口里有 {sorted(set(rebuilt) - set(planned))} 被重烧了——"
                 "缓存键漏算了某个影响画面的输入，或把不该算的算进去了",
             ),
             _ev(f"旧版本没有被覆盖：{base} 的成片"
@@ -3597,7 +3764,7 @@ class PatchVideoNode(RenderVideoNode):
                 proof="新版本落在分叉出来的新作用域，写的是另一组对象键"
                 if still_there else "旧版成片不在了：回不去旧版，只能重渲"),
         ]
-        return before, base_video, extra
+        return before, base_video, extra, base_shot
 
 
 def _attempt_dir(dst: Path, tag: str) -> Path:
@@ -3697,10 +3864,15 @@ def _render_via_ffmpeg(tl: dict[str, Any], dst: Path, notify=None) -> None:
         else:
             se = ss + float(ae.get("duration", 0.0) or 0.0)
         dur = max(0.04, se - ss)
+        # 逐段音量与 MoviePy 那条路同一口径（见 _render_with_moviepy）：兜底路径
+        # 不读它，就会出现「MoviePy 一崩，用户拧的音量静默失效而没人知道」。
+        vol = ae.get("volume")
+        af = (["-af", f"volume={float(vol):.3f}"]
+              if vol is not None and abs(float(vol) - 1.0) > 1e-3 else [])
         try:
             mediaops.ffmpeg("-ss", f"{ss:.3f}", "-i", str(ae["path"]),
                             "-t", f"{dur:.3f}", "-vn", "-ac", "2", "-ar", "48000",
-                            "-c:a", "pcm_s16le", str(seg))
+                            *af, "-c:a", "pcm_s16le", str(seg))
             audio_segs.append((seg, float(ae.get("start", 0.0))))
         except Exception:
             continue

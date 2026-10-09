@@ -173,9 +173,9 @@ async def _speech_of(providers: Providers, text: str, dst: Path, *, voice: str,
 #: 留着旧对象不会报错，只会让「选着改」读到一份对不上版的表。
 CACHE_VERSION = "1"
 
-#: 影响这一镜**像素与声音**的顶层开关。BGM 不在其中（它在母带那一层混，
-#: 换配乐不该让 20 镜全部重烧）；title/style 名之外的版式参数也不在（版式参数
-#: 全在 shot 自己身上）。
+#: 影响这一镜**像素与声音**的顶层开关。BGM 与质感（``texture``）都不在其中——
+#: 它们挂在母带那一层，换配乐或换滤镜只重过一遍母带，不该让 20 镜全部重烧；
+#: title/style 名之外的版式参数也不在（版式参数全在 shot 自己身上）。
 _CACHE_KNOBS = ("aspect", "width", "height", "fps", "style", "narration",
                 "voice", "rate", "subtitle_mode")
 
@@ -236,11 +236,15 @@ async def render_shot(shot: dict[str, Any], *, spec: dict[str, Any], providers: 
                       work: Path, chrome: str, inset: tuple[int, int],
                       index: int, frames_used: int,
                       progress: Progress | None = None,
-                      cache: "ShotCache | None" = None) -> dict[str, Any]:
+                      cache: "ShotCache | None" = None,
+                      assets: dict[str, Path] | None = None) -> dict[str, Any]:
     """一镜 → (带声 mp4, 记账)。帧数超预算时抛错，不静默截断。
 
     ``cache`` 给了就走「按镜复用」：命中即整段跳过（连 TTS 都不重发），未命中则渲完
     把切片、代表帧、命中表与本镜账一起存进去。见 :class:`ShotCache`。
+
+    ``assets`` 是叠加图片层的 ``{ref: 本文件}``，由出片节点在**开渲之前**取好：
+    浏览器只吃路径，而字节在对象存储里。命中缓存的镜用不到它（像素早就烧完了）。
     """
     fps = int(spec["fps"])
     width, height = int(spec["width"]), int(spec["height"])
@@ -301,8 +305,18 @@ async def render_shot(shot: dict[str, Any], *, spec: dict[str, Any], providers: 
             f"{MAX_FRAMES_TOTAL}。降 fps（{fps}→10）或缩短片子再来")
 
     page = shot_work / "page.html"
+    src_map = {r: _file_uri(p) for r, p in (assets or {}).items()}
+    lacking = [str(l.get("ref") or "") for l in (shot.get("overlay") or [])
+               if isinstance(l, dict) and str(l.get("type")) == "image"
+               and str(l.get("ref") or "") not in src_map]
+    if lacking:
+        # 画面上会是一个带说明的虚线空位（模板画的），账上也必须留一句：
+        # 「加了东西但画面没变」最贵的版本是没人知道它没变。
+        note = "叠加图层没有本文件，画面上是空位：" + "、".join(lacking[:3])
+        degrade = f"{degrade}；{note}" if degrade else note
     page.write_text(T.build_shot_page(shot, spec=spec, timed=timed, duration_sec=sec,
-                                      width=width, height=height, fps=fps),
+                                      width=width, height=height, fps=fps,
+                                      index=index, assets=src_map),
                     encoding="utf-8")
     uri = _file_uri(page)
     settle = T.settle_ms(shot, timed, sec)
@@ -361,6 +375,48 @@ async def render_shot(shot: dict[str, Any], *, spec: dict[str, Any], providers: 
     return rec
 
 
+#: 整片质感：母带上的**一趟**视频滤镜。值是一条 filter_complex 里的视频链，
+#: 输入 pad 为 ``[0:v]``、输出 label 必须是 ``[v]``（``apply_texture`` 按这个口径拼命令）。
+#:
+#: 为什么挂在母带而不是每镜：换一档质感不该让 20 镜全部重烧（与 BGM 同一层，
+#: 见 ``_CACHE_KNOBS`` 那条注释）。代价也说清楚：这一趟是**二代编码**，母带会再过一次
+#: x264，所以只在真要那层观感时开——「none」是缺省档，不是可省的装饰。
+TEXTURE_FILTERS: dict[str, str] = {
+    # 老胶片：细颗粒 + 暗角 + 一点暖偏，纸片版式压色偏所以走 colorbalance 而不是 eq
+    "film": ("[0:v]noise=alls=7:allf=t+u,vignette=PI/5,"
+             "colorbalance=rm=.05:gm=.01:bm=-.05,"
+             "unsharp=3:3:.6:3:3:.2[v]"),
+    # 老电视：横向扫描线 + 左右色偏 + 压一点饱和，颗粒比胶片细
+    "tv": ("[0:v]drawgrid=w=iw:h=3:t=1:c=black@0.16,"
+           "rgbashift=rh=2:bh=-2,eq=saturation=.82:brightness=.02,"
+           "noise=alls=4:allf=t[v]"),
+    # 柔光：亮部分成一糊再 screen 回原图，高光往外泛
+    "glow": ("[0:v]split=2[base][soft];[soft]gblur=sigma=14[blur];"
+             "[base][blur]blend=all_mode=screen:all_opacity=.38,"
+             "format=yuv420p[v]"),
+    # 漂白：硬对比、低饱和，冲印过头那种发白的暗部
+    "bleach": ("[0:v]eq=contrast=1.22:saturation=.42:brightness=.03,"
+               "curves=preset=increase_contrast,unsharp=5:5:.4[v]"),
+}
+
+
+def apply_texture(src: Path, out: Path, kind: str) -> str:
+    """母带 → 加质感的母带。→ 实际消费的滤镜串（空串 = 这趟没做，原样拷贝）。
+
+    返回串而不是布尔：记账要能回答「画面没变是档选错了，还是滤镜根本没跑」。
+    """
+    chain = TEXTURE_FILTERS.get(str(kind or "").strip().lower())
+    if not chain:
+        mediaops.ffmpeg("-i", str(src), "-c", "copy", str(out), timeout=300)
+        return ""
+    mediaops.ffmpeg("-i", str(src), "-filter_complex", chain,
+                    "-map", "[v]", "-map", "0:a?",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-pix_fmt", "yuv420p", "-c:a", "copy",
+                    "-movflags", "+faststart", str(out), timeout=900)
+    return chain
+
+
 async def _mux_bgm(master: Path, bgm: Path | None, *, volume: float, duck: bool,
                    total_sec: float, out: Path) -> str:
     """旁白 + BGM 合流。返回实际走的合成方式，写进记账。"""
@@ -393,8 +449,12 @@ async def _mux_bgm(master: Path, bgm: Path | None, *, volume: float, duck: bool,
 async def render_motion(spec: dict[str, Any], *, providers: Providers, work: Path,
                         bgm: Path | None = None,
                         progress: Progress | None = None,
-                        cache: ShotCache | None = None) -> dict[str, Any]:
-    """整条链路：分镜 spec → 成片。返回记账（每镜时长/帧数/降级），不落对象存储。"""
+                        cache: ShotCache | None = None,
+                        assets: dict[str, Path] | None = None) -> dict[str, Any]:
+    """整条链路：分镜 spec → 成片。返回记账（每镜时长/帧数/降级），不落对象存储。
+
+    ``assets``：叠加图片层的 ``{ref: 本文件}``（见 :func:`render_shot`）。
+    """
     work.mkdir(parents=True, exist_ok=True)
     chrome = find_chrome()
     if chrome is None:
@@ -417,7 +477,7 @@ async def render_motion(spec: dict[str, Any], *, providers: Providers, work: Pat
         rec = await render_shot(shot, spec=spec, providers=providers, work=work,
                                 chrome=chrome, inset=inset, index=i,
                                 frames_used=frames_used, progress=progress,
-                                cache=cache)
+                                cache=cache, assets=assets)
         hitmaps[rec["id"]] = rec.pop("hits", None) or {}
         files[rec["id"]] = {"clip": rec["clip"], "frame": rec["frame"]}
         # 帧预算只管「这次真的启动浏览器截了多少帧」：缓存镜一帧没截，
@@ -440,13 +500,26 @@ async def render_motion(spec: dict[str, Any], *, providers: Providers, work: Pat
     await asyncio.to_thread(mediaops.concat, clips, master, fps=fps)
     total = float(mediaops.probe(master)["duration"])
 
+    # 质感排在混音之前：它只动像素，音频那一趟不该被拖进来重编一次。
+    texture = str(spec.get("texture") or "none")
+    source = master
+    texture_filter = ""
+    if texture != "none":
+        if progress is not None:
+            r = progress({"stage": "texture", "texture": texture})
+            if asyncio.iscoroutine(r):
+                await r
+        textured = work / "textured.mp4"
+        texture_filter = await asyncio.to_thread(apply_texture, master, textured, texture)
+        source = textured
+
     bgm_conf = spec.get("bgm") or {}
     out = work / "final.mp4"
     if progress is not None:
         r = progress({"stage": "mux"})
         if asyncio.iscoroutine(r):
             await r
-    mix_mode = await _mux_bgm(master, bgm, volume=float(bgm_conf.get("volume", 0.18)),
+    mix_mode = await _mux_bgm(source, bgm, volume=float(bgm_conf.get("volume", 0.18)),
                               duck=bool(bgm_conf.get("duck", True)),
                               total_sec=total, out=out)
     info = mediaops.probe(out)
@@ -462,5 +535,7 @@ async def render_motion(spec: dict[str, Any], *, providers: Providers, work: Pat
             # 计划帧数与成片真有的帧数是两回事（每镜画面按语音收口），分开报
             "published_frames": int(info.get("frames") or 0), "inset": list(inset),
             "chrome": chrome, "mix_mode": mix_mode, "bgm": str(bgm or ""),
+            # 档位与串分开报：只回 texture 就看不出「选了 film 却原样拷贝」这种失败
+            "texture": texture, "texture_filter": texture_filter,
             "av_drift_sec": round(drift, 3),
             "degraded": [f"{r['id']}：{r['degraded']}" for r in ledger if r["degraded"]]}

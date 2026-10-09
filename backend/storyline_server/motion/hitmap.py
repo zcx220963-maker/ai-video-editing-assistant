@@ -165,9 +165,17 @@ def _match(entry_text: str, pool: list[tuple[str, str]],
 
 
 def resolve(shot: dict[str, Any], index: int, entries: list[dict[str, Any]]) -> None:
-    """就地给每个条目补 ``field`` / ``confidence`` / ``ambiguous``。"""
+    """就地给每个条目补 ``field`` / ``confidence`` / ``ambiguous``。
+
+    页面自己写明指针的那些条目（``data-fields`` → 探针带出 ``field``）**不参与反查**：
+    它是模板逐字写下的地址，不是靠画面上的字猜出来的，所以恒为 exact。背景、色块、
+    图片这些没有字的元素就靠这一条入口变得可点——只按文本反查的话它们永远选不中。
+    """
     pool = _candidates(shot, index)
     for entry in entries:
+        if entry.get("field"):
+            entry["confidence"] = "exact"
+            continue
         text = _norm(entry.get("text"))
         role = str(entry.get("role"))
         field, confidence, ambiguous = _match(
@@ -183,17 +191,21 @@ def resolve(shot: dict[str, Any], index: int, entries: list[dict[str, Any]]) -> 
 # ---------------------------------------------------------------------------
 
 #: 同一块字被倒成多条时留哪条：越具体越靠前（能定到字段的优先）。
-_ROLE_PRIORITY = ("caption", "panel-value", "panel-key", "label",
+_ROLE_PRIORITY = ("caption", "style", "panel-value", "panel-key", "label",
                   "art-text", "anim", "art-block")
 
 
 def _dedupe(entries: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    """按「框 + 文本」折叠重复条目 → (留下的条目, 被折叠掉的条数)。
+    """按「框 + 文本 + 字段」折叠重复条目 → (留下的条目, 被折叠掉的条数)。
 
     一个元素常常同时满足"是个块"和"有字"（印章的内层、带 data-anim 的数值），
     父节点还会把子的 textContent 回显一遍。留着它们，前端点一下就要问用户
     "这两个一模一样的框你要改哪个"。幸存者取角色更具体的那条（id 与 role 才
     对得上），另一条独有的字段并进来——anim 的元数据不能丢，改时长靠它。
+
+    键里带上 field 是「整页可编辑」的前提：一条字幕的框和文本完全相同，却同时是
+    文案、墨色、字号、字体四个可改的东西。不带 field 就会剩一条，而剩下那条
+    的指针是文本——用户点中字号却没有输入框。
     """
     def rank(e: dict[str, Any]) -> int:
         try:
@@ -205,7 +217,7 @@ def _dedupe(entries: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
         b = e.get("box") or {}
         return (round(float(b.get("x") or 0), 3), round(float(b.get("y") or 0), 3),
                 round(float(b.get("w") or 0), 3), round(float(b.get("h") or 0), 3),
-                str(e.get("text") or ""))
+                str(e.get("text") or ""), str(e.get("field") or ""))
 
     kept: dict[tuple, dict[str, Any]] = {}
     order: list[tuple] = []

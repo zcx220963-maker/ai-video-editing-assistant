@@ -266,27 +266,48 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
 - **一帧 = 时刻 t 的纯函数**:页面把 `?t=毫秒` 在解析期同步算成画面状态,**不靠 rAF**——实测 headless
   Chrome 在 `--virtual-time-budget` 下只发得出 1~2 个 rAF 回调就饿死,挂在 rAF 上的动画会让每镜都截成起始帧。
   同理 **SMIL(`<animate>`/`<set>`)一律拒**:它们按墙钟走,逐帧截图推不动;
-- **三族版式 × 两套设计空间**(`motion/spec.py` 的 `CARD_KINDS` 共 18 个):
+- **四族版式 × 两套设计空间**(`motion/spec.py` 的 `CARD_KINDS` 共 22 个):
   档案家族 10 个(archive/dict_entry/stamp/book/print/theatre/webpage/silhouette/plain/title,
   写在 1080×1920 设计空间)、图示家族 7 个(flow/compare/timeline/levels/chart/scatter/orbit,
-  写在 `0 0 1000 560` 的 viewBox 里)、`custom` 自画一张。**竖屏与方屏共用**竖排版式(方屏四周是同一张纸);
+  写在 `0 0 1000 560` 的 viewBox 里)、绘制家族 4 个(pixel 像素网格/burst 粒子群/net 节点连线/
+  brush 手绘笔触,与图示同用 `1000×560` 与同一份颜色白名单,公共坐标与净化在 `motion/canvas.py`)、
+  `custom` 自画一张。**竖屏与方屏共用**竖排版式(方屏四周是同一张纸);
   **横屏是第二套版式**(1920×1080 + 中央 1760×658 画面带),`fit=box` 的档案卡**按自身像素落进带里**
   (早先按高度把整张竖构图缩 .35,实测一张 640×520 的封面卡在 1920 宽的纸上只剩 224px)、`fit=fill`
-  的图示与自画按 viewBox 缩放——内置图示的 `1000×560`(1.79:1)在 2.67:1 的带里受**带高**卡住,
+  的图示/绘制/自画按 viewBox 缩放——内置图示的 `1000×560`(1.79:1)在 2.67:1 的带里受**带高**卡住,
   实得 1175×658、两侧各留 292 纸(竖屏带宽正好 1080,那边才吃满宽度)。字幕容量随之分档:竖屏 60 字、横屏 110 字;
+- **绘制家族扩的是词汇表,不是执行权**:模型交的是参数(`pixel` 给 `rows`/`poses`/`palette`,
+  `burst` 给 `count`/`dist`/`colors`/`seed`,`net` 给 `nodes`/`edges`/`mode`,`brush` 给 `strokes`),
+  服务端把它们**展开成 SVG** 再过同一道净化闸、同一本命中表、同一个按镜缓存。
+  因此四条治理保证一条没断:画不出来的参数(各行字数不齐、色板外字符、`shape` 不认识、
+  `mode` 越界、一笔没有)在分镜校验里**带镜号退回且不烧像素**;`burst` 的落点用**整数种子**的
+  `random.Random`,同输入必然同图,否则按镜缓存会拿旧片冒充新片;
 - **`card=custom` 有净化闸**(`motion/art.py`):白名单只放行绘图元素与绘图属性,`<script>`/
   `<foreignObject>`/`<image>`/外链 href 一律拒,根节点必须带 viewBox,上限 20000 字 / 400 个元素。
   不合格**带镜号硬报错**而不是"悄悄画少一块"——渲染层永远拿不到未清洗的字节(spec 入库前净化一次,
   出片页编译时再净化一次);
-- **动效是声明式的**,12 种:`fade, rise, slide-x, draw, grow-x, grow-y, pop, count, wipe, orbit, pulse, pan`,
-  配 `data-at`/`data-dur`/`data-dist`(可负)/`data-count-to`/`data-dp`/`data-num-unit`(≤8 字的数量级后缀)/
-  `data-period`。带 `data-anim` 的元素**自身不能再写 `transform`**(CSS 会盖掉表现属性);
+- **动效是声明式的**,13 种:`fade, rise, slide-x, draw, grow-x, grow-y, pop, count, wipe, orbit, pulse, pan`
+  加一个 `pose`,配 `data-at`/`data-dur`/`data-dist`(可负)/`data-count-to`/`data-dp`/`data-num-unit`(≤8 字的数量级后缀)/
+  `data-period`/`data-hold`。带 `data-anim` 的元素**自身不能再写 `transform`**(CSS 会盖掉表现属性);
+- **`pose` 是轮播不是入场**:`data-at` 起显示、停留 `data-hold` 毫秒后整格隐去(省略 `hold` 就一直显示,
+  所以只有末格能省)。`pixel` 卡的逐帧角色动画就是它——一格格 `<g data-anim="pose">` 靠 `at` 首尾相接。
+  因此 `anim_end_ms` 对离散动效取 `max(at + max(dur, hold))`:只算 `dur` 会把一轮姿势播到一半就冻住,
+  成片里等于只有一帧动画;
 - **成本口径**:帧数是这条链路唯一的成本项(`MAX_FRAMES_TOTAL = 4000` 硬报错,不静默砍)。
   `settle_ms` 是「第一个什么都不变的时刻」,之后的帧直接复用末帧 PNG,所以花钱的是**动效的时长**而不是片子长度;
   `orbit`/`pulse`/`pan` 是连续运动,永不 settle → 整镜每帧真截(账上 `captured_frames`/`frames` 看得见这笔);
-- **六个开关走顶层入参**(aspect / fps / narration / voice / rate / subtitle_mode):嵌在 spec 里的字段对
+  绘制家族新增两笔:`burst` 的 `twinkle: true` 给粒子挂的就是 `pulse`,一开闪那一镜每帧都要截;
+  `pixel` 的 `poses` 播到「最后一格的 at+hold」才冻住,把姿势排到镜头末尾等于整镜活帧;
+- **七个开关走顶层入参**(aspect / fps / narration / voice / rate / subtitle_mode / texture):嵌在 spec 里的字段对
   计划卡不存在,卡上勾选的值**覆盖**模型写在 spec 里的同名字段——那是用户的决定;`narration` 的终值是字符串
   `"false"`,所以合并时用 None 哨兵判"有没有传"并按文本解析,否则会把开关读反;
+- **整片质感是母带层的一趟滤镜,不是某一镜的版式**:档位名单在 `spec.TEXTURES`
+  (`none`/`film` 颗粒暗角暖偏 /`tv` 扫描线色偏 /`glow` 柔光泛开 /`bleach` 漂白硬对比),
+  滤镜串单源在 `render.TEXTURE_FILTERS`,调用点排在 `concat` 之后、`_mux_bgm` 之前。
+  它与 `bgm` 同层,**故意不进 `_CACHE_KNOBS`**——进了它,用户选一次「老胶片」就等于 20 镜全部重烧;
+  代价也说清:这一趟是**二代编码**,母带再过一次 x264(画质略降、多花几十秒),`glow` 那一路带
+  `gblur`+`blend` 最贵。回执把**档位**与**实际消费的滤镜串**分开记(`texture` / `texture_filter`),
+  所以「选了 film 却原样拷贝」这一类失败看得见,不会退化成「跑了但没人知道」;
 - **配乐两种写法都收**:`bgm`(与 `spec.bgm.ref`)给 `obj:` 引用,或直接给**消息附件/曲库歌曲的
   material_id**——零素材链路里模型手上只有 material_id,而唯一产 `obj:` 引用的 `select_BGM` 绑在
   有素材那条链上(`required_nodes=generate_script`),调它会连带补齐 ASR 一串上游。取不到字节直接
@@ -311,10 +332,11 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
   `x=880` 起排时「1.00万亿」被裁出 viewBox 边缘,抽帧才看得见(离线用例断言的是不越界,看不见字宽)。
 
 代码位:契约 `motion/spec.py`、净化与动画 `motion/art.py`、图示 `motion/diagrams.py`、
+绘制四族的公共坐标与颜色白名单 `motion/canvas.py` 与参数展开 `motion/graphics.py`、
 排版与页面 `motion/templates.py`、出片 `motion/render.py`;节点 `nodes/motion_plan.py` 与
 `nodes/motion_nodes.py`;技能 `examples/skills/motion_explainer/SKILL.md`;
 样片冒烟 `.smoke/motion_film_smoke.py`(竖屏·档案家族)与 `.smoke/motion_wide_smoke.py`
-(横屏·图示·custom·连续运动);版式对照 `.smoke/motion_sheet_smoke.py`——18 个 card × 2 个画幅
+(横屏·图示·custom·连续运动);版式对照 `.smoke/motion_sheet_smoke.py`——22 个 card × 2 个画幅
 各截一帧落 PNG,专查离线用例查不见的那一类错(字掉出可视区、卡缩成邮票)。
 
 ### 16. 联网检索:后端按身份热读,出处要对上检索账
@@ -379,6 +401,12 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
 - **为什么不嵌第三方剪辑器**:第三方只认时间线与素材,框不出「屏幕这一块属于 `/shots/0/panel/编号`」。
   要的是「鼠标选中的那块就是待改的那格」,这件事只有自己的命中表说得出对应关系,所以编辑器自己画
   (`frontend/src/MotionEditor.vue`:命中层 + 框选 + 轨道 + 表单 + 对比帧);
+- **它是右侧停靠栏,不是整屏弹窗**:`App.vue` 把它挂在 `.shell` 的最后一列(`.editor-dock`,占壳宽 58%),
+  会话区 `flex:1` 自动让宽——剪片时用户还要看得见上下文与进度,盖一层遮罩等于把刚说过的话藏起来。
+  打开时顺手收起左侧卷宗栏(正在剪片子的人不需要会话历史列表),关掉再还原成**打开前**的状态,
+  且不动 `ca.railOpen`(那是用户自己设的偏好,不该被一次剪辑改掉)。
+  「渲染完成自动弹出」和「点卡片上的✂ 选区改」走同一个 `openEditorFor()`,两条路同一形态;
+  面板实宽 <900px 时容器查询把右侧 400px 表单挪到画面下方,而不是把画面挤没;
 - **改动拼成一次补丁,四种动作**(`POST /motion/patch`,校验在 `motion/patch.py`):
   ①`edits` 逐格指针改写(框选的主场) ②`shot_sets` 整镜栏位改写(前端 `setFor` 逐栏与原值比 JSON,
   没变的一栏不进补丁) ③`remove_shots` 删镜 ④`reorder` 换序。**空补丁直接拒**;
@@ -481,6 +509,67 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 ⑤ 画面上改了数字不会重跑配音——文案 `text` 与画面 `panel` 是两处,只改画面那一处时旁白仍念原话,
 这是选区改的语义,不是 bug,界面上两栏分开摆着。
 
+### 18. 成片入库 + 按会话回收:删对话清的是工作区,不是用户已经拥有的东西
+
+两件事是同一条约束的两半:**烧出来的那版片子必须能在库里长久找到**,**它的对话删掉时其余产物要跟着走**。
+过去两头都缺——渲染终态只写 `render_jobs`/`artifacts`(都只挂 `session_id`),而
+`DELETE /convs/{id}` 只删 `messages` + `conversations` 两行,于是每条被删的对话都在库和桶里留下
+永远没人再来清的账。
+
+- **入库落在渲染终态本身**(`agent_framework/render_library.py::register_render`),不在前端:
+  只有出片那一侧知道「这一版字节确实烧出来了」,而登记晚一步就可能赶在删对话之后,把这版片子
+  当会话垃圾清掉。两个落点:口播链 `nodes/core_nodes.py::RenderVideoNode.process`(2450 前后)与
+  图形科普片链 `nodes/motion_nodes.py::_render`;两条「选区改」局部改链复用各自的出片体,
+  对象键不变 → 按 `object_key` 命中同一行,不重复登记。`dry_run` 在写终态之前就 return,不入库。
+  素材行 `origin='render'`(`materials.origin` 枚举扩了一格,schema 与 `migrations.sql` 同步),
+  前端素材卡按 origin 显示「成片 / 上传 / 链接取料 / 曲库 / 配乐」;展示名取本次标题
+  (路径分隔符与控制字符换成 `_`,截 80 字符)。
+  **入库失败不改判这次渲染**:片子已发布、终态行已 done,素材库少一行只是少一个「以后还能在库里
+  找到它」的入口——所以回一句说明,由调用方并进 `notes` 对用户明说,不静默吞。
+- **回收按会话,但两种拼法都得清**:`artifacts`/`render_jobs` 与对象键用剪辑侧的
+  `u:{user}:c:{conv}`,`checkpoints`/`token_usage` 用 Agent 侧的 `{user}:{conv}`——
+  只按一种删就是永远只清掉一半账。`identity.session_forms()` 把一个会话展开成它的两副面孔,
+  `session_gc.purge_session()` 据此删四张表的行,并顺带清 `checkpoint_entries`(按先取出的
+  `run_id`)、`tasks`/`task_edges`/`subagents`(按 `scope`),再按前缀收桶里的字节:
+  `renders/{会话}/`、`derived/{会话}/`、`motion-shots/{会话}/`、`render-windows/{会话}/`
+  (前缀一律带尾斜杠,否则 `sess-1` 会误配 `sess-12`)与 `uploads/{用户}/convs/{对话}/` 的分片。
+  **素材字节的 `users/{用户}/convs/{对话}/` 根本不在名单里**;名单之内还有一层保护名单:
+  `materials.object_key` 指向的字节一个都不删——所以「删对话」清掉的是工作区,不是用户已有的东西。
+  回收回一份账(删了几行、几个对象、护住几个),接口把它带回响应,前端在「这册已删」之外
+  多吐一句说明。
+- **在途渲染优先于回收**:`render_jobs` 里有 `queued`/`running` 的行时整体跳过并说明原因——
+  此刻删字节会让那次渲染跑完时只剩一张空账。跳过不是放弃:后台对账稍后会再扫一次。
+- **两处调用共用这一份口径**(`agent_framework/session_gc.py`):删对话时即时回收
+  (`server.py::conv_drop` 删两行之后 `purge_conversation`);以及对账扫描——启动先扫一次、
+  之后按 `--upload-sweep-sec` 周期再扫(和上传分片回收同一个循环 `_reap_garbage`)。
+  对账兜两种崩法:库里有行但对话已不在(`orphan_sessions`,两种拼法各算一条,回收时按拼法集合去重),
+  以及**字节落了桶、行却没落**的崩溃残留(`orphan_scopes`——成片先 publish、`artifacts` 行随后才写,
+  中间进程没了就只剩字节)。只剩已入库字节的作用域**不算孤儿**:那版字节归素材行管,
+  否则每次开机都重扫一个永远删不动的作用域,对账就不幂等了。
+
+**边界(不粉)**:① 回收的触发点是「删对话」和「开机/周期对账」,**没有 TTL**——对话不删,
+产物与切片就一直涨(`render-windows/*`、`motion-shots/*` 的保留期仍未定,见 §17 边界②);
+② `timelines` 行的 `conv_id` 是 `ON DELETE SET NULL`,删对话后那一行仍长存(它按 `material_id`
+归属,不归本回收口径);③ 在途渲染期间删对话,`register_render` 会因对话行已删而失败,
+那一版成片**不入库**(只回说明,渲染本身仍算成功)——想留住它得等渲染收口后再删;
+④ 历史 `tasks`/`subagents` 里 `scope-xxxxxxxx` 那种对不回身份的形态不在回收范围内;
+⑤ 回收发生在容器/卷内部,**Docker 的 vhdx 不会自动缩小**——库里清了,宿主机磁盘文件不回落;
+⑥ `scripts/purge_identities.py` 按 `users/{用户}/` 前缀收字节,而渲染成片在 `renders/{会话}/` 下——
+删身份时那版成片字节**不归它删**(实测报「对象 0 个」),要等下一轮对账:身份删掉后 `materials`
+行随级联消失、保护名单不再护它,`orphan_scopes` 就把它当无主字节收掉。
+
+**真机回执**(`.smoke/b21_render_persist_gc_smoke.py`,真 PG + 真 MinIO,27 条断言全过):
+零素材分镜走 `render_motion_video` 出 1080×1920 / 8.865s / 138,726B 的一版,
+回执带 `material_id`、库里 `origin='render'`、字节与 sha256 取自对象本身;
+改标题重烧 → 同一 `object_key` 仍恰一行、id 不变、展示名刷新;`DELETE /convs/{cid}` 之后
+`artifacts`/`render_jobs`/`checkpoints`/`token_usage` 两副拼法都清零、`checkpoint_entries` 随 run 清、
+该会话前缀 11 个字节回收、**素材行留下且 `conv_id` 被真库置成 NULL、成片字节仍可 `get_stream` 读回并通过 ffprobe**。
+开机对账实测:埋一行孤儿 `render_jobs` 与一个只有字节的 `renders/{无主会话}/` 再重启,
+日志回「孤儿会话对账:回收 2 个作用域(删行 1 条、删对象 1 个…)」,复查 `orphan_scopes()` /
+`orphan_sessions()` 都是空集合(对账幂等,不会每次开机重扫同一坨)。
+界面这一格另有实测:素材库面板出现「🎬 中子星·入库可见.mp4 · 135KB · 9s · **成片**」,
+`<video>` 从预签名地址真播到 2.3s(readyState 4、无 error)。
+
 ## 剪辑节点(25 个 DAG 节点)
 
 `available_nodes` 白名单里是 **25 个 DAG 节点**(`core_nodes.py` 的 21 个 + `web_nodes.py` 的 `render_web`
@@ -524,8 +613,8 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 | 分组 | 表 | 要点 |
 |---|---|---|
 | 身份与对话 | `users` `conversations` `messages` | 消息挂 `conv_id`;`qa.parts` 存媒体部件供刷新重放 |
-| 素材 | `materials` `upload_sessions` `timelines` | 归属列是 `owner_user_id`;分片续传以桶内进度为准 |
-| 产物与渲染 | `artifacts` `render_jobs` | 产物按 `(作用域, 产物集)` 隔离;`render_jobs` 有 `attempt` 令牌与 `UNIQUE(session_id, artifact_id)` |
+| 素材 | `materials` `upload_sessions` `timelines` | 归属列是 `owner_user_id`;`object_key` UNIQUE,`origin` 枚举含 `render`(渲染终态把成片登记进同一张表,同对象键重烧只更新一行);分片续传以桶内进度为准 |
+| 产物与渲染 | `artifacts` `render_jobs` | 产物按 `(作用域, 产物集)` 隔离;`render_jobs` 有 `attempt` 令牌与 `UNIQUE(session_id, artifact_id)`;`session_id` 有两种拼法(`u:{u}:c:{c}` 与 `{u}:{c}`),删对话时两种一起回收(机制 18) |
 | 执行链 | `checkpoints` `checkpoint_entries` | 指针行 + 增量链(`delta`/`full` + `parent_seq`) |
 | 团队与调度 | `inbox_messages` `tasks` `task_edges` `subagents` `scheduled_jobs` | 消息中心 / 任务图 / 常驻子 Agent 租约 |
 | 记忆与扩展 | `memories` `skills` `skill_files` `mcp_servers` `app_secrets` | 记忆 PK `(user_id, category)`;技能与 MCP 按用户隔离,系统内置的 `owner_user_id` 为空 |
@@ -536,7 +625,8 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 
 - **鉴权**:`POST /auth/register` · `POST /auth/login` · `POST /register`(匿名 token,可被 `REGISTER_OPEN=0` 关) · `GET /whoami`
 - **对话**:`POST /chat`(投 MQ) · `POST /chat/sync`(同步版,给脚本用) · `WS /ws/{conv_id}?token=…` · `GET /sessions`
-- **会话与执行**:`/convs*` · `/convs/{cid}/runs[/active]` · `/runs/{id}[/history|/fork|/resume|/approve]` · `GET /preview/{cid}`
+- **会话与执行**:`/convs*`(其中 `DELETE /convs/{cid}` 除删消息与对话行外按会话回收,响应带 `gc` 账;
+  在途渲染被跳过时另带 `gc_notice`) · `/convs/{cid}/runs[/active]` · `/runs/{id}[/history|/fork|/resume|/approve]` · `GET /preview/{cid}`
 - **计划门**:`GET /plans/{id}` · `POST /plans/{id}/confirm` · `POST /plans/{id}/revise`
 - **素材**:`POST /upload` + `/upload/init|part|status|complete|abort`(分片续传) · `/materials*` · `POST /fetch_media`(按链接取料)
 - **BGM 曲库**:`GET /bgm` · `/bgm/search`(多源聚合) · `/bgm/url` · `POST /bgm/import` · `DELETE /bgm/{id}`
@@ -680,9 +770,9 @@ docker compose --profile app up -d --build    # + editor(:8001) + app(:8000) + c
 
 | 层 | 内容 | 怎么跑 |
 |---|---|---|
-| 离线回归 | `backend/tests/` **84 份**脚本式套件——每份自带 `asyncio.run(main())` 与断言计数,pytest 把**整份脚本**收成一个用例、以子进程执行(全量输出落 `.tmp/reg_pytest/`)。pytest 从脚本内部还会解析出 15 个假用例(`async def` 缺插件 / 缺 `tmp` fixture),由 `conftest.py` 在收集后丢弃——否则标准入口的结论全是假故障 | `cd backend && python -m pytest`(或单跑 `python tests/test_xxx.py`) |
-| 真机冒烟 | `backend/.smoke/` **24 个** `*_smoke.py`(b3~b17 + `settings_key`/`thinking_off`/`vl_shared_key` + `motion_film`/`motion_wide`/`motion_sheet` 三条零素材样片)+ **15 个**探针/种子脚本(含 b18 搜索链六路探针、b19 跨量级读数抽帧对照) | 依赖模型的那批带 `credit_gate()` 前置闸:额度不就绪直接 SKIP 并打印原因,不会把"账户空了"报成"代码坏了" |
-| 关键路径的钉子 | 计划门(`test_plan_gate`)· 出口中文(`test_display_outlets`)· 存储契约(`test_storage_contract` 212 项)· 渲染跟随(`test_render_follow`)· dry-run 路由(`test_dry_run_dispatch`)· 修字(`test_transcript_correction`)· 复盘(`test_plan_retrospective`)· 判断模型(`test_judge_gate`)· 零素材通道(`test_motion_channel` 236 项:净化闸拒绝清单、动效停止时刻、横屏第二套版式、字幕容量分档、图示几何不越界、跨量级读数自动换对数刻度与「万/亿」收成) | 见各文件头的"钉住 N 件事" |
+| 离线回归 | `backend/tests/` **88 份**脚本式套件——每份自带 `asyncio.run(main())` 与断言计数,pytest 把**整份脚本**收成一个用例、以子进程执行(全量输出落 `.tmp/reg_pytest/`)。pytest 从脚本内部还会解析出 15 个假用例(`async def` 缺插件 / 缺 `tmp` fixture),由 `conftest.py` 在收集后丢弃——否则标准入口的结论全是假故障 | `cd backend && python -m pytest`(或单跑 `python tests/test_xxx.py`) |
+| 真机冒烟 | `backend/.smoke/` **26 个** `*_smoke.py`(b3~b17 + `settings_key`/`thinking_off`/`vl_shared_key` + `motion_film`/`motion_wide`/`motion_sheet` 三条零素材样片 + `b21_render_persist_gc` 成片入库与回收)+ **26 个**探针/种子脚本(含 b18 搜索链六路探针、b19 跨量级读数抽帧对照) | 依赖模型的那批带 `credit_gate()` 前置闸:额度不就绪直接 SKIP 并打印原因,不会把"账户空了"报成"代码坏了" |
+| 关键路径的钉子 | 计划门(`test_plan_gate`)· 出口中文(`test_display_outlets`)· 存储契约(`test_storage_contract` 212 项)· 渲染跟随(`test_render_follow`)· dry-run 路由(`test_dry_run_dispatch`)· 修字(`test_transcript_correction`)· 复盘(`test_plan_retrospective`)· 判断模型(`test_judge_gate`)· 零素材通道(`test_motion_channel` 236 项:净化闸拒绝清单、动效停止时刻、横屏第二套版式、字幕容量分档、图示几何不越界、跨量级读数自动换对数刻度与「万/亿」收成)· 成片入库与按会话回收(`test_session_gc` 56 项:两种 `session_id` 拼法都清、同对象键重烧只更新一行、`materials.object_key` 的保护名单护住已入库字节、在途渲染拒绝回收、开机对账幂等) | 见各文件头的"钉住 N 件事" |
 | 提示词回归 | `tests/data/planning_round_golden.json` 金样逐字比对 + `scripts/run_eval.py` 的 prompt fingerprint | 改提示词后先跑这两个 |
 
 > **重要**:`backend/tests/`、`backend/.smoke/`、`backend/scripts/`、`backend/docs/`、`backend/pytest.ini`、
@@ -704,6 +794,7 @@ docker compose --profile app up -d --build    # + editor(:8001) + app(:8000) + c
 | YouTube 取料失败 | 需要网络出口 + JS 运行时(`YTDLP_JS_RUNTIMES`,装 deno 或 node);登录态站点按 `YTDLP_COOKIES_FILE` 给 cookie 文件 |
 | 界面上还是看到 `split_shots` 这类英文 | 说明那条工具没声明中文名(词表未覆盖 → 如实退回机器名);补 `display_name` 即可 |
 | 改了 `agent_framework/` 代码没生效 | :8000 是常驻进程,**要重启才上线**;改剪辑节点则重启 :8001 |
+| 构建时 apt 报 `Failed to fetch … 502/500` 后 `exit code 100` | 是网络路(本机代理/CDN)对个别 `.deb` 丢包,不是 Dockerfile 坏了——每次失败的文件还不一样。`ffmpeg` 与 `chromium` 两层已改成**层内最多装三遍**:失败字节留在 apt 缓存里,后一遍只补没取到的那几个(实测第二遍就过),层末再用 `ffmpeg -version`/`chromium --version` 硬验真装上。三遍仍红就换网络,或把构建走的那个代理关掉再试 |
 
 ## 已知边界(如实,不粉)
 
@@ -734,7 +825,44 @@ docker compose --profile app up -d --build    # + editor(:8001) + app(:8000) + c
 - `orbit`/`pulse`/`pan` 是连续运动,**永不 settle** → 该镜每帧都得真截,帧数 = 时长 × 帧率,
   别把它放在长镜头上(账上 `captured_frames == frames` 就是这笔);
 - `card=custom` 只放行**矢量绘图**:位图、外链字体、外部 CSS、SMIL 动画一律没有,自画的图只能用
-  SVG 基本形状 + `data-anim` 的 12 种声明式动效;
+  SVG 基本形状 + `data-anim` 的 13 种声明式动效;
+- **绘制四族画的是「参数化的图形」,不是任意画面**:`pixel` 是字符网格、`burst` 是撒粒子、
+  `net` 是点与线、`brush` 是抖动的线/圆/方框/折线。要画一件具体的实物剖面(活字印刷机的侧视、
+  一枚字模的透视),这四族都画不出来,得走 `custom` 自画;
+- 这两处得自己调,闸不拦(画得出来但不好看):`pixel` 每格封顶 40 个坐标单位,所以小网格的角色
+  在横屏带里会偏小;`burst` 默认中心 `y=260` 而射程可到 460,配大了粒子会压到图题那一行——
+  下移 `y` 或收窄 `dist`/`dist-max`(版式对照帧实测);
+- **整片质感只有四档固定滤镜串**,不开放自定义参数(要自定义等于把滤镜链交给模型,那条链上
+  没有静态校验)。`glow` 那一路带 `gblur`+`blend`,是四档里最贵的一趟。而且质感加在**母带**上,
+  逐镜切片与代表帧都是加质感之前的像素——所以**编辑器里的缩略图与对比帧看不到这层观感**,
+  要看效果只能放成片;
+- 这一批(绘制四族 + pose + 整片质感)的证据:离线用例 395 条全绿(含先证红再证绿的破坏性探针)、
+  本机版式对照表 22 卡 × 2 画幅逐张看过帧、四条滤镜串各自跑过 ffmpeg 并量到与母带的 PSNR 17.6~21.4 dB。
+  **2026-10-10 容器内整片真机补上了最后一格**(`.smoke/motion_film_ac_smoke.py`,竖屏 1080×1920、
+  fps=10、五镜 pixel/burst/net/brush/archive 连排、`texture=film`):成片 17.13s、发布 168 帧、
+  真截 171 帧、命中表错误 0、音画偏差 0.0s;逐镜帧账按动效类型分开落定——`pixel` 32 帧只真截 18
+  (pose 是离散动效,settle=1700ms 后末帧复用)、`burst`(twinkle) 32 帧全真截(连续闪动 = 整镜活帧)、
+  `net` 34/17、`brush` 34/22、`archive` 39/5;每镜命中表可指字段 8~16 条,画面里的字确实回指
+  `/shots/i/visual/…`(`title`/`caption`/`nodes/N/label`)。质感层量到同帧**平均绝对像素差 51.12/255**
+  (中灰 203.4→151.6、墨色占比 0.34%→33.6%),抽帧肉眼看到四角压暗与颗粒。母带层开关的账也对上:
+  `film→tv` 换档**复用全部 5 镜、真截 0 帧**;只改一镜的 `count`(26→40)**只重烧那一镜**
+  (真截 32 帧 vs 整片 171),其余 4 镜 `cached=True` 且缓存键一字不差。
+  同一脚本再跑一轮 **`--narration`**(配音 + 字幕层参与,`subtitle_mode=torn_highlight`):成片
+  12.66s、发布 125 帧、真截 127 帧、`mix=voice_only`、音画偏差 0.0s、命中表错误 0、**降级为空**;
+  五镜逐条拿到词时间轴(3/2/4/3/3 词,语音 1.896/1.872/2.016/2.136/2.520s),成片音轨与画面同长
+  (12.66s);这一轮逐镜帧账 pixel 23/18、burst 23/23、net 25/17、brush 26/22、archive 30/17,
+  质感差 51.15/255,`film→tv` 仍复用 5 镜真截 0,局部改仍只重烧 s02(真截 127→23、其余 4 镜键不动)。
+  **listening 级证据已补上**:抽到 5315ms 那一帧能看到撕纸高亮条里的字按词推进(「字模连成」已上色、
+  「版」还是浅色),即字幕确实吃的是词时间轴而非整段文本。edge-tts 出网在容器内实测可用(离线环境仍会降级)。
+- **2026-10-10 修掉的静默失败(局部改其实整片重烧)**:容器里跑四族连排的整片渲染,账上出现
+  「只改一镜的数值,五镜全部重烧、缓存键全换」。根因是**分镜归一化不幂等**:`theme` 的像素栏
+  第一次过闸时由 `DEFAULT_THEME` 补成 int `44`,而用户显式填的值走 `_clean_num` 出的是 float
+  `44.0`;局部改必经「patch 后再过一遍闸」,第二趟就把**没动过的那几镜**也写成 `44.0`。
+  `44 == 44.0` 为真,所以补丁的改动账、逐镜字典比较、成片时长与帧数**全都看不出异常**,
+  而 `shot_cache_key` 认的是 JSON 字节——「局部改只重烧受影响的那几镜」这条合同于是是假的。
+  现在 `_norm_theme` 返回前把 `THEME_PX` 的每个键都过同一趟数值归一,默认值与显式值同一类型;
+  `tests/test_motion_channel.py` ⑯ 段守这条:**一律用 JSON 字节断言,不用 `==`**,并覆盖
+  全部 22 张卡逐张二次过闸字节相同 + 改一句文案后其余 21 镜缓存键一个不许动。
 - 这条通道的配音依赖 edge-tts **出网**;离线环境里 `narration=true` 会失败,`narration=false` 仍可用;
 - 画面字体吃镜像里的 `fonts-noto-cjk`;本机没装 Noto Serif SC 时回落 SimSun/雅黑,版面观感会变(字宽不同,
   字幕换行位置随之挪)。
@@ -765,13 +893,24 @@ docker compose --profile app up -d --build    # + editor(:8001) + app(:8000) + c
   —— 这批**没有任何字段能对回账号**(实测 0 行命中 `conversations.id`),所以「只保留某账号的」这个口径表达不出来,
   只有全留与全删两个选项。2026-10-09 选了全删，入口是新加的 `scripts/wipe_session_tables.py`
   （同样默认 dry-run，`--apply` 才动手；本机当天清掉 6.9k 行 + 293 个对象 / 2.05 GB，桶里只剩内置技能与一个账号）。
-  **但这是清账不是修好**：这些表按 run 只增不减，没有 TTL 也没有自动回收，跑一阵就会重新涨回来。
+  **但这是清账不是修好**：这些表按 run 只增不减。2026-10-09 之后堵上了两条自动回收的路
+  （机制小节 18）：删对话时按会话级联清行与前缀字节，启动/周期对账再扫「对话已不存在」的残留
+  与只有字节没有行的崩溃残留。**仍然会涨的是不删对话的那批**——没有 TTL，一条长会话跑久了
+  它的 `motion-shots/*`、`render-windows/*` 切片与 artifacts 行就一直累积，清理口径未定。
   两条口径记在这里：`scheduled_jobs` 里那行 `heartbeat` 是系统自己的 30 秒任务，**不属于历史产物**，
   清理名单故意不含它；`default` / `cron` 两个内部身份删了会在下次启动自检时重新登记，不算数据丢失。
   落地时踩到的两点:`purge_identities.py` 刻意只认逐个点名的 id(批量口径要自己生成清单再喂 `xargs`);
   删完桶里会留下**0 字节的目录标记**——`objects.head(前缀/)` 仍然打得开而 `list_prefix` 不列它,
   拿 head 判「对象还在不在」会误判成没删干净。
 - 历史日志(早于本轮掩码改造的 `.tmp`/`.log`)里存在当时明文写下的 WS token,属历史数据,未回溯清洗。
+- **选区改「换配乐」会重烧全部窗口**:配乐混在母带那一层,`timeline_edit.window_inputs` 把它算进**每一窗**自己的缓存输入(`core_nodes.py` 的逐窗台账同源)——所以拧一次配乐音量,逐窗输入清单全部不同,没有一窗能复用。这不是退化成整片重烧的 bug,是"配乐影响整条片子"的正常结果;嫌慢就接受"换配乐=重新出片"。
+- **手改过的段,同步闸不再判、只能人眼验**:段上带 `manual` 标(`timeline_edit.MANUAL_MARK`)时,`resync_original_audio_timeline` 会跳过它不替用户改回去、`av_sync_check` 也跳过它不判——用户刚拧好的取景/音量不能被自动校准抹掉。代价是这一段的口型对不对,机器不再背书,账上如实记一条 UNVERIFIED(`eyeball`)。要机器重新接管,得去掉手动标重渲。
+- **图形科普片的样式同步只认同 `card`**:`MotionEditor.vue` 的 `shotSetFor` 把"全片同卡型"理解成"复制给**同 card** 的其他镜"(按 `shotBase().card` 匹配),跨 card 型不同步——同卡型才是用户眼里的一套版式。
+- **版本列表只活在本次编辑器会话内**:`MotionEditor.vue` 的 `chain` 是内存里的,只列"本次编辑器里走过的版本";服务端**没有**"列出某会话全部版本"的口,跨刷新/重开面板找旧版要在对话里报产物号(`adopt(artifact_id)` 才打得开)。
+- **工具调用气泡的参数值仍会露机器名**:参数**名**有三级中文兜底(`arg_labels` 帧内 → `/tools` 的 `params_display` → 本地 `ARG_LABELS` 白名单),`App.vue::summarizeArgs` 末尾 `|| k` 意味着**不在词表里的参数名直接露英文原名**;参数**值**按原样 `JSON.stringify`,对象键、段 id(`ev-…`/`su-…`)、机器枚举值都会原样出现在气泡里——这一条目前没有做,属如实保留的展示层粗糙。
+- **拧声音段的取源区间会把画面搬走、并按新内容改名**:`resync_original_audio_timeline` 为了让嘴型对上,把压在改过的声音段底下的画面段钉到新的声音位置;画面段 id 是按「素材 + 取源区间」算的,内容一换名就换(`ev-52cea4bed2` → `ev-12c33fa9e5` 是真机那一次)。若两段因此取到**同一段素材的同一区间**,`assign_segment_ids` 去重成 `ev-xxx#2`——而 `_safe()` 落对象键时把 `#` 换成 `_`,所以帧文件名与指针里的名字**写法不同**,跨机器比对要认段 id 而不是文件名。
+- **「改了哪几窗」以渲染器台账为准**:调用方改前算出的 `expected_rebuild` 用的是旧名字,名字一漂就点不到(那一窗会被当成没改、从旧片切进来冒充)。所以 `render_windowed` 额外按**秒区间**比对两份时间线的逐窗输入清单,补出 `planned_rebuild`;证据与对比帧都按这份取,新旧名的映射由后端在 `patch.before_frame_shots` 里给(`MotionEditor.vue::baseShotOf` 读它)。**副作用**:改名后的那一窗必然是重烧的,复用率比不漂名时低。
+- **一格指针的取值收口在入口**:编辑器拖一个把手只发**一个数**,`apply_patch` 负责成对——源区间塌成零/负长度时另一端按原输出长度平移回去、顶出负起点时整段回 `0~长度`(旧写法会落出一段零长度源段,渲到那儿 MoviePy 在合成音频时抛 `zero-size array … no identity`,补丁却已落库)。**仍然存在的边界**:源文件比请求的区间短,只能渲到素材尽头,入口不预知素材时长。
 
 ## 设计文档
 

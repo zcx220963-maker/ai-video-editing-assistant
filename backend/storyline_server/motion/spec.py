@@ -59,10 +59,16 @@ CARD_KINDS = (
     "chart",        # 柱状/折线：一组 label+value，带单位
     "scatter",      # 散点：x/y 两个轴，最多 30 个点
     "orbit",        # 环绕：中心体 + 若干轨道体（连续运动，整镜都要逐帧截）
+    "pixel",        # 像素网格：rows 逐行字符画 + palette 配色（poses 就是逐帧动画）
+    "burst",        # 粒子群：从原点迸发或铺散，参数定数量/方向/射程
+    "net",          # 节点连线网：关系图、注意力图、神经网络那一类
+    "brush",        # 手绘笔触：抖动重描的线/圆/方框/折线
     "custom",       # 自定义画面：visual.svg 内联一整段 SVG
 )
 
-#: 图示卡单源在 diagrams.py——清单漂了就会有一张卡没有 builder。
+#: 图示卡与绘制 op 族单源在 diagrams.py（它底部并入了 graphics 的四个族）。
+#: 这里的清单是**手写**的：漂移由 tests/test_motion_channel.py 按这张表逐项查 builder
+#: 拦住——卡型能过校验却渲不出画面，是那种要烧完像素才发现的错。
 DIAGRAM_KINDS = tuple(diagrams.BUILDERS)
 
 MAX_SHOTS = 120
@@ -83,9 +89,242 @@ VOICES = (
 #: 字幕形态：撕纸条 + 逐词高亮是参考片的读法
 SUBTITLE_MODES = ("torn_highlight", "torn", "bottom", "none")
 
-MAX_SHOTS = 120
-MAX_TEXT_CHARS = 60          # 竖屏撕纸条两行的容量
-MAX_HIGHLIGHTS_PER_SHOT = 4
+#: 整片级质感档：**母带上的滤镜，不是某一镜的版式**。与 BGM 同一层，所以换质感
+#: 不该让 20 镜全部重烧（见 ``render._CACHE_KNOBS`` 那条注释）。
+#: 每条链路的滤镜串单源在 ``render.TEXTURE_FILTERS``——这里只列名与人话说明，
+#: 两边各写一遍就会出现「界面上有这档、渲出来是原片」。
+TEXTURES = ("none", "film", "tv", "glow", "bleach")
+
+# ---------------------------------------------------------------------------
+# 样式层（theme）与叠加图层（overlay）——「选区改」要能对整页落笔，靠的就是这两栏
+# ---------------------------------------------------------------------------
+
+#: theme 的颜色栏。这些值会被**直接拼进 <style>**，所以取值必须先过字符白名单：
+#: 出现 ``}``、``<``、引号或分号就等于让一次「改个底色」拿到注入 CSS/HTML 的能力，
+#: 而注入是拼在 headless 浏览器里跑的——那不是「样式没生效」，那是页面替我们执行了别人写的东西。
+THEME_COLORS = ("bg", "paper", "ink", "accent", "hl")
+#: theme 的像素栏（设计空间像素，不是成片像素：版式整体按 ``--u`` 缩放，
+#: 写死成片像素会在横屏与方图上跳一位）
+THEME_PX: dict[str, tuple[float, float]] = {"caption_size": (16, 140)}
+#: 字体只给三个档，值落进模板里那三套真实存在的字族栈——列一个没装的字体名
+#: 等于让 headless 静默回落，用户在界面上选「霞鹜文楷」，画面上仍是宋体。
+THEME_FONTS = ("serif", "sans", "mono")
+
+#: 每镜的默认样式。整页可编辑的前提是**每个旋钮都有一个真实当前值**：缺省时不给，
+#: 指针就落在不存在的字段上（``apply_patch`` 拒写新键），第一次改样式就得整镜改写。
+DEFAULT_THEME: dict[str, Any] = {
+    "bg": "",                  # 空串 = 用模板默认那张纸（渐变），不是「白色」
+    "paper": "#f6f1e4", "ink": "#23211c", "accent": "#a8352c",
+    "hl": "#f0b7bd", "caption_size": 44, "font": "serif",
+}
+
+OVERLAY_TYPES = ("text", "rect", "ellipse", "line", "image")
+#: 动效复用版式里那套纯 t 函数（templates._JS 的 ANIMS）；none = 一直显示
+OVERLAY_ANIMS = ("none", "fade", "rise", "pop", "wipe")
+OVERLAY_STYLE_COLORS = ("color", "background", "border")
+OVERLAY_ALIGN = ("left", "center", "right")
+MAX_OVERLAYS_PER_SHOT = 16
+MAX_OVERLAY_TEXT_CHARS = 120
+DEFAULT_OVERLAY_STYLE: dict[str, Any] = {
+    "color": "#23211c", "background": "", "border": "",
+    "size": 40, "weight": 700, "align": "center",
+    "radius": 0, "opacity": 1, "rotation": 0,
+}
+
+#: 取值范围单源：入口校验与前端表单的滑杆读的是同一张表。
+#: 分成两份写的代价是「界面能拖到 3、提交被拒」——用户只会认为功能坏了。
+OVERLAY_BOX_RANGE: dict[str, tuple[float, float]] = {
+    "x": (-0.2, 1.2), "y": (-0.2, 1.2), "w": (0.01, 1.4), "h": (0.01, 1.4)}
+OVERLAY_STYLE_NUM: dict[str, tuple[float, float]] = {
+    "size": (8, 400), "radius": (0, 400), "opacity": (0, 1),
+    "rotation": (-180, 180), "weight": (100, 900)}
+
+#: 只允许 CSS 字面量里会出现的字符。宽度收紧到「数字、#、字母、函数括号、逗号、点、
+#: 百分号、空格、减号」——渐变与 rgb() 都在里面，注入用的那几个符号全在外面。
+_CSS_SAFE_RE = re.compile(r"^[\w#%(),.\s-]{1,160}$")
+
+
+def _clean_color(value: Any) -> tuple[str | None, str]:
+    """→ (可用的颜色字面量, 拒收理由)。空值当「不覆盖」返回空串，不是错误。"""
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return "", ""
+    if not _CSS_SAFE_RE.match(text):
+        return None, f"只许写颜色或渐变字面量（收到 {text[:40]!r}）"
+    head = text.split("(")[0].strip()
+    if not (text.startswith("#") or head in ("rgb", "rgba", "hsl", "hsla",
+                                             "linear-gradient", "radial-gradient")):
+        return None, f"只许写颜色或渐变字面量（收到 {text[:40]!r}）"
+    if text.count("(") != text.count(")"):
+        return None, f"括号不成对：{text[:40]!r}"
+    return text, ""
+
+
+def _clean_num(value: Any, lo: float, hi: float, name: str) -> tuple[float | None, str]:
+    """数值旋钮一律夹到区间内，越界就退回——静默夹会让用户以为「设了 200 怎么没变」。"""
+    try:
+        got = float(value)
+    except (TypeError, ValueError):
+        return None, f"{name}={value!r} 不是数字"
+    if not lo <= got <= hi:
+        return None, f"{name}={got:g} 超出 {lo:g}~{hi:g}"
+    return round(got, 3), ""
+
+
+def _norm_theme(raw: Any, sid: str, errors: list[str]) -> dict[str, Any]:
+    """样式栏 → 一份**每键都在**的字典（缺省取 DEFAULT_THEME）。"""
+    src = raw if isinstance(raw, Mapping) else {}
+    out = dict(DEFAULT_THEME)
+    for key in THEME_COLORS:
+        if key not in src:
+            continue
+        clean, why = _clean_color(src.get(key))
+        if clean is None:
+            _err(errors, f"{sid}：样式栏 {key} {why}——它是拼进 <style> 的，不接受别的写法")
+        else:
+            out[key] = clean
+    for key, (lo, hi) in THEME_PX.items():
+        if key not in src:
+            continue
+        got, why = _clean_num(src.get(key), lo, hi, f"样式栏 {key}")
+        if got is None:
+            _err(errors, f"{sid}：{why}")
+        else:
+            out[key] = got
+    if "font" in src:
+        font = str(src.get("font") or "").strip()
+        if font in THEME_FONTS:
+            out["font"] = font
+        else:
+            _err(errors, f"{sid}：字体 {font!r} 不在能用的三档里（{', '.join(THEME_FONTS)}）"
+                         f"——列出来的是镜像里真装着的字族，别的名字画面上不会变")
+    # 默认值也要过同一趟数值归一：``DEFAULT_THEME`` 写的是 int 44，而 ``_clean_num`` 出的是
+    # float 44.0。``44 == 44.0`` 让改动账与逐镜比较全都看不出来，但缓存键按 JSON 字节算——
+    # 局部改必经「patch 后再过一遍闸」，于是**没动的镜也会换键、整片重烧**。
+    for key in THEME_PX:
+        out[key] = round(float(out[key]), 3)
+    return out
+
+
+def _norm_overlay(raw: Any, sid: str, errors: list[str]) -> list[dict[str, Any]]:
+    """叠加图层清单 → 归一后的数组（每层一个稳定 id，供指针与命中表回指）。"""
+    items = raw if isinstance(raw, (list, tuple)) else []
+    if not isinstance(items, list):
+        _err(errors, f"{sid}：overlay 必须是数组")
+        return []
+    if len(items) > MAX_OVERLAYS_PER_SHOT:
+        _err(errors, f"{sid}：叠加图层 {len(items)} 层 > {MAX_OVERLAYS_PER_SHOT}，"
+                     f"这一镜要放这么多东西应该拆成几镜")
+        items = items[:MAX_OVERLAYS_PER_SHOT]
+    out: list[dict[str, Any]] = []
+    for n, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            _err(errors, f"{sid}：第 {n + 1} 层叠加不是对象")
+            continue
+        kind = str(item.get("type") or "text")
+        if kind not in OVERLAY_TYPES:
+            _err(errors, f"{sid}：第 {n + 1} 层的 type={kind!r} 画不出来"
+                         f"（可用：{', '.join(OVERLAY_TYPES)}）")
+            continue
+        box_in = item.get("box") if isinstance(item.get("box"), Mapping) else {}
+        box = {}
+        for key, (lo, hi) in OVERLAY_BOX_RANGE.items():
+            got, why = _clean_num(box_in.get(key, DEFAULT_BOX[key]), lo, hi,
+                                  f"第 {n + 1} 层的 {key}")
+            if got is None:
+                _err(errors, f"{sid}：叠加盒 {why}（盒用 0~1 归一化坐标，"
+                             "x/y 是左上角，w/h 是宽高）")
+                got = DEFAULT_BOX[key]
+            box[key] = got
+        style = dict(DEFAULT_OVERLAY_STYLE)
+        src_style = item.get("style") if isinstance(item.get("style"), Mapping) else {}
+        for key in OVERLAY_STYLE_COLORS:
+            if key not in src_style:
+                continue
+            clean, why = _clean_color(src_style.get(key))
+            if clean is None:
+                _err(errors, f"{sid}：第 {n + 1} 层的样式 {key} {why}")
+            else:
+                style[key] = clean
+        for key, (lo, hi) in OVERLAY_STYLE_NUM.items():
+            if key not in src_style:
+                continue
+            got, why = _clean_num(src_style.get(key), lo, hi,
+                                  f"第 {n + 1} 层的 {key}")
+            if got is None:
+                _err(errors, f"{sid}：{why}")
+            else:
+                style[key] = got
+        align = str(src_style.get("align") or style["align"])
+        if "align" in src_style:
+            if align in OVERLAY_ALIGN:
+                style["align"] = align
+            else:
+                _err(errors, f"{sid}：第 {n + 1} 层的对齐 {align!r} 不认识"
+                             f"（{', '.join(OVERLAY_ALIGN)}）")
+                align = style["align"]
+        text = str(item.get("text") or "")[:MAX_OVERLAY_TEXT_CHARS]
+        if kind == "text" and not text.strip():
+            _err(errors, f"{sid}：第 {n + 1} 层是文字层却没写 text——画面上是一个看不见的空盒")
+        ref = str(item.get("ref") or "")[:200]
+        if kind == "image" and not ref:
+            _err(errors, f"{sid}：第 {n + 1} 层是图片层却没写 ref"
+                         "（素材库的 material_id 或 obj: 引用）——取不到字节的图层不上屏")
+        anim = str(item.get("anim") or "none")
+        if anim not in OVERLAY_ANIMS:
+            _err(errors, f"{sid}：第 {n + 1} 层的动效 {anim!r} 不存在"
+                         f"（可用：{', '.join(OVERLAY_ANIMS)}）")
+            anim = "none"
+        at, _why = _clean_num(item.get("at_ms", 0), 0, 60_000, "落层时刻 at_ms")
+        dur, _w2 = _clean_num(item.get("dur_ms", 600), 1, 60_000, "动效时长 dur_ms")
+        out.append({
+            "id": str(item.get("id") or f"{sid}o{n + 1}")[:32],
+            "type": kind, "box": box, "style": style,
+            "text": text, "ref": ref,
+            "at_ms": round(at if at is not None else 0.0, 1),
+            "dur_ms": round(dur if dur is not None else 600.0, 1),
+            "anim": anim,
+            "z": "back" if str(item.get("z") or "") == "back" else "front",
+        })
+    return out
+
+
+#: 叠加层的默认盒（画面正中一条横幅的量）
+DEFAULT_BOX = {"x": 0.12, "y": 0.42, "w": 0.76, "h": 0.12}
+
+
+def form_controls() -> dict[str, Any]:
+    """样式栏与叠加层的旋钮清单（可改键、类型、范围、档位、默认值）→ 一份给前端的载荷。
+
+    为什么要单源：表单要显示「这一格能填什么、能拖到哪、不填时是什么」，而这些信息
+    本来就散在本模块的常量里。前端重写一遍的必然后果是「界面标到 3、提交被入口拒收」
+    ——把校验表原样发出去，界面与校验就只剩一份真相。
+    """
+    return {
+        "theme": {
+            "colors": list(THEME_COLORS),
+            "num": {k: [lo, hi] for k, (lo, hi) in THEME_PX.items()},
+            "fonts": list(THEME_FONTS),
+            "defaults": dict(DEFAULT_THEME),
+        },
+        "overlay": {
+            "types": list(OVERLAY_TYPES),
+            "anims": list(OVERLAY_ANIMS),
+            "aligns": list(OVERLAY_ALIGN),
+            "style_colors": list(OVERLAY_STYLE_COLORS),
+            "style_num": {k: [lo, hi] for k, (lo, hi) in OVERLAY_STYLE_NUM.items()},
+            "box": {k: [lo, hi] for k, (lo, hi) in OVERLAY_BOX_RANGE.items()},
+            "box_default": dict(DEFAULT_BOX),
+            "style_defaults": dict(DEFAULT_OVERLAY_STYLE),
+            "max_per_shot": MAX_OVERLAYS_PER_SHOT,
+            "max_text_chars": MAX_OVERLAY_TEXT_CHARS,
+            # 落层时刻与动效时长的窗口：校验里写死在 _norm_overlay 的两个调用上，
+            # 表单要画时间滑杆就得知道上限——同样只在这里列一次给外面看。
+            "at_ms": [0, 60_000], "dur_ms": [1, 60_000],
+            "z": ["front", "back"],
+        },
+    }
+
 
 _VOICE_RE = re.compile(r"^[a-z]{2}(-[A-Za-z]{2,})?-[A-Za-z]+Neural$")
 _RATE_RE = re.compile(r"^[+-]\d{1,3}%$")
@@ -124,6 +363,10 @@ KNOB_VALUE_LABELS: dict[str, dict[str, str]] = {
              "+10%": "稍快", "+20%": "较快", "+30%": "很快"},
     "subtitle_mode": {"torn_highlight": "撕纸条·逐词点亮", "torn": "撕纸条",
                       "bottom": "底部字幕", "none": "不上字幕"},
+    # 质感是整片一层滤镜，标签要说清「加的是哪种观感」，不然选的人只能猜
+    "texture": {"none": "不加（原片直出）", "film": "老胶片·颗粒与暗角",
+                "tv": "老电视·扫描线与色偏", "glow": "柔光·高光处泛开",
+                "bleach": "漂白·硬对比低饱和"},
 }
 
 #: 每字朗读秒数的经验区间：估算总时长用，不是承诺值。
@@ -143,7 +386,12 @@ SEC_PER_CHAR_HIGH = 0.30
 #:
 #: ``style`` 故意不在这里：当前只实现了一套版式，单值枚举等于没有选择权，
 #: 硬凑第二个候选就是瞎编。多一套模板时再补进这份清单。
-KNOB_FIELDS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode")
+#:
+#: ``texture`` 在这里：它是整片一层的母带滤镜（与 bgm 同一层），用户在计划卡上勾的
+#: 那一格不该由模型在 spec 里替它决定。也正因为挂在母带而不挂在镜头上，
+#: 换质感不重烧任何一镜——所以它**不进** ``render._CACHE_KNOBS``。
+KNOB_FIELDS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode",
+               "texture")
 
 
 def knob_props() -> dict[str, Any]:
@@ -182,6 +430,13 @@ def knob_props() -> dict[str, Any]:
             "type": "string", "enum": list(SUBTITLE_MODES), "default": "torn_highlight",
             "description": "字幕形态：torn_highlight 撕纸条+逐词点亮(参考片读法) / "
                            "torn 只撕纸条 / bottom 底部常规字幕 / none 不上字幕",
+        },
+        "texture": {
+            "type": "string", "enum": list(TEXTURES), "default": "none",
+            "description": "整片质感（母带上的一趟滤镜，不是某一镜的版式）："
+                           "film 老胶片(颗粒+暗角+暖偏) / tv 老电视(扫描线+色偏) / "
+                           "glow 柔光(高光泛开，要多编一次、最贵) / bleach 漂白(硬对比低饱和) / "
+                           "none 不加。换它只重过一遍母带，**不重烧任何镜头**",
         },
     }
     for key, spec in props.items():
@@ -247,6 +502,24 @@ _VISUAL_DOC = (
     "· scatter：points 数组 {x, y, label?}，≤30 个；x-max/y-max 轴上限；x-label/y-label 轴名\n"
     "· orbit：center {label}；parts 数组 {label, r 半径, period-ms 一圈毫秒}，≤5 个。"
     "**这是连续运动：整镜每帧都要真截**，别在长镜头上用\n"
+    "· pixel：rows＝逐行字符串的字符画（一个字符一格），palette＝{字符: 颜色}，"
+    "cell＝每格像素（可省，自动按画面带铺满）。**每行字数必须相等**（不齐会画成斜的），"
+    "行里出现色板没有的字符要嘛给它配个颜色、要嘛改成透明占位符 . / 空格 / 下划线。"
+    "poses＝[{rows, at_ms, hold_ms}]，就是逐帧角色动画：按顺序在 at_ms 切到该姿势、"
+    "停 hold_ms（只有最后一个姿势可以省 hold，它播完就停住）；≤24 个姿势\n"
+    "· burst：count 粒子数(≤100，默认 40) / x,y 原点 / dir 主方向角、spread 张角"
+    "（≥360 就是四面八方）/ dist~dist-max 射程 / size 半径 / shape 取 circle 或 rect / "
+    "colors 配色数组 / seed 固定随机（同 seed 必得同一片，缓存才钉得住）/ "
+    "at_ms、dur_ms、stagger_ms 逐颗错开。**twinkle=true 会加连续闪动，整镜每帧都要真截**\n"
+    "· net：nodes 数组 {label, x?, y?}（≤24 个，不给坐标就按 mode 自动铺）或 count 裸数；"
+    "mode 取 ring 环形 / layers 分层 / mesh 网 / star 中心辐射；edges 数组 [[i,j],…]（≤80 条，"
+    "不写就按模式连最近的两个）/ loop 让 ring 首尾相连 / color 节点色、line 连线色、"
+    "r 节点半径。连线与节点分两批入场，先织线后亮点\n"
+    "· brush：strokes 数组（≤12 笔），每笔 {shape: line|circle|rect|poly, "
+    "line 写 x,y→x2,y2；circle 写 x,y,r；rect 写 x,y,w,h；poly 写 points:[[x,y],…]、"
+    "≤40 点}, color 描边色, width 笔画粗细, passes 叠描几遍(≤3，越多越像蜡笔), "
+    "jitter 手抖幅度, at_ms/dur_ms 这一笔什么时候画出来。一笔一笔按顺序画出来，"
+    "不是一次贴上去\n"
     "· custom：svg＝一整段自画示意图，规则见下\n"
     "\n【custom 的 SVG 合同】"
     f"根节点必须是 <svg> 且带 viewBox（横竖画幅共用一套坐标全靠它，建议 0 0 1000 560；"
@@ -256,9 +529,12 @@ _VISUAL_DOC = (
     "<animate>/<animateTransform>/<set> 这类 SMIL 动画也拒——它们按墙钟走，"
     "逐帧截图推不动，画面会冻在起始帧。"
     "要动就写 data-anim（" + m_art.anim_table() + "），"
-    "配 data-at（毫秒）、data-dur（毫秒）、data-dist（像素，可负）、"
+    "配 data-at（毫秒）、data-dur（毫秒）、data-hold（毫秒，pose 的停留时长）、"
+    "data-dist（像素，可负）、"
     "data-count-to 与 data-dp（小数位）、data-num-unit（数字后缀，如 万/亿）、"
     "data-period（一圈毫秒，用于 orbit/pulse/pan）；"
+    "pose 是「只在 at~at+hold 这段区间里可见」：把几个 data-anim=\"pose\" 的兄弟节点排在"
+    "不同时刻，就是一段逐帧切换（内置的 pixel 卡走的就是它）。"
     "带 data-anim 的元素**自身不要再写 transform 属性**，CSS 会盖掉它，需要位移就外面套一层 <g>。"
     "同理，<text> 上写 fill=\"#fff\" 也**不生效**——字级样式挂在 .dg 的 CSS 规则上，"
     "CSS 盖得过呈现属性；深色形状上要压白字就写 style='fill:#f3ecd9'。"
@@ -318,10 +594,14 @@ def spec_schema() -> dict[str, Any]:
                                                 "plain 只有字幕条 / archive 档案卡 / dict_entry 词条卡 / "
                                                 "stamp 印章页 / book 书页 / print 印刷页 / theatre 剧场 / "
                                                 "webpage 网页 / silhouette 剪影 / title 封面卡。"
-                                                "图示系与自定义（SVG viewBox，横竖都装得下，横屏按画面带高度缩放）："
+                                                "图示系（SVG viewBox，横竖都装得下，横屏按画面带高度缩放）："
                                                 "flow 流程链 / compare 左右对照 / timeline 时间线 / "
-                                                "levels 层级 / chart 柱状折线 / scatter 散点 / orbit 环绕 / "
-                                                "custom 自画一张示意图（visual.svg）。清单外的版式是不存在的排版"},
+                                                "levels 层级 / chart 柱状折线 / scatter 散点 / orbit 环绕。"
+                                                "绘制 op 系（同一张画面带，参数展开成图）："
+                                                "pixel 像素网格与逐帧角色动画 / burst 粒子群 / "
+                                                "net 节点连线网 / brush 手绘笔触。"
+                                                "custom 自画一张示意图（visual.svg）。"
+                                                "清单外的版式是不存在的排版"},
                         "text": {"type": "string", "maxLength": MAX_TEXT_CHARS_WIDE,
                                  "description": f"这一镜要说的一句话。容量按画幅："
                                                 f"竖屏 ≤{MAX_TEXT_CHARS} 字、横屏 ≤{MAX_TEXT_CHARS_WIDE} 字"
@@ -339,6 +619,30 @@ def spec_schema() -> dict[str, Any]:
                                   "description": "红印章两行：{\"zh\": \"尚未存在\", "
                                                  "\"en\": \"NOT YET INVENTED\"}"},
                         "visual": {"type": "object", "description": _VISUAL_DOC},
+                        "theme": {"type": "object",
+                                  "description": "这一镜的样式覆盖（不写就用默认那张纸）。可填："
+                                                 "bg 背景(颜色或渐变，留空=模板默认渐变) / "
+                                                 "paper 纸片与字幕条底色 / ink 字色 / "
+                                                 "accent 红框与印章主色 / hl 高亮词底衬色 / "
+                                                 f"caption_size 字幕字号(设计像素 "
+                                                 f"{THEME_PX['caption_size'][0]}~"
+                                                 f"{THEME_PX['caption_size'][1]}，默认 44) / "
+                                                 f"font 字体档（{', '.join(THEME_FONTS)}）。"
+                                                 "颜色只许写 #hex、rgb()/hsl() 或 "
+                                                 "linear-/radial-gradient()"},
+                        "overlay": {"type": "array", "maxItems": MAX_OVERLAYS_PER_SHOT,
+                                    "description": f"画面上自由叠加的图层（≤{MAX_OVERLAYS_PER_SHOT} 层，"
+                                                   "叠在版式与字幕之上）。每层："
+                                                   "{type: text|rect|ellipse|line|image, "
+                                                   "box: {x,y,w,h} 归一化到整页(0~1), "
+                                                   "text: 文字层内容, "
+                                                   "style: {color, background, border, size, "
+                                                   "weight, align, radius, opacity, rotation}, "
+                                                   "ref: 图片层的 material_id 或 obj: 引用, "
+                                                   "at_ms/dur_ms: 落层时刻与动效时长, "
+                                                   "anim: none|fade|rise|pop|wipe, "
+                                                   "z: front|back（back 压在版式底下，当背景用）}。"
+                                                   "换整页背景图就写一层 z=back 的 image"},
                         "source": {"type": "object",
                                    "description": "出处 {\"标题\": …, \"链接\": …}。机器不判史实，"
                                                   "它会如实出现在**分镜卡与逐镜账**上（版式不自动排它）；"
@@ -450,6 +754,12 @@ def _check_visual_content(sid: str, card: str, visual: dict[str, Any],
                          f"这张卡{reads}，"
                          f"多写的键不会出现在画面上（真机：archive 卡写 visual.kind/rows，"
                          f"红框里只剩模板默认的 INV. 00000）；{hint}")
+    if card in diagrams.VALIDATORS:
+        # 绘制 op 族的「画得出来吗」按参数算（色板缺字、各行字数不齐、粒子形状不认识），
+        # 内置图示那套「数列表长度」的表写不出这些判据，所以各族的检查留在 graphics 里。
+        for msg in diagrams.VALIDATORS[card](visual):
+            _err(errors, f"{sid}：{card} 卡 {msg}")
+        return
     if card in _TEXT_FIELDS:
         keys = _TEXT_FIELDS[card]
         filled = any(_filled(visual.get(k)) for k in keys)
@@ -559,6 +869,8 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *,
         "panel": panel or {},
         "stamp": stamp or {},
         "visual": visual,
+        "theme": _norm_theme(raw.get("theme"), sid, errors),
+        "overlay": _norm_overlay(raw.get("overlay"), sid, errors),
         "source": raw.get("source") if isinstance(raw.get("source"), dict) else {},
         "min_duration_sec": dur,
     }
@@ -617,6 +929,11 @@ def validate_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         _err(errors, f"subtitle_mode={sub_mode!r} 不支持（可用：{', '.join(SUBTITLE_MODES)}）")
         sub_mode = "torn_highlight"
 
+    texture = str(raw.get("texture") or "none").strip().lower()
+    if texture not in TEXTURES:
+        _err(errors, f"texture={texture!r} 没有对应的滤镜链（可用：{', '.join(TEXTURES)}）")
+        texture = "none"
+
     raw_shots = raw.get("shots")
     if not isinstance(raw_shots, list) or not raw_shots:
         _err(errors, "shots 为空——没有镜头就没有片子")
@@ -647,6 +964,7 @@ def validate_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         "voice": voice,
         "rate": rate,
         "subtitle_mode": sub_mode,
+        "texture": texture,
         "shots": shots,
         "bgm": {"ref": str(bgm.get("ref") or ""), "volume": bgm_volume,
                 "duck": bool(bgm.get("duck", True))},

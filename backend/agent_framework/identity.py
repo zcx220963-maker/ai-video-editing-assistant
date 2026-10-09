@@ -41,6 +41,44 @@ def storyline_session_id(user_id: str, conversation_id: str) -> str:
     return f"u:{user_id}:c:{conversation_id}"
 
 
+def parse_storyline_session(sid: str) -> tuple[str, str]:
+    """``storyline_session_id`` 的反向：拆回 (user_id, conversation_id)。
+
+    拆不开就回 ``("", "")``——离线直调的会话键（``sess-xxxx``）与旧格式都属于这一类，
+    调用方据此判断「这不是某个用户某个对话的产物作用域」，而不是硬猜一个归属。
+    """
+    if sid.startswith("u:") and ":c:" in sid:
+        user_id, _, conv_id = sid[2:].partition(":c:")
+        if user_id and conv_id:
+            return user_id, conv_id
+    return "", ""
+
+
+def parse_session(sid: str) -> tuple[str, str]:
+    """拆**任一**拼法回 (user_id, conversation_id)，拆不开回 ``("", "")``。
+
+    库里同一个会话有两副面孔：Agent 侧（``checkpoints`` / ``token_usage``）用
+    ``Identity.session_id`` 的 ``{user}:{conv}``，剪辑侧（``artifacts`` /
+    ``render_jobs`` 与对象键）用 ``u:{user}:c:{conv}``。按会话回收必须两副都认得，
+    否则只会清掉一半账。
+    """
+    user_id, conv_id = parse_storyline_session(sid)
+    if user_id:
+        return user_id, conv_id
+    parts = sid.split(":")
+    if len(parts) == 2 and all(parts):
+        return parts[0], parts[1]
+    return "", ""
+
+
+def session_forms(sid: str) -> list[str]:
+    """一个会话在库里的全部作用域拼法（拆不出归属时原样回一条）。"""
+    user_id, conv_id = parse_session(sid)
+    if not user_id:
+        return [sid]
+    return sorted({f"{user_id}:{conv_id}", storyline_session_id(user_id, conv_id)})
+
+
 _current: ContextVar[Identity | None] = ContextVar("creation_assistant_identity",
                                                    default=None)
 

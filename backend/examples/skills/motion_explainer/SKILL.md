@@ -54,19 +54,28 @@ Bing RSS（英文维基随后），DuckDuckGo 垫底。这台机器上 DDG 两�
 - `text` 容量按画幅：竖屏 ≤ 60 字、横屏 ≤ 110 字。超了裁镜，不要裁句子。
 - `highlight` 里的每个词**必须是该镜文案的子串**，每镜 ≤ 4 个。差一个字就是画面上
   永远不亮——校验会拦，但拦下来等于白跑一轮。
-- `card` 只能从清单里选，分三族：
+- `card` 只能从清单里选，分四族：
   - **档案系**（纸质竖构图）：plain / archive / dict_entry / stamp / book / print /
     theatre / webpage / silhouette / title。
   - **图示系**（SVG，横竖都自适应）：flow 流程链 / compare 左右对照 / timeline 时间线 /
     levels 层级台阶 / chart 柱状折线 / scatter 散点 / orbit 环绕。数据填进 `visual`，
     时值由组件自己排——你不用写毫秒。
+  - **绘制系**（SVG，参数展开，横竖都自适应）：pixel 像素网格（`rows` 逐行字符画 +
+    `palette` 配色，`poses` 就是逐帧角色动画）/ burst 粒子群（`count` `dist` `dir`
+    `spread` `shape` `colors` `seed`，`twinkle` 让粒子持续闪）/ net 节点连线网
+    （`nodes` `edges` `mode`=ring 环形·layers 分层·mesh 网·star 辐射）/
+    brush 手绘笔触（`strokes` 每笔 `shape`=line·circle·rect·poly + `color` `width`
+    `passes` `jitter`）。**这一族同样是声明式的**：你交参数，服务端展开成 SVG 再过净化闸——
+    没有画笔代码可写，也就没有「只有渲完才知道画歪了」。
   - **custom**：上面都盖不住的那张图，自己画（见下面那份合同）。
   清单外的版式是不存在的排版，别编。
 - **`text` 只进字幕条，不进版式画面**：卡片上看得见的字全在 `visual` 里。
   `title` 的片名是 `visual.zh`（不是 `text`），`stamp` 的印章文字是 `visual.zh`，
   `dict_entry` 的大字是 `visual.word`，`archive` 的挂签是 `visual.line1~line3`，
   `compare` 两栏是 `visual.left/right = {title, points}`，
-  `flow/timeline/levels/chart/scatter/orbit` 的数据是 `visual.steps/marks/levels/series/points/parts`。
+  `flow/timeline/levels/chart/scatter/orbit` 的数据是 `visual.steps/marks/levels/series/points/parts`，
+  `pixel/burst/net/brush` 的数据是 `visual.rows|poses / count|dist|colors / nodes|edges|mode / strokes`
+  （这四族也认 `visual.title` 图题、`visual.note` 小注、`visual.caption` 题注）。
   缺了这些字段，模板不会报错——它会画一张只有边框的空壳，而 `ok=True` 的回包看不见这一点。
   所以服务端把这一关拦在分镜校验里，带镜号退回，改完再调。
   **反过来也一样**：往 `visual` 里写这张卡不读的键（例如给 `archive` 写 `kind`/`rows`），
@@ -114,9 +123,12 @@ Bing RSS（英文维基随后），DuckDuckGo 垫底。这台机器上 DDG 两�
 - **不要写 SMIL 动画**（`<animate>` / `<animateTransform>` / `<set>`）。它们按墙钟走，
   而逐帧截图推不动，画面会冻在起始帧——这类一律直接退回。
 - 要动就写 `data-anim`，可选：fade / rise / slide-x / draw / grow-x / grow-y / pop /
-  count / wipe / orbit / pulse / pan，配 `data-at`（毫秒）、`data-dur`、`data-dist`（像素，可负）、
+  count / wipe / orbit / pulse / pan / pose，配 `data-at`（毫秒）、`data-dur`、`data-dist`（像素，可负）、
   `data-count-to` + `data-dp`（小数位）+ `data-num-unit`（数字后缀，≤8 字，如 `万` / `亿`，
   会拼在滚动到位的数字后面）、`data-period`（一圈毫秒）。
+  `pose` 与别的动效不同：它是**关键帧轮播**（`data-at` 起显示，停留 `data-hold` 毫秒后整格隐去；
+  省略 `hold` 就一直显示，所以只有最后一格能省）。同一镜要摆几个 `pose` 元素、每个都写自己的
+  `data-at` + `data-hold`，靠 `at` 首尾相接才连得起来。
 - 带 `data-anim` 的元素**自身不要再写 `transform` 属性**——CSS 会盖掉它，位置就飞了；
   需要位移请外面套一层 `<g transform="…">`。
 - **同理，`<text fill="#fff">` 也不生效**：字级样式挂在 `.dg` 的 CSS 规则上，CSS 盖得过呈现属性。
@@ -128,7 +140,8 @@ Bing RSS（英文维基随后），DuckDuckGo 垫底。这台机器上 DDG 两�
 # 用户在计划卡上能改的那几件事
 
 `aspect`（画幅）/ `fps`（帧率）/ `narration`（要不要人声）/ `voice`（音色）/
-`rate`（语速）/ `subtitle_mode`（字幕形态）是**整部片子的属性**，不是每步各设一个。
+`rate`（语速）/ `subtitle_mode`（字幕形态）/ `texture`（整片质感）是**整部片子的属性**，
+不是每步各设一个。
 **只在 plan_motion 的 param_options 里出现一次**；render_motion_video 自动继承
 plan_motion 的值，**不要在 render_motion_video 上再列这些 param_options**——
 否则计划卡上同一组选项弹两遍，用户选两次同样的值。
@@ -137,7 +150,14 @@ plan_motion 的值，**不要在 render_motion_video 上再列这些 param_optio
 勾选的值**覆盖**你写在 spec 里的同名字段——那是用户的决定，不要在 spec 里再写一份旧值去"提醒"。
 
 建议的默认档：portrait + 15fps + narration=true + zh-CN-YunjianNeural + rate=+0% +
-torn_highlight。用户没表态就按这套，但**开关要照常给**，让他有机会改。
+torn_highlight + texture=none。用户没表态就按这套，但**开关要照常给**，让他有机会改。
+
+`texture` 是**整片那一层**的观感滤镜，不是某一镜的版式：film 老胶片（颗粒+暗角+暖偏）/
+tv 老电视（扫描线+色偏）/ glow 柔光（高光泛开）/ bleach 漂白（硬对比低饱和）/ none 不加。
+题材真要那层旧片子味才开——它是母带上多走一趟 x264（二代编码，画质略降、出片多花几十秒），
+但**不会让任何一镜重烧**：这一档不进按镜缓存键，换档只重过一遍母带。
+模型选了非 none 时，出片回执的 `evidence` 会带上实际消费的滤镜串；串为空而档位非 none，
+就说明这趟根本没跑（而不是「跑了但看不出来」）。
 
 **只有卡面那排按钮受枚举约束**：param_options 的每个候选值都要能从节点枚举表里反查得到，
 用户手打的「+8%」这类非档位值会被第四重校验整张卡退回。而 spec 本体收任意 ±50% 的百分比
@@ -155,9 +175,9 @@ torn_highlight。用户没表态就按这套，但**开关要照常给**，让�
 # 出片之后要改哪里：局部改（patch_motion_video）
 
 片已经出来了，用户说的是「第 3 镜那个数字错了」「这句字幕换个说法」「把最后那镜删掉」
-「BGM 换一首」——这些都不该重做整片。**只有**要换画幅/帧率/音色/语速/字幕形态，或者要
-加镜、换叙事结构时，才重走 plan_motion → render_motion_video（那几件是整部片子的属性，
-改它们等于每一镜都要重烧，那不叫局部改）。
+「BGM 换一首」「加一层老胶片味」——这些都不该重做整片。**只有**要换画幅/帧率/音色/语速/
+字幕形态，或者要加镜、换叙事结构时，才重走 plan_motion → render_motion_video（那几件是整部
+片子的属性，改它们等于每一镜都要重烧，那不叫局部改）。
 
 四种改法一次调用可以同时给：
 
@@ -174,7 +194,8 @@ torn_highlight。用户没表态就按这套，但**开关要照常给**，让�
 - `reorder`：重排后的**完整**镜号清单，必须与现有镜号成套（漏一个就当错误——要删请写
   `remove_shots`）。重排只动顺序，一镜都不重烧。
 
-另有 `bgm`（换配乐：素材 id 或 `obj:` 引用；配乐不进按镜缓存键，所以只重走混音）和
+另有 `bgm`（换配乐：素材 id 或 `obj:` 引用；配乐不进按镜缓存键，所以只重走混音）、
+`texture`（换整片质感档：与配乐同挂母带，也不进按镜缓存键，所以一镜都不重烧）和
 `target_duration_sec`（缺省沿用那一版当初的承诺值，显式传了才算改口）。
 
 要知道的三件事：
@@ -200,4 +221,9 @@ torn_highlight。用户没表态就按这套，但**开关要照常给**，让�
 
 例外是**连续动效**：`orbit` / `pulse` / `pan` 永不停止，那一个镜头的每一帧都是活帧。
 `orbit` 卡尤其贵，别把它放在长镜头上，也别整条片都用。
+`burst` 的 `twinkle: true` 给粒子挂的就是 `pulse`，所以一开闪，那一镜同样每帧都要截——
+想要「散开之后停住」的迸发就别开它。
+`pixel` 的 `poses` 属轮播：它播到「最后一格的 at+hold」才冻住，所以逐帧动画的代价是按那句
+算的，把姿势排到镜头末尾等于整镜活帧——三两套姿势足够讲完一个动作。
+`texture` 不在这本账上：质感档不动逐帧截图，它只在母带上多编一次。
 全片帧预算上限 4000 帧，超了直接报错（要求降 fps 或删镜），不会静默截断成半条片子。

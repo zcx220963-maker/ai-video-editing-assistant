@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS materials (
   height        integer,
   has_audio     boolean NOT NULL DEFAULT false,
   origin        text NOT NULL DEFAULT 'upload'
-                CHECK (origin IN ('upload','library','bgm','url')),
+                CHECK (origin IN ('upload','library','bgm','url','render')),
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS mat_owner_idx  ON materials(owner_user_id, created_at DESC);

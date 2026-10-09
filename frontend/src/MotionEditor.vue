@@ -23,7 +23,7 @@ const props = defineProps({
   mediaUrl: { type: String, default: "" },
   title: { type: String, default: "" },
 });
-const emit = defineEmits(["close", "patched"]);
+const emit = defineEmits(["close", "patched", "ask"]);
 
 // 与 App.vue 同一份凭证：浏览器只留 token，身份由服务端反查。
 const TOKEN_KEY = "ca.token";
@@ -112,52 +112,165 @@ const shotBase = (sid) => {
   return r ? ((docRoot.value[r.track] || [])[r.index] || {}) : {};
 };
 const baseValue = (p) => resolvePath(docRoot.value, segs(p));
-// 类型按原值收：图示的 value/x/y 契约上必须是数字，别等闸门把中文数字打回来。
-function coerce(p, raw) {
-  const t = typeof baseValue(p);
-  if (t === "number") return Number(raw);
-  if (t === "boolean") return raw === "true";
-  return raw;
-}
 
 // ---- 播放与时间线 ----
 const stageEl = ref(null), videoEl = ref(null), trackEl = ref(null);
 const playUrl = ref(props.mediaUrl);
 const cur = ref(0), playing = ref(false), muted = ref(true);
 const aspect = computed(() => (hm.value ? `${hm.value.width} / ${hm.value.height}` : "9 / 16"));
-// 「第几镜」在两种形态下指的是不同东西：那条链整条表就是镜序；这条链同一秒上
-// 画面/声音/字幕各有一行，跟着整条表跳会让标题来回换段，所以只看画面轨。
+// 「第几镜」在两种形态下指的是不同东西：轨道形态整条表就是镜序，但同一秒上画面/声音/
+// 字幕各有一行，跟着整条表跳会让标题来回换段，所以只看画面轨；空间形态改用投影后的
+// 镜行——用户拖过时长或换了序，播放头归属要跟着新的秒数走，而不是停在出片那一刻。
+const startOf = (r) => Number(r.start_sec ?? r.start) || 0;
 const laneRows = computed(() => (isTrack.value
-  ? timeline.value.filter((r) => r.track === "events") : timeline.value));
+  ? timeline.value.filter((r) => r.track === "events") : projected.value.rows));
 const curIdx = computed(() => {
   const tl = laneRows.value;
   if (!tl.length) return 0;
   let i = 0;
-  tl.forEach((t, k) => { if (cur.value + 0.001 >= (t.start_sec || 0)) i = k; });
+  tl.forEach((t, k) => { if (cur.value + 0.001 >= startOf(t)) i = k; });
   return i;
 });
 const curSid = computed(() => laneRows.value[curIdx.value]?.id || "");
 // 右侧面板对谁说话：轨道形态是用户点上的那一段，框选形态是播放头那一镜。
 const focusSid = computed(() => (isTrack.value ? selectedRow.value : curSid.value));
 const entries = computed(() => (shots.value[focusSid.value] || {}).entries || []);
-const headPct = computed(() => {
-  const d = hm.value?.duration || 0;
-  return d ? `${Math.min(100, (cur.value / d) * 100)}%` : "0%";
-});
-// ---- 轨道形态的时间线：每轨一行，块摆在自己的 start/时长上 ----
-// 那条链按镜序铺块（等宽 flex 就够了），这一条必须按**时间**铺：同一秒上画面/声音/
-// 字幕各有一段，只有按秒定位才看得出「这句字幕压在哪个画面上」。
-const lanes = computed(() => (hm.value?.tracks || [])
-  .map((t) => ({ ...t, rows: timeline.value.filter((r) => r.track === t.key) }))
-  .filter((l) => l.rows.length));
-const secPct = (v) => {
-  const d = Number(hm.value?.duration) || 0;
-  return d ? Math.max(0, Math.min(100, (Number(v) || 0) / d * 100)) : 0;
+// 播放头用像素而不是百分比：整条时间线在一个横向滚动容器里，缩放后两者会漂。
+const headX = computed(() => cur.value * pps.value);
+// ---- 统一时间线：一条秒尺 + 若干条 lane，两条链共用同一套坐标 ----
+// 为什么不用百分比铺块：百分比放不进缩放，也滚不起来，而「拖到第几帧」要的是把
+// 1/fps 秒放大到人眼看得见的宽度。两条链的段都只给 start_sec/sec，坐标口径因此一致。
+const viewW = ref(880);
+const zoomPx = ref(0);                 // 0 = 按容器宽度铺满
+const scrollEl = ref(null);
+// 秒尺的「铺满」按容器**实宽**算：这块面板会被左侧会话栏的收放挤压，写死 880 的话
+// 缩放比例与滚动的边界都会跟画面对不上。
+let ro = null;
+// 不用 onMounted：这一整块在 v-else-if="hm" 里，表没到就挂不上，onMounted 量到的是 null。
+const setScrollEl = (el) => {
+  scrollEl.value = el;
+  ro?.disconnect(); ro = null;
+  if (!el || typeof ResizeObserver === "undefined") return;
+  viewW.value = el.clientWidth || viewW.value;
+  ro = new ResizeObserver(() => { viewW.value = el.clientWidth || viewW.value; });
+  ro.observe(el);
 };
-const barStyle = (r) => ({ left: `${secPct(r.start_sec)}%`,
-                          width: `${Math.max(1.6, secPct(r.sec))}%` });
-const rowIsNow = (r) => cur.value + 0.001 >= (r.start_sec || 0)
-  && cur.value < (r.start_sec || 0) + (r.sec || 0);
+const setTrackEl = (el) => { trackEl.value = el; };
+// 改动账的四个容器声明在这里而不是下面：``watch(curSid)`` 在 setup 期间就取一次值，
+// 而 curSid→laneRows→projected 要读镜序与删镜清单——晚一行就是渲染期 TDZ 报错，
+// 整个剪辑侧栏空挂（真机踩过：侧栏宽度在、内容一片白）。
+const overrides = reactive({});
+const deepEdits = reactive({});
+const removals = ref([]);
+const order = ref([]);
+// 图形科普片那条链没有「时长表」：每镜一段配音、整片一条背景乐，长度是算出来的。
+// 投影跟着当前编辑走（镜序、时长、删镜），所以拖完右边缘立刻在秒尺上看得到结果。
+const projected = computed(() => {
+  if (isTrack.value) {
+    // 口播/素材链只许改字段、不许改总长，时长表里画面/声音/字幕/配乐是**同一秒上的四行**，
+    // 把它们各段的秒数再累一遍会把 6 秒的片子画成 21 秒（真机踩过：刻度走到 20s、播放头拖不满轴）。
+    // 秒尺因此只看画面轨，其余轨贴在同一个坐标上，不参与轴长。
+    const rows = timeline.value.filter((r) => r.track === "events").map((r) => ({
+      sid: r.id, id: r.id, i: Number(r.index) || 0, start: startOf(r),
+      sec: Number(r.sec) || 0, text: String((shotBase(r.id) || {}).text || ""),
+      speech: Number(r.speech_sec) || 0,
+    }));
+    const t = rows.reduce((a, r) => a + r.sec, 0);
+    return { rows, total: Math.round(t * 1000) / 1000 };
+  }
+  const rows = [];
+  let t = 0;
+  order.value.forEach((sid) => {
+    if (removals.value.includes(sid)) return;
+    const sec = effSec(sid).sec;
+    const base = shotBase(sid) || {};
+    const r = rowOf(sid) || {};
+    rows.push({ sid, id: sid, i: idxOf(sid), start: Math.round(t * 1000) / 1000, sec,
+                text: String(base.text || ""), speech: Number(r.speech_sec) || 0 });
+    t += sec;
+  });
+  return { rows, total: Math.round(t * 1000) / 1000 };
+});
+const timelineDur = computed(() => Math.max(
+  0.1, Number(hm.value?.duration) || 0, projected.value.total));
+const pps = computed(() => zoomPx.value || Math.max(
+  3, (viewW.value - 78) / timelineDur.value));
+const laneW = computed(() => Math.max(viewW.value,
+                                      timelineDur.value * pps.value + 10));
+const xOf = (sec) => (Number(sec) || 0) * pps.value;
+// 刻度档位：挑「相邻两条至少隔开 56px」里最小的那一档，缩放时自动从 1/4 秒走到 5 分钟
+const TICK_STEPS = [0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+const ticks = computed(() => {
+  const st = TICK_STEPS.find((s) => s * pps.value >= 56) || 900;
+  const out = [];
+  for (let t = 0; t <= timelineDur.value + 1e-6; t += st) {
+    out.push({ sec: Math.round(t * 1000) / 1000, x: xOf(t) });
+  }
+  return out;
+});
+const fmtSec = (v) => (v >= 60
+  ? `${Math.floor(v / 60)}:${String(Math.round(v % 60)).padStart(2, "0")}`
+  : `${v.toFixed(v % 1 ? 2 : 0)}s`);
+function zoomBy(k) {
+  zoomPx.value = Math.max(2, Math.min(1200, pps.value * k));
+}
+const fps = computed(() => Number(hm.value?.fps) || 25);
+// 逐帧步进按「第几帧」取整再回秒：直接 ±0.04 会累积成小数漂移，第 25 帧落不到整码上。
+function stepFrames(n) {
+  seek((Math.round(cur.value * fps.value) + n) / fps.value);
+}
+function onScrubDown(ev) {
+  if (ev.button !== 0 || !ev.currentTarget) return;
+  const move = (e) => {
+    const r = ev.currentTarget.getBoundingClientRect();
+    seek(Math.max(0, Math.min(timelineDur.value, (e.clientX - r.left) / pps.value)));
+  };
+  move(ev);
+  const up = () => window.removeEventListener("pointermove", move);
+  window.addEventListener("pointermove", move, { once: false });
+  window.addEventListener("pointerup", up, { once: true });
+  ev.currentTarget.setPointerCapture?.(ev.pointerId);
+}
+// 三条 lane 的来历不同，但形状一致：label + 若干按秒定位的块。
+// 图形片的「旁白」与「配乐」是从分镜合成出来的——界面上要的仍是「画面在上、
+// 声音在下、字幕贴着同一条时间轴」，两条链共用同一个编辑动作。
+const lanes = computed(() => {
+  if (isTrack.value) {
+    return (hm.value?.tracks || []).map((t) => ({
+      key: t.key, label: t.label,
+      bars: timeline.value.filter((r) => r.track === t.key).map((r) => ({
+        sid: r.id, start: r.start_sec, sec: r.sec, label: r.label, kind: "row",
+        frame: frameUrls[`${artifact.value}|${r.id}`] || "",
+      })),
+    })).filter((l) => l.bars.length);
+  }
+  const rows = projected.value.rows;
+  const out = [{
+    key: "shots", label: "画面",
+    bars: rows.map((r) => ({
+      sid: r.sid, start: r.start, sec: r.sec, kind: "shot",
+      label: `镜 ${r.i + 1} · ${r.sid}`,
+      frame: frameUrls[`${artifact.value}|${r.sid}`] || "",
+    })),
+  }];
+  const voice = rows.filter((r) => r.text).map((r) => ({
+    sid: r.sid, start: r.start, sec: Math.max(0.1, r.speech || r.sec), kind: "voice",
+    label: r.text, frame: "",
+  }));
+  if (voice.length) out.push({ key: "voice", label: "旁白", bars: voice });
+  const bg = (hm.value?.spec?.bgm) || {};
+  if (bg.ref) {
+    out.push({ key: "bgm", label: "配乐", bars: [{
+      sid: "bgm", start: 0, sec: timelineDur.value, kind: "bgm",
+      label: `音量 ${bg.volume}${bg.duck ? " · 人声起时压低" : ""}`, frame: "",
+    }] });
+  }
+  return out;
+});
+const barStyle = (b) => ({ left: `${xOf(b.start)}px`,
+                          width: `${Math.max(b.kind === "shot" ? 54 : 22, xOf(b.sec))}px` });
+const barIsNow = (b) => cur.value + 0.001 >= (b.start || 0)
+  && cur.value < (b.start || 0) + (b.sec || 0);
 function onTime() { if (videoEl.value) cur.value = videoEl.value.currentTime; }
 function toggle() {
   const v = videoEl.value; if (!v) return;
@@ -251,11 +364,8 @@ const groups = computed(() => {
 // ---- 改动账 ----
 // overrides：整镜表单覆盖的顶层栏（落在这些栏上的指针改动也写进同一份，两处不会口径不一）
 // deepEdits：表单没覆盖的深层指针（图示数值、画面里的文字坐标）——选区改的主场
-const FORM_FIELDS = ["text", "highlight", "panel", "label", "stamp", "min_duration_sec"];
-const overrides = reactive({});
-const deepEdits = reactive({});
-const removals = ref([]);
-const order = ref([]);
+const FORM_FIELDS = ["text", "highlight", "panel", "label", "stamp", "min_duration_sec",
+                     "theme", "overlay"];
 function resetEdits() {
   Object.keys(overrides).forEach((k) => delete overrides[k]);
   Object.keys(deepEdits).forEach((k) => delete deepEdits[k]);
@@ -263,6 +373,9 @@ function resetEdits() {
   order.value = [...baseIds.value];
   selected.value = [];
   selectedRow.value = "";
+  themeScope.value = "";      // 同步范围属于这一批改动：留着就是拿上一次的选择替这一次定
+  syncAsk.value = false;
+  tab.value = "cells";        // 样式/整镜两页只有空间形态有，换到口播版要退回共有的那页
 }
 // 指针 → 表里那条条目：轨道形态提交时要照它的 segment_id 一起交（闸门拿段号核对
 // 这张表量的是不是当前这一版），字段标签也从这里取。
@@ -333,7 +446,7 @@ const changedShots = computed(() => {
     const sid = baseIds.value[Number(segs(p)[1])];
     if (sid) touched.add(sid);
   });
-  order.value.forEach((sid) => { if (Object.keys(setFor(sid)).length) touched.add(sid); });
+  order.value.forEach((sid) => { if (Object.keys(shotSetFor(sid)).length) touched.add(sid); });
   return touched;
 });
 const dirty = computed(() => Object.keys(deepEdits).length > 0
@@ -350,30 +463,29 @@ function effSec(sid) {
   const want = o && "min_duration_sec" in o ? Number(o.min_duration_sec) : (tl.sec || 0);
   return { want: want || 0, floor, sec: Math.max(want || 0, floor) };
 }
-const blocks = computed(() => {
-  const items = order.value.map((sid) => {
-    const e = effSec(sid);
-    const removed = removals.value.includes(sid);
-    return { sid, removed, want: e.want, floor: e.floor, sec: e.sec,
-             grow: removed ? 0.6 : e.sec,
-             thumb: frameUrls[`${artifact.value}|${sid}`] || "" };
-  });
-  const total = items.reduce((a, b) => a + b.grow, 0) || 1;
-  items.forEach((b) => { b.pct = (b.grow / total) * 100; });
-  return items;
-});
-const estTotal = computed(() => blocks.value
-  .filter((b) => !b.removed).reduce((a, b) => a + b.sec, 0));
+const estTotal = computed(() => projected.value.total);
+const removedShots = computed(() => order.value.filter((s) => removals.value.includes(s)));
 
-// 轨道拖拽：块身拖 = 换序，右边缘拖 = 改时长，纯点击 = 定位到那一镜
+// 时间线上的拖拽（只有图形片那条链吃这三样——那条链的合同允许换序与删镜，
+// 口播链不许：画面与口播句子的对应是基准，挪一次就得回计划卡重新规划）：
+// 块身拖 = 换序，右边缘拖 = 改时长，纯点击 = 定位到那一镜。
 let trackDrag = null;
 function blockRects() {
   return [...(trackEl.value?.querySelectorAll(".me-block") || [])]
     .map((el) => el.getBoundingClientRect());
 }
-function onBlockDown(ev, sid, i) {
+function onBarDown(ev, b, laneKey) {
   if (ev.button !== 0) return;
-  trackDrag = { kind: "move", sid, i, x0: ev.clientX, moved: false };
+  if (isTrack.value) {                    // 轨道形态的块就是那一段：点它=选它
+    pickRow(b.sid);
+    seek(b.start);
+    return;
+  }
+  if (laneKey !== "shots") {              // 旁白/配乐是从镜合成出来的，不是可拖的旋钮
+    seek(b.start);
+    return;
+  }
+  trackDrag = { kind: "move", sid: b.sid, x0: ev.clientX, moved: false };
   window.addEventListener("pointermove", onTrackMove);
   window.addEventListener("pointerup", onTrackUp, { once: true });
 }
@@ -381,9 +493,8 @@ function onResizeDown(ev, sid) {
   ev.stopPropagation();
   if (ev.button !== 0) return;
   const e = effSec(sid);
-  const total = order.value.reduce((a, s) => a + effSec(s).sec, 0) || 1;
   trackDrag = { kind: "resize", sid, x0: ev.clientX, sec0: e.want, moved: false,
-                floor: e.floor, pxPerSec: (trackEl.value?.clientWidth || 600) / total };
+                floor: e.floor, pxPerSec: pps.value };
   window.addEventListener("pointermove", onTrackMove);
   window.addEventListener("pointerup", onTrackUp, { once: true });
 }
@@ -413,8 +524,8 @@ function onTrackUp() {
   const d = trackDrag;
   trackDrag = null;
   if (d && !d.moved && d.kind === "move") {
-    const tl = timeline.value[idxOf(d.sid)] || {};
-    seek(tl.start_sec || 0);
+    const r = projected.value.rows.find((x) => x.sid === d.sid);
+    seek(r ? r.start : (rowOf(d.sid) || {}).start_sec || 0);
   }
 }
 const toggleRemove = (sid) => {
@@ -446,6 +557,234 @@ function delRow(sid, field, key) {
 function addHighlight(sid) { const o = overrideFor(sid); (o.highlight ||= []).push(""); }
 function delHighlight(sid, k) { overrideFor(sid).highlight.splice(k, 1); }
 
+// ---- 样式表单（F2）：旋钮清单与取值范围都读表里的 controls ----
+// 为什么不在前端写一份：写死的那份与入口校验迟早对不上，代价是「界面能拖到 3、
+// 提交被拒收」，而用户读到的只是「改不动」。表里发了范围，滑杆就只可能给出合法值。
+const ctl = computed(() => hm.value?.controls || {});
+const themeCtl = computed(() => ctl.value.theme || {});
+const ovlCtl = computed(() => ctl.value.overlay || {});
+const COLOR_FIELDS = new Set(["color", "background", "border", "bg", "paper", "ink",
+                              "accent", "hl"]);
+const ranges = computed(() => {
+  const c = ctl.value, out = {};
+  if (c.volume_max != null) out.volume = [0, c.volume_max];
+  if (c.font_size_range) out.font_size = c.font_size_range;
+  Object.entries(c.theme?.num || {}).forEach(([k, v]) => { out[k] = v; });
+  Object.entries(c.overlay?.style_num || {}).forEach(([k, v]) => { out[k] = v; });
+  Object.entries(c.overlay?.box || {}).forEach(([k, v]) => { out[`box.${k}`] = v; });
+  if (c.overlay?.at_ms) out.at_ms = c.overlay.at_ms;
+  if (c.overlay?.dur_ms) out.dur_ms = c.overlay.dur_ms;
+  return out;
+});
+const enums = computed(() => ({
+  position: ctl.value.subtitle_positions || [],
+  font: themeCtl.value.fonts || [],
+  align: ovlCtl.value.aligns || [],
+  anim: ovlCtl.value.anims || [],
+  type: ovlCtl.value.types || [],
+  z: ovlCtl.value.z || [],
+}));
+/** 指针末端 → 查表用的键：``box`` 下的 x/y/w/h 与样式里的同名数值不是一个范围。 */
+function ctlKey(p) {
+  const leaf = segs(p);
+  const f = String(leaf.slice(-1)[0] || "");
+  return `${leaf[leaf.length - 2] === "box" ? "box." : ""}${f}`;
+}
+/** 这一格该用什么控件：类型问表（口播链的 editable_fields 连类型一起发），
+ *  范围与档位也问表；只有图形科普片那条链没有字段类型表，才按原值类型推。 */
+function ctlKind(p) {
+  const ss = segs(p);
+  const f = String(ss.slice(-1)[0] || "");
+  const t = isTrack.value ? (hm.value?.editable_fields?.[ss[0]] || {})[f] : "";
+  if (t === "color" || COLOR_FIELDS.has(f)) return "color";
+  if (t === "enum") return "enum";
+  if (ranges.value[ctlKey(p)]) return "range";
+  if ((enums.value[f] || []).length) return "enum";
+  if (t === "number") return "number";
+  return typeof baseValue(p) === "number" ? "number" : "text";
+}
+const rangeOf = (p) => ranges.value[ctlKey(p)] || [0, 1];
+/** 步长按范围跨度给：0~1 的透明度拖不出 0.01 的差别就等于没改，400 档字号拖 0.01 又点不准。 */
+function stepOf(p) {
+  const [lo, hi] = rangeOf(p);
+  const s = hi - lo;
+  return s <= 1 ? 0.01 : s <= 4 ? 0.05 : s <= 150 ? 1 : 2;
+}
+/** 取色器只认 #rrggbb；颜色名与空串（= 用模板默认）照原样由文本框写回。 */
+const HEX6 = /^#[0-9a-fA-F]{6}$/;
+// 命中表把「这一栏没写值时渲染真正吃进去的那个数」一起发过来（表里的 default）。
+// 没有它，滑杆和色块只能拿最小值去画：音量标 0、字幕色标黑，而片子里其实是 1.0× 白字。
+const defaultOf = (p) => entryByPointer.value[p]?.default ?? null;
+const shownValue = (p) => editValue(p) ?? defaultOf(p);
+const colorHex = (p) => hexOf(shownValue(p));
+const NAMED_COLOR = Object.fromEntries([
+  ["white", "#ffffff"], ["black", "#000000"], ["yellow", "#ffd400"], ["red", "#e03a26"],
+  ["green", "#1f9d55"], ["blue", "#1c6ee8"], ["orange", "#f2811d"], ["pink", "#f0b7bd"],
+  ["purple", "#7b3fbf"], ["cyan", "#00b3b8"], ["magenta", "#d13fb0"], ["gray", "#8a8a8a"],
+  ["grey", "#8a8a8a"], ["silver", "#c4c4c4"], ["gold", "#b98a2f"], ["beige", "#f6f1e4"],
+  ["brown", "#7a4a21"], ["lime", "#8fd40a"], ["teal", "#18796f"], ["navy", "#1b2a5c"],
+  ["violet", "#8f5fd6"], ["ivory", "#fffdf2"], ["khaki", "#c8b784"], ["salmon", "#f08a7a"],
+  ["turquoise", "#3fc0b0"], ["wheat", "#e6c88a"],
+]);
+const namedHex = (v) => NAMED_COLOR[String(v || "").toLowerCase()] || "";
+const FIELD_LABEL = {
+  bg: "底色", paper: "纸面", ink: "文字", accent: "强调", hl: "高亮",
+  caption_size: "标题字号", font: "字体档",
+  color: "字色", background: "填充", border: "描边", size: "字号", weight: "粗细",
+  align: "对齐", radius: "圆角", opacity: "不透明", rotation: "旋转",
+  x: "横向", y: "纵向", w: "宽", h: "高",
+  type: "类型", text: "文字", ref: "素材", anim: "动效", at_ms: "起 (ms)",
+  dur_ms: "动效时长 (ms)", z: "层级",
+  volume: "音量倍率", font_size: "字号", position: "位置",
+  src_start: "取源起点 (s)", src_end: "取源终点 (s)", path: "素材路径",
+  offset_sec: "起播偏移 (s)", style: "样式名", start: "起点 (s)", end: "终点 (s)",
+};
+const leafField = (p) => String(segs(p).slice(-1)[0] || "");
+/** 任意写法 → 取色器要的 #rrggbb（空串 = 用模板默认，色板上只能显示成黑，原样仍由文本框写）。 */
+function hexOf(v) {
+  const s = String(v ?? "");
+  if (HEX6.test(s)) return s;
+  const m = /^#([0-9a-fA-F]{3})$/.exec(s);
+  if (m) return `#${[...m[1]].map((c) => c + c).join("")}`;
+  return namedHex(s) || "#000000";
+}
+const rg = (key) => ranges.value[key] || [0, 1];
+/** 下拉里连当前值一起列：原值不在档位表里时，打开下拉不该顺手把它改成第一项。 */
+const enumOpts = (kind, cur) => {
+  const list = enums.value[kind] || [];
+  return cur == null || cur === "" || list.includes(cur) ? list : [...list, cur];
+};
+
+function themeFor(sid) {
+  const o = overrideFor(sid);
+  if (!o.theme) {
+    o.theme = { ...(themeCtl.value.defaults || {}), ...((shotBase(sid) || {}).theme || {}) };
+  }
+  return o.theme;
+}
+function layersFor(sid) {
+  const o = overrideFor(sid);
+  if (!o.overlay) {
+    o.overlay = JSON.parse(JSON.stringify((shotBase(sid) || {}).overlay || []));
+  }
+  return o.overlay;
+}
+function addLayer(sid) {
+  const list = layersFor(sid);
+  if (list.length >= (ovlCtl.value.max_per_shot || 16)) return;
+  const type = (ovlCtl.value.types || ["text"])[0];
+  list.push({ type, text: type === "text" ? "新图层" : "", ref: "",
+              box: { ...(ovlCtl.value.box_default || { x: .12, y: .42, w: .76, h: .12 }) },
+              style: { ...(ovlCtl.value.style_defaults || {}) },
+              at_ms: 0, dur_ms: 600, anim: "none", z: "front" });
+}
+function delLayer(sid, k) { layersFor(sid).splice(k, 1); }
+
+// 表单**读**用这两个：它们不会把没改过的镜写进 overrides。若在 computed 里调
+// themeFor/layersFor，等于每次重绘都可能改一次响应式状态，Vue 会转成递归更新。
+const curTheme = computed(() => {
+  const sid = curSid.value;
+  if (!sid) return {};
+  const o = overrides[sid];
+  if (o?.theme) return o.theme;
+  return { ...(themeCtl.value.defaults || {}), ...((shotBase(sid) || {}).theme || {}) };
+});
+const curOverlay = computed(() => {
+  const sid = curSid.value;
+  if (!sid) return [];
+  const o = overrides[sid];
+  return o?.overlay ?? ((shotBase(sid) || {}).overlay || []);
+});
+function themeSet(key, value) { themeFor(curSid.value)[key] = value; }
+function layGet(k, path) {
+  let cur = curOverlay.value[k];
+  for (const s of path.split(".")) cur = cur?.[s];
+  return cur;
+}
+function laySet(k, path, value) {
+  const lay = layersFor(curSid.value)[k];
+  if (!lay) return;
+  const ss = path.split(".");
+  let cur = lay;
+  for (let i = 0; i < ss.length - 1; i += 1) cur = cur[ss[i]] ||= {};
+  cur[ss[ss.length - 1]] = value;
+}
+// 画面上的图层芯片：拖动即写归一化盒，与「样式」页那几格是同一份数据。
+const stageLayers = computed(() => curOverlay.value.map((l, k) => ({
+  ...l, k, style: boxStyle(l.box || {}),
+})));
+
+// 画面上直接拖图层挪位置：写的仍是归一化盒（0~1），与命中表、与渲染端同一套单位，
+// 所以缩放窗口或换分辨率都不会把拖出来的位置改掉。只挪左上角，宽高留给表单填。
+let layerDrag = null;
+function onLayerDown(ev, sid, k) {
+  if (ev.button !== 0 || !stageEl.value) return;
+  ev.stopPropagation();
+  const layer = layersFor(sid)[k];
+  if (!layer) return;
+  const p = norm(ev);
+  layerDrag = { sid, k, dx: p.x - (layer.box?.x || 0), dy: p.y - (layer.box?.y || 0) };
+  window.addEventListener("pointermove", onLayerMove);
+  window.addEventListener("pointerup", onLayerUp, { once: true });
+}
+function onLayerMove(ev) {
+  if (!layerDrag) return;
+  const p = norm(ev);
+  const layer = layersFor(layerDrag.sid)[layerDrag.k];
+  if (!layer) return;
+  layer.box = { ...(layer.box || {}),
+                x: Math.round(Math.max(-0.2, Math.min(1.2, p.x - layerDrag.dx)) * 1000) / 1000,
+                y: Math.round(Math.max(-0.2, Math.min(1.2, p.y - layerDrag.dy)) * 1000) / 1000 };
+}
+function onLayerUp() {
+  window.removeEventListener("pointermove", onLayerMove);
+  layerDrag = null;
+}
+
+// ---- 样式同步范围（F3）：改完这一镜的样式，保存前必须说清同步到哪 ----
+// 为什么问而不是默认全片：全片同卡型是常见诉求，但「这一镜想例外」同样是——
+// 默认任何一个方向，另一批用户都会觉得自己被替决定了。
+const themeScope = ref("");          // "" 未决 · all 全片同卡型 · single 只这一镜
+const syncAsk = ref(false);
+const themeTouched = computed(() => Object.keys(overrides).filter((sid) => {
+  const o = overrides[sid];
+  if (!o?.theme) return false;
+  return JSON.stringify(o.theme) !== JSON.stringify((shotBase(sid) || {}).theme ?? null);
+}));
+/** 这一镜要写回的栏；「全片同卡型」时把改过的那份 theme 复制给同 card 的其他镜。 */
+function shotSetFor(sid) {
+  const set = setFor(sid);
+  if (themeScope.value !== "all" || "theme" in set) return set;
+  const card = (shotBase(sid) || {}).card;
+  const src = themeTouched.value.find((s) => (shotBase(s) || {}).card === card);
+  if (src) set.theme = JSON.parse(JSON.stringify(overrides[src].theme));
+  return set;
+}
+const sameCardCount = computed(() => {
+  const card = (shotBase(curSid.value) || {}).card;
+  const live = order.value.filter((s) => !removals.value.includes(s));
+  return card ? live.filter((s) => (shotBase(s) || {}).card === card).length : live.length;
+});
+const scopeTag = computed(() => {
+  if (isTrack.value || !themeTouched.value.length) return "";
+  if (themeScope.value === "all") return `样式同步=全片同卡型（${sameCardCount.value} 镜）`;
+  if (themeScope.value === "single") return "样式同步=只这一镜";
+  return "样式同步=还没定（提交时会问）";
+});
+
+// ---- 带着这个选区去问（F4）----
+// 选中的是「这一版的这一段/这一块」，光说「把那句字幕改一下」模型得回头猜；
+// 把锚点原样贴进聊天框，AI 改与手工改用的就是同一个选中态。
+function askAbout() {
+  const sid = focusSid.value || "(没选)";
+  const what = groups.value.length
+    ? groups.value.map((g) => `${g.pointer || "(回指不到字段)"}＝`
+        + (isTrack.value ? g.hits[0].label : `画面上是「${g.hits[0].text}」`)).join("；")
+    : ((shots.value[sid] || {}).entries || [])[0]?.label || "";
+  emit("ask", `【选区改】在成片 ${artifact.value}（${isTrack.value ? "口播/素材片" : "图形科普片"}）`
+    + `的 ${isTrack.value ? "段" : "镜"} ${sid}${what ? ` · ${what}` : ""} 上，我想改：`);
+}
+
 // ---- 提交：拼成一次局部改 ----
 const busy = ref("");
 const failMsg = ref("");
@@ -470,7 +809,7 @@ function payload() {
   }));
   const shotSets = order.value
     .filter((sid) => !removals.value.includes(sid))
-    .map((sid) => ({ shot: sid, set: setFor(sid) }))
+    .map((sid) => ({ shot: sid, set: shotSetFor(sid) }))
     .filter((x) => Object.keys(x.set).length);
   const removed = removals.value.filter((s) => baseIds.value.includes(s));
   const kept = baseIds.value.filter((s) => !removed.includes(s));
@@ -490,6 +829,7 @@ const planBits = computed(() => {
   if (p.shot_sets) bits.push(`整镜 ${p.shot_sets.length} 镜`);
   if (p.remove_shots) bits.push(`删 ${p.remove_shots.length} 镜`);
   if (p.reorder) bits.push("换序");
+  if (scopeTag.value) bits.push(scopeTag.value);
   return bits;
 });
 const plan = computed(() => (planBits.value.length ? planBits.value.join(" · ") : "还没有改动"));
@@ -507,6 +847,11 @@ const rebakeNote = computed(() => {
 
 async function submit() {
   if (!dirty.value || busy.value) return;
+  if (themeTouched.value.length && !themeScope.value && !isTrack.value) {
+    syncAsk.value = true;                 // 样式改动的同步范围要先定，这一趟不替用户决定
+    return;
+  }
+  syncAsk.value = false;
   busy.value = "submitting"; failMsg.value = ""; done.value = null;
   progress.status = "queued"; progress.percent = 0; progress.stage = "提交中";
   try {
@@ -573,6 +918,8 @@ function finish(view, id) {
     reused: cache.reused || [],
     removed: patch.removed_ids || patch.removed_shots || [],
     reordered: !!patch.reordered, hadBefore: Object.keys(before).length,
+    // 改过取景的窗在新版里换了段名，而 base 的帧按旧名存：这份映射由后端算给出。
+    beforeShots: patch.before_frame_shots || {},
     evidence: view.evidence || [],
   };
   if (!chain.some((c) => c.id === id)) chain.unshift({ id, url: view.media_url || "" });
@@ -584,16 +931,19 @@ function finish(view, id) {
   emit("patched", summary);
   prepareCompare();
 }
+const baseShotOf = (d, sid) => d.beforeShots[sid] || sid;
 async function prepareCompare() {
   const d = done.value;
   if (!d) return;
-  await Promise.all(d.changed.flatMap((sid) => [frameUrl(d.base, sid), frameUrl(d.id, sid)]));
+  await Promise.all(d.changed.flatMap((sid) => [frameUrl(d.base, baseShotOf(d, sid)),
+                                                frameUrl(d.id, sid)]));
 }
 const compare = computed(() => {
   const d = done.value;
   if (!d) return [];
   return d.changed.map((sid) => ({
-    sid, base: frameUrls[`${d.base}|${sid}`] || "", after: frameUrls[`${d.id}|${sid}`] || "",
+    sid, base: frameUrls[`${d.base}|${baseShotOf(d, sid)}`] || "",
+    after: frameUrls[`${d.id}|${sid}`] || "",
     removed: d.removed.includes(sid),
   }));
 });
@@ -603,8 +953,12 @@ async function adopt(id) {
   done.value = null; failMsg.value = ""; cur.value = 0; playing.value = false;
   await loadHitmap(id);
 }
+// 侧栏开着时点另一张成片卡：只有 props 在变，表不会自己重读——不接这一句，界面上挂着
+// 的仍是上一版的命中表，指针也就改到上一版的镜号上（真机踩过：新出的版本点不开）。
+watch(() => props.artifactId, (id) => { if (id && id !== artifact.value) adopt(id); });
 onBeforeUnmount(() => {
   pollAbort = true;
+  ro?.disconnect();
   Object.values(frameUrls).forEach((u) => URL.revokeObjectURL(u));
 });
 
@@ -612,8 +966,9 @@ loadHitmap(props.artifactId);
 </script>
 
 <template>
-  <div class="me-mask" @click.self="emit('close')">
-    <div class="me-panel">
+  <!-- 根节点就是面板本体：外层 <aside class="editor-dock"> 给宽度与左边框，
+       这里只负责把自己填满那一列并整体滚动。 -->
+  <div class="me-panel">
       <header class="me-head">
         <b>✂ 选区改 · {{ title || (isTrack ? "口播 / 素材片" : "图形科普片") }}</b>
         <span class="me-art">在改版本 {{ artifact }}</span>
@@ -640,9 +995,18 @@ loadHitmap(props.artifactId);
                       :class="{ on: b.on, dead: b.dead }" :style="b.style"
                       :title="b.field || '量到了字，但回指不到分镜字段'"><i v-if="b.on">✎</i></span>
               </div>
+              <div v-if="!isTrack" class="me-ovls">
+                <span v-for="l in stageLayers" :key="`ovl${l.k}`" class="me-ovl"
+                      :style="l.style" :title="`叠加层 ${l.k + 1}（${l.type}）：按住拖动定位`"
+                      @pointerdown="onLayerDown($event, curSid, l.k)">
+                  <i>{{ l.k + 1 }} {{ l.type }}</i>
+                </span>
+              </div>
               <div v-if="marquee" class="me-marquee" :style="boxStyle(marquee)"></div>
               <div v-if="!isTrack" class="me-hint">
-                在画面上<b>按住拖</b>框住要改的那块字/图，点一下选单格
+                在画面上<b>按住拖</b>框住要改的那块字/图，点一下选单格 ·
+                金色编号虚框是<b>叠加图层</b>，按住它能直接拖位置（改的是数据，
+                要提交重烧才在画面上看得见）
               </div>
               <div v-else class="me-hint">
                 这一版的段就是「第 s 秒到第 e 秒的一整幅画面」，画面上没有可框的格子：
@@ -661,56 +1025,66 @@ loadHitmap(props.artifactId);
               <span class="me-old">放着的是<b>这一版的原片</b>，改动要提交之后才看得见</span>
             </div>
 
-            <template v-if="!isTrack">
-              <div ref="trackEl" class="me-track">
-                <div v-for="(b, i) in blocks" :key="b.sid" class="me-block"
-                     :class="{ del: b.removed, hot: b.sid === curSid }"
-                     :style="{ flexGrow: b.grow, flexBasis: 0 }"
-                     @pointerdown="onBlockDown($event, b.sid, i)">
-                  <img v-if="b.thumb" :src="b.thumb" alt="" />
-                  <div class="me-bk">
-                    <b>{{ i + 1 }} · {{ b.sid }}</b>
-                    <span>{{ b.sec.toFixed(1) }}s</span>
-                    <em v-if="b.want < b.floor" class="me-floor">拖到 {{ b.floor.toFixed(1) }}s
-                      以下无效：这一镜的时钟归配音</em>
-                  </div>
-                  <button class="me-del" @click.stop="toggleRemove(b.sid)">
-                    {{ b.removed ? "↺ 恢复" : "✕ 删镜" }}</button>
-                  <span class="me-edge" @pointerdown="onResizeDown($event, b.sid)"></span>
-                </div>
-                <div class="me-playline" :style="{ left: headPct }"></div>
-              </div>
-              <div class="me-track-note">
-                块宽 ∝ 秒数 · 拖块身换序 · 拖右边缘改 min_duration_sec · 点块定位到那一镜 ·
-                改完合计约 {{ estTotal.toFixed(1) }}s（原来 {{ (hm.duration || 0).toFixed(1) }}s）
-              </div>
-            </template>
+            <div class="me-zoom">
+              <button class="me-btn" @click="zoomBy(1 / 1.4)">－</button>
+              <button class="me-btn" @click="zoomBy(1.4)">＋</button>
+              <button class="me-btn" :class="{ on: !zoomPx }" @click="zoomPx = 0">铺满</button>
+              <span class="me-zoomtag">{{ pps.toFixed(0) }} px/秒</span>
+              <button class="me-btn" @click="stepFrames(-1)">⏯ 上一帧</button>
+              <button class="me-btn" @click="stepFrames(1)">下一帧 ⏯</button>
+              <span class="me-zoomtag">第 {{ Math.round(cur * fps) }} 帧 ·
+                {{ cur.toFixed(2) }}s / {{ timelineDur.toFixed(2) }}s
+                · 1 帧 = {{ (1000 / fps).toFixed(1) }}ms</span>
+            </div>
 
-            <template v-else>
-              <div class="me-lanes">
+            <div :ref="setScrollEl" class="me-scroll">
+              <div class="me-wide" :style="{ width: `${laneW}px` }">
+                <div class="me-ruler" @pointerdown="onScrubDown">
+                  <span v-for="t in ticks" :key="t.sec" class="me-tick"
+                        :style="{ left: `${t.x}px` }"><i></i><b>{{ fmtSec(t.sec) }}</b></span>
+                  <div class="me-playline" :style="{ left: `${headX}px` }"></div>
+                </div>
                 <div v-for="l in lanes" :key="l.key" class="me-lane">
-                  <div class="me-lanegd">{{ l.label }}<em>{{ l.rows.length }} 段</em></div>
-                  <div class="me-lanebody">
-                    <button v-for="r in l.rows" :key="r.id" class="me-seg"
-                            :class="{ on: r.id === selectedRow, now: rowIsNow(r) }"
-                            :style="barStyle(r)"
-                            :title="`${r.id} · ${r.start_sec}s 起 ${r.sec}s · ${r.label}`"
-                            @click="pickRow(r.id); seek(r.start_sec)">
-                      <img v-if="frameUrls[`${artifact}|${r.id}`]"
-                           :src="frameUrls[`${artifact}|${r.id}`]" alt="" />
-                      <b>{{ r.label }}</b>
-                      <span>{{ r.start_sec.toFixed(1) }}–{{ (r.start_sec + r.sec).toFixed(1) }}s</span>
+                  <div class="me-lanebody" :ref="l.key === 'shots' ? setTrackEl : null">
+                    <div class="me-lanegd">{{ l.label }}<em>{{ l.bars.length }}</em></div>
+                    <button v-for="b in l.bars" :key="`${l.key}-${b.sid}`"
+                            :class="['me-bar', l.key, { hot: b.sid === curSid, now: barIsNow(b),
+                                                       on: isTrack && b.sid === selectedRow,
+                                                       'me-block': l.key === 'shots' }]"
+                            :style="barStyle(b)"
+                            :title="`${b.label} · ${fmtSec(b.start)} 起 ${b.sec.toFixed(2)}s`"
+                            @pointerdown="onBarDown($event, b, l.key)">
+                      <img v-if="b.frame" :src="b.frame" alt="" />
+                      <b>{{ b.label }}</b>
+                      <span>{{ fmtSec(b.start) }}–{{ fmtSec(b.start + b.sec) }}</span>
+                      <em v-if="l.key === 'shots' && effSec(b.sid).want < effSec(b.sid).floor"
+                          class="me-floor">拖到 {{ effSec(b.sid).floor.toFixed(1) }}s 以下无效：
+                        这一镜的时钟归配音</em>
+                      <span v-if="l.key === 'shots'" class="me-del"
+                            @click.stop="toggleRemove(b.sid)">✕</span>
+                      <span v-if="l.key === 'shots'" class="me-edge"
+                            @pointerdown="onResizeDown($event, b.sid)"></span>
                     </button>
-                    <div class="me-playline" :style="{ left: headPct }"></div>
+                    <div class="me-playline" :style="{ left: `${headX}px` }"></div>
                   </div>
                 </div>
               </div>
-              <div class="me-track-note">
-                每行一条轨，块摆在这一段真实的起止秒上 · 点一段就在右侧改它的字段 ·
-                改字与换素材只重烧它压着的窗口。<b>改时长、删段、换序不在这张表里</b>：
-                那会打乱画面与口播句子的对应，请回计划卡重新出片。
-              </div>
-            </template>
+            </div>
+            <div v-if="removedShots.length" class="me-removed">
+              已删待恢复：<button v-for="s in removedShots" :key="s" class="me-ver"
+                                 @click="toggleRemove(s)">↺ {{ s }}</button>
+            </div>
+            <div class="me-track-note">
+              一条秒尺上按真实起止秒铺块，三条 lane 同轴对齐 ·
+              <template v-if="isTrack">
+                点一段就在右侧改它的字段，改字与换素材只重烧它压着的窗口。<b>改时长、删段、
+                换序不在这张表里</b>：那会打乱画面与口播句子的对应，请回计划卡重新出片。
+              </template>
+              <template v-else>
+                拖块身换序 · 拖右边缘改时长 · 点块定位到那一镜 ·
+                改完合计约 {{ estTotal.toFixed(1) }}s（原来 {{ (hm.duration || 0).toFixed(1) }}s）
+              </template>
+            </div>
 
             <div v-if="done" class="me-done">
               <b>✓ 新的一版：{{ done.id }}</b>
@@ -753,6 +1127,21 @@ loadHitmap(props.artifactId);
                 {{ isTrack ? "选中段的字段" : "选中格" }}</button>
               <button v-if="!isTrack" :class="{ on: tab === 'shot' }"
                       @click="tab = 'shot'">整镜 {{ curSid }}</button>
+              <button v-if="!isTrack" :class="{ on: tab === 'style' }"
+                      @click="tab = 'style'">样式 · {{ curSid }}</button>
+            </div>
+
+            <div v-if="syncAsk" class="me-askbar">
+              <b>这次改了卡面样式：同步到哪儿？</b>
+              <span class="me-sub">改动没有落下去——同一套版式（card）的镜有好几个，
+                默认全同步或默认不同步都会替你做决定，所以这里必须问一次。
+                同 card 的镜共用一份样式，别的版式不受影响。</span>
+              <div class="me-line">
+                <button class="me-btn primary" @click="themeScope = 'all'; syncAsk = false">
+                  全片同卡型都改（{{ sameCardCount }} 镜）</button>
+                <button class="me-btn" @click="themeScope = 'single'; syncAsk = false">
+                  只改这一镜（其余留原样）</button>
+              </div>
             </div>
 
             <div class="me-vers">
@@ -790,12 +1179,47 @@ loadHitmap(props.artifactId);
                   {{ isTrack ? g.hits[0].label : `画面上是：${g.hits[0].text}` }}
                 </div>
                 <template v-if="g.pointer">
-                  <input class="me-in"
-                         :type="isTrack && typeof baseValue(g.pointer) === 'number' ? 'number' : 'text'"
-                         :step="isTrack ? '0.01' : undefined"
-                         :value="editValue(g.pointer) ?? ''"
-                         @input="setEdit(g.pointer, coerce(g.pointer, $event.target.value))" />
-                  <div class="me-sub">原值：{{ JSON.stringify(baseValue(g.pointer)) }}</div>
+                  <div class="me-ctl">
+                    <template v-if="ctlKind(g.pointer) === 'color'">
+                      <input class="me-color" type="color" :value="colorHex(g.pointer)"
+                             @input="setEdit(g.pointer, $event.target.value)" />
+                      <input class="me-in" :value="editValue(g.pointer) ?? ''"
+                             @input="setEdit(g.pointer, $event.target.value.trim())" />
+                    </template>
+                    <template v-else-if="ctlKind(g.pointer) === 'range'">
+                      <input class="me-range" type="range"
+                             :min="rangeOf(g.pointer)[0]" :max="rangeOf(g.pointer)[1]"
+                             :step="stepOf(g.pointer)"
+                             :value="Number(shownValue(g.pointer) ?? rangeOf(g.pointer)[0])"
+                             @input="setEdit(g.pointer, Number($event.target.value))" />
+                      <input class="me-in num" type="number" :step="stepOf(g.pointer)"
+                             :value="editValue(g.pointer) ?? ''"
+                             @input="setEdit(g.pointer, Number($event.target.value))" />
+                    </template>
+                    <template v-else-if="ctlKind(g.pointer) === 'enum'">
+                      <select class="me-in" :value="shownValue(g.pointer) ?? ''"
+                              @change="setEdit(g.pointer, $event.target.value)">
+                        <option v-for="o in enumOpts(leafField(g.pointer), shownValue(g.pointer))"
+                                :key="o" :value="o">{{ o }}</option>
+                      </select>
+                    </template>
+                    <input v-else-if="typeof baseValue(g.pointer) === 'number'"
+                           class="me-in" type="number" step="0.01"
+                           :value="editValue(g.pointer) ?? ''"
+                           @input="setEdit(g.pointer, Number($event.target.value))" />
+                    <input v-else class="me-in" :value="editValue(g.pointer) ?? ''"
+                           @input="setEdit(g.pointer, $event.target.value)" />
+                  </div>
+                  <div class="me-sub">
+                    {{ FIELD_LABEL[leafField(g.pointer)] || leafField(g.pointer) }} ·
+                    <template v-if="baseValue(g.pointer) == null">
+                      未设置 · 渲染按默认 {{ JSON.stringify(defaultOf(g.pointer)) }}
+                    </template>
+                    <template v-else>原值：{{ JSON.stringify(baseValue(g.pointer)) }}</template>
+                    <template v-if="ctlKind(g.pointer) === 'range'">
+                      · 可取 {{ rangeOf(g.pointer)[0] }}~{{ rangeOf(g.pointer)[1] }}
+                    </template>
+                  </div>
                 </template>
                 <div v-else class="me-dead">
                   这一格没有可写的字段。要改它请切到「整镜」改对应栏，或重新出片。
@@ -803,7 +1227,7 @@ loadHitmap(props.artifactId);
               </div>
             </div>
 
-            <div v-else-if="!isTrack" class="me-form">
+            <div v-else-if="tab === 'shot'" class="me-form">
               <div class="me-frow">
                 <label>文案 text（字幕与配音同源，改这里等于换这一镜说的话）</label>
                 <textarea class="me-in" rows="2" :value="overrideFor(curSid).text ?? ''"
@@ -863,9 +1287,133 @@ loadHitmap(props.artifactId);
                 请在左边框住后用「选中格」改。</div>
             </div>
 
+            <div v-else-if="tab === 'style'" class="me-form">
+              <div v-if="themeScope" class="me-sub">
+                本次样式同步范围：{{ scopeTag }}
+                <button class="me-mini" @click="themeScope = ''">重新问过</button>
+              </div>
+
+              <div class="me-frow">
+                <label>卡面样式 theme · {{ curSid }}
+                  （版式 {{ (shotBase(curSid) || {}).card || "—" }}：改这一栏就是改这一镜的配色与字号）</label>
+                <div v-for="k in (themeCtl.colors || [])" :key="k" class="me-line">
+                  <span class="me-fl">{{ FIELD_LABEL[k] || k }}</span>
+                  <input class="me-color" type="color" :value="hexOf(curTheme[k])"
+                         @input="themeSet(k, $event.target.value)" />
+                  <input class="me-in" :value="curTheme[k] ?? ''"
+                         @input="themeSet(k, $event.target.value.trim())" />
+                </div>
+                <div v-for="(r, k) in (themeCtl.num || {})" :key="k" class="me-line">
+                  <span class="me-fl">{{ FIELD_LABEL[k] || k }}</span>
+                  <input class="me-range" type="range" :min="r[0]" :max="r[1]" :step="1"
+                         :value="Number(curTheme[k] ?? r[0])"
+                         @input="themeSet(k, Number($event.target.value))" />
+                  <input class="me-in num" type="number" :value="curTheme[k] ?? ''"
+                         @input="themeSet(k, Number($event.target.value))" />
+                </div>
+                <div class="me-line">
+                  <span class="me-fl">字体档</span>
+                  <select class="me-in" :value="curTheme.font ?? ''"
+                          @change="themeSet('font', $event.target.value)">
+                    <option v-for="f in enumOpts('font', curTheme.font)" :key="f" :value="f">
+                      {{ f }}
+                    </option>
+                  </select>
+                </div>
+                <div class="me-sub">底色留空 = 用模板自带的那张纸（不是白色）。
+                  字体只有这三档是真的装了字族，选别的名画面上会静默回落成宋体。</div>
+              </div>
+
+              <div class="me-frow">
+                <label>叠加图层 overlay · {{ curOverlay.length }}/{{ ovlCtl.max_per_shot || 16 }} 层
+                  （画面上那圈带编号的虚框可以<b>按住拖</b>直接定位）</label>
+                <div v-for="(l, k) in curOverlay" :key="k" class="me-lyr">
+                  <div class="me-line">
+                    <b class="me-fl">层 {{ k + 1 }}</b>
+                    <select class="me-in" :value="l.type"
+                            @change="laySet(k, 'type', $event.target.value)">
+                      <option v-for="t in enumOpts('type', l.type)" :key="t" :value="t">{{ t }}</option>
+                    </select>
+                    <button class="me-mini" @click="delLayer(curSid, k)">✕ 删这层</button>
+                  </div>
+                  <input class="me-in" placeholder="文字（text 层用）" :value="l.text ?? ''"
+                         @input="laySet(k, 'text', $event.target.value)" />
+                  <input class="me-in" placeholder="素材引用 ref（image 层用）" :value="l.ref ?? ''"
+                         @input="laySet(k, 'ref', $event.target.value)" />
+                  <div class="me-grid">
+                    <div v-for="b in ['x', 'y', 'w', 'h']" :key="b" class="me-gcell">
+                      <label>盒 {{ b }} {{ FIELD_LABEL[b] }}
+                        （{{ rg(`box.${b}`)[0] }}~{{ rg(`box.${b}`)[1] }}）</label>
+                      <input class="me-in" type="number" step="0.01"
+                             :min="rg(`box.${b}`)[0]" :max="rg(`box.${b}`)[1]"
+                             :value="l.box?.[b] ?? ''"
+                             @input="laySet(k, `box.${b}`, Number($event.target.value))" />
+                    </div>
+                  </div>
+                  <div v-for="c in (ovlCtl.style_colors || [])" :key="c" class="me-line">
+                    <span class="me-fl">{{ FIELD_LABEL[c] || c }}</span>
+                    <input class="me-color" type="color" :value="hexOf(l.style?.[c])"
+                           @input="laySet(k, `style.${c}`, $event.target.value)" />
+                    <input class="me-in" :value="l.style?.[c] ?? ''"
+                           @input="laySet(k, `style.${c}`, $event.target.value.trim())" />
+                  </div>
+                  <div v-for="(r, s) in (ovlCtl.style_num || {})" :key="s" class="me-line">
+                    <span class="me-fl">{{ FIELD_LABEL[s] || s }}</span>
+                    <input class="me-range" type="range" :min="r[0]" :max="r[1]"
+                           :step="s === 'size' ? 1 : (r[1] - r[0] <= 1 ? 0.05 : 1)"
+                           :value="Number(l.style?.[s] ?? r[0])"
+                           @input="laySet(k, `style.${s}`, Number($event.target.value))" />
+                    <input class="me-in num" type="number" :value="l.style?.[s] ?? ''"
+                           @input="laySet(k, `style.${s}`, Number($event.target.value))" />
+                  </div>
+                  <div class="me-grid">
+                    <div class="me-gcell">
+                      <label>对齐</label>
+                      <select class="me-in" :value="l.style?.align ?? ''"
+                              @change="laySet(k, 'style.align', $event.target.value)">
+                        <option v-for="o in enumOpts('align', l.style?.align)" :key="o" :value="o">
+                          {{ o }}
+                        </option>
+                      </select>
+                    </div>
+                    <div class="me-gcell">
+                      <label>动效</label>
+                      <select class="me-in" :value="l.anim ?? ''"
+                              @change="laySet(k, 'anim', $event.target.value)">
+                        <option v-for="o in enumOpts('anim', l.anim)" :key="o" :value="o">{{ o }}</option>
+                      </select>
+                    </div>
+                    <div class="me-gcell">
+                      <label>层级</label>
+                      <select class="me-in" :value="l.z ?? 'front'"
+                              @change="laySet(k, 'z', $event.target.value)">
+                        <option v-for="o in enumOpts('z', l.z)" :key="o" :value="o">{{ o }}</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="me-line">
+                    <span class="me-fl">起 (ms)</span>
+                    <input class="me-range" type="range" :min="rg('at_ms')[0]" :max="rg('at_ms')[1]"
+                           :step="10" :value="Number(l.at_ms ?? 0)"
+                           @input="laySet(k, 'at_ms', Number($event.target.value))" />
+                    <span class="me-fl">动效时长</span>
+                    <input class="me-range" type="range" :min="rg('dur_ms')[0]" :max="rg('dur_ms')[1]"
+                           :step="10" :value="Number(l.dur_ms ?? 600)"
+                           @input="laySet(k, 'dur_ms', Number($event.target.value))" />
+                  </div>
+                </div>
+                <button class="me-mini" @click="addLayer(curSid)">＋ 加一层</button>
+                <div class="me-note">叠加层是画面上自由加的那一层：文字、色块、线、图都能加，
+                  也能盖在版式自己画的字上面。素材引用要写成这一版认得的 ref
+                  （比如已入库的素材号），写不出来的路径会被闸门退回。</div>
+              </div>
+            </div>
+
             <div class="me-submit">
+              <button class="me-btn" :disabled="!focusSid" @click="askAbout">
+                💬 带着这个选区去问</button>
               <div v-if="busy" class="me-prog">
-                <div class="me-bar"><i :style="{ width: `${progress.percent}%` }"></i></div>
+                <div class="me-progressbar"><i :style="{ width: `${progress.percent}%` }"></i></div>
                 <span>{{ progress.status }} · {{ progress.stage || "—" }} · {{ progress.percent }}%</span>
               </div>
               <button class="me-btn primary big" :disabled="!dirty || !!busy" @click="submit">
@@ -880,17 +1428,16 @@ loadHitmap(props.artifactId);
           </aside>
         </div>
       </template>
-    </div>
   </div>
 </template>
 
 <style scoped>
-.me-mask { position: fixed; inset: 0; z-index: 60; background: rgba(38, 34, 28, .55);
-  display: flex; align-items: center; justify-content: center; padding: 18px; }
-.me-panel { background: var(--paper); border: 1px solid var(--line); border-radius: 10px;
-  width: min(1240px, 100%); max-height: 96vh; overflow: auto;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, .28); }
-.me-head { display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+/* 右侧停靠栏：宽度和左边框归父级 aside，这里只填满那一列并自己滚动。
+   container-type 让下面的表单栏按面板**实宽**换列——停靠栏比原来的全屏弹窗窄，
+   塞不下「画面 + 400px 表单」两栏时把表单挪到画面下面，而不是把画面挤没。 */
+.me-panel { background: var(--paper); width: 100%; flex: 1; min-height: 0;
+  overflow: auto; container-type: inline-size; }
+.me-head { display: flex; align-items: center; gap: 12px; padding: 12px 16px; flex-wrap: wrap;
   border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--paper); z-index: 2; }
 .me-head b { font-family: var(--serif); font-size: 16px; }
 .me-art { font-size: 12px; color: var(--ink-soft); }
@@ -898,6 +1445,7 @@ loadHitmap(props.artifactId);
 .me-x { border: 1px solid var(--line); background: transparent; border-radius: 6px;
   padding: 4px 10px; cursor: pointer; font-size: 12px; }
 .me-body { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 16px; padding: 16px; }
+@container (max-width: 900px) { .me-body { grid-template-columns: minmax(0, 1fr); } }
 .me-left { min-width: 0; }
 .me-stage { position: relative; background: #141210; border-radius: 8px; overflow: hidden;
   max-height: 54vh; margin: 0 auto; cursor: crosshair; touch-action: none; }
@@ -918,44 +1466,50 @@ loadHitmap(props.artifactId);
 .me-ctrl { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
 .me-time { font-size: 12px; color: var(--ink-soft); }
 .me-old { font-size: 11px; color: var(--ink-soft); margin-left: auto; }
-.me-track { position: relative; display: flex; gap: 4px; height: 78px; padding: 6px;
-  border: 1px solid var(--line); border-radius: 8px; background: var(--paper-deep);
-  touch-action: none; user-select: none; }
-.me-block { position: relative; min-width: 46px; border: 1px solid var(--line);
-  border-radius: 6px; background: #fff; overflow: hidden; cursor: grab; }
-.me-block.hot { border-color: var(--gold); }
-.me-block.del { opacity: .4; filter: grayscale(1); }
-.me-block img { position: absolute; inset: 0; width: 100%; height: 100%;
-  object-fit: cover; opacity: .55; }
-.me-bk { position: relative; padding: 3px 6px; font-size: 11px; line-height: 1.3; }
-.me-bk b { display: block; font-family: var(--serif); }
-.me-bk span { color: var(--ink-soft); }
+.me-zoom { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 8px 0 4px; }
+.me-zoomtag { font-size: 11px; color: var(--ink-soft); }
+.me-btn.on { border-color: var(--vermilion); color: var(--vermilion); }
+.me-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--paper-deep); user-select: none; }
+.me-wide { position: relative; display: grid; gap: 3px; padding: 2px 0 6px; }
+.me-ruler { position: relative; height: 20px; cursor: ew-resize; touch-action: none; }
+.me-tick { position: absolute; top: 0; height: 20px; border-left: 1px solid var(--line); }
+.me-tick b { position: absolute; left: 3px; top: 1px; font-size: 10px; font-weight: 400;
+  color: var(--ink-soft); white-space: nowrap; }
+.me-lane { position: relative; }
+.me-lanebody { position: relative; height: 42px; border: 1px solid var(--line);
+  border-radius: 6px; background: rgba(255, 255, 255, .5); overflow: hidden; touch-action: none; }
+/* 导标浮在块上而不是占一列：占列会把整条 lane 相对秒尺右移，块就对不上刻度了。 */
+.me-lanegd { position: absolute; left: 3px; top: 2px; z-index: 3; font-size: 10px;
+  color: var(--ink-soft); background: rgba(255, 255, 255, .82); border-radius: 3px;
+  padding: 0 4px; pointer-events: none; }
+.me-lanegd em { font-style: normal; margin-left: 3px; opacity: .7; }
+.me-bar { position: absolute; top: 3px; bottom: 3px; padding: 1px 5px; border: 1px solid var(--line);
+  border-radius: 4px; background: #fff; overflow: hidden; cursor: pointer; text-align: left;
+  font: inherit; line-height: 1.25; white-space: nowrap; }
+.me-bar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
+  opacity: .35; }
+.me-bar b, .me-bar span { position: relative; display: block; font-size: 10px; }
+.me-bar b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.me-bar span { color: var(--ink-soft); }
+.me-bar.now, .me-bar.hot { border-color: var(--gold); }
+.me-bar.on { border-color: var(--vermilion); background: rgba(200, 64, 31, .12); }
+.me-bar.voice, .me-bar.audio_events { background: rgba(28, 110, 232, .10); }
+.me-bar.subtitles { background: rgba(31, 157, 85, .12); }
+.me-bar.overlay_events { background: rgba(123, 63, 191, .10); }
+.me-bar.bgm { background: rgba(185, 138, 47, .16); }
+.me-block { cursor: grab; }
 .me-floor { display: block; font-style: normal; font-size: 10px; color: var(--vermilion); }
 .me-del { position: absolute; right: 2px; bottom: 2px; font-size: 10px; padding: 1px 4px;
   border: 1px solid var(--line); background: #fff; border-radius: 4px; cursor: pointer; }
-.me-edge { position: absolute; right: -3px; top: 0; width: 8px; height: 100%;
-  cursor: ew-resize; }
+.me-edge { position: absolute; right: 0; top: 0; width: 8px; height: 100%; cursor: ew-resize; }
 .me-edge:hover { background: rgba(200, 64, 31, .3); }
 .me-playline { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--vermilion);
   pointer-events: none; }
+.me-removed { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; margin-top: 6px;
+  font-size: 11px; color: var(--vermilion); }
 .me-track-note { font-size: 11px; color: var(--ink-soft); margin: 6px 0 0; }
 .me-track-note b { color: var(--vermilion); }
-.me-lanes { display: grid; gap: 4px; }
-.me-lane { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 6px; align-items: center; }
-.me-lanegd { font-size: 11px; color: var(--ink-soft); text-align: right; }
-.me-lanegd em { font-style: normal; display: block; font-size: 10px; opacity: .75; }
-.me-lanebody { position: relative; height: 34px; border: 1px solid var(--line);
-  border-radius: 6px; background: var(--paper-deep); overflow: hidden; }
-.me-seg { position: absolute; top: 2px; bottom: 2px; padding: 0 4px; border: 1px solid var(--line);
-  border-radius: 4px; background: #fff; overflow: hidden; cursor: pointer; text-align: left;
-  font: inherit; line-height: 1.25; white-space: nowrap; }
-.me-seg img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
-  opacity: .35; }
-.me-seg b, .me-seg span { position: relative; display: block; font-size: 10px; }
-.me-seg b { font-weight: 600; text-overflow: ellipsis; overflow: hidden; }
-.me-seg span { color: var(--ink-soft); }
-.me-seg.now { border-color: var(--gold); }
-.me-seg.on { border-color: var(--vermilion); background: rgba(200, 64, 31, .12); }
 .me-done { margin-top: 12px; border: 1px solid var(--gold); border-radius: 8px; padding: 10px;
   background: rgba(185, 138, 47, .08); font-size: 12px; display: grid; gap: 6px; }
 .me-done-act { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -992,6 +1546,7 @@ loadHitmap(props.artifactId);
 .me-form { display: grid; gap: 10px; }
 .me-frow label { display: block; font-size: 11px; color: var(--ink-soft); margin-bottom: 3px; }
 .me-line { display: flex; gap: 5px; align-items: center; margin-bottom: 4px; }
+.me-line .me-in { width: auto; flex: 1 1 auto; min-width: 0; }
 .me-mini { border: 1px dashed var(--line); background: transparent; border-radius: 5px;
   font-size: 11px; padding: 2px 7px; cursor: pointer; color: var(--ink-soft); }
 .me-submit { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px;
@@ -1002,9 +1557,29 @@ loadHitmap(props.artifactId);
 .me-btn.big { padding: 9px 12px; font-size: 13px; }
 .me-btn:disabled { opacity: .45; cursor: not-allowed; }
 .me-prog { font-size: 11px; color: var(--ink-soft); }
-.me-bar { height: 6px; border-radius: 4px; background: var(--paper-deep);
+.me-progressbar { height: 6px; border-radius: 4px; background: var(--paper-deep);
   overflow: hidden; margin-bottom: 4px; }
-.me-bar i { display: block; height: 100%; background: var(--gold); transition: width .3s; }
+.me-progressbar i { display: block; height: 100%; background: var(--gold); transition: width .3s; }
+.me-ctl { display: flex; gap: 6px; align-items: center; }
+.me-ctl .me-in { width: auto; flex: 1 1 auto; min-width: 0; }
+.me-ctl .me-in.num { flex: 0 0 78px; width: 78px; }
+.me-color { width: 34px; height: 27px; padding: 0; border: 1px solid var(--line);
+  border-radius: 5px; background: #fff; cursor: pointer; flex: 0 0 auto; }
+.me-range { flex: 1 1 90px; min-width: 70px; }
+.me-in.num { flex: 0 0 78px; width: 78px; }
+.me-fl { font-size: 11px; color: var(--ink-soft); flex: 0 0 72px; }
+.me-lyr { border: 1px solid var(--line); border-radius: 6px; padding: 7px; margin-bottom: 8px;
+  display: grid; gap: 5px; background: var(--paper-deep); }
+.me-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+.me-gcell label { display: block; font-size: 10px; color: var(--ink-soft); margin-bottom: 2px; }
+.me-askbar { border: 1px solid var(--vermilion); border-radius: 8px; padding: 8px; margin-bottom: 8px;
+  background: rgba(200, 64, 31, .07); display: grid; gap: 5px; font-size: 12px; }
+.me-ovls { position: absolute; inset: 0; pointer-events: none; }
+.me-ovl { position: absolute; border: 1px dashed var(--gold); border-radius: 2px;
+  pointer-events: auto; cursor: move; }
+.me-ovl:hover { background: rgba(185, 138, 47, .18); }
+.me-ovl i { position: absolute; left: 0; top: -13px; font-size: 10px; font-style: normal;
+  color: var(--gold); }
 .me-note { font-size: 11px; color: var(--ink-soft); }
 .me-note.pad { padding: 14px 16px; }
 .me-err { font-size: 12px; color: var(--vermilion); padding: 14px 16px; }

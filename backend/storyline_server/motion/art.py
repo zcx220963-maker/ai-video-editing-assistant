@@ -81,13 +81,16 @@ ALLOWED_ATTRS = frozenset({
 #: 声明式动画的取值。每种都在 templates._JS 的 apply(t) 里有一段真实实现。
 ANIM_KINDS = (
     "fade", "rise", "slide-x", "draw", "grow-x", "grow-y", "pop", "count",
-    "wipe", "orbit", "pulse", "pan",
+    "wipe", "orbit", "pulse", "pan", "pose",
 )
 
 ANIM_LABELS = {
     "fade": "淡入", "rise": "上浮入场", "slide-x": "侧向滑入", "draw": "描出一条线",
     "grow-x": "横向长出来", "grow-y": "纵向长出来", "pop": "弹出", "count": "数字滚动",
     "wipe": "擦除显现", "orbit": "绕圈", "pulse": "明暗呼吸", "pan": "横移漂移",
+    # pose 不是入场动效而是**轮播**：它让「按时刻换一张画面」写成声明式（逐帧角色动画），
+    # 区间走完就退场，所以它既不属于离散入场、也不属于永不停止的连续动画。
+    "pose": "在 at~at+hold 区间内显示（关键帧轮播，hold 省略则一直显示）",
 }
 
 #: 这几种**永不停止**：相位由 (t − at)/period 算，最后一帧也和第一帧不同。
@@ -99,6 +102,7 @@ CONTINUOUS_ANIMS = frozenset({"orbit", "pulse", "pan"})
 _ANIM_ATTRS: dict[str, tuple[float, float]] = {
     "data-at": (0.0, 180000.0),
     "data-dur": (1.0, 20000.0),
+    "data-hold": (0.0, 180000.0),
     "data-dist": (-4000.0, 4000.0),
     "data-period": (200.0, 60000.0),
     "data-count-to": (-1e12, 1e12),
@@ -247,7 +251,7 @@ def _render_attr(name: str, value: str, errors: list[str], *, root: bool = False
                 return None
             return f'{NUM_UNIT_ATTR}="{html.escape(unit, quote=True)}"' if unit else None
         errors.append(f"丢掉了未登记的属性 {low}——动画只用 data-anim / -at / -dur / "
-                      f"-dist / -period / -count-to / -dp / -num-unit")
+                      f"-hold / -dist / -period / -count-to / -dp / -num-unit")
         return None
     if low == "href":
         target = value.strip()
@@ -408,6 +412,7 @@ def anim_fragments(art_html: str) -> list[dict[str, Any]]:
         found.append({"tag": m.group(1), "anim": kind,
                       "at_ms": _pick("at", DEFAULT_ANIM_AT_MS),
                       "dur_ms": _pick("dur", DEFAULT_ANIM_DUR_MS),
+                      "hold_ms": _pick("hold", 0.0),
                       "period_ms": _pick("period", DEFAULT_PERIOD_MS)})
     return found
 
@@ -417,14 +422,16 @@ def anim_end_ms(art_html: str, duration_ms: float) -> float | None:
 
     * 连续动画（``orbit``/``pulse``/``pan``）永不停止 → 返回 ``duration_ms``，
       整镜都当活帧截；否则会截出一个「动到一半冻住」的镜头；
-    * 离散动画取 ``max(at + dur)``。
+    * 离散动画取 ``max(at + max(dur, hold))``：入场动效看 ``dur``，``pose`` 这类
+      轮播看 ``hold``。漏了 hold，一轮姿势播到一半就被末帧冻住。
     """
     items = anim_fragments(art_html)
     if not items:
         return None
     if any(i["anim"] in CONTINUOUS_ANIMS for i in items):
         return duration_ms
-    return max(min(i["at_ms"] + i["dur_ms"], duration_ms) for i in items)
+    return max(min(i["at_ms"] + max(i["dur_ms"], i["hold_ms"]), duration_ms)
+               for i in items)
 
 
 def anim_table() -> str:

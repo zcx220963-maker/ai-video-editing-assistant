@@ -270,6 +270,22 @@ class Datastore(ABC):
     @abstractmethod
     async def _do_max(self, meta: Any, conds: list[Cond], column: str) -> Any: ...
 
+    async def distinct_values(self, table: str, column: str, *,
+                              where: Where = None) -> list[Any]:
+        """某列的去重取值——同样是下推聚合，不把整表（含 jsonb 正文）搬回 Python。
+
+        为什么开这一个：按会话回收要列「库里出现过哪些 session_id」，用 ``select``
+        全表等于每次开机把所有 artifacts 的 payload 拖一遍；会话数量是个位数，
+        去重取值才是它本来的大小。语义：忽略 NULL，返回值有序（结果稳定才好写断言）。
+        """
+        m = self.meta(table)
+        m.check_columns([column])
+        return await self._do_distinct(m, self._conds(m, where), column)
+
+    @abstractmethod
+    async def _do_distinct(self, meta: Any, conds: list[Cond],
+                           column: str) -> list[Any]: ...
+
     async def next_id(self, sequence: str) -> int:
         """取下一个序列值：序列名一律照 schema.sql（tasks.id ← task_seq）。"""
         if sequence not in self.sequences:
@@ -374,6 +390,12 @@ class MemoryDatastore(Datastore):
         vals = [r.get(column) for r in self._rows[meta.name]
                 if match(r, conds) and r.get(column) is not None]
         return max(vals) if vals else None
+
+    async def _do_distinct(self, meta: Any, conds: list[Cond],
+                           column: str) -> list[Any]:
+        await self.ping()
+        return sorted({r.get(column) for r in self._rows[meta.name]
+                       if match(r, conds) and r.get(column) is not None})
 
     @staticmethod
     def _eq_key(conds: list[Cond]) -> tuple[str, tuple] | None:
@@ -651,6 +673,17 @@ class PgDatastore(Datastore):
         w, params = self._where(meta, conds)
         sql = (f"SELECT MAX({safe_ident(column)}) AS v FROM {safe_ident(meta.name)}{w}")
         return await self._scalar(sql, params)
+
+    async def _do_distinct(self, meta: Any, conds: list[Cond],
+                           column: str) -> list[Any]:
+        """下推到 SQL 的 DISTINCT：同上，只回那一列的去重值。"""
+        w, params = self._where(meta, conds)
+        col = safe_ident(column)
+        clause = (f"{w} AND {col} IS NOT NULL" if w
+                  else f" WHERE {col} IS NOT NULL")
+        sql = (f"SELECT DISTINCT {col} AS v FROM {safe_ident(meta.name)}{clause} "
+               f"ORDER BY 1")
+        return [r["v"] for r in await self._run(sql, params)]
 
     # ---- SQL 拼装：标识符白名单 + 值全绑定；jsonb 显式 CAST ----
 

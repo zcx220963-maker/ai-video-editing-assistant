@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from agent_framework.orchestration import ArtifactStore, NodeState, _safe
+from agent_framework.render_library import register_render
 from agent_framework.storage import to_ref
 
 from ..motion import hitmap as mhit
@@ -112,8 +113,9 @@ class RenderMotionVideoNode(StoryNode):
             "description": "分镜 spec（plan_motion 的产物；缺省从 Store 的 plan_motion 取，"
                            "也可按下面的结构手写）。**别写每镜 duration_sec**——有旁白时"
                            "时钟归声音，写了只被当作下限参考。"
-                           "aspect/fps/narration/voice/rate/subtitle_mode 也能走下面的顶层开关，"
-                           "顶层的优先（用户在计划卡上勾的那一份）",
+                           "aspect/fps/narration/voice/rate/subtitle_mode/texture 也能走下面的"
+                           "顶层开关，顶层的优先（用户在计划卡上勾的那一份）。"
+                           "texture 是整片一层的母带滤镜，换它只重过一遍母带，不重烧镜头",
         },
         **mspec.knob_props(),
         "bgm": {
@@ -187,6 +189,47 @@ class RenderMotionVideoNode(StoryNode):
             raise ValueError(f"没有这条配乐素材：{value}")
         return to_ref(got[0]["object_key"])
 
+    async def _asset_ref(self, state: NodeState, value: str) -> str:
+        """素材引用 → 能取到字节的 ``obj:`` 引用（``material_id`` 也收）。"""
+        if value.startswith("obj:"):
+            return value
+        got, _denied = await self.storage.materials.resolve(
+            [value], user_id=state.user_id, conv_id=state.conversation_id or None)
+        if not got:
+            raise ValueError(f"没有这条素材：{value}")
+        return to_ref(got[0]["object_key"])
+
+    async def _overlay_assets(self, state: NodeState,
+                              spec: dict[str, Any]) -> dict[str, Path]:
+        """各镜叠加图片层的 ref → 本机文件（``{原始 ref: 路径}``，浏览器只吃路径）。
+
+        取不到字节就**整批在开渲之前拒收**，不等渲染到那一镜才发现：一张铺满画面的
+        背景层取不到图，用户看到的还是原来那张纸，而像素已经烧完、缓存也已经按这一镜
+        钉上——那一版片子会一直带着这个「改了却没变」的假象。
+        归属交给 ``materials.resolve`` 判：别人会话里的 material_id 一律算不存在。
+        """
+        want: list[str] = []
+        for shot in spec.get("shots") or []:
+            for lay in (shot.get("overlay") or []):
+                if isinstance(lay, dict) and str(lay.get("type")) == "image":
+                    ref = str(lay.get("ref") or "")
+                    if ref and ref not in want:
+                        want.append(ref)
+        out: dict[str, Path] = {}
+        bad: list[str] = []
+        for ref in want:
+            try:
+                out[ref] = await self._local(
+                    state, await self._asset_ref(state, ref), "motion", "ovl")
+            except Exception as exc:      # noqa: BLE001 - 一次说完缺哪几张，别挤牙膏
+                bad.append(f"{ref}（{type(exc).__name__}: {str(exc)[:120]}）")
+        if bad:
+            raise ValueError(
+                "叠加图层里的图片取不到字节：" + "、".join(bad)
+                + "——ref 写素材库的 material_id 或 obj: 引用；"
+                  "换一张能取到的图，或去掉这一层")
+        return out
+
     async def _render(self, state: NodeState, spec: dict[str, Any],
                       errors: list[str], *, target: float | None, bgm_ref: str,
                       sess: str, artifact: str, jobs: Any,
@@ -224,6 +267,7 @@ class RenderMotionVideoNode(StoryNode):
                     "或去掉 bgm 出纯人声片") from exc
 
         work = self._work(state, "motion")
+        assets = await self._overlay_assets(state, spec)
         total = max(1, len(spec.get("shots") or []))
         probe = _JobProgress(jobs, asyncio.get_running_loop(), sess, artifact, attempt)
         done = {"n": 0, "pct": -1}
@@ -239,7 +283,7 @@ class RenderMotionVideoNode(StoryNode):
         try:
             out = await motion.render_motion(
                 spec, providers=self.providers, work=work, bgm=bgm_path,
-                progress=on_event,
+                progress=on_event, assets=assets,
                 cache=_ObjectShotCache(self.storage.workspace, sess))
             await probe.drain()           # 迟到进度不能盖掉后面的终态
             frames, frame_reason = await self._spotcheck(state, out)
@@ -263,6 +307,17 @@ class RenderMotionVideoNode(StoryNode):
                               hitmap_ref=hits_key,
                               shot_frames=shot_frames,
                               hitmap_errors=list(out.get("hitmap_errors") or []))
+        # 成片入素材库：这条路径没有素材，产物就是这条片子的唯一交付物，
+        # 不入库就只是「会话删掉一起没」的临时字节。入库失败只补一句说明——
+        # 像素已经烧出来了，记账失败不该把一次成功渲染改判成失败。
+        mat_id, mat_note = await register_render(
+            self.storage, sess, object_key,
+            title=str(spec.get("title") or "未命名"),
+            duration_sec=float(out["duration"]))
+        if mat_id:
+            result["material_id"] = mat_id
+        if mat_note:
+            result.setdefault("notes", []).append(mat_note)
         await jobs.succeed(sess, artifact, object_key, float(out["duration"]),
                            result=result, attempt=attempt or None)
         return result
@@ -326,6 +381,9 @@ class RenderMotionVideoNode(StoryNode):
             "schema": "motion-hitmap/1",
             "spec": spec,
             "spec_fingerprint": mhit.fingerprint(spec),
+            "hit_mode": "space",             # 与口播链的 "track" 相对：这条有像素命中层
+            "editable_fields": {"shot": list(mpatch.EDITABLE_SHOT_FIELDS)},
+            "controls": mspec.form_controls(),
             "width": int(out["width"]), "height": int(out["height"]),
             "fps": float(out["fps"]), "duration": float(out["duration"]),
             "settle_unit": "shot_relative_ms",
@@ -436,6 +494,20 @@ class RenderMotionVideoNode(StoryNode):
                 proof="降级会逐镜记在 motion_ledger[].degraded" if not degraded
                 else "；".join(degraded[:3])),
         ]
+        texture = str(out.get("texture") or "none")
+        chain = str(out.get("texture_filter") or "")
+        if texture == "none":
+            evidence.append(_ev("整片质感：没加（母带原样直出）", "machine",
+                                verified=True, proof="texture=none 时那一趟直接 -c copy 跳过"))
+        else:
+            evidence.append(_ev(
+                f"整片质感：{texture} 档"
+                + (f"，实际消费的滤镜链 {chain[:70]}…" if chain else "，但滤镜链是空的"),
+                "machine", verified=bool(chain),
+                proof="质感挂在母带那一层（与 BGM 同层）：换档只重过一遍母带，不重烧任何镜头；"
+                      "串跑没跑得出这行账，好不好看仍是人眼的事"
+                if chain else f"选了 {texture} 却没拿到滤镜串——成片是原片，请核对 "
+                              f"render.TEXTURE_FILTERS 里有没有这一档"))
         if frames:
             evidence.append(_ev(
                 f"抽帧实测不黑屏：取样点 {frames['at']}s 的亮度 "
@@ -495,6 +567,7 @@ class RenderMotionVideoNode(StoryNode):
             "title": spec.get("title") or "未命名",
             "style": spec.get("style"),
             "mix_mode": out["mix_mode"],
+            "texture": str(out.get("texture") or "none"),
             "frames_total": out["frames_total"],
             "motion_ledger": ledger,
             "hitmap": hitmap_ref,
@@ -539,7 +612,9 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
         "必须带 base_artifact_id，且它自带的命中表指纹要与所改的那版分镜一致；"
         "不一致就是「拿着旧表改新片」，会被拒收，此时唯一出路是重新出片（顺带重新量表）。"
         "画幅/帧率/音色/语速/字幕形态不在本工具范围内：改它们等于每一镜都要重烧，"
-        "那是重新出片而不是局部改。改完的清单照旧过分镜闸门（版式空壳、高亮词不是文案子串、"
+        "那是重新出片而不是局部改——质感与配乐是例外，两者都挂在母带那一层，"
+        "换它们一镜都不重烧，所以本工具收 texture 与 bgm。"
+        "改完的清单照旧过分镜闸门（版式空壳、高亮词不是文案子串、"
         "这张卡不读的 visual 死键、枚举越界都会带镜号退回，且不烧像素）。"
         "渲染是分钟级：返回 status=queued/running 时须继续调 render_status"
         "（同 artifact_id）直到 done/failed")
@@ -596,6 +671,12 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
             "description": "换配乐：material_id 或 obj: 引用（覆盖这一版 spec 里的 bgm.ref）。"
                            "配乐不进按镜缓存键，所以换它只重走混音，一镜都不重烧",
         },
+        "texture": {
+            "type": "string", "enum": list(mspec.TEXTURES),
+            "description": "换整片质感（覆盖这一版 spec 里的 texture）。与配乐同理："
+                           "它挂在母带那一层、不进按镜缓存键，所以换档**一镜都不重烧**，"
+                           "只重过一遍滤镜；不传就沿用 base 那一版的档",
+        },
         "target_duration_sec": {
             "type": "number",
             "description": "目标秒数。**缺省沿用 base 那一版当初的承诺值**（从它的渲染任务行读），"
@@ -625,6 +706,11 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
             shot_sets=inputs.get("shot_sets") or (),
             remove_shots=inputs.get("remove_shots") or (),
             reorder=inputs.get("reorder") or ())
+        # 质感在这一层覆盖，与 bgm 的「传了才改口」同一条口径：它不进按镜缓存键，
+        # 覆盖它不会让任何一镜重烧，所以「换一档看看」也算局部改。
+        want_texture = str(inputs.get("texture") or "").strip()
+        if want_texture:
+            patched["texture"] = want_texture
         # 补丁后的分镜照样过出片那道闸门：局部改不是「免检通道」，
         # 改完照样可能把高亮词改到文案外面、把图示值写成中文。
         spec, errors = mspec.validate_spec(patched)

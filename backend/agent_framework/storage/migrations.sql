@@ -3,9 +3,10 @@
 -- 每条都用 DROP IF EXISTS + 重建，跑两遍结果一致。B5 的 run_migrate.py 接管后本文件并入迁移。
 
 -- materials.origin 增 'url'：按链接取料（/fetch_media、fetch_media 工具）新增的入料来源。
+-- 增 'render'：渲染终态的成片登记回素材库（归用户，不随对话删除）——与 schema.sql 那份同步。
 ALTER TABLE materials DROP CONSTRAINT IF EXISTS materials_origin_check;
 ALTER TABLE materials ADD CONSTRAINT materials_origin_check
-  CHECK (origin IN ('upload','library','bgm','url'));
+  CHECK (origin IN ('upload','library','bgm','url','render'));
 
 -- render_jobs 增 result jsonb：渲染改成「提交 + 轮询」后，终态产物要能在任意实例、
 -- 进程重启之后照样重建出来（此前它只活在一次阻塞调用的返回值里）。
