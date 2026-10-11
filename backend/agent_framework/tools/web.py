@@ -14,13 +14,16 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import ipaddress
 import json
 import re
 import socket
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import zlib
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Callable
@@ -111,22 +114,74 @@ def _ascii_url(url: str) -> str:
     return urllib.parse.quote(url, safe=":/?&=%#[]@!$'()*+,;~-_.")
 
 
+def _decode_body(raw: bytes, encoding: str, limit: int) -> tuple[bytes, bool]:
+    """按 Content-Encoding 还原字节 → (正文, 是否因预算被截)。
+
+    **urllib 不解压**（它只负责传输，不像 requests 那样替你解码）。B 站这类 CDN 无视
+    ``Accept-Encoding: identity`` 照发 gzip，于是抓回来的是压缩流本身：里面必然有 0x00
+    字节，`decode(errors="replace")` 把它们原样留成 U+0000，工具文本再进 jsonb 列时
+    ``json.dumps`` 转成 ``\\u0000``，PG 直接报「unsupported Unicode escape sequence」——
+    界面上一格乱码 + 一句 PG 失败，其实是这一处漏解压的下游症状。
+    """
+    enc = (encoding or "").split(";")[0].strip().lower()
+    if not raw or enc not in ("gzip", "x-gzip", "deflate", "br"):
+        return raw, False
+    if enc == "br":
+        try:
+            import brotli  # noqa: PLC0415 - 可选依赖，缺了宁可报错也不喂乱码
+        except ImportError as e:
+            raise RuntimeError("响应是 brotli(br) 压缩，本镜像没有 brotli 解码器") from e
+        d = brotli.Decompressor()
+        out = d.process(raw)
+        return out[:limit], len(out) > limit
+    # gzip 是 16+MAX_WBITS 的 zlib 流；裸 deflate 有些服务端不给 zlib 套壳，两种都试。
+    variants = ((16 + zlib.MAX_WBITS),) if enc in ("gzip", "x-gzip") \
+        else (zlib.MAX_WBITS, -zlib.MAX_WBITS)
+    for wbits in variants:
+        dec = zlib.decompressobj(wbits)
+        try:
+            out = dec.decompress(raw, limit) + dec.flush()
+        except zlib.error:
+            continue
+        # 截断的流（读取时按预算切过）不报错，只是 eof 为假——照实标出来。
+        return out, not dec.eof
+    raise RuntimeError(f"响应声明 Content-Encoding={enc}，但两种 deflate 壳都解不开")
+
+
+def _read_budget(fp, max_bytes: int, encoding: str) -> _Fetched:
+    """从响应（或错误页）读至多 max_bytes 字节，读完就解压。"""
+    raw = fp.read(max_bytes + 1)
+    over = len(raw) > max_bytes
+    body, dec_trunc = _decode_body(raw[:max_bytes], encoding, max_bytes)
+    return _Fetched(getattr(fp, "status", None) or 0, "", body, over or dec_trunc)
+
+
 def default_transport(url: str, max_bytes: int, timeout: float, *,
                       headers: dict[str, str] | None = None,
                       data: bytes | None = None) -> _Fetched:
-    """同步抓取（供 to_thread 调用）：读至多 max_bytes 字节。
+    """同步抓取（供 to_thread 调用）：读至多 max_bytes 字节（按**解压后**的正文计）。
 
     ``headers``/``data`` 是给带 key 的检索 API 用的（它们要 ``X-Subscription-Token``、
     ``Authorization``、POST JSON）——位置参数仍是 (url, max_bytes, timeout)，
     注入用的假 transport 不必认识这两个新参数。
     """
-    hdrs = {"User-Agent": USER_AGENT, **(headers or {})}
+    hdrs = {"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate",
+            **(headers or {})}
     req = urllib.request.Request(_ascii_url(url), headers=hdrs, data=data)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (scheme 已校验)
-        ctype = resp.headers.get("Content-Type", "")
-        data_out = resp.read(max_bytes + 1)
-        truncated = len(data_out) > max_bytes
-        return _Fetched(resp.status, ctype, data_out[:max_bytes], truncated)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (scheme 已校验)
+            f = _read_budget(resp, max_bytes, resp.headers.get("Content-Encoding", ""))
+            f.content_type = resp.headers.get("Content-Type", "")
+            f.status = resp.status
+            return f
+    except urllib.error.HTTPError as e:
+        # 403/429 这类错误页也是内容：取回字节，让调用方用 _blocked 把
+        # 「被反爬挡住」和「网上没有这条」分开回——混成一桶，模型就把能核实的事实
+        # 判成查不到。HTTPError 本身就是个类文件对象。
+        f = _read_budget(e, max_bytes, e.headers.get("Content-Encoding", ""))
+        f.content_type = e.headers.get("Content-Type", "")
+        f.status = e.code
+        return f
 
 
 def _strip_tags(markup: str) -> str:
@@ -198,6 +253,43 @@ def html_to_text(html: str) -> str:
     return parser.text()
 
 
+#: C0 控制字符与 DEL（\t \n \r 除外）。0x00 是漏解压的压缩流里最常见的一个。
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _scrub_control(text: str) -> str:
+    """外部字节解码出的文本里剔掉控制字符——PG 的 text/jsonb 不收 U+0000，
+    ``json.dumps`` 会把任何漏网的 0x00 转成 ``\\u0000``，整条消息就写不进去。
+    抓取是外部输入入口，这一刀必须在这里落，不能让每个下游各自防。"""
+    return _CONTROL.sub("", text)
+
+
+_META_KEYS = ("description", "keywords", "og:title", "og:description", "og:site_name",
+              "article:title", "article:summary", "twitter:title", "twitter:description")
+
+
+def _meta_text(markup: str) -> str:
+    """JS 壳页的兜底：正文全靠脚本渲染时，能读的只有 <title> 与 <meta>。
+
+    YouTube -watch 页就是这一类——服务端 HTML 除了 script 几乎没别的节点，
+    `_TextExtractor` 把 script/title 全跳过之后返回空串，工具回「(空内容)」，
+    模型据此判「这页没有内容」。取 meta 是为了把「壳页」和「空页」分开。
+    """
+    parts: list[str] = []
+    t = re.search(r"<title[^>]*>(.*?)</title>", markup, re.S | re.I)
+    if t:
+        parts.append("title: " + _strip_tags(t.group(1)))
+    for m in re.finditer(r"<meta\b[^>]*>", markup, re.I):
+        tag = m.group(0)
+        key = re.search(r'(?:name|property)\s*=\s*"([^"]+)"', tag, re.I)
+        val = re.search(r'content\s*=\s*"([^"]*)"', tag, re.I)
+        if key and val and key.group(1).lower() in _META_KEYS:
+            text = _strip_tags(val.group(1))
+            if text:
+                parts.append(f"{key.group(1)}: {text}")
+    return "\n".join(parts)
+
+
 # --------------------------------------------------------------------------
 # FetchTool
 # --------------------------------------------------------------------------
@@ -250,11 +342,29 @@ class FetchTool(Tool):
             return f"Error: 抓取失败 {url}: {e}"
 
         ctype = fetched.content_type.lower()
-        if "html" in ctype or fetched.body.lstrip()[:15].lower().startswith(b"<!doctype html"):
-            text = html_to_text(fetched.body.decode("utf-8", errors="replace"))
-        else:
-            text = fetched.body.decode("utf-8", errors="replace").strip()
+        is_html = "html" in ctype or fetched.body.lstrip()[:15].lower().startswith(b"<!doctype html")
+        markup = fetched.body.decode("utf-8", errors="replace")
+        text = _scrub_control(html_to_text(markup) if is_html else markup.strip())
+        shell = ""
+        if is_html and not text:
+            # 一个字都没抽到 ≠ 页面是空的：JS 渲染的壳页（YouTube -watch、各类 SPA）服务端
+            # HTML 里只有 script。按字符数当阈值会误伤本来正文就短的小页面，所以只判「全空」。
+            meta = _scrub_control(_meta_text(markup))
+            if meta:
+                text = meta
+                shell = "\n（正文抽不到字，以上取自 <title>/<meta>——这页多半靠 JS 渲染）"
+            else:
+                shell = "(这页是 JS 渲染的壳，服务端 HTML 里连 <title>/<meta> 都没给可读正文)"
+        # 「这一页把我们的流量挡在门外」和「网上没有这条内容」是两句话：后者才是事实
+        # 结论，前者只该让人换源。先判它，否则 403 的错误页会掉进下面的「空内容」分支。
+        # 文案判据只在短页面上生效——长正文里出现 "captcha" 是内容本身，不是壳。
+        if _blocked(fetched.status, text if len(text) < 600 else ""):
+            return (f"Error: 这一页被挡在门外（HTTP {fetched.status}，反爬/限流），"
+                    f"不代表网上没有这条内容——换一个源，或用已知页面直取。 url={url}")
         if not text:
+            if shell:
+                return (f"{shell} status={fetched.status} url={url} —— 需要浏览器渲染才能读到"
+                        f"内容，**不代表这页没有内容**")
             return f"(空内容) status={fetched.status} url={url}"
         if fetched.truncated:
             text += f"\n...（内容超过 {max_bytes} 字节，已截断）"
@@ -262,7 +372,7 @@ class FetchTool(Tool):
         if 200 <= fetched.status < 400:
             from ..retrieval import note_hit
             await note_hit(url, "", backend="fetch_url")
-        return f"[{fetched.status}] {url}\n{text}"
+        return f"[{fetched.status}] {url}\n{text}" + shell
 
 
 # --------------------------------------------------------------------------
