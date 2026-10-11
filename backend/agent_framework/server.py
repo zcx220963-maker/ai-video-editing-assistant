@@ -40,6 +40,7 @@ import os
 import urllib.parse
 import urllib.request
 import re
+import time
 import uuid
 
 from contextlib import asynccontextmanager, suppress
@@ -66,6 +67,8 @@ from .ingest import IngestRejected, ingest_bytes
 from .identity import storyline_session_id
 from .orchestration import _safe
 from . import judge as judge_mod
+from .hooks import quota_status
+from .tools.web import KEYED_SEARCH_PROVIDERS, auto_provider, keyed_provider
 from .llm_openai import (DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_THINKING,
                          get_default_llm)
 from .media_fetch import FetchPolicy, FetchRejected, fetch_media
@@ -637,6 +640,32 @@ class JudgeModelRequest(BaseModel):
     api_key: str = ""
 
 
+class SearchBackendRequest(BaseModel):
+    """POST /settings/search：检索后端三件套。api_key 传空 = 清除已存密钥。"""
+
+    provider: str = ""      # brave|tavily|serpapi|searxng；空 = 免 key 回落链
+    base_url: str = ""      # searxng 自建实例地址；填了才生效
+    api_key: str = ""
+
+
+class SearchTestRequest(BaseModel):
+    """POST /settings/search/test：测试查询词可自带，留空则用一句固定的中文查询。"""
+
+    query: str = ""
+
+
+class QuotaRequest(BaseModel):
+    """POST /settings/quota：按身份的配额上限与窗口。
+
+    三种输入是三件事，不能合并：字段**不带** = 这一项不动；传**空串** = 清掉页面覆盖、
+    回落到环境变量与启动参数；传 **"0"** = 明确关掉拦截（清除做不到这件事——env 里的
+    正数还会接着拦）。
+    """
+
+    limit: str | None = None
+    window: str | None = None
+
+
 class SkillFromRunRequest(BaseModel):
     """POST /skills/from_run 请求体：run_id=沉淀单条执行；conversation_id=整会话合并沉淀。"""
 
@@ -667,6 +696,8 @@ def create_app(
     broadcast_url: str | None = None,      # Redis DSN：多副本时把 OutBound 帧广播给各实例
     broadcast_channel: str = OUTBOUND_CHANNEL,
     broadcast_client_factory: Any | None = None,  # 假 redis 客户端入口（离线单测用）
+    quota_limit: int = 0,                  # 启动参数层：页面/env 都没填时的回落上限
+    quota_window: int = 86400,             # 同上，窗口秒数
 ) -> FastAPI:
     consumer = SessionConsumer(agent, mq, topic=topic)
     connections = ConnectionManager(mq)
@@ -1941,6 +1972,16 @@ def create_app(
         judge_model = await secrets.get_user_key(user_id, secrets.JUDGE_MODEL_KEY)
         judge_key_row = await storage.secrets.row(user_id, secrets.JUDGE_API_KEY_NAME)
         judge_key = (judge_key_row or {}).get("value", "")
+        s_provider = await secrets.get_user_key(user_id, secrets.SEARCH_PROVIDER_KEY)
+        s_base = await secrets.get_user_key(user_id, secrets.SEARCH_BASE_KEY)
+        s_key_row = await storage.secrets.row(user_id, secrets.SEARCH_API_KEY_NAME)
+        s_key = (s_key_row or {}).get("value", "")
+        eff_provider, _, _, s_source = await secrets.resolve_search_config(user_id)
+        q_limit, q_window, q_source = await secrets.resolve_quota(
+            user_id, default_limit=quota_limit, default_window=quota_window)
+        q_status = await quota_status(storage.db, user_id, limit=q_limit, window=q_window)
+        pg_limit = await secrets.get_user_key(user_id, secrets.QUOTA_LIMIT_KEY)
+        pg_window = await secrets.get_user_key(user_id, secrets.QUOTA_WINDOW_KEY)
         return {
             "api_key": {
                 "configured": bool(stored),
@@ -1958,6 +1999,32 @@ def create_app(
                 "model": judge_model or "",
                 "configured": bool(judge_base and judge_model and judge_key),
                 "masked": secrets.mask(judge_key) if judge_key else "",
+            },
+            "search": {
+                "provider": s_provider or "",
+                "base_url": s_base or "",
+                "configured": bool(s_key or s_base),
+                "masked": secrets.mask(s_key) if s_key else "",
+                "effective_provider": eff_provider,
+                "source": s_source,
+                "overridden": bool(s_provider or s_base or s_key),
+                "providers": list(KEYED_SEARCH_PROVIDERS),
+            },
+            "quota": {
+                "limit": q_limit,
+                "window_sec": q_window,
+                "window_label": q_status["window_label"],
+                "used": q_status["used"],
+                "calls": q_status["calls"],
+                "remaining": q_status["remaining"],
+                "blocking": q_status["blocking"],
+                "frees_at": q_status["frees_at"],
+                "frees_in_minutes": q_status["frees_in_minutes"],
+                "source": q_source,
+                # 页面层原文（含填 0）与非空判断——「清除覆盖」按钮只在真覆盖过才该出现
+                "pg_limit": pg_limit,
+                "pg_window": pg_window,
+                "overridden": bool(pg_limit or pg_window),
             },
             "model": getattr(llm, "model", DEFAULT_MODEL),
             "base_url": getattr(llm, "base_url", DEFAULT_BASE_URL),
@@ -2043,6 +2110,105 @@ def create_app(
         return {"judge": {"base_url": jbase, "model": jmodel,
                           "configured": bool(jbase and jmodel and jkey),
                           "masked": secrets.mask(jkey) if jkey else ""}}
+
+    @app.post("/settings/quota")
+    async def settings_quota(req: QuotaRequest,
+                             user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """配额上限/窗口的按身份覆盖：保存即生效，两个服务都不重启。
+
+        limit/window 的三态（缺省 / 空串 / "0"）由 QuotaRequest 的文档定死，这里只做
+        校验与落库——把「填 0」误当成「没填」会让环境变量层的正数把用户的关闭盖回去。
+        """
+        updates = [(secrets.QUOTA_LIMIT_KEY, req.limit, "上限"),
+                   (secrets.QUOTA_WINDOW_KEY, req.window, "窗口")]
+        for name, raw, label in updates:
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if not text:
+                await secrets.drop_user_key(user_id, name)
+                continue
+            value = secrets.parse_int(text)
+            if value is None:
+                raise HTTPException(400, f"{label}要的是非负整数（千分位逗号可以），实得 {text!r}")
+            if name == secrets.QUOTA_WINDOW_KEY and 0 < value < 60:
+                raise HTTPException(400, "窗口至少 60 秒，否则任何一条长 run 都会自我拦截")
+            await secrets.put_user_key(user_id, name, str(value))
+        secrets.invalidate(user_id)
+        view = await _settings_view(user_id)
+        view["status"] = "saved"
+        return view
+
+    @app.post("/settings/search")
+    async def settings_search(req: SearchBackendRequest,
+                              user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """检索后端三件套：provider/base_url/api_key 各写各的，空串即清除该项。
+
+        与 /settings/judge 的「成对」语义不同：这里「什么都没填」是合法状态（免 key
+        回落链），所以清除要能逐项做，不能一清就全清。
+        """
+        provider = (req.provider or "").strip().lower()
+        base = (req.base_url or "").strip().rstrip("/")
+        key = (req.api_key or "").strip()
+        if provider and provider not in KEYED_SEARCH_PROVIDERS:
+            raise HTTPException(
+                400, f"不认识的后端 {provider!r}（可用：{', '.join(KEYED_SEARCH_PROVIDERS)}；"
+                     f"留空 = 免 key 回落链）")
+        if base and not base.startswith(("http://", "https://")):
+            raise HTTPException(400, "自建实例地址要带协议：http:// 或 https://")
+        if any(c.isspace() for c in key):
+            raise HTTPException(400, "密钥格式不对：不能包含空格或换行")
+        if (key or base) and not provider:
+            raise HTTPException(400, "填了密钥或实例地址但没选后端——无法判断该把 key 交给谁")
+        for name, value in ((secrets.SEARCH_PROVIDER_KEY, provider),
+                            (secrets.SEARCH_BASE_KEY, base),
+                            (secrets.SEARCH_API_KEY_NAME, key)):
+            if value:
+                await secrets.put_user_key(user_id, name, value)
+            else:
+                await secrets.drop_user_key(user_id, name)
+        secrets.invalidate(user_id)
+        view = await _settings_view(user_id)
+        view["status"] = "saved"
+        return view["search"]
+
+    @app.post("/settings/search/test")
+    async def settings_search_test(req: SearchTestRequest,
+                                   user_id: str = Depends(auth.http_user_id)
+                                   ) -> dict[str, Any]:
+        """连通性自检：按当前生效配置**真发一条查询**，回后端名、条数、样题与时延。
+
+        判据只有一条「后端有没有回结果」，所以 0 条也算通路活着——那说明 key、地址、
+        网络都对，只是这条查询没命中。后端本身报错才是失败。
+        """
+        name, key, base, source = await secrets.resolve_search_config(user_id)
+        name = (name or "").strip().lower()
+        query = (req.query or "").strip() or "人工智能 最新进展"
+        if not (name or key or base):
+            runner, label = (lambda q, n: auto_provider(q, n)), "免 key 回落链"
+        elif not name:
+            return {"ok": False, "provider": "", "source": source, "results": 0,
+                    "message": "填了密钥或实例地址但没选后端，无法判断该把 key 交给谁"}
+        else:
+            runner, err = keyed_provider(name, key, base)
+            if err:
+                return {"ok": False, "provider": name, "source": source, "results": 0,
+                        "message": err.removeprefix("Error: ")}
+            label = f"{source}·{name}"
+        started = time.monotonic()
+        try:
+            rows = await asyncio.to_thread(runner, query, 3)
+        except Exception as e:  # noqa: BLE001 - 自检端点：任何后端异常都要如实回给用户
+            return {"ok": False, "provider": name, "source": source, "results": 0,
+                    "latency_ms": int((time.monotonic() - started) * 1000),
+                    "message": f"{type(e).__name__}: {e}"}
+        latency = int((time.monotonic() - started) * 1000)
+        titles = [r.title for r in (rows or [])][:3]
+        return {"ok": True, "provider": name or "auto", "backend": label,
+                "source": source, "query": query, "results": len(rows or []),
+                "sample": titles, "latency_ms": latency,
+                "message": ("后端有响应" if rows else "后端连通但这条查询没回结果——"
+                            "换关键词再试，或改走别的路")}
 
     @app.websocket("/ws/{conversation_id}")
     async def ws_endpoint(websocket: WebSocket, conversation_id: str) -> None:

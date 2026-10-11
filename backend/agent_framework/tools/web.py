@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import gzip
 import ipaddress
 import json
@@ -264,6 +265,40 @@ def _scrub_control(text: str) -> str:
     return _CONTROL.sub("", text)
 
 
+#: 页面声明字符集的两种写法：HTTP 头的 ``; charset=`` 与 HTML 的 ``<meta charset>`` /
+#: ``<meta http-equiv="Content-Type" content="text/html; charset=gbk">``。
+_CHARSET = re.compile(r"charset[ \t]*=[ \t]*[\"']?([A-Za-z][A-Za-z0-9_\-]*)", re.I)
+
+#: 中文页最常见的三种声明都是 GBK 家族，gb18030 是它们的超集，统一升一档少一类失败。
+_CODEC_ALIAS = {"gb2312": "gbk", "gbk": "gb18030", "windows-936": "gb18030",
+                "gb-2312": "gbk", "x-gbk": "gbk", "utf8": "utf-8"}
+
+
+def _decode_text(raw: bytes, content_type: str = "") -> str:
+    """按**页面自己声明的**字符集解码，而不是逢字节就按 UTF-8 硬解。
+
+    压缩壳（Content-Encoding）治的是「解不开」，这是同类的另一半「解开了是乱码」：
+    中文站还有一批 GBK/GB18030 页（真机 ``js.99.com.cn`` 那条），按 UTF-8 解出来全是
+    U+FFFD，模型据此判「这页没内容」或把引文抄成乱码——而引文要过出处闸，抄错等于造假。
+    声明只信两处：HTTP 头、HTML 里的 ``<meta>``；都没有才按 UTF-8 兜底。
+    任何一档解不动就退到下一档，**绝不因为编码问题让抓取报错**。
+    """
+    names: list[str] = []
+    for found in (_CHARSET.search(content_type or ""),
+                  _CHARSET.search(raw[:4096].decode("ascii", "ignore"))):
+        if found:
+            names.append(found.group(1))
+    names.append("utf-8")
+    for raw_name in names:
+        codec = _CODEC_ALIAS.get(raw_name.lower(), raw_name.lower())
+        try:
+            codecs.lookup(codec)
+            return _scrub_control(raw.decode(codec))
+        except (LookupError, UnicodeDecodeError, ValueError):
+            continue
+    return _scrub_control(raw.decode("utf-8", errors="replace"))
+
+
 _META_KEYS = ("description", "keywords", "og:title", "og:description", "og:site_name",
               "article:title", "article:summary", "twitter:title", "twitter:description")
 
@@ -343,7 +378,7 @@ class FetchTool(Tool):
 
         ctype = fetched.content_type.lower()
         is_html = "html" in ctype or fetched.body.lstrip()[:15].lower().startswith(b"<!doctype html")
-        markup = fetched.body.decode("utf-8", errors="replace")
+        markup = _decode_text(fetched.body, fetched.content_type)
         text = _scrub_control(html_to_text(markup) if is_html else markup.strip())
         shell = ""
         if is_html and not text:

@@ -331,8 +331,18 @@ class StorylineServer:
             state = await server._make_state(sid, artifact_id)
             store = state.store
             if not await store.has(key):
-                return json.dumps({"error": f"Store 中还没有 {key}",
-                                   "executed": await store.executed()}, ensure_ascii=False)
+                # 必须以 ``Error: `` 开头：主 Agent 的 ToolRegistry 只按这一个前缀把
+                # 工具返回值判成失败（``is_tool_error``）。真机执行轮曾因这里回的是
+                # ``{"error": ...}`` 这种 JSON 串被记成「成功」，连续失败守卫一次都没
+                # 触发，模型连猜 25 个键名、26 秒烧掉 121 万 token 直到配额闸炸掉整条 run。
+                executed = await store.executed()
+                return (f"Error: Store 中还没有 {key} 的产物。"
+                        f"已执行节点：{executed or '（空）'}。"
+                        + ("空列表＝这条片子的产物还没生成——**别再换键名试**，"
+                           "下一个键也不会因此存在。要拿到它的产物就**调用产出它的节点**"
+                           "（如 plan_motion），读产物是「上一步已经跑过、这一步要用它的结果」"
+                           "时才用的。" if not executed else
+                           "请调用对应节点或其依赖。"))
             return json.dumps({"node": key, "payload": await store.get(key)},
                               ensure_ascii=False)
 

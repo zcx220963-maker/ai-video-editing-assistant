@@ -31,6 +31,12 @@ SEARCH_BASE_KEY = "search_base_url"       # searxng 实例地址；填了才生�
 ENV_SEARCH_KEY_NAME = "SEARCH_API_KEY"
 ENV_SEARCH_PROVIDER = "SEARCH_PROVIDER"
 ENV_SEARCH_BASE = "SEARCH_BASE_URL"
+# 配额也走同一套按身份热读：以前它只有 env 一处，超限的用户只能改编排文件 + 重建容器，
+# 而页面上一句「配额已用尽」连出路都没有。现在页面填的值压过 env，保存即生效。
+QUOTA_LIMIT_KEY = "quota_limit"           # 窗口内 token 上限，0 或空 = 只记账不拦
+QUOTA_WINDOW_KEY = "quota_window"         # 窗口秒数
+ENV_QUOTA_LIMIT = "QUOTA_LIMIT"
+ENV_QUOTA_WINDOW = "QUOTA_WINDOW"
 ENV_KEY_NAME = "OPENAI_API_KEY"         # 前端没配时的回落环境变量（首选）
 # .env 里还留着 DEEPSEEK_API_KEY / SILICONFLOW_API_KEY 这两把历史名字。原先没有任何代码
 # 读它们——用户填了、静默无效，还以为「填了就生效」。现在把它们接成同一层的回落位，
@@ -129,9 +135,10 @@ async def resolve_api_key(user_id: str = "", *, fallback: str = "") -> tuple[str
 __all__ = ["API_KEY_NAME", "CACHE_TTL_SEC", "ENV_KEY_NAME", "ENV_KEY_NAMES", "SOURCE_PG",
            "SOURCE_ENV", "SOURCE_FALLBACK", "SOURCE_NONE", "bind_storage", "unbind_storage",
            "bound_storage", "current_user_id", "env_api_key", "invalidate",
-           "resolve_api_key", "resolve_search_config", "mask",
+           "resolve_api_key", "resolve_search_config", "resolve_quota", "parse_int", "mask",
            "SEARCH_PROVIDER_KEY", "SEARCH_API_KEY_NAME", "SEARCH_BASE_KEY",
-           "ENV_SEARCH_KEY_NAME", "ENV_SEARCH_PROVIDER", "ENV_SEARCH_BASE"]
+           "ENV_SEARCH_KEY_NAME", "ENV_SEARCH_PROVIDER", "ENV_SEARCH_BASE",
+           "QUOTA_LIMIT_KEY", "QUOTA_WINDOW_KEY", "ENV_QUOTA_LIMIT", "ENV_QUOTA_WINDOW"]
 
 
 # ---- 主模型 model/base_url 的按用户覆盖（前端「设置」→ app_secrets）----
@@ -179,6 +186,56 @@ async def resolve_search_config(user_id: str = "") -> tuple[str, str, str, str]:
     if env_provider or env_key or env_base:
         return env_provider, env_key, env_base, f"环境变量 {ENV_SEARCH_PROVIDER or ENV_SEARCH_KEY_NAME}"
     return "", "", "", SOURCE_NONE
+
+
+def parse_int(raw: str) -> int | None:
+    """页面传来的可能是 "8,000,000" / "8000000 " / 空串；解析不出整数就当作没填。
+
+    返回 None 表示「这一层没值」，与 0（明确填零 = 不拦截）是两回事——
+    把「填了 0」当成「没填」的话，环境变量层的正数会盖掉用户在页面上的关闭操作。
+    """
+    s = (raw or "").strip().replace(",", "").replace("_", "")
+    if not s:
+        return None
+    try:
+        value = int(float(s))
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+async def resolve_quota(user_id: str = "", *, default_limit: int = 0,
+                        default_window: int = 86400) -> tuple[int, int, str]:
+    """配额的按身份热读，返回 (上限 token, 窗口秒, 来源名)。
+
+    三层各表各的：**页面「设置」→ 环境变量 → 调用方给的启动默认**，谁填了谁说话，
+    没填（None）才轮到下一层。这里的关键是「填了 0」与「没填」必须区分开：
+    页面填 0 是用户明确要关掉拦截，环境变量里的正数不许把它盖回去；
+    反过来，env 没设时也不能被误当成 0 而让启动参数的正数失效。
+
+    上限 <=0 = 不拦截，但 UsageHook 照样落账——额度观测与成本核算不该因为不拦了就断数据源。
+    """
+    uid = user_id or current_user_id()
+    pg_limit = pg_window = None
+    if _storage is not None and uid:
+        try:
+            pg_limit = parse_int(await _storage.secrets.get(uid, QUOTA_LIMIT_KEY) or "")
+            pg_window = parse_int(await _storage.secrets.get(uid, QUOTA_WINDOW_KEY) or "")
+        except Exception:  # noqa: BLE001 - 存储抖动退回下一层，不该让模型调用整条挂掉
+            pg_limit = pg_window = None
+    env_limit = parse_int(os.environ.get(ENV_QUOTA_LIMIT, ""))
+    env_window = parse_int(os.environ.get(ENV_QUOTA_WINDOW, ""))
+    limit = (pg_limit if pg_limit is not None
+             else env_limit if env_limit is not None else default_limit)
+    window = (pg_window if pg_window is not None
+              else env_window if env_window is not None else default_window)
+    if pg_limit is not None or pg_window is not None:
+        source = SOURCE_PG
+    elif env_limit is not None or env_window is not None:
+        source = f"环境变量 {ENV_QUOTA_LIMIT}"
+    else:
+        source = "启动参数默认"
+    return limit, window, source
 
 
 async def put_user_key(user_id: str, key_name: str, value: str) -> None:

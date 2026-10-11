@@ -16,6 +16,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .connection_manager import OUTBOUND_TOPIC
@@ -400,16 +401,41 @@ class ApprovalHook(AgentHook):
 
 
 class QuotaExceeded(Exception):
-    """用户在配额窗口内的 token 用量超限。Agent 收到后以此收尾，不再调 LLM。"""
+    """用户在配额窗口内的 token 用量超限。Agent 收到后以此收尾，不再调 LLM。
 
-    def __init__(self, user_id: str, used: int, limit: int, window_label: str) -> None:
+    文案必须自带出路，不能只报数：真机就撞在「刷新页面再跑，还是这句」——配额是**服务端按
+    身份算的滑动窗口**，与浏览器状态无关，所以刷新、换会话、重开标签页都动不了它。用户看得见的
+    出路只有两条：等窗口把最早那笔滚出去（这里算给他看时刻），或在页面「设置 → 配额」改上限
+    （保存即生效，不重启任何进程）。
+    """
+
+    def __init__(self, user_id: str, used: int, limit: int, window_label: str, *,
+                 source: str = "", frees_at: datetime | None = None,
+                 in_minutes: int | None = None) -> None:
         self.user_id = user_id
         self.used = used
         self.limit = limit
         self.window_label = window_label
-        super().__init__(
-            f"配额已用尽：{user_id} 在{window_label}内已用 {used} token，上限 {limit}。"
-        )
+        self.source = source
+        self.frees_at = frees_at
+        self.in_minutes = in_minutes
+        parts = [f"配额已用尽：{user_id} 在{window_label}内已用 {used} token，"
+                 f"上限 {limit}"]
+        if source:
+            parts.append(f"（上限来源：{source}）")
+        parts.append(
+            "。这不是渲染失败，也不是页面状态——被拦的是「下一次问模型」，"
+            "已经花掉的账退不回来；**刷新页面、换会话、重开标签页都不会让额度回来**。")
+        if frees_at is not None:
+            when = frees_at.astimezone(timezone.utc).strftime("%m-%d %H:%M UTC")
+            countdown = f"，约 {in_minutes} 分钟后" if in_minutes is not None else ""
+            parts.append(f"窗口是滑动的：最早那笔在 {when}{countdown}滚出窗口，额度自动回落。")
+        else:
+            parts.append("窗口是滑动的，最早的用量会随时间滚出窗口。")
+        parts.append(
+            "要立刻继续，去页面「设置 → 配额」把上限改大或填 0（0 = 只记账、不拦截），"
+            "保存即生效，两个服务都不用重启。")
+        super().__init__("".join(parts))
 
 
 class UsageHook(AgentHook):
@@ -436,33 +462,94 @@ class UsageHook(AgentHook):
         })
 
 
-class QuotaHook(AgentHook):
-    """每轮调 LLM 之前查近 window 秒的用量合计，超 limit 抛 QuotaExceeded。
+def _as_dt(value: Any) -> datetime | None:
+    """把 token_usage.created_at 归一成 aware datetime（PG 给 datetime，替身可能给 epoch）。"""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
-    limit=0 表示不限制（默认）。window 以秒计，常见值：3600（小时）、86400（天）。
-    查询走 token_usage(user_id, created_at) 索引，单行聚合，开销可忽略。
+
+def _window_label(seconds: int) -> str:
+    if seconds >= 3600:
+        return f"{seconds // 3600} 小时"
+    return f"{seconds} 秒"
+
+
+async def quota_status(db: Any, user_id: str, *, limit: int,
+                       window: int) -> dict[str, Any]:
+    """一个身份在当前窗口内的配额账（设置页与拦截文案共用同一份算法）。
+
+    `frees_at` 只在**已经超限**时给：把窗口内这摞账单按时间升序累加，累到「刚好把
+    超出部分挤出去」的那一笔，它的 created_at + window 就是额度重新够用的最早时刻——
+    窗口是滑动的，谁都不知道要等多久这件事，报个数比报「等一天」有用。
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=window)
+    rows = await db.select(
+        "token_usage",
+        where=[Cond("user_id", "eq", user_id), Cond("created_at", "ge", cutoff)],
+    )
+    used = sum(int(r.get("total_tokens") or 0) for r in rows)
+    out: dict[str, Any] = {
+        "user_id": user_id, "used": used, "calls": len(rows),
+        "limit": limit, "window_sec": window, "window_label": _window_label(window),
+        "blocking": limit > 0,
+        "remaining": None if limit <= 0 else max(0, limit - used),
+        "frees_at": None, "frees_in_minutes": None,
+    }
+    if limit > 0 and used >= limit:
+        need = used - limit + 1
+        timed = [(dt, int(r.get("total_tokens") or 0))
+                 for r in rows if (dt := _as_dt(r.get("created_at"))) is not None]
+        timed.sort(key=lambda x: x[0])
+        acc = 0
+        for dt, tokens in timed:
+            acc += tokens
+            if acc >= need:
+                frees_at = dt + timedelta(seconds=window)
+                out["frees_at"] = frees_at.isoformat()
+                out["frees_in_minutes"] = max(
+                    0, int((frees_at - now).total_seconds() // 60))
+                break
+    return out
+
+
+class QuotaHook(AgentHook):
+    """每轮调 LLM 之前按**当前身份**查近 window 秒的用量合计，超 limit 抛 QuotaExceeded。
+
+    上限与窗口都是热读的（页面「设置」→ 环境变量 → 启动参数），所以用户改完不用重启任何进程；
+    这一层曾经只在构造时读一次 env，于是「超限了怎么办」只有改编排文件 + 重建容器一条路，
+    而页面上那句报错连这条都没告诉用户。
+
+    limit<=0 表示不拦截（默认），UsageHook 仍照常落账。查询走 token_usage(user_id, created_at)
+    索引，单行聚合，开销可忽略。
     """
 
     def __init__(self, db: Any, *, limit: int = 0, window: int = 86400) -> None:
         self._db = db
-        self.limit = limit
+        self.limit = limit          # 启动参数层的回落位
         self.window = window
 
     async def before_iteration(self, context: AgentHookContext) -> None:
-        if self.limit <= 0:
-            return
+        from .secrets import resolve_quota
         user_id = context.session.user_id
-        from datetime import datetime, timedelta, timezone
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.window)
-        rows = await self._db.select(
-            "token_usage",
-            where=[Cond("user_id", "eq", user_id), Cond("created_at", "ge", cutoff)],
-        )
-        used = sum(int(r.get("total_tokens") or 0) for r in rows)
-        if used >= self.limit:
-            label = (f"{self.window // 3600} 小时" if self.window >= 3600
-                     else f"{self.window} 秒")
-            raise QuotaExceeded(user_id, used, self.limit, label)
+        limit, window, source = await resolve_quota(
+            user_id, default_limit=self.limit, default_window=self.window)
+        if limit <= 0:
+            return
+        st = await quota_status(self._db, user_id, limit=limit, window=window)
+        if st["used"] >= limit:
+            raise QuotaExceeded(user_id, st["used"], limit, _window_label(window),
+                                source=source, frees_at=_as_dt(st["frees_at"]),
+                                in_minutes=st["frees_in_minutes"])
 
 
 def _find_media(obj: Any) -> dict[str, Any] | None:

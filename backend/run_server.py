@@ -408,10 +408,10 @@ def build_runtime(
     # 均不受 observability 开关限制；Logging/Metrics 才是纯观测。
     hook_list: list = [OutboundStreamHook(mq), MediaCardHook(mq), ToolTraceHook(mq),
                        PlanCardHook(mq, cp_mgr=checkpoint), PlanReconcileHook(mq), ApprovalHook(mq)]
-    # 配额：用量落库 + 超限拦截（limit=0 时不拦截，UsageHook 仍记录用量供观测）
+    # 配额：用量落库 + 超限拦截。钩子**无条件挂上**——上限改成按身份热读（页面→env→启动参数），
+    # 只在启动 limit>0 时才挂的话，页面把拦截打开这件事就永远落不了地。
     hook_list.append(UsageHook(storage.db))
-    if quota_limit > 0:
-        hook_list.append(QuotaHook(storage.db, limit=quota_limit, window=quota_window))
+    hook_list.append(QuotaHook(storage.db, limit=quota_limit, window=quota_window))
     if observability:
         hook_list += [LoggingHook(), MetricsHook()]
     hooks = CompositeHook(hook_list)
@@ -730,6 +730,8 @@ def build_runtime(
         editing_contract=editing_contract,
         broadcast_url=broadcast_url or None,
         broadcast_channel=broadcast_channel,
+        quota_limit=quota_limit,
+        quota_window=quota_window,
     )
     return Runtime(
         agent=agent,
@@ -872,9 +874,11 @@ def main() -> None:
     if args.approve_tools:
         print(f"HITL 审批断点：执行前需人工审批的工具 = {args.approve_tools}")
     if args.quota_limit > 0:
-        print(f"配额闸：每用户 {args.quota_limit} token / {args.quota_window} 秒，超限拦截")
+        print(f"配额闸：默认每用户 {args.quota_limit} token / {args.quota_window} 秒，超限拦截"
+              "（身份在页面「设置 → 配额」填过就以那条为准，保存即生效不重启）")
     else:
-        print("配额闸：关闭（token 用量仍记录到 token_usage 表，不拦截）")
+        print("配额闸：默认关闭（token 用量仍记录到 token_usage 表）"
+              "——身份在页面「设置 → 配额」填过正数即对该身份启用，保存即生效不重启")
     if args.broadcast_redis_url:
         mode = f"经 Redis {args.broadcast_redis_url} 频道 {args.broadcast_channel}（多副本）"
     else:

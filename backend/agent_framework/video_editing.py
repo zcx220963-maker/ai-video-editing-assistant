@@ -567,9 +567,14 @@ class ReadNodeHistoryTool(Tool):
     async def execute(self, key: str) -> str:
         store = self._state.store
         if not await store.has(key):
+            executed = await store.executed()
             return (
                 f"Error: Store 中还没有 {key} 的产物。"
-                f"已执行节点：{await store.executed()}。请先调用对应节点或其依赖。"
+                f"已执行节点：{executed or '（空）'}。"
+                + ("空列表＝这条片子的产物还没生成——**别再换键名试**，下一个键也不会"
+                   "因此存在。要拿到它的产物就调用产出它的节点，读产物是「上一步已经"
+                   "跑过、这一步要用它的结果」时才用的。" if not executed else
+                   "请先调用对应节点或其依赖。")
             )
         return json.dumps({"node": key, "payload": await store.get(key)}, ensure_ascii=False)
 

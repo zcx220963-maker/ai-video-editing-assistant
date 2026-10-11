@@ -256,6 +256,40 @@ ASR 之后、粗剪之前的可选节点。**只改字,不改时间与词 id**:
   (页面配置压过环境变量,见 §16)。之所以是三项而不是一把 key:自建 SearXNG 没有 key 只有地址,
   而 brave/tavily/serpapi 只有 key 没有地址——只存 key 的那套设计会把自建这条路走死;
 - **配额**:`--quota-limit` / `QUOTA_LIMIT` 按身份记 `token_usage`,默认 0 = 不拦截但仍记量(刻意默认)。
+  拦截点在 `agent_framework/hooks.py` 的 `QuotaHook.before_iteration`:**每次调 LLM 之前**按身份聚合
+  `token_usage` 近 `QUOTA_WINDOW` 秒的 `total_tokens`,到线就抛 `QuotaExceeded` 收尾——注意它拦的是
+  「下一条消息」而不是「这一帧像素」,所以被炸掉的那条 run 往往**一个节点都没跑完**,用户看到的是
+  「确认了计划,然后什么也没产出」;
+- **上限本身按身份热读,三层**(`secrets.resolve_quota`):① 页面「设置 → 配额」写 PG(`app_secrets`
+  的 `quota_limit`/`quota_window`)→ ② 环境变量 `QUOTA_LIMIT`/`QUOTA_WINDOW` → ③ 启动参数默认。
+  每次 `before_iteration` 现读,**改上限不必重启也不必重烤镜像**。取值是三态的,不是「填个数」:
+  请求里**不带这个字段**＝这一项不动;**空串**＝清掉页面覆盖、回落到 env/启动参数;**`"0"`**＝明确关拦截
+  (只记账)。这个区分是「页面填 0 压过 env 正数」能成立的前提,所以 `parse_int` 必须把 `None` 与 `0`
+  分开——把它们混成一样就等于关掉了页面这一层。窗口下限 60 秒,更小的窗口会让「一次长 run 自己把自己
+  拦掉」;
+- **超限时先报出路,再报数**:旧文案只有「已用 X,上限 Y」,而那句里的 Y 当时**只能改环境变量再重烤镜像**
+  ——用户手里没有任何旋钮,于是唯一能想到的动作就是刷新页面重跑,而账是服务端按身份滑动窗口聚合的,
+  刷新、换会话、重开标签页都动不了它一笔。这就是 2026-10-11 那句「怎么刷新后跑还是不行」的全部成因,
+  不是前端缓存。现在 `quota_status` 在窗口内按时间升序累计到刚好越过上限的那一笔,给出
+  **最早一笔滚出窗口的时刻**(`frees_at`,UTC 落纸 + 折成分钟数 `frees_in_minutes`)与还剩多少,
+  `QuotaExceeded` 的文案里明写「刷新页面、换会话、重开标签页都不会让额度回来」+ 何时自然释放 +
+  上限来源是哪一层 + 去哪儿改(设置 → 配额)。
+- **配额怎么被一次空转烧穿的(2026-10-11 真机,身份 `u-6d962435c873`)**:执行轮开局 Store 是空的,
+  模型把 `read_node_history` 当成「查查 Store 里有哪些键」的浏览器用,连着猜了 25 个键名
+  (`plan_motion` → `motion_spec` → `plan_motion_spec_draft_v2` …)。那一轮 29 次 LLM 调用挤在 **26 秒**里,
+  每次只回 40 个 completion token(就是一个工具调用),而上文每轮从 3.0 万涨到 4.35 万 token——
+  **一条 run 烧 121 万**,整个身份 24 小时累计 802.2856 万,越过 800 万上限后连收尾那句都发不出去。
+  账目里 97% 是 prompt(777.2 万 / 802.3 万):ReAct 每轮重发全部上文,所以死循环的代价按**平方**长;
+- **为什么旧的「连续失败守卫」没拦住,以及现在的修法**:守卫在 `agent.py::_run_tool_round`,阈值
+  `_MAX_CONSECUTIVE_FAILURES=4`,数的是 `is_tool_error(返回值)`——而判定口 `ToolRegistry.execute`
+  只认**以 `Error` 开头**的字符串。服务端那一路的 `read_node_history` 当时回的是 `{"error": ..., "executed": []}`
+  这种 JSON 串,前缀判定看不见它,于是每一次猜空都被记成「工具调用成功」、计数每轮清零,守卫一次都没触发
+  (`agent.py:52` 那段注释记录的「规划轮猜六十次」事故,治的是抛异常那条路,这条路是漏的)。
+  现在两处 `read_node_history`(主 Agent 侧与服务端 MCP 侧)读不到键时统一回 `Error: ` 前缀的纯文本,
+  并把出路写进文案(空列表＝产物还没生成,换键名也换不出来,直接调用产出它的节点);执行轮的
+  `<approved_plan>` 承诺段同步补这条纪律。`test_tool_failure_guard` ⑧ 钉住正例(第 5 次起不再真打)
+  与负例(**回 JSON 错误体时守卫全盲,六次全真打**)——所以将来任何新控制面工具想被守卫计入,
+  回执必须走同一个 `Error: ` 前缀约定,这不是可选风格而是守卫的接口。
 
 ### 14. 回投与多副本
 
@@ -388,6 +422,13 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
   现在请求显式声明只收 `gzip, deflate`(br 没有解码器就不给服务端发的理由),`max_bytes` 按**解压后**的
   正文计,工具出口再统一剔掉控制字符(`\t\n\r` 除外)——外部字节进数据库之前的这一刀落在抓取这一层,
   不指望下游各自防;
+- **解压只治了乱码的一半,另一半是字符集**(`tools/web.py` 的 `_decode_text`):中文站今天仍在发
+  GBK/GB18030 页,而旧代码无条件 `decode("utf-8", errors="replace")`。这一类比 gzip 更阴——解出来的碎片
+  (`浣撹偛` 这种看着像日文的字)**不含 0x00**,PG 照收、`json.dumps` 照转,错误一路无声穿到模型面前,
+  直到人眼看页面才发现。现在按两级声明取编码:HTTP 头里的 `charset=` 优先,头里没写就认正文 `<meta>`
+  里的声明;`gb2312`/`gbk`/`windows-936` 一律升一档到超集 `gb18030`(老页混简体扩展字不会解不开);
+  编码名认不出、或按声明解不开时退回 UTF-8 兜底而不是抛异常——**抓取宁可回得难看,也不因编码问题整条失败**。
+  声明 `utf-8` 时与旧行为逐字相同,这条改动只对「声明了非 UTF-8」的页面生效;
 - **抓取的回喂分三类,不共用一句「失败」**:HTTP 403/429 这类错误页当正文取回来再判,回「这一页被挡在
   门外(反爬/限流),不代表网上没有这条内容」;正文抽不到字但页面是 JS 渲染的壳(YouTube -watch 这类),
   退回 `<title>`/`<meta>` 并明说是壳;两者都不是「这页没有内容」——只有 status 与正文都支持时才那么回。
@@ -400,6 +441,16 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
 代码位:后端与链 `backend/agent_framework/tools/web.py`,按身份热读 `backend/agent_framework/secrets.py`,
 记账与查询 `backend/agent_framework/retrieval.py`,设置页读写 `backend/agent_framework/server.py`
 (`/settings/search` 写、`/settings/search/test` 让页面当场拿一条查询试这路后端通不通),前端在「设置」页的检索后端区块。
+
+- **订正(2026-10-11,这一节先前是超前于代码写的)**:上面那句里的 `POST /settings/search`、
+  `POST /settings/search/test` 和「设置」页的检索后端区块,**在这批之前一个都不存在**——此前只有
+  `GET /settings` 的读侧把这三项掩码回显出来,页面上没有能填它们的框,后端也没有写入口,
+  配置检索后端只能改环境变量再重烤镜像。文档描述的是设计意图而不是当时的实现,读者按它找不到入口。
+  现在两处口与区块都落地了,校验口径与工具侧同源:provider 走 `KEYED_SEARCH_PROVIDERS` 白名单、
+  自建地址必须带协议、密钥含空白拒收、**给了 key 或地址却没选后端直接 400**——`SearchTool._runner`
+  本来就拒绝猜服务商,口子上若猜了就是两处口径打架。`/settings/search/test` 同样按
+  `resolve_search_config` 那一层装配、不自创优先级:没配后端时自检的是免 key 回落链并在回执里明说;
+  0 条结果算「连通」(key 与地址都对,只是这条查询没命中)而不算失败。
 
 ### 17. 选区改:框住画面上的一块 / 点住轨道上的一段,只重烧受影响的那几块
 
@@ -727,7 +778,9 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
   闸门退回也表现为一路 200 + `status=failed` + `error`,HTTP 状态码不作判据
 - **扩展管理**:`/tools` · `/skills*`(含 .zip 技能包) · `/mcp/servers*`(热连热断)
 - **设置**:`/settings*`(模型密钥、主模型选型、判断模型三件套 + `POST /settings/judge/test` 连通性自检;
-  检索后端三件套 + `POST /settings/search/test` 试一路)
+  检索后端三件套 `POST /settings/search` 写 + `POST /settings/search/test` 试一路;
+  配额 `POST /settings/quota`——字段**缺省＝不动、空串＝清页面覆盖、`"0"`＝关拦截**;
+  后两组与「设置」页对应区块都是 2026-10-11 落地的,此前文档里写过但代码没有,见 §16 订正)
 - **运维**:`GET /health` 存活探针。免凭证的只有它和三个**签发凭证**的入口
   (`/auth/login` · `/auth/register` · `/register`),其余全部要求凭证。
 
@@ -772,7 +825,7 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 | 模型 | `OPENAI_API_KEY`(别名 `DEEPSEEK_API_KEY`/`SILICONFLOW_API_KEY`,同层回落) · `OPENAI_THINKING` | 页面「设置」永远压过环境变量 |
 | 模型 ★ | `OPENAI_MODEL` · `OPENAI_BASE_URL` | `llm_openai.py:149,151` 的回落位;优先级在"前端配置 + 进程内常量"之后 |
 | 判断模型 | `JUDGE_BASE_URL` · `JUDGE_MODEL` · `JUDGE_API_KEY` · `JUDGE_MIN_CONFIDENCE`(默认 0.80) | 三项配齐走 Jev,否则回落主 LLM |
-| 账号与配额 | `JWT_SECRET` · `REGISTER_OPEN`(默认 1) · `QUOTA_LIMIT`(默认 0=不拦) · `QUOTA_WINDOW` | `JWT_SECRET` 缺省时首启自动生成入库 |
+| 账号与配额 | `JWT_SECRET` · `REGISTER_OPEN`(默认 1) · `QUOTA_LIMIT`(默认 0=不拦) · `QUOTA_WINDOW` | `JWT_SECRET` 缺省时首启自动生成入库;`QUOTA_*` 只是**中间一层**,页面「设置 → 配额」按身份压过它——改 env 要重烤镜像,改页面不用 |
 | 部署 | `SITE_DOMAIN` | 供 Caddy 出 HTTPS 块 |
 | 取料 | `YTDLP_JS_RUNTIMES` · `YTDLP_COOKIES_FILE` | cookie 只写**文件路径**,凭证值不进代码/日志/库 |
 | 运行开关 ★ | `MQ_BACKEND`(默认 memory) · `KAFKA_BOOTSTRAP_SERVERS` · `STORAGE_BACKEND`(默认 pg_minio) · `BROADCAST_REDIS_URL` · `OBJECT_CACHE_ROOT` · `WORKSPACE_ROOT` · `MAX_FETCH_MB`(默认 512) | 都是 `run_server.py` 里对应 CLI 参数的 env 默认值——`--mq/--storage/--broadcast-redis-url/--cache-root/--workspace-root/--max-fetch-mb` 显式传参时压过它们 |

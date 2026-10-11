@@ -2883,6 +2883,15 @@ const savingLLM = ref(false);
 const testingJudge = ref(false);
 const testJudgeResult = ref(null);
 
+// 配额(按身份覆盖 env 与启动参数；limit 填 "0" = 明确关拦截，留空 = 交回下层)
+const quotaDraft = ref({ limit: "", window: "" });
+const savingQuota = ref(false);
+// 联网检索后端：provider + 密钥/自建地址，全空 = 免 key 回落链
+const searchDraft = ref({ provider: "", base_url: "", api_key: "" });
+const savingSearch = ref(false);
+const testingSearch = ref(false);
+const testSearchResult = ref(null);
+
 async function loadSettings() {
   await ensureIdentity();
   const r = await fetch("/settings", { headers: authHeaders() });
@@ -2898,6 +2907,14 @@ async function loadSettings() {
     model: j.judge?.model || "",
     api_key: "",
   };
+  // 配额：留空 = 这一项不动（不是清除），所以每次打开都从空白开始写
+  quotaDraft.value = { limit: "", window: "" };
+  searchDraft.value = {
+    provider: j.search?.provider || j.search?.effective_provider || "",
+    base_url: j.search?.base_url || "",
+    api_key: "",
+  };
+  testSearchResult.value = null;
   return j;
 }
 
@@ -3024,6 +3041,137 @@ async function testJudgeConn() {
     keyError.value = "Jev 自检没跑成：" + e.message;
   } finally {
     testingJudge.value = false;
+  }
+}
+
+async function saveQuota() {
+  if (savingQuota.value) return;
+  savingQuota.value = true;
+  keyError.value = "";
+  try {
+    await ensureIdentity();
+    const limit = quotaDraft.value.limit.trim();
+    const window = quotaDraft.value.window.trim();
+    // 没写的字段发 null = 不动；写成空串发过去 = 清掉页面覆盖交回下层。两者是两件事。
+    const r = await fetch("/settings/quota", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        limit: limit === "" ? null : limit,
+        window: window === "" ? null : window,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    settings.value = j;
+    quotaDraft.value = { limit: "", window: "" };
+  } catch (e) {
+    keyError.value = "配额保存失败：" + e.message;
+  } finally {
+    savingQuota.value = false;
+  }
+}
+
+async function refreshQuota() {
+  if (savingQuota.value) return;
+  keyError.value = "";
+  try {
+    await loadSettings();
+  } catch (e) {
+    keyError.value = "读不到配额账：" + e.message;
+  }
+}
+
+async function clearQuotaOverride() {
+  if (savingQuota.value) return;
+  savingQuota.value = true;
+  keyError.value = "";
+  try {
+    await ensureIdentity();
+    // 全空串 = 后端 drop 页面层，回落到环境变量与启动参数（发 null 是「不动」，两回事）
+    const r = await fetch("/settings/quota", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ limit: "", window: "" }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    settings.value = j;
+    quotaDraft.value = { limit: "", window: "" };
+  } catch (e) {
+    keyError.value = "清除页面覆盖失败：" + e.message;
+  } finally {
+    savingQuota.value = false;
+  }
+}
+
+async function clearSearchOverride() {
+  if (savingSearch.value) return;
+  savingSearch.value = true;
+  keyError.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch("/settings/search", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ provider: "", base_url: "", api_key: "" }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    testSearchResult.value = null;
+    await loadSettings();
+  } catch (e) {
+    keyError.value = "清除检索后端失败：" + e.message;
+  } finally {
+    savingSearch.value = false;
+  }
+}
+
+async function saveSearch() {
+  if (savingSearch.value) return;
+  savingSearch.value = true;
+  keyError.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch("/settings/search", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        provider: searchDraft.value.provider,
+        base_url: searchDraft.value.base_url.trim(),
+        api_key: searchDraft.value.api_key.trim(),
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    testSearchResult.value = null;
+    await loadSettings();
+  } catch (e) {
+    keyError.value = "检索后端保存失败：" + e.message;
+  } finally {
+    savingSearch.value = false;
+  }
+}
+
+async function testSearchConn() {
+  if (testingSearch.value) return;
+  testingSearch.value = true;
+  keyError.value = "";
+  testSearchResult.value = null;
+  try {
+    await ensureIdentity();
+    const r = await fetch("/settings/search/test", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ query: "" }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    testSearchResult.value = j;
+  } catch (e) {
+    keyError.value = "检索自检没跑成：" + e.message;
+  } finally {
+    testingSearch.value = false;
   }
 }
 
@@ -4142,6 +4290,101 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           </div>
           <div class="set-note">密钥来源 {{ testResult.source }} · {{ testResult.masked || "无可用 key" }}</div>
         </div>
+        <!-- 配额：按身份的滑动窗口，页面值压过环境变量与启动参数，保存即生效 -->
+        <div class="set-line set-head">
+          配额（按身份 · 滑动窗口）
+          <span v-if="settings && settings.quota"
+                :class="settings.quota.blocking ? 'set-v' : 'set-note'">
+            {{ settings.quota.blocking
+               ? `拦截中 · 窗口内已用 ${settings.quota.used.toLocaleString()} / ${settings.quota.limit.toLocaleString()} token`
+               : `只记账不拦截 · 窗口内已用 ${settings.quota.used.toLocaleString()} token` }}
+            （{{ settings.quota.window_label }} · 来源 {{ settings.quota.source }}）
+          </span>
+        </div>
+        <div class="set-line">
+          <input v-model.trim="quotaDraft.limit" spellcheck="false"
+                 :placeholder="settings && settings.quota && settings.quota.pg_limit
+                   ? `页面已填 ${settings.quota.pg_limit}（不改则留空）`
+                   : '上限 token，如 20000000；填 0 = 只记账不拦'"
+                 :disabled="savingQuota" @keydown.enter.prevent="saveQuota" />
+          <input v-model.trim="quotaDraft.window" spellcheck="false"
+                 :placeholder="settings && settings.quota && settings.quota.pg_window
+                   ? `窗口已填 ${settings.quota.pg_window} 秒（不改则留空）`
+                   : '窗口秒数,留空 = 默认 86400'"
+                 :disabled="savingQuota" @keydown.enter.prevent="saveQuota" />
+          <button class="clip" :disabled="savingQuota
+                  || (!quotaDraft.limit && !quotaDraft.window)" @click="saveQuota">
+            {{ savingQuota ? "保存中…" : "保存" }}
+          </button>
+          <button v-if="settings && settings.quota && settings.quota.overridden"
+                  class="clip ghost" :disabled="savingQuota" @click="clearQuotaOverride">清除页面覆盖</button>
+          <button class="clip ghost" :disabled="savingQuota" @click="refreshQuota">刷新账</button>
+        </div>
+        <p v-if="settings && settings.quota" class="set-note">
+          <template v-if="settings.quota.frees_at">
+            <b class="set-v bad">当前已被拦住</b>：最早那笔在
+            {{ settings.quota.frees_at.slice(0, 16).replace("T", " ") }} UTC
+            （约 {{ settings.quota.frees_in_minutes }} 分钟后）滚出窗口，届时额度自动回落。
+            刷新页面、换会话、重开标签页都退不回已花掉的账——要立刻继续，把上面的上限改大或填 0。
+          </template>
+          <template v-else>
+            被拦的是「下一次问模型」：用量按身份记在服务端，与浏览器状态无关。
+            上限填 <b>0</b> = 照常记账但不拦截；留空则交回环境变量与启动参数那两层。
+            {{ settings.quota.calls }} 笔调用 · 剩余 {{ settings.quota.remaining === null
+               ? "不限" : settings.quota.remaining.toLocaleString() }}。
+          </template>
+        </p>
+
+        <!-- 联网检索后端：哪一路能出结果由这台机器说了算，配置也按身份热读 -->
+        <div class="set-line set-head">
+          联网检索后端
+          <span v-if="settings && settings.search" :class="settings.search.provider
+                 || settings.search.effective_provider ? 'set-v' : 'set-note'">
+            {{ settings.search.effective_provider
+               ? `走 ${settings.search.effective_provider}（来源 ${settings.search.source}）`
+               : "未配置后端 —— 走免 key 回落链，命中率看这台机器的 IP 像不像爬虫" }}
+            <template v-if="settings.search.masked"> · {{ settings.search.masked }}</template>
+          </span>
+        </div>
+        <div class="set-line">
+          <select v-model="searchDraft.provider" :disabled="savingSearch">
+            <option value="">免 key 回落链（不指定后端）</option>
+            <option v-for="p in (settings && settings.search && settings.search.providers) || []"
+                    :key="p" :value="p">{{ p }}</option>
+          </select>
+          <input v-if="searchDraft.provider === 'searxng'" v-model.trim="searchDraft.base_url"
+                 spellcheck="false" placeholder="自建实例地址 http(s)://…"
+                 :disabled="savingSearch" />
+          <input v-else v-model="searchDraft.api_key" type="password" autocomplete="off"
+                 spellcheck="false" placeholder="搜索 API Key（不改则留空）"
+                 :disabled="savingSearch" />
+        </div>
+        <div class="set-line">
+          <button class="clip" :disabled="savingSearch" @click="saveSearch">
+            {{ savingSearch ? "保存中…" : "保存" }}
+          </button>
+          <button class="clip" :disabled="testingSearch" @click="testSearchConn">
+            {{ testingSearch ? "自检中…" : "测试连接" }}
+          </button>
+          <button v-if="settings && settings.search && settings.search.overridden"
+                  class="clip ghost" :disabled="savingSearch" @click="clearSearchOverride">清除页面覆盖</button>
+        </div>
+        <p class="set-note">
+          brave / tavily / serpapi 要 API Key；searxng 是自建实例、只要地址（它的
+          settings.yml 得打开 json_format）。留空即回到免 key 回落链，保存即生效不重启。
+        </p>
+        <div v-if="testSearchResult" class="probe">
+          <div>
+            <b :class="testSearchResult.ok ? 'ok' : 'bad'">{{ testSearchResult.backend
+                       || testSearchResult.provider || "免 key 回落链" }}</b>
+            {{ testSearchResult.ok
+               ? `连通 · ${testSearchResult.results} 条 · ${testSearchResult.latency_ms}ms`
+               : "不通 · " + (testSearchResult.message || "未知错误") }}
+          </div>
+          <div v-if="testSearchResult.sample && testSearchResult.sample.length"
+               class="set-note">{{ testSearchResult.sample.join(" ／ ") }}</div>
+          <div class="set-note">{{ testSearchResult.message }}</div>
+        </div>
         <div v-if="keyError" class="set-v bad">{{ keyError }}</div>
       </div>
 
@@ -4775,13 +5018,13 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   display: flex; flex-direction: column; gap: 10px;
 }
 .set-line { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-.set-line input {
+.set-line input, .set-line select {
   flex: 1; min-width: 240px; padding: 9px 12px;
   font-family: ui-monospace, monospace; font-size: 13px; color: var(--ink);
   background: rgba(255, 253, 247, 0.9); border: 1px dashed var(--line); border-radius: 4px;
   outline: none;
 }
-.set-line input:focus { border-color: var(--vermilion); border-style: solid; }
+.set-line input:focus, .set-line select:focus { border-color: var(--vermilion); border-style: solid; }
 .set-k { font-family: var(--serif); font-size: 13px; color: var(--ink-soft); letter-spacing: 1px; }
 .set-v { font-size: 12.5px; color: var(--ink-soft); }
 .set-note { margin: 0; font-size: 12px; line-height: 1.7; color: var(--ink-soft); }

@@ -120,6 +120,11 @@ def render_injections(compiled: Mapping[str, Any]) -> list[str]:
     if pairs:
         lines.append("可并行：以下步骤互不依赖，请放进**同一次回复**里一起调用"
                      "（分成两次就是串行，白等一倍时间）：" + "；".join(pairs))
+    lines.append("读产物：read_node_history 只在某一步要用**它上一步刚产出的结果**时才读，"
+                 "键就是那个上一步的节点名。它不是「查 Store 里有什么」的浏览器——"
+                 "报「Store 中还没有」说明那一步还没跑，本轮没有任何键可查；"
+                 "**换个键名再试也不会变出来**（真机实测：连猜 25 个键、26 秒烧 121 万 token "
+                 "把整条 run 撑到配额上限）。唯一出路是直接调用产出它的节点。")
     lines.append("</approved_plan>")
     out = ["\n".join(lines)]
     custom = compiled.get("custom") or []
