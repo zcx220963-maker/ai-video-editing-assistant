@@ -148,7 +148,8 @@ def render_attachments_section(rows: Sequence[Mapping[str, Any]],
             # 所以单独给一条出路——出片节点的 bgm 参数直接收 material_id。
             lines.append(
                 "其中音频（kind=audio）是配乐/曲目，**不要**当画面素材传给 load_media："
-                "零素材出片（render_motion_video）直接把它的 material_id 传给 bgm 参数即可；"
+                "零素材出片（render_motion_code）直接把它的 "
+                "material_id 传给 bgm 参数即可；"
                 "有素材的剪辑链先调 select_BGM(query=歌名) 拿到引用，再交给渲染节点。"
             )
     if rejected:

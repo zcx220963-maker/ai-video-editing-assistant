@@ -2806,6 +2806,18 @@ def _flag_on(value: Any) -> bool:
     return bool(value)
 
 
+def new_patch_scope_id() -> str:
+    """局部改要落进的新产物作用域号：``p`` + 8 位十六进制。
+
+    为什么单源：渲染任务行、成片字节、命中表、代表帧全都按 ``artifact_id`` 落位，而
+    执行位（``RenderDispatcher.submit``）**在提交那一刻**就得决定这一行开在哪个键上，
+    比节点体分叉出号早。这个号因此有两个出产的人：分叉那一步，和 MCP 入口在提交前的
+    预发（见 ``server.py`` 的 ``forks_artifact_scope``）。两处一旦漂开格式，就是
+    「任务行开在 A、终态写在 B」——轮询端等不到终态，看门狗把一次成功的局部改判成失败。
+    """
+    return f"p{uuid.uuid4().hex[:8]}"
+
+
 def _overlay_window_issues(tl: dict[str, Any]) -> list[str]:
     """覆盖层里**不碰字节就能判出**的问题（dry-run 与真渲染共用这一份判据）。"""
     total = float(tl.get("duration") or 0)
@@ -3478,6 +3490,9 @@ class PatchVideoNode(RenderVideoNode):
     # 一旦写了 render_video，补齐依赖时会**重跑一次整片出片**。
     required_nodes: list[str] = []
     require_explicit_call = True
+    #: 同 ``MotionPatchBase``：本节点会在体里分叉出新产物作用域，MCP 入口必须把渲染任务行
+    #: 开在那个新号上，而不是调用方传来的 ``_default``（那正是 base 那一版的账）。
+    forks_artifact_scope = True
     ephemeral = ("media_url",)
     input_schema = _obj("口播/素材片局部改（只重烧受影响的窗口）", {
         "base_artifact_id": {
@@ -3637,7 +3652,7 @@ class PatchVideoNode(RenderVideoNode):
         if artifact in ("", "_default") or artifact == base:
             # 等于 base 的那一种必须换号：沿用就是把旧版覆盖掉，而旧版留着才能
             # 「改坏了直接播回去」——那一版片子是这次局部改唯一的退路。
-            artifact = f"p{uuid.uuid4().hex[:8]}"
+            artifact = new_patch_scope_id()
         repo = self.storage.artifacts(sess, artifact)
         try:
             await repo.clone_from(self.storage.artifacts(
@@ -3966,15 +3981,17 @@ REAL_NODE_CLASSES = [
 def build_real_registry(settings: Settings, providers: Providers, storage: Storage,
                         allowed: list[str] | None = None) -> NodeRegistry:
     """实例化真实节点；allowed 为 TOML available_nodes 白名单。"""
-    # 网页出片、图形科普片出片与它的分镜节点三条通道延迟到这里导入：它们的模块反过来引
-    # 本模块的 StoryNode/_obj/_JobProgress，模块级互相导入会因加载顺序炸掉其中一边。
-    from .motion_nodes import PatchMotionVideoNode, RenderMotionVideoNode
+    # 网页出片、图形科普片的分镜与出片通道延迟到这里导入：它们的模块反过来引本模块的
+    # StoryNode/_obj/_JobProgress，模块级互相导入会因加载顺序炸掉其中一边。
+    # motion_nodes.py 里的两个基类**不注册**（那个文件没有工具，只有流程）。
+    from .motion_code_nodes import (PatchCodeMotionVideoNode,
+                                    RenderCodeMotionVideoNode)
     from .motion_plan import PlanMotionNode
     from .web_nodes import RenderWebNode
     reg = NodeRegistry()
     name_to_cls = {cls.name: cls
                    for cls in [*REAL_NODE_CLASSES, RenderWebNode, PlanMotionNode,
-                               RenderMotionVideoNode, PatchMotionVideoNode]}
+                               RenderCodeMotionVideoNode, PatchCodeMotionVideoNode]}
     for nm in (allowed or list(name_to_cls)):
         cls = name_to_cls.get(nm)
         if cls is not None:

@@ -56,7 +56,7 @@ class RunState:
     # 续跑换 run 身份。落进 state 就跟着指针行走，重启与续跑都记得「这道题问过了」。
     #
     # 为什么按**通道**而不是整条 run 一个布尔：用户确认了剪素材那条路
-    # （``render_video``），不等于批准了零素材那条路（``render_motion_video``）——
+    # （``render_video``），不等于批准了零素材那条路（``render_motion_code``）——
     # 那是另一笔不可逆的算力，一位布尔会把第二道门直接放行。
     render_gate_asked: list[str] = field(default_factory=list)
     # 对账：上一次推给前端的偏差（据此去重），以及终答时算出的完整结论

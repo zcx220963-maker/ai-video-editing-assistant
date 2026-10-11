@@ -52,6 +52,8 @@ PLACEHOLDER_API_KEY = "pending-frontend-settings"
 MY_API_KEY = ""                    # ← 留空；要回落配置请设环境变量 OPENAI_API_KEY
 MY_MODEL = "deepseek-flash"        # ← 例如 "deepseek-chat" 或 "deepseek-v4-flash"；留空用默认
 MY_BASE_URL = ""     # ← 换服务商时才填；留空用 https://api.deepseek.com
+# 12 镜分镜（每镜含 TSX 代码）约需 8K~16K 输出 token；API 默认 4096 会截断末尾镜头。
+DEFAULT_MAX_TOKENS = 16384
 # ==============================================================================
 
 
@@ -66,28 +68,40 @@ def _is_retryable(err: Exception) -> bool:
 
 
 def _parse_tool_args(raw: str) -> dict[str, Any]:
-    """工具调用参数串 → dict，并对**流式拼接产生的尾部垃圾**做一次保守修复。
+    """工具调用参数串 → dict，并对**流式拼接产生的尾部垃圾**做保守修复。
 
-    为什么不能只 ``json.loads`` 了事：流式下参数是逐块拼出来的，模型偶尔会多吐一个
-    收尾括号。真机实测到过：``{"plans": [...]]}}`` —— ``{`` 58 个、``}`` 59 个，
-    去掉最后 1 个字符就是完全合法的 JSON。原先的实现直接判 ``_raw``，
-    于是这份**内容完全正确**的计划被当成「缺少必填参数 plans」打回，
-    模型重试第二次还是同样结果，最后只能告诉用户「工具侧参数解析有问题」——
-    一整轮白跑，用户拿不到计划卡。
+    为什么不能只 ``json.loads`` 了事：流式下参数是逐块拼出来的，至少出过三种坏法：
 
-    修复只做**一件**非常保守的事：整体括号不平衡时，试剥掉末尾 1~3 个字符再解析。
-    不做括号补全、不做截断提取——那些会把「模型确实传错了」也悄悄修成看似成功，
-    反而掩盖问题。修不好就退回 ``{"_raw": …}``，由工具层如实报错。
+    1. **多吐收尾括号**：``{"plans": [...]]}}`` —— ``}`` 比 ``{`` 多，剥掉末尾 1~3 字符即可。
+    2. **max_tokens 截断**：12 镜分镜的参数串很长，模型输出被 max_tokens 砍断，
+       JSON 没闭合（``}`` 比 ``{`` 少）。之前只剥多闭合、不补少闭合，
+       于是整份参数变成 ``{"_raw": …}``，工具层看到 ``spec=None`` 直接报错——
+       用户连着 4 轮拿不到分镜卡。补全只追加**结构上缺的闭合符**，
+       不捏造内容：截断丢的是尾部数据，补上括号后解析出的部分仍可用。
+    3. **双重编码**：某些模型把 arguments 整体当一个字符串值再 JSON 编码一次，
+       ``json.loads`` 成功但返回 ``str`` 而非 ``dict``。再 loads 一次即可。
+
+    修不好就退回 ``{"_raw": …}``，由工具层如实报错。
     """
     text = raw or ""
     if not text.strip():
         return {}
     try:
         doc = json.loads(text)
-        return doc if isinstance(doc, dict) else {"_raw": text}
+        if isinstance(doc, dict):
+            return doc
+        if isinstance(doc, str) and doc.strip():
+            try:
+                inner = json.loads(doc)
+                if isinstance(inner, dict):
+                    logger.warning("工具参数双重编码，已解一层")
+                    return inner
+            except json.JSONDecodeError:
+                pass
+        return {"_raw": text}
     except json.JSONDecodeError:
         pass
-    # 只在不平衡（多闭合）时才试：少闭合属于截断，剥字符救不了，也不该救。
+    # 多闭合：剥末尾 1~3 字符
     if text.count("}") > text.count("{") or text.count("]") > text.count("["):
         for cut in (1, 2, 3):
             if cut >= len(text):
@@ -99,7 +113,65 @@ def _parse_tool_args(raw: str) -> dict[str, Any]:
             if isinstance(doc, dict):
                 logger.warning("工具参数流式拼接多了 %d 个收尾字符，已保守修复", cut)
                 return doc
+    # 少闭合：max_tokens 截断——用括号栈+字符串状态跟踪正确补全
+    repaired = _repair_truncated_json(text)
+    if repaired is not None:
+        try:
+            doc = json.loads(repaired)
+            if isinstance(doc, dict):
+                logger.warning("工具参数被 max_tokens 截断，已按括号栈补全闭合符")
+                return doc
+        except json.JSONDecodeError:
+            pass
     return {"_raw": text}
+
+
+def _repair_truncated_json(text: str) -> str | None:
+    """对被 max_tokens 截断的 JSON 串，按实际括号栈和字符串状态补全闭合符。
+
+    只做结构补全，不捏造内容：截断丢的尾部数据不会无中生有。
+    返回补全后的字符串；如果文本看起来不像 JSON 开头则返回 None。
+    """
+    stripped = text.strip()
+    if not stripped.startswith("{") and not stripped.startswith("["):
+        return None
+    in_string = False
+    escape = False
+    stack: list[str] = []
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack and stack[-1] == ("{" if ch == "}" else "["):
+                stack.pop()
+    closers = "".join("}" if o == "{" else "]" for o in reversed(stack))
+    base = text + ('"' if in_string else "")
+    rstrip = base.rstrip()
+    candidates = [
+        rstrip + closers,
+        rstrip.rstrip(",").rstrip() + closers,
+        rstrip + "null" + closers if rstrip.endswith(":") else None,
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        try:
+            json.loads(c)
+            return c
+        except json.JSONDecodeError:
+            continue
+    return rstrip + closers
 
 
 def _describe_error(err: Exception) -> str:
@@ -150,7 +222,7 @@ class OpenAICompatClient:
         self.api_key = api_key or MY_API_KEY or runtime_secrets.env_api_key()[0] or ""
         self.base_url = base_url or MY_BASE_URL or os.getenv("OPENAI_BASE_URL") or DEFAULT_BASE_URL
         self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.max_tokens = max_tokens or DEFAULT_MAX_TOKENS
         self.thinking = _resolve_thinking(thinking)
         self._injected = client is not None
         self._client = client or self._build_real_client()

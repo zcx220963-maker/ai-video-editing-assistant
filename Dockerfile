@@ -40,6 +40,12 @@ RUN apt-get update -o Acquire::Retries=3 \
     && rm -rf /var/lib/apt/lists/* && chromium --version
 
 COPY backend/ ./
+# 母版（TSX）源码里被离线对账比的那几个文件也带一份：tests/test_code_spec.py ⑤ 拿
+# Python 契约比 tokens.ts 的字幕档位与画幅、比 lint-rules.mjs 的 import 白名单、比
+# package.json 的依赖——不在这里 COPY，这一条在 sanctioned 环境（creation-app 内跑套件）
+# 就是读不到文件。拷贝只会因「改了 TSX 没重烤 app 镜像」而变旧，变旧报红不静默过。
+COPY remotion/src/tokens.ts /app/remotion/src/tokens.ts
+COPY remotion/lint-rules.mjs remotion/package.json /app/remotion/
 # 前端产物放进 REPO_ROOT/frontend/dist(run_server 的静态目录锚点在容器内=/frontend/dist)
 COPY --from=web /web/dist /frontend/dist
 

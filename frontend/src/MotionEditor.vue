@@ -3,15 +3,21 @@
 //
 // 为什么自己画这一层而不是嵌第三方剪辑器：要的是「鼠标框住屏幕上这一块，改的就是这一块」，
 // 而这件事只有我们的命中表（出片时量好的 元素框 ↔ 分镜字段 凭据）说得出对应关系。
-// 第三方剪辑器只认时间线与素材，框不出「这一格字属于 /shots/0/panel/编号」。
+// 第三方剪辑器只认时间线与素材，框不出「屏幕上这一块属于 /shots/0/fields/半径/value」。
 //
 // 两种形态由**表自己声明**，不靠前端猜：
-// * 图形科普片（motion-hitmap/1）量的是浏览器里的框 → 画面上能框选、有整镜表单；
+// * 图形科普片·代码镜（motion-code-hitmap/1 + chain=remotion）：盒是母版在探针帧量回来的
+//   **成片像素**（表里写着 coord=output_px），条目只有 `pointer` 与字段声明，控件的类型/范围/
+//   档位由条目自带的 fields schema 说（闸⑥ 那条通道）；
 // * 口播/素材片（segment-hitmap/1 + hit_mode=track）没有版式可量，每一段本来就是
 //   「第 s 秒到第 e 秒」→ 没有空间命中层，选段只能在时间线上点，表单是那一段的字段。
+// 代码镜那一份的**形状差异只在下面那个适配器里处理**（盒归一、补 id 与 field 两栏），
+// 框选 / 表单 / 提交三条码路吃的都是适配后的条目 —— 在三个位置各写一个 if 的话，
+// 漏掉的那一处就是「按旧框改错字段」，而那正是命中表要消灭的失败模式。
 // 两条链的口实现同一份（/motion/* 与 /timeline/* 落到同一个读表/取帧/提交函数），
 // 差别只在提交时的键：那条链收 edits/shot_sets/remove_shots/reorder，这条只收 edits
 // ——它的合同不改总长也不换序（画面与口播句子的对应是基准）。
+// 交给哪条链的局部改节点由**服务端读 base 那一版的表里的 chain** 决定，前端不猜。
 //
 // 全部改动拼成一次 POST，提交后轮询 GET /render_status——拒绝也落在轮询端的 error
 // 正文里，HTTP 状态码不作判据。
@@ -95,7 +101,17 @@ function resolvePath(doc, ss) {
   let cur = doc;
   for (const s of ss) {
     if (cur == null) return undefined;
-    cur = Array.isArray(cur) ? cur[Number(s)] : cur[s];
+    if (Array.isArray(cur)) {
+      // 代码镜的字段指针中段是**按 name 寻址的数组**（`/shots/i/fields/<name>/value`），
+      // 与后端 code_patch 同口径。只认下标的话这一格永远查不到值，〈字段〉页就会把
+      // 「原值 240」说成「未设置 · 渲染按默认 null」、滑杆停在量程左端。
+      const i = Number(s);
+      cur = (Number.isInteger(i) && String(i) === s)
+        ? cur[i]
+        : cur.find((el) => String(el?.name ?? "") === s);
+    } else {
+      cur = cur[s];
+    }
   }
   return cur;
 }
@@ -134,7 +150,43 @@ const curIdx = computed(() => {
 const curSid = computed(() => laneRows.value[curIdx.value]?.id || "");
 // 右侧面板对谁说话：轨道形态是用户点上的那一段，框选形态是播放头那一镜。
 const focusSid = computed(() => (isTrack.value ? selectedRow.value : curSid.value));
-const entries = computed(() => (shots.value[focusSid.value] || {}).entries || []);
+// ---- 代码镜那份表的形状差异**只在这里抹平** ----
+// 表里的盒是母版在探针帧量回来的**成片像素**（coord=output_px），条目也只有 pointer
+// 没有 id/field 两栏；口播轨那份压根没有盒（一段就是一整幅画面）。
+// 不在这里补齐，框选、表单、提交三条码路就要各写一个 if；漏掉的那一处就是「按旧框
+// 改错字段」，而那正是命中表要消灭的失败模式。
+const isCode = computed(() => hm.value?.chain === "remotion");
+function adaptCodeEntry(e, sid, tbl) {
+  const w = Number(tbl?.width) || 1, h = Number(tbl?.height) || 1;
+  const px = Array.isArray(e.box) ? e.box : null;
+  const isField = e.kind === "field";
+  return {
+    ...e,
+    id: `${sid}/${isField ? e.name : "@shot"}`,
+    // 整镜那条对应的是 code/text/source **三条**指针，不是一格可写的字段，所以 field
+    // 留空、不进框选层；它的改写入口在〈代码〉与〈文案·出处〉两页。
+    field: isField ? e.pointer : "",
+    box: px ? { x: px[0] / w, y: px[1] / h, w: px[2] / w, h: px[3] / h } : null,
+    text: typeof e.value === "string" ? e.value : "",
+    // pointer 来自分镜契约，不是按文字近似对上的，所以没有「请核对」那一档。
+    confidence: "exact",
+    title: `${isField ? e.label || e.name : e.label} · ${e.pointer}`,
+  };
+}
+const tableEntries = computed(() => {
+  const out = {};
+  Object.entries(shots.value || {}).forEach(([sid, tbl]) => {
+    out[sid] = ((tbl || {}).entries || [])
+      .map((e) => (isCode.value ? adaptCodeEntry(e, sid, tbl) : e));
+  });
+  return out;
+});
+const entries = computed(() => tableEntries.value[focusSid.value] || []);
+// 代码镜铺满全幅的整镜框不进框选层：留着它，每次框选都多命中一个没有字段的空行。
+const spaceEntries = computed(() => (isCode.value
+  ? entries.value.filter((e) => e.kind === "field" && e.box) : entries.value));
+const codeFields = computed(() => (isCode.value
+  ? entries.value.filter((e) => e.kind === "field") : []));
 // 播放头用像素而不是百分比：整条时间线在一个横向滚动容器里，缩放后两者会漂。
 const headX = computed(() => cur.value * pps.value);
 // ---- 统一时间线：一条秒尺 + 若干条 lane，两条链共用同一套坐标 ----
@@ -289,11 +341,12 @@ const selected = ref([]);
 const selectedRow = ref("");           // 轨道形态：点中的是哪一段
 const marquee = ref(null);
 const tab = ref("cells");
+const bgmEdit = ref({ volume: null, duck: null }); // 配乐改：null=未改
 let dragStart = null;
 function pickRow(sid) {
   selectedRow.value = sid;
   // 一段能改的字段全在那一行的条目里（timeline_edit 每条可改字段一条），一次选上
-  selected.value = ((shots.value[sid] || {}).entries || []).map((e) => e.id);
+  selected.value = (tableEntries.value[sid] || []).map((e) => e.id);
   tab.value = "cells";
 }
 const norm = (ev) => {
@@ -303,7 +356,7 @@ const norm = (ev) => {
 };
 const boxStyle = (b) => ({ left: `${b.x * 100}%`, top: `${b.y * 100}%`,
                           width: `${b.w * 100}%`, height: `${b.h * 100}%` });
-const visibleBoxes = computed(() => entries.value.map((e) => ({
+const visibleBoxes = computed(() => spaceEntries.value.map((e) => ({
   ...e, style: boxStyle(e.box || {}), on: selected.value.includes(e.id),
   dead: !e.field || e.confidence === "none",
 })));
@@ -332,17 +385,17 @@ function onStageUp(ev) {
   marquee.value = null;
   if (!start) return;
   if (mq && (mq.w > 0.01 || mq.h > 0.01)) {
-    selected.value = entries.value.filter((e) => overlap(mq, e.box || {})).map((e) => e.id);
-    tab.value = "cells";
+    selected.value = spaceEntries.value.filter((e) => overlap(mq, e.box || {})).map((e) => e.id);
+    tab.value = "fields";
     return;
   }
   // 没拖动 = 单击：多个框叠在一起时取最小的（父块会把子文本再回显一遍）
   const p = norm(ev);
-  const hit = entries.value.map((e) => ({ e, b: e.box || {} }))
+  const hit = spaceEntries.value.map((e) => ({ e, b: e.box || {} }))
     .filter(({ b }) => b.x <= p.x && p.x <= b.x + b.w && b.y <= p.y && p.y <= b.y + b.h)
     .sort((a, c) => (a.b.w * a.b.h) - (c.b.w * c.b.h));
   selected.value = hit.length ? [hit[0].e.id] : [];
-  tab.value = "cells";
+  tab.value = "fields";
 }
 // 换镜即清选区：选中的是「这一帧上的这一块」，跳到别的镜还留着就是拿旧框改新字。
 // 轨道形态不清：那里的选区是点段点出来的，播放头路过别的时间不改变「在改哪一段」。
@@ -352,7 +405,7 @@ watch(curSid, () => { if (!isTrack.value) selected.value = []; });
 const groups = computed(() => {
   const want = new Set(selected.value);
   const by = new Map();
-  for (const e of entries.value) {
+  for (const e of spaceEntries.value) {
     if (!want.has(e.id)) continue;
     const k = e.field || `@none:${e.id}`;
     if (!by.has(k)) by.set(k, { pointer: e.field || "", key: k, hits: [] });
@@ -360,12 +413,16 @@ const groups = computed(() => {
   }
   return [...by.values()];
 });
+// 〈字段〉页那一栏吃的是**这一镜全部旋钮**，不是选区：框住某个元素只是把那一行点亮，
+// 没点到的旋钮一样要能改（spec §6：表吐出 fields schema，界面自动出控件）。
+const cellGroups = computed(() => (isCode.value
+  ? codeFields.value.map((f) => ({ pointer: f.pointer, key: f.id, hits: [f] }))
+  : groups.value));
 
 // ---- 改动账 ----
-// overrides：整镜表单覆盖的顶层栏（落在这些栏上的指针改动也写进同一份，两处不会口径不一）
-// deepEdits：表单没覆盖的深层指针（图示数值、画面里的文字坐标）——选区改的主场
-const FORM_FIELDS = ["text", "highlight", "panel", "label", "stamp", "min_duration_sec",
-                     "theme", "overlay"];
+// overrides：〈文案·出处〉表单覆盖的顶层栏（落在这些栏上的指针改动也写进同一份，两处不会口径不一）
+// deepEdits：表单没覆盖的指针（镜头代码、字段注入值、出处整份）——选区改的主场
+const FORM_FIELDS = ["text", "highlight", "min_duration_sec"];
 function resetEdits() {
   Object.keys(overrides).forEach((k) => delete overrides[k]);
   Object.keys(deepEdits).forEach((k) => delete deepEdits[k]);
@@ -373,16 +430,18 @@ function resetEdits() {
   order.value = [...baseIds.value];
   selected.value = [];
   selectedRow.value = "";
-  themeScope.value = "";      // 同步范围属于这一批改动：留着就是拿上一次的选择替这一次定
+  fieldScope.value = "";
   syncAsk.value = false;
-  tab.value = "cells";        // 样式/整镜两页只有空间形态有，换到口播版要退回共有的那页
+  bgmEdit.value = { volume: null, duck: null };
+  // 〈字段〉〈代码〉〈文案·出处〉是代码镜那三页，口播版只有「点一段改它的字段」那一页。
+  tab.value = isTrack.value ? "cells" : "fields";
 }
 // 指针 → 表里那条条目：轨道形态提交时要照它的 segment_id 一起交（闸门拿段号核对
 // 这张表量的是不是当前这一版），字段标签也从这里取。
 const entryByPointer = computed(() => {
   const m = {};
-  Object.values(shots.value || {}).forEach((s) =>
-    (s.entries || []).forEach((e) => { if (e.field) m[e.field] = e; }));
+  Object.values(tableEntries.value).forEach((list) =>
+    list.forEach((e) => { if (e.field) m[e.field] = e; }));
   return m;
 });
 function overrideFor(sid) {
@@ -436,23 +495,25 @@ const changedShots = computed(() => {
   const touched = new Set();
   if (isTrack.value) {
     // 轨道形态的指针中段是「该轨内的下标」，不能拿整条表的镜序去查——那是别的段
-    Object.keys(deepEdits).forEach((p) => {
+    Object.keys(editAccount.value).forEach((p) => {
       const sid = String(entryByPointer.value[p]?.segment_id || "");
       if (sid) touched.add(sid);
     });
     return touched;
   }
-  Object.keys(deepEdits).forEach((p) => {
+  Object.keys(editAccount.value).forEach((p) => {
     const sid = baseIds.value[Number(segs(p)[1])];
     if (sid) touched.add(sid);
   });
-  order.value.forEach((sid) => { if (Object.keys(shotSetFor(sid)).length) touched.add(sid); });
+  order.value.forEach((sid) => { if (Object.keys(setFor(sid)).length) touched.add(sid); });
   return touched;
 });
 const dirty = computed(() => Object.keys(deepEdits).length > 0
   || removals.value.length > 0
   || order.value.join(" ") !== baseIds.value.join(" ")
-  || changedShots.value.size > 0);
+  || changedShots.value.size > 0
+  || bgmEdit.value.volume !== null
+  || bgmEdit.value.duck !== null);
 
 // 时长：拖右边缘改的就是 min_duration_sec。有旁白时镜头长度归真实语音时长，
 // 这一栏只剩「下限」的意思——所以拖到配音秒数以下不会有任何效果，这里如实拦住。
@@ -460,7 +521,12 @@ function effSec(sid) {
   const tl = timeline.value[idxOf(sid)] || {};
   const floor = Math.max(Number(tl.speech_sec) || 0, 0.5);
   const o = overrides[sid];
-  const want = o && "min_duration_sec" in o ? Number(o.min_duration_sec) : (tl.sec || 0);
+  // overrides 是表单一渲染就预填的（overrideFor 把当前值抄进去好做对比），所以
+  // 「这一栏在 overrides 里」不等于「用户拖过」——照 presence 判的话，只是打开
+  // 〈文案·出处〉看一眼，秒尺就会把实测 4.36s 换成下限 2.0s 并报「合计约 4.0s」。
+  const base = Number(shotBase(sid).min_duration_sec);
+  const dragged = o && "min_duration_sec" in o && Number(o.min_duration_sec) !== base;
+  const want = dragged ? Number(o.min_duration_sec) : (tl.sec || 0);
   return { want: want || 0, floor, sec: Math.max(want || 0, floor) };
 }
 const estTotal = computed(() => projected.value.total);
@@ -482,6 +548,7 @@ function onBarDown(ev, b, laneKey) {
     return;
   }
   if (laneKey !== "shots") {              // 旁白/配乐是从镜合成出来的，不是可拖的旋钮
+    if (laneKey === "bgm") tab.value = "bgm"; // 配乐轨可点开配乐编辑面板
     seek(b.start);
     return;
   }
@@ -533,79 +600,56 @@ const toggleRemove = (sid) => {
     ? removals.value.filter((x) => x !== sid) : [...removals.value, sid];
 };
 
-// ---- 表单小工具：panel/label 的键名也要能改（指针只认已存在的字段，改名只能整镜写回）----
-function renameKey(sid, field, oldKey, ev) {
-  const nk = ev.target.value.trim();
-  const src = overrideFor(sid)[field] || {};
-  if (!nk || nk === oldKey || nk in src) return;
-  const out = {};
-  Object.entries(src).forEach(([k, v]) => { out[k === oldKey ? nk : k] = v; });
-  overrideFor(sid)[field] = out;
-}
-function addRow(sid, field) {
-  const o = overrideFor(sid);
-  const src = (o[field] ||= {});
-  let n = 1;
-  while (`新字段 ${n}` in src) n += 1;
-  src[`新字段 ${n}`] = "";
-}
-function delRow(sid, field, key) {
-  const src = { ...(overrideFor(sid)[field] || {}) };
-  delete src[key];
-  overrideFor(sid)[field] = src;
-}
+// ---- 表单小工具：高亮词是数组，增删只能整镜写回（指针只认已存在的格）----
 function addHighlight(sid) { const o = overrideFor(sid); (o.highlight ||= []).push(""); }
 function delHighlight(sid, k) { overrideFor(sid).highlight.splice(k, 1); }
 
-// ---- 样式表单（F2）：旋钮清单与取值范围都读表里的 controls ----
+// ---- 控件清单与取值范围都读表里的 controls ----
 // 为什么不在前端写一份：写死的那份与入口校验迟早对不上，代价是「界面能拖到 3、
 // 提交被拒收」，而用户读到的只是「改不动」。表里发了范围，滑杆就只可能给出合法值。
+// 代码镜的旋钮不读这里——那份声明（type/min/max/options/step）随条目一起发，见 fieldEntry。
 const ctl = computed(() => hm.value?.controls || {});
-const themeCtl = computed(() => ctl.value.theme || {});
-const ovlCtl = computed(() => ctl.value.overlay || {});
-const COLOR_FIELDS = new Set(["color", "background", "border", "bg", "paper", "ink",
-                              "accent", "hl"]);
 const ranges = computed(() => {
   const c = ctl.value, out = {};
   if (c.volume_max != null) out.volume = [0, c.volume_max];
   if (c.font_size_range) out.font_size = c.font_size_range;
-  Object.entries(c.theme?.num || {}).forEach(([k, v]) => { out[k] = v; });
-  Object.entries(c.overlay?.style_num || {}).forEach(([k, v]) => { out[k] = v; });
-  Object.entries(c.overlay?.box || {}).forEach(([k, v]) => { out[`box.${k}`] = v; });
-  if (c.overlay?.at_ms) out.at_ms = c.overlay.at_ms;
-  if (c.overlay?.dur_ms) out.dur_ms = c.overlay.dur_ms;
   return out;
 });
-const enums = computed(() => ({
-  position: ctl.value.subtitle_positions || [],
-  font: themeCtl.value.fonts || [],
-  align: ovlCtl.value.aligns || [],
-  anim: ovlCtl.value.anims || [],
-  type: ovlCtl.value.types || [],
-  z: ovlCtl.value.z || [],
-}));
-/** 指针末端 → 查表用的键：``box`` 下的 x/y/w/h 与样式里的同名数值不是一个范围。 */
-function ctlKey(p) {
-  const leaf = segs(p);
-  const f = String(leaf.slice(-1)[0] || "");
-  return `${leaf[leaf.length - 2] === "box" ? "box." : ""}${f}`;
-}
+const enums = computed(() => ({ position: ctl.value.subtitle_positions || [] }));
+/** 指针 → 这一格的**声明**（代码镜的字段条目）。控件的类型、范围、档位、候选
+ *  都从这一份读：表里没给 min/max 就把滑杆退成纯数字框，而不是前端编一个上界——
+ *  编出来的上界与契约对不上，用户拖到的值迟早被闸门打回。 */
+const fieldEntry = (p) => {
+  const e = entryByPointer.value[p];
+  return e && e.kind === "field" ? e : null;
+};
 /** 这一格该用什么控件：类型问表（口播链的 editable_fields 连类型一起发），
- *  范围与档位也问表；只有图形科普片那条链没有字段类型表，才按原值类型推。 */
+ *  范围与档位也问表；两处都不在前端猜类型。 */
 function ctlKind(p) {
-  const ss = segs(p);
-  const f = String(ss.slice(-1)[0] || "");
-  const t = isTrack.value ? (hm.value?.editable_fields?.[ss[0]] || {})[f] : "";
-  if (t === "color" || COLOR_FIELDS.has(f)) return "color";
-  if (t === "enum") return "enum";
-  if (ranges.value[ctlKey(p)]) return "range";
-  if ((enums.value[f] || []).length) return "enum";
+  const f = fieldEntry(p);
+  if (f) {
+    if (f.type === "number") return f.min != null && f.max != null ? "range" : "number";
+    return f.type === "color" ? "color" : f.type === "bool" ? "bool"
+      : f.type === "select" ? "enum" : "text";
+  }
+  const name = leafField(p);
+  const t = (hm.value?.editable_fields?.[segs(p)[0]] || {})[name] || "";
+  if (t === "color") return "color";
+  if (t === "enum" || (enums.value[name] || []).length) return "enum";
+  if (ranges.value[name]) return "range";
   if (t === "number") return "number";
   return typeof baseValue(p) === "number" ? "number" : "text";
 }
-const rangeOf = (p) => ranges.value[ctlKey(p)] || [0, 1];
-/** 步长按范围跨度给：0~1 的透明度拖不出 0.01 的差别就等于没改，400 档字号拖 0.01 又点不准。 */
+const rangeOf = (p) => {
+  const f = fieldEntry(p);
+  if (f && f.min != null && f.max != null) return [f.min, f.max];
+  return ranges.value[leafField(p)] || [0, 1];
+};
+/** 步长按范围跨度给：0~2 的音量拖不出 0.05 的差别就等于没改，400 档字号拖 0.01 又点不准。
+ *  代码镜的旋钮例外：声明里写了 step 就用它，那是契约给的档位，不是前端猜的跨度。 */
 function stepOf(p) {
+  const f = fieldEntry(p);
+  if (f && f.step != null) return f.step;
   const [lo, hi] = rangeOf(p);
   const s = hi - lo;
   return s <= 1 ? 0.01 : s <= 4 ? 0.05 : s <= 150 ? 1 : 2;
@@ -627,15 +671,9 @@ const NAMED_COLOR = Object.fromEntries([
   ["turquoise", "#3fc0b0"], ["wheat", "#e6c88a"],
 ]);
 const namedHex = (v) => NAMED_COLOR[String(v || "").toLowerCase()] || "";
+// 只覆盖口播轨那几条字段：代码镜的标题来自条目声明里的 label，不查这张表。
 const FIELD_LABEL = {
-  bg: "底色", paper: "纸面", ink: "文字", accent: "强调", hl: "高亮",
-  caption_size: "标题字号", font: "字体档",
-  color: "字色", background: "填充", border: "描边", size: "字号", weight: "粗细",
-  align: "对齐", radius: "圆角", opacity: "不透明", rotation: "旋转",
-  x: "横向", y: "纵向", w: "宽", h: "高",
-  type: "类型", text: "文字", ref: "素材", anim: "动效", at_ms: "起 (ms)",
-  dur_ms: "动效时长 (ms)", z: "层级",
-  volume: "音量倍率", font_size: "字号", position: "位置",
+  color: "字色", text: "文字", volume: "音量倍率", font_size: "字号", position: "位置",
   src_start: "取源起点 (s)", src_end: "取源终点 (s)", path: "素材路径",
   offset_sec: "起播偏移 (s)", style: "样式名", start: "起点 (s)", end: "终点 (s)",
 };
@@ -648,140 +686,210 @@ function hexOf(v) {
   if (m) return `#${[...m[1]].map((c) => c + c).join("")}`;
   return namedHex(s) || "#000000";
 }
-const rg = (key) => ranges.value[key] || [0, 1];
 /** 下拉里连当前值一起列：原值不在档位表里时，打开下拉不该顺手把它改成第一项。 */
-const enumOpts = (kind, cur) => {
-  const list = enums.value[kind] || [];
-  return cur == null || cur === "" || list.includes(cur) ? list : [...list, cur];
+const withCur = (list, cur) => (cur == null || cur === "" || list.includes(cur)
+  ? list : [...list, cur]);
+/** 一格的候选：代码镜的旋钮读**条目自己带的 options**（声明期就校验过值在里面），
+ *  其余仍读整片那一份枚举表。两处各写一遍枚举，迟早出现「界面有这档、渲出来没有」。 */
+const ctlOpts = (p) => {
+  const f = fieldEntry(p);
+  return withCur(f ? (f.options || []) : (enums.value[leafField(p)] || []), shownValue(p));
 };
+/** 一格的标题：代码镜用声明里的 label（那是给人看的），其余按字段名查中文表。 */
+const fieldLabel = (p) => {
+  const f = fieldEntry(p);
+  return f ? (f.label || f.name) : (FIELD_LABEL[leafField(p)] || leafField(p));
+};
+// 闸⑥ 的四种回执（执行层那侧的同一批字符串）。mismatch 是唯一的红，跑到这里就已经
+// 整镜拦下了；剩下三态都只影响「点不点得中」，所以〈字段〉页把它写成原因而不是错误。
+const FIELD_STATUS = {
+  ok: "画面对上了",
+  unreported: "这一镜没把它标在元素上（代码里缺 <F>）",
+  no_geometry: "标了但量不到盒（零宽/被裁掉/不可见）",
+  mismatch: "注入值与画上自报不一致",
+};
+const codeNoBox = computed(() => codeFields.value.filter((f) => !f.box));
 
-function themeFor(sid) {
-  const o = overrideFor(sid);
-  if (!o.theme) {
-    o.theme = { ...(themeCtl.value.defaults || {}), ...((shotBase(sid) || {}).theme || {}) };
-  }
-  return o.theme;
-}
-function layersFor(sid) {
-  const o = overrideFor(sid);
-  if (!o.overlay) {
-    o.overlay = JSON.parse(JSON.stringify((shotBase(sid) || {}).overlay || []));
-  }
-  return o.overlay;
-}
-function addLayer(sid) {
-  const list = layersFor(sid);
-  if (list.length >= (ovlCtl.value.max_per_shot || 16)) return;
-  const type = (ovlCtl.value.types || ["text"])[0];
-  list.push({ type, text: type === "text" ? "新图层" : "", ref: "",
-              box: { ...(ovlCtl.value.box_default || { x: .12, y: .42, w: .76, h: .12 }) },
-              style: { ...(ovlCtl.value.style_defaults || {}) },
-              at_ms: 0, dur_ms: 600, anim: "none", z: "front" });
-}
-function delLayer(sid, k) { layersFor(sid).splice(k, 1); }
 
-// 表单**读**用这两个：它们不会把没改过的镜写进 overrides。若在 computed 里调
-// themeFor/layersFor，等于每次重绘都可能改一次响应式状态，Vue 会转成递归更新。
-const curTheme = computed(() => {
-  const sid = curSid.value;
-  if (!sid) return {};
-  const o = overrides[sid];
-  if (o?.theme) return o.theme;
-  return { ...(themeCtl.value.defaults || {}), ...((shotBase(sid) || {}).theme || {}) };
-});
-const curOverlay = computed(() => {
-  const sid = curSid.value;
-  if (!sid) return [];
-  const o = overrides[sid];
-  return o?.overlay ?? ((shotBase(sid) || {}).overlay || []);
-});
-function themeSet(key, value) { themeFor(curSid.value)[key] = value; }
-function layGet(k, path) {
-  let cur = curOverlay.value[k];
-  for (const s of path.split(".")) cur = cur?.[s];
-  return cur;
-}
-function laySet(k, path, value) {
-  const lay = layersFor(curSid.value)[k];
-  if (!lay) return;
-  const ss = path.split(".");
-  let cur = lay;
-  for (let i = 0; i < ss.length - 1; i += 1) cur = cur[ss[i]] ||= {};
-  cur[ss[ss.length - 1]] = value;
-}
-// 画面上的图层芯片：拖动即写归一化盒，与「样式」页那几格是同一份数据。
-const stageLayers = computed(() => curOverlay.value.map((l, k) => ({
-  ...l, k, style: boxStyle(l.box || {}),
-})));
-
-// 画面上直接拖图层挪位置：写的仍是归一化盒（0~1），与命中表、与渲染端同一套单位，
-// 所以缩放窗口或换分辨率都不会把拖出来的位置改掉。只挪左上角，宽高留给表单填。
-let layerDrag = null;
-function onLayerDown(ev, sid, k) {
-  if (ev.button !== 0 || !stageEl.value) return;
-  ev.stopPropagation();
-  const layer = layersFor(sid)[k];
-  if (!layer) return;
-  const p = norm(ev);
-  layerDrag = { sid, k, dx: p.x - (layer.box?.x || 0), dy: p.y - (layer.box?.y || 0) };
-  window.addEventListener("pointermove", onLayerMove);
-  window.addEventListener("pointerup", onLayerUp, { once: true });
-}
-function onLayerMove(ev) {
-  if (!layerDrag) return;
-  const p = norm(ev);
-  const layer = layersFor(layerDrag.sid)[layerDrag.k];
-  if (!layer) return;
-  layer.box = { ...(layer.box || {}),
-                x: Math.round(Math.max(-0.2, Math.min(1.2, p.x - layerDrag.dx)) * 1000) / 1000,
-                y: Math.round(Math.max(-0.2, Math.min(1.2, p.y - layerDrag.dy)) * 1000) / 1000 };
-}
-function onLayerUp() {
-  window.removeEventListener("pointermove", onLayerMove);
-  layerDrag = null;
-}
-
-// ---- 样式同步范围（F3）：改完这一镜的样式，保存前必须说清同步到哪 ----
-// 为什么问而不是默认全片：全片同卡型是常见诉求，但「这一镜想例外」同样是——
+// ---- 样式同步范围：改完这一镜的旋钮取值，保存前必须说清同步到哪 ----
+// 为什么问而不是默认全片：全片同型是常见诉求，但「这一镜想例外」同样是——
 // 默认任何一个方向，另一批用户都会觉得自己被替决定了。
-const themeScope = ref("");          // "" 未决 · all 全片同卡型 · single 只这一镜
+//
+// 代码镜没有 card 也没有 theme，能同步的只有**这一镜自己交出来的旋钮**：
+// 同名字段（且同 type）才叫同一个样式。别的镜没声明这个 name 就没有这一栏，
+// 硬塞进去等于替它改代码；声明了但取值不合**它自己的** min/max/options，
+// 也不许偷偷改——那是拿这一镜的刻度去量另一镜，所以它进「没改」那一栏并写明数字。
+const fieldScope = ref("");          // "" 未决 · all 全片同名字段 · single 只这一镜
 const syncAsk = ref(false);
-const themeTouched = computed(() => Object.keys(overrides).filter((sid) => {
-  const o = overrides[sid];
-  if (!o?.theme) return false;
-  return JSON.stringify(o.theme) !== JSON.stringify((shotBase(sid) || {}).theme ?? null);
-}));
-/** 这一镜要写回的栏；「全片同卡型」时把改过的那份 theme 复制给同 card 的其他镜。 */
-function shotSetFor(sid) {
-  const set = setFor(sid);
-  if (themeScope.value !== "all" || "theme" in set) return set;
-  const card = (shotBase(sid) || {}).card;
-  const src = themeTouched.value.find((s) => (shotBase(s) || {}).card === card);
-  if (src) set.theme = JSON.parse(JSON.stringify(overrides[src].theme));
-  return set;
+const FIELD_POINTER_RE = /^\/shots\/(\d+)\/fields\/([^/]+)\/value$/;
+const fieldEdits = computed(() => Object.keys(deepEdits).filter((p) => FIELD_POINTER_RE.test(p)));
+const codeFieldOf = (sid, name) =>
+  (tableEntries.value[sid] || []).find((e) => e.kind === "field" && e.name === name) || null;
+/** 这一镜自己声明的取值界接不接得住这个值（与补丁口那份 check_field_value 同一口径）。 */
+function fieldValueFits(f, v) {
+  if (f.type === "number") {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return false;
+    if (f.min != null && n < Number(f.min)) return false;
+    if (f.max != null && n > Number(f.max)) return false;
+    return true;
+  }
+  if (f.type === "select") return (f.options || []).map(String).includes(String(v));
+  if (f.type === "bool") return typeof v === "boolean";
+  if (f.type === "color") return /^#[0-9a-fA-F]{3,8}$/.test(String(v));
+  return true;
 }
-const sameCardCount = computed(() => {
-  const card = (shotBase(curSid.value) || {}).card;
-  const live = order.value.filter((s) => !removals.value.includes(s));
-  return card ? live.filter((s) => (shotBase(s) || {}).card === card).length : live.length;
+/** 每个被改到的字段指针 → 可以接同一个值的其他镜（take）与不接纳的（skip）。 */
+const fieldSiblings = computed(() => {
+  const out = [];
+  fieldEdits.value.forEach((p) => {
+    const m = FIELD_POINTER_RE.exec(p);
+    const sid = m ? baseIds.value[Number(m[1])] : "";
+    const src = sid && codeFieldOf(sid, m[2]);
+    if (!src) return;
+    const value = deepEdits[p];
+    const take = [];
+    const skip = [];
+    order.value.forEach((t) => {
+      if (t === sid || removals.value.includes(t)) return;
+      const f = codeFieldOf(t, m[2]);
+      if (!f || f.type !== src.type) return;
+      if (Object.prototype.hasOwnProperty.call(deepEdits, f.pointer)) return;
+      (fieldValueFits(f, value) ? take : skip).push(f.pointer);
+    });
+    out.push({ pointer: p, name: m[2], value, take, skip });
+  });
+  return out;
 });
+const syncTake = computed(() =>
+  [...new Set(fieldSiblings.value.flatMap((g) => g.take))].length);
+const syncSkip = computed(() =>
+  [...new Set(fieldSiblings.value.flatMap((g) => g.skip))].length);
+// 别的镜一个同名同类字段都没交出来时，「同步到哪儿」这个问题没有对象，不问。
+const syncTargets = computed(() => syncTake.value + syncSkip.value);
+/** 「全片同名字段」这一档在**提交时**才代写：不提前塞进改动账，用户后来在别的镜
+ *  上亲手改回原值才算真撤销，否则下一次联动又会把它推回去。 */
+const codeFanOut = computed(() => {
+  const out = {};
+  if (fieldScope.value !== "all") return out;
+  fieldSiblings.value.forEach((g) =>
+    g.take.forEach((p) => { out[p] = g.value; }));
+  return out;
+});
+/** 提交用的改动账 = 代写那份打底，用户自己改的指针覆盖在上面（手改优先）。 */
+const editAccount = computed(() => ({ ...codeFanOut.value, ...deepEdits }));
+function applyFieldSyncAll() {
+  fieldScope.value = "all";
+  syncAsk.value = false;
+}
+function setFieldScopeSingle() {
+  fieldScope.value = "single";
+  syncAsk.value = false;
+}
+/** 这一趟改了旋钮取值、还没定同步范围（口播轨没有这个问题：一段的字段不跨段共用）。 */
+const styleScopePending = computed(() => (!isTrack.value
+  && syncTargets.value > 0 && !fieldScope.value));
 const scopeTag = computed(() => {
-  if (isTrack.value || !themeTouched.value.length) return "";
-  if (themeScope.value === "all") return `样式同步=全片同卡型（${sameCardCount.value} 镜）`;
-  if (themeScope.value === "single") return "样式同步=只这一镜";
+  if (isTrack.value) return "";
+  if (!syncTargets.value) return "";
+  if (fieldScope.value === "all") {
+    return `样式同步=全片同名字段（${syncTake.value} 处`
+      + (syncSkip.value ? ` · ${syncSkip.value} 处取值不合它自己声明的界，没改` : "") + "）";
+  }
+  if (fieldScope.value === "single") return "样式同步=只这一镜";
   return "样式同步=还没定（提交时会问）";
 });
+
+// ---- 代码镜的两页逃生口：〈代码〉与〈文案·出处〉----
+// 〈代码〉改了走 `/shots/i/code` 指针，服务端**必须重过闸①**才允许落盘
+// （`code_patch.relint_codes`：验不过一寸不落盘）；〈字段〉那页改的是注入值，代码字节
+// 没动，lint 结论不可能变，所以不重跑。两条路的复闸口径不同，界面上要写明——
+// 否则用户会以为改代码更便宜，而它恰恰是贵的那一条。
+const pointerTo = (sid, tail) => {
+  const i = idxOf(sid);
+  return i < 0 ? "" : `/shots/${i}/${tail}`;
+};
+const codePointer = computed(() => pointerTo(focusSid.value, "code"));
+const codeValue = computed(() => (codePointer.value
+  ? String(editValue(codePointer.value) ?? "") : ""));
+const setCode = (v) => { if (codePointer.value) setEdit(codePointer.value, v); };
+const resetCode = () => { if (codePointer.value) delete deepEdits[codePointer.value]; };
+const codeBytes = computed(() => new TextEncoder().encode(codeValue.value).length);
+
+// 出处（source）整镜三条指针之一，值必须是对象（写成字符串的话出处闸读不到键），
+// 所以这里不按 key 逐条发指针，而是一次写回整个 source——它不进缓存键，改它不动像素。
+const sourcePointer = computed(() => pointerTo(focusSid.value, "source"));
+const sourceRows = computed(() => {
+  const v = sourcePointer.value ? editValue(sourcePointer.value) : null;
+  return v && typeof v === "object" ? v : {};
+});
+const sourceSet = (next) => { if (sourcePointer.value) setEdit(sourcePointer.value, next); };
+function sourceRename(oldKey, ev) {
+  const nk = String(ev.target.value || "").trim();
+  if (!nk || nk === oldKey || nk in sourceRows.value) return;
+  const out = {};
+  Object.entries(sourceRows.value).forEach(([k, v]) => { out[k === oldKey ? nk : k] = v; });
+  sourceSet(out);
+}
+const sourceEdit = (k, v) => sourceSet({ ...sourceRows.value, [k]: v });
+function sourceDel(k) { const s = { ...sourceRows.value }; delete s[k]; sourceSet(s); }
+function sourceAdd() {
+  const s = sourceRows.value;
+  let n = 1;
+  while (`新出处 ${n}` in s) n += 1;
+  sourceSet({ ...s, [`新出处 ${n}`]: "" });
+}
+
+// ---- 逐镜质感（第五口指针：/shots/i/texture）----
+// 档位与标签都读命中表里的 `controls.texture`（enum + value_labels），不在前端抄一份：
+// 抄的那份与契约迟早对不上，代价是「界面能选、闸门打回」。
+// **「跟整片默认」(空串) 与 「不加」("none") 是两个选项**，前者把决定权交回顶层，
+// 后者是这一镜点名不要——后端把这两种形状判给不同的滤镜趟，界面上也不许合成一个。
+const texCtl = computed(() => ctl.value.texture || {});
+const texLabels = computed(() => texCtl.value.value_labels || {});
+const texEnum = computed(() => texCtl.value.enum || []);
+const texLabel = (k) => (k === "" ? "跟整片默认"
+  : (texLabels.value[k] || k));
+const filmTexture = computed(() => String(hm.value?.spec?.texture || "none"));
+const texturePointer = computed(() => pointerTo(focusSid.value, "texture"));
+/** 这一镜**声明**的档（空串＝没表态）。 */
+const textureDeclared = computed(() => String((texturePointer.value
+  ? editValue(texturePointer.value) : "") ?? ""));
+/** 画面上**实际**的档：与逐镜账同源（后端 `out["shots"][].texture`），前端不重算那条
+ *  「有就用、没有问整片」的规则——自己算一遍就是第二个出处。 */
+const textureEffective = computed(() => String(rowOf(curSid.value)?.texture || "none"));
+const setTexture = (v) => { if (texturePointer.value) setEdit(texturePointer.value, v); };
+const resetTexture = () => { if (texturePointer.value) delete deepEdits[texturePointer.value]; };
 
 // ---- 带着这个选区去问（F4）----
 // 选中的是「这一版的这一段/这一块」，光说「把那句字幕改一下」模型得回头猜；
 // 把锚点原样贴进聊天框，AI 改与手工改用的就是同一个选中态。
 function askAbout() {
   const sid = focusSid.value || "(没选)";
-  const what = groups.value.length
-    ? groups.value.map((g) => `${g.pointer || "(回指不到字段)"}＝`
-        + (isTrack.value ? g.hits[0].label : `画面上是「${g.hits[0].text}」`)).join("；")
-    : ((shots.value[sid] || {}).entries || [])[0]?.label || "";
-  emit("ask", `【选区改】在成片 ${artifact.value}（${isTrack.value ? "口播/素材片" : "图形科普片"}）`
+  const kind = isTrack.value ? "口播/素材片" : "图形科普片 · 代码镜";
+  let what;
+  if (isCode.value) {
+    // 代码镜的选区是**旋钮**，不是画面上的一块字：把指针与当前值一起带上，模型才不必
+    // 把「把那个圆改大一点」再翻成一次整镜改写（那会白重过一趟闸①）。
+    const list = selected.value.length
+      ? codeFields.value.filter((f) => selected.value.includes(f.id)) : codeFields.value;
+    what = list.length
+      ? list.map((f) => `${f.label || f.name}＝${JSON.stringify(editValue(f.pointer) ?? f.value)}`
+          + `（${f.pointer}）`).join("；")
+      : "这一镜没交出旋钮（fields 为空），只能改代码、整镜文案或质感档";
+    if (texturePointer.value) {
+      what += `${what ? "；" : ""}质感＝${texLabel(textureDeclared.value)}`
+        + (textureDeclared.value !== textureEffective.value
+            ? `（画面上是 ${texLabel(textureEffective.value)}）` : "")
+        + `（${texturePointer.value}）`;
+    }
+  } else if (groups.value.length) {
+    what = groups.value.map((g) => `${g.pointer || "(回指不到字段)"}＝${g.hits[0].label}`)
+      .join("；");
+  } else {
+    what = (tableEntries.value[sid] || [])[0]?.label || "";
+  }
+  emit("ask", `【选区改】在成片 ${artifact.value}（${kind}）`
     + `的 ${isTrack.value ? "段" : "镜"} ${sid}${what ? ` · ${what}` : ""} 上，我想改：`);
 }
 
@@ -796,7 +904,7 @@ function payload() {
   if (isTrack.value) {
     // 这条链只收指针补丁：段号逐字取自表，闸门拿它对「这张表量的是不是当前这一版」，
     // 对不上就整批拒收。没有 shot_sets/remove_shots/reorder——那条合同不改总长也不换序。
-    const edits = Object.entries(deepEdits).map(([p, value]) => ({
+    const edits = Object.entries(editAccount.value).map(([p, value]) => ({
       pointer: p, value,
       segment_id: String(entryByPointer.value[p]?.segment_id ?? ""),
     }));
@@ -804,12 +912,12 @@ function payload() {
     if (edits.length) body.edits = edits;
     return body;
   }
-  const edits = Object.entries(deepEdits).map(([p, value]) => ({
+  const edits = Object.entries(editAccount.value).map(([p, value]) => ({
     pointer: p, value, shot: baseIds.value[Number(segs(p)[1])] || "",
   }));
   const shotSets = order.value
     .filter((sid) => !removals.value.includes(sid))
-    .map((sid) => ({ shot: sid, set: shotSetFor(sid) }))
+    .map((sid) => ({ shot: sid, set: setFor(sid) }))
     .filter((x) => Object.keys(x.set).length);
   const removed = removals.value.filter((s) => baseIds.value.includes(s));
   const kept = baseIds.value.filter((s) => !removed.includes(s));
@@ -819,6 +927,8 @@ function payload() {
   if (shotSets.length) body.shot_sets = shotSets;
   if (removed.length) body.remove_shots = removed;
   if (now.join(" ") !== kept.join(" ")) body.reorder = now;
+  if (bgmEdit.value.volume !== null) body.bgm_volume = bgmEdit.value.volume;
+  if (bgmEdit.value.duck !== null) body.bgm_duck = bgmEdit.value.duck;
   return body;
 }
 const planBits = computed(() => {
@@ -829,10 +939,29 @@ const planBits = computed(() => {
   if (p.shot_sets) bits.push(`整镜 ${p.shot_sets.length} 镜`);
   if (p.remove_shots) bits.push(`删 ${p.remove_shots.length} 镜`);
   if (p.reorder) bits.push("换序");
+  if (p.bgm_volume !== undefined) bits.push(`音量→${p.bgm_volume}`);
+  if (p.bgm_duck !== undefined) bits.push(p.bgm_duck ? "人声压低" : "不压低");
   if (scopeTag.value) bits.push(scopeTag.value);
   return bits;
 });
-const plan = computed(() => (planBits.value.length ? planBits.value.join(" · ") : "还没有改动"));
+const plan = computed(() => (planBits.value.join(" · ") || "还没有改动"));
+/** 代码链的**重烧**口径：改动账按镜内容算（含只改出处的），但 `source` 与 `texture`
+ *  都不在缓存键里——改出处不改像素，改质感只在切片之后多过一趟滤镜，一帧 Remotion 都不重烧。
+ *  预计数里不摘掉它们，界面就会报「重烧 1 镜」而后端回「0 镜」——
+ *  这类虚报与旧链那次「局部改其实整片重烧」是同一族，只是方向相反。 */
+const NO_BAKE_FIELDS = ["source", "texture"];
+const pixelTouched = computed(() => {
+  const touched = new Set();
+  Object.keys(editAccount.value).forEach((p) => {
+    if (NO_BAKE_FIELDS.includes(segs(p)[2])) return;
+    const sid = baseIds.value[Number(segs(p)[1])];
+    if (sid) touched.add(sid);
+  });
+  order.value.forEach((sid) => { if (Object.keys(setFor(sid)).length) touched.add(sid); });
+  return touched;
+});
+const noBake = computed(() =>
+  [...changedShots.value].filter((sid) => !pixelTouched.value.has(sid)));
 const rebakeNote = computed(() => {
   if (isTrack.value) {
     // 具体几窗由后端按「这一窗的输入清单变没变」点名（一句跨两窗的字幕要重烧两窗），
@@ -840,14 +969,16 @@ const rebakeNote = computed(() => {
     return `改到 ${changedShots.value.size} 段 · 只重烧这些段压着的窗口`;
   }
   const p = payload();
-  const n = changedShots.value.size;
-  if (!p.reorder || n) return `预计重烧 ${n} 镜`;
+  const n = pixelTouched.value.size;
+  const tail = noBake.value.length
+    ? ` · 另 ${noBake.value.length} 镜只改出处或质感（都不进缓存键，一帧不重烧）` : "";
+  if (!p.reorder || n) return `预计重烧 ${n} 镜${tail}`;
   return "重排不烧像素（拼而已）";
 });
 
 async function submit() {
   if (!dirty.value || busy.value) return;
-  if (themeTouched.value.length && !themeScope.value && !isTrack.value) {
+  if (styleScopePending.value) {
     syncAsk.value = true;                 // 样式改动的同步范围要先定，这一趟不替用户决定
     return;
   }
@@ -993,20 +1124,13 @@ loadHitmap(props.artifactId);
               <div v-if="!isTrack" class="me-layer">
                 <span v-for="b in visibleBoxes" :key="b.id" class="me-hit"
                       :class="{ on: b.on, dead: b.dead }" :style="b.style"
-                      :title="b.field || '量到了字，但回指不到分镜字段'"><i v-if="b.on">✎</i></span>
-              </div>
-              <div v-if="!isTrack" class="me-ovls">
-                <span v-for="l in stageLayers" :key="`ovl${l.k}`" class="me-ovl"
-                      :style="l.style" :title="`叠加层 ${l.k + 1}（${l.type}）：按住拖动定位`"
-                      @pointerdown="onLayerDown($event, curSid, l.k)">
-                  <i>{{ l.k + 1 }} {{ l.type }}</i>
-                </span>
+                      :title="b.title || b.field || '量到了字，但回指不到分镜字段'"><i v-if="b.on">✎</i></span>
               </div>
               <div v-if="marquee" class="me-marquee" :style="boxStyle(marquee)"></div>
-              <div v-if="!isTrack" class="me-hint">
-                在画面上<b>按住拖</b>框住要改的那块字/图，点一下选单格 ·
-                金色编号虚框是<b>叠加图层</b>，按住它能直接拖位置（改的是数据，
-                要提交重烧才在画面上看得见）
+              <div v-if="isCode" class="me-hint">
+                画面上这些框是<b>这一镜交出的旋钮</b>（母版在探针帧量出来的盒子）：
+                框住或点一下，右边〈字段〉页就把那一行点亮 ·
+                量不到盒的旋钮仍列在表里，只是点不中
               </div>
               <div v-else class="me-hint">
                 这一版的段就是「第 s 秒到第 e 秒的一整幅画面」，画面上没有可框的格子：
@@ -1123,23 +1247,37 @@ loadHitmap(props.artifactId);
 
           <aside class="me-right">
             <div class="me-tabs">
-              <button :class="{ on: tab === 'cells' }" @click="tab = 'cells'">
-                {{ isTrack ? "选中段的字段" : "选中格" }}</button>
-              <button v-if="!isTrack" :class="{ on: tab === 'shot' }"
-                      @click="tab = 'shot'">整镜 {{ curSid }}</button>
-              <button v-if="!isTrack" :class="{ on: tab === 'style' }"
-                      @click="tab = 'style'">样式 · {{ curSid }}</button>
+              <template v-if="isCode">
+                <button :class="{ on: tab === 'fields' }" @click="tab = 'fields'">
+                  字段 · {{ curSid }}<em>{{ codeFields.length }}</em></button>
+                <button :class="{ on: tab === 'code' }" @click="tab = 'code'">
+                  代码 · {{ curSid }}</button>
+                <button :class="{ on: tab === 'doc' }" @click="tab = 'doc'">
+                  文案 · 出处 · {{ curSid }}</button>
+                <button :class="{ on: tab === 'texture' }" @click="tab = 'texture'">
+                  质感 · {{ curSid }}</button>
+                <button :class="{ on: tab === 'bgm' }" @click="tab = 'bgm'">
+                  配乐</button>
+              </template>
+              <template v-else>
+                <button :class="{ on: tab === 'cells' }" @click="tab = 'cells'">
+                  选中段的字段</button>
+              </template>
             </div>
 
-            <div v-if="syncAsk" class="me-askbar">
-              <b>这次改了卡面样式：同步到哪儿？</b>
-              <span class="me-sub">改动没有落下去——同一套版式（card）的镜有好几个，
-                默认全同步或默认不同步都会替你做决定，所以这里必须问一次。
-                同 card 的镜共用一份样式，别的版式不受影响。</span>
+            <div v-if="syncAsk && isCode" class="me-askbar">
+              <b>这次改了画面旋钮的取值：同步到哪儿？</b>
+              <span class="me-sub">改动没有落下去。代码镜没有「同一版式共用一份样式」
+                这回事，能同步的只有<b>别的镜也交出来的同名同类字段</b>（name 与 type
+                都对上才算同一个旋钮）。这一趟有 {{ syncTargets }} 处这样的字段：
+                {{ syncTake }} 处接得住这个值{{ syncSkip ? `；另 ${syncSkip} 处它自己声明的上下界或选项容不下，
+                不拿这一镜的刻度去量另一镜，保持原样` : "" }}。
+                没交这个字段的镜不受影响，也不会替它改代码。</span>
               <div class="me-line">
-                <button class="me-btn primary" @click="themeScope = 'all'; syncAsk = false">
-                  全片同卡型都改（{{ sameCardCount }} 镜）</button>
-                <button class="me-btn" @click="themeScope = 'single'; syncAsk = false">
+                <button class="me-btn primary" :disabled="!syncTake"
+                        @click="applyFieldSyncAll">
+                  全片同名字段都改（{{ syncTake }} 处）</button>
+                <button class="me-btn" @click="setFieldScopeSingle">
                   只改这一镜（其余留原样）</button>
               </div>
             </div>
@@ -1153,30 +1291,47 @@ loadHitmap(props.artifactId);
                 「列出某会话全部版本」的口，跨刷新找旧版要在对话里报产物号。</span>
             </div>
 
-            <div v-if="tab === 'cells'" class="me-cells">
-              <div v-if="!selected.length" class="me-note">
-                <template v-if="isTrack">
-                  还没点段。在下面按轨道点一段——每一段能改的就是它的素材路径、进出点或文字。
-                  改完只重烧那一段压着的窗口，其余窗复用上一版字节。
-                </template>
-                <template v-else>
-                  还没框到东西。当前这一镜（{{ curSid }}）量到 {{ entries.length }} 格，
-                  其中 {{ entries.filter((e) => e.field).length }} 格能回指到分镜字段。
-                </template>
+            <div v-if="tab === 'cells' || tab === 'fields'" class="me-cells">
+              <div v-if="isCode && syncTargets" class="me-sub">
+                {{ scopeTag }}
+                <button class="me-mini" @click="fieldScope = ''; syncAsk = true">重新问过</button>
+              </div>
+              <div v-if="isCode && !codeFields.length" class="me-note">
+                <b>这一镜没交出可改的旋钮。</b>
+                要调的值都写死在代码里了。三条路：切〈代码〉页直接改那一段（这一条要
+                <b>重过闸①</b>）、切〈文案 · 出处〉改文案与引用，或回计划卡让模型重新出
+                这一镜并在 <code>fields</code> 里交旋钮（name / type / label / value，
+                界面就照那份自动出控件，改值不必动代码）。
+              </div>
+              <div v-else-if="isCode" class="me-sub">
+                这一镜 {{ codeFields.length }} 个旋钮{{ codeNoBox.length
+                  ? `，其中 ${codeNoBox.length} 个量不到盒（点不中，仍可改）` : "" }} ·
+                左边框住一块会把对应那一行点亮，清单本身不收窄
+              </div>
+              <div v-else-if="!selected.length" class="me-note">
+                还没点段。在下面按轨道点一段——每一段能改的就是它的素材路径、进出点或文字。
+                改完只重烧那一段压着的窗口，其余窗复用上一版字节。
                 <div v-if="(shots[curSid] || {}).error" class="me-dead">
                   这一镜的表没量成：{{ (shots[curSid] || {}).error }}
                 </div>
               </div>
-              <div v-for="g in groups" :key="g.key" class="me-cell">
+              <div v-for="g in cellGroups" :key="g.key" class="me-cell"
+                   :class="{ hot: isCode && selected.includes(g.hits[0].id) }">
                 <div class="me-cellhd">
                   <code>{{ g.pointer || "（回指不到字段）" }}</code>
-                  <em v-if="!g.pointer">只能整镜改写</em>
-                  <em v-else-if="g.hits.some((h) => h.confidence !== 'exact')"
-                      class="me-maybe">按文字近似对上，请核对</em>
-                  <em v-else-if="g.hits.some((h) => h.ambiguous)" class="me-maybe">多处同字</em>
+                  <em v-if="!g.pointer">这一格回指不到字段指针</em>
+                  <em v-else-if="isCode && !g.hits[0].box" class="me-maybe"
+                      :title="`闸⑥ 回执：${g.hits[0].field_status}`"
+                  >无空间命中 · {{ FIELD_STATUS[g.hits[0].field_status] || "量不到盒" }}</em>
                 </div>
                 <div class="me-cellt">
-                  {{ isTrack ? g.hits[0].label : `画面上是：${g.hits[0].text}` }}
+                  <template v-if="isCode">
+                    <b>{{ g.hits[0].label || g.hits[0].name }}</b>
+                    · 机器名 <code>{{ g.hits[0].name }}</code>
+                    · 类型 {{ g.hits[0].type }}
+                    <template v-if="g.hits[0].unit"> · 单位 {{ g.hits[0].unit }}</template>
+                  </template>
+                  <template v-else>{{ g.hits[0].label }}</template>
                 </div>
                 <template v-if="g.pointer">
                   <div class="me-ctl">
@@ -1199,39 +1354,76 @@ loadHitmap(props.artifactId);
                     <template v-else-if="ctlKind(g.pointer) === 'enum'">
                       <select class="me-in" :value="shownValue(g.pointer) ?? ''"
                               @change="setEdit(g.pointer, $event.target.value)">
-                        <option v-for="o in enumOpts(leafField(g.pointer), shownValue(g.pointer))"
-                                :key="o" :value="o">{{ o }}</option>
+                        <option v-for="o in ctlOpts(g.pointer)" :key="o" :value="o">{{ o }}</option>
                       </select>
                     </template>
-                    <input v-else-if="typeof baseValue(g.pointer) === 'number'"
-                           class="me-in" type="number" step="0.01"
+                    <label v-else-if="ctlKind(g.pointer) === 'bool'" class="me-bool">
+                      <input type="checkbox" :checked="!!editValue(g.pointer)"
+                             @change="setEdit(g.pointer, $event.target.checked)" />
+                      {{ editValue(g.pointer) ? "开" : "关" }}</label>
+                    <input v-else-if="ctlKind(g.pointer) === 'number'"
+                           class="me-in" type="number" :step="stepOf(g.pointer)"
+                           :min="fieldEntry(g.pointer)?.min"
+                           :max="fieldEntry(g.pointer)?.max"
                            :value="editValue(g.pointer) ?? ''"
                            @input="setEdit(g.pointer, Number($event.target.value))" />
                     <input v-else class="me-in" :value="editValue(g.pointer) ?? ''"
                            @input="setEdit(g.pointer, $event.target.value)" />
                   </div>
                   <div class="me-sub">
-                    {{ FIELD_LABEL[leafField(g.pointer)] || leafField(g.pointer) }} ·
+                    <template v-if="!isCode">{{ fieldLabel(g.pointer) }} · </template>
                     <template v-if="baseValue(g.pointer) == null">
                       未设置 · 渲染按默认 {{ JSON.stringify(defaultOf(g.pointer)) }}
                     </template>
                     <template v-else>原值：{{ JSON.stringify(baseValue(g.pointer)) }}</template>
                     <template v-if="ctlKind(g.pointer) === 'range'">
                       · 可取 {{ rangeOf(g.pointer)[0] }}~{{ rangeOf(g.pointer)[1] }}
+                      <template v-if="isCode && g.hits[0].unit">{{ g.hits[0].unit }}</template>
+                      · 步进 {{ stepOf(g.pointer) }}
+                    </template>
+                    <template v-else-if="isCode && g.hits[0].type === 'number'">
+                      · 这条声明没给范围，数字框照原样收值
+                    </template>
+                    <template v-if="isCode">· 画面上自报
+                      {{ JSON.stringify(g.hits[0].reported) }}（闸⑥
+                      {{ FIELD_STATUS[g.hits[0].field_status] || g.hits[0].field_status }}）
+                      · 改注入值<b>不重过闸①</b>，只重烧这一镜
                     </template>
                   </div>
                 </template>
                 <div v-else class="me-dead">
-                  这一格没有可写的字段。要改它请切到「整镜」改对应栏，或重新出片。
+                  这一格没有可写的字段指针：代码镜请切〈代码〉页改那一段，口播轨请回计划卡重新出片。
                 </div>
               </div>
             </div>
 
-            <div v-else-if="tab === 'shot'" class="me-form">
+            <div v-else-if="tab === 'code'" class="me-form">
+              <div class="me-frow">
+                <label>镜头代码 code · {{ curSid }}（React/TSX，一镜一次浏览器）</label>
+                <textarea class="me-in me-code" rows="16" spellcheck="false"
+                          :value="codeValue" @input="setCode($event.target.value)"></textarea>
+                <div class="me-sub">{{ codePointer || "（这一镜不在表里）" }} ·
+                  {{ codeBytes }} 字节
+                  <button v-if="codePointer in deepEdits" class="me-mini"
+                          @click="resetCode">↺ 回到这一版的代码</button>
+                </div>
+                <div class="me-note">
+                  改代码<b>必须重过闸①</b>：容器里的 lint 带行号退回「声明了没读、读了没声明、
+                  &lt;F&gt; 没引用 fields.x」这几类，验不过一寸不落盘，旧版字节原位还在。
+                  要调的数、色、开关只要在〈字段〉页里有旋钮就别动代码——那一页不重跑 lint。
+                  版式与字幕带挂在母版上，镜头代码碰不到它们；这一镜代码为空会被直接拒收
+                  （这条链没有默认版式可退，空代码渲出来就是一张空画面）。
+                </div>
+              </div>
+            </div>
+
+            <div v-else-if="tab === 'doc'" class="me-form">
               <div class="me-frow">
                 <label>文案 text（字幕与配音同源，改这里等于换这一镜说的话）</label>
                 <textarea class="me-in" rows="2" :value="overrideFor(curSid).text ?? ''"
                           @input="overrideFor(curSid).text = $event.target.value"></textarea>
+                <div class="me-sub">字数上限按竖屏/横屏给，超了带镜号退回；
+                  换文案会重发这一镜的配音并重烧这一镜</div>
               </div>
               <div class="me-frow">
                 <label>高亮词 highlight（必须是文案里的子串，否则闸门会带镜号退回）</label>
@@ -1243,37 +1435,6 @@ loadHitmap(props.artifactId);
                 <button class="me-mini" @click="addHighlight(curSid)">＋ 加一个高亮词</button>
               </div>
               <div class="me-frow">
-                <label>档案栏 panel（左列是屏幕上那行的小标，键名也能改）</label>
-                <div v-for="(v, k) in (overrideFor(curSid).panel || {})" :key="k" class="me-line">
-                  <input class="me-in key" :value="k" @blur="renameKey(curSid, 'panel', k, $event)" />
-                  <input class="me-in val" :value="v"
-                         @input="overrideFor(curSid).panel[k] = $event.target.value" />
-                  <button class="me-mini" @click="delRow(curSid, 'panel', k)">✕</button>
-                </div>
-                <button class="me-mini" @click="addRow(curSid, 'panel')">＋ 加一行</button>
-              </div>
-              <div class="me-frow">
-                <label>标签 label</label>
-                <div v-for="(v, k) in (overrideFor(curSid).label || {})" :key="k" class="me-line">
-                  <input class="me-in key" :value="k" @blur="renameKey(curSid, 'label', k, $event)" />
-                  <input class="me-in val" :value="v"
-                         @input="overrideFor(curSid).label[k] = $event.target.value" />
-                  <button class="me-mini" @click="delRow(curSid, 'label', k)">✕</button>
-                </div>
-                <button class="me-mini" @click="addRow(curSid, 'label')">＋ 加一行</button>
-              </div>
-              <div class="me-frow">
-                <label>印章 stamp</label>
-                <div class="me-line">
-                  <input class="me-in" placeholder="中文"
-                         :value="(overrideFor(curSid).stamp || {}).zh ?? ''"
-                         @input="overrideFor(curSid).stamp = { ...(overrideFor(curSid).stamp || {}), zh: $event.target.value }" />
-                  <input class="me-in" placeholder="EN"
-                         :value="(overrideFor(curSid).stamp || {}).en ?? ''"
-                         @input="overrideFor(curSid).stamp = { ...(overrideFor(curSid).stamp || {}), en: $event.target.value }" />
-                </div>
-              </div>
-              <div class="me-frow">
                 <label>时长下限 min_duration_sec（秒）</label>
                 <input class="me-in" type="number" step="0.1" min="0.5"
                        :value="overrideFor(curSid).min_duration_sec ?? ''"
@@ -1282,131 +1443,84 @@ loadHitmap(props.artifactId);
                   {{ (timeline[curIdx]?.speech_sec || 0).toFixed(1) }}s ·
                   实际长度取两者的大值（也可以直接在轨道上拖右边缘）</div>
               </div>
-              <div class="me-note">版式（card）与画面（visual）不在表单里改：
-                换版式等于每一镜都要重烧，那是重新出片；画面里的数字与文字，
-                请在左边框住后用「选中格」改。</div>
+              <div class="me-frow">
+                <label>出处 source（写在分镜卡与逐镜账上，不进画面）</label>
+                <div v-for="(v, k) in sourceRows" :key="k" class="me-line">
+                  <input class="me-in key" :value="k" @blur="sourceRename(k, $event)" />
+                  <input class="me-in val" :value="v"
+                         @input="sourceEdit(k, $event.target.value)" />
+                  <button class="me-mini" @click="sourceDel(k)">✕</button>
+                </div>
+                <div v-if="!Object.keys(sourceRows).length" class="me-sub">这一镜没写出处。</div>
+                <button class="me-mini" @click="sourceAdd()">＋ 加一条出处</button>
+                <div class="me-sub">凭记忆写的请标「未核实：…」；写「查证过」的要对得上本会话的
+                  检索账（出片那一步的出处闸判）。改这一栏不进缓存键，所以不动像素。</div>
+              </div>
+              <div class="me-note">这条链没有 panel/label/stamp 与卡面样式那几栏：版式来自母版，
+                画面来自代码。要改画面上看得见的东西，看〈字段〉与〈代码〉两页。</div>
             </div>
 
-            <div v-else-if="tab === 'style'" class="me-form">
-              <div v-if="themeScope" class="me-sub">
-                本次样式同步范围：{{ scopeTag }}
-                <button class="me-mini" @click="themeScope = ''">重新问过</button>
-              </div>
-
+            <div v-else-if="tab === 'texture'" class="me-form">
               <div class="me-frow">
-                <label>卡面样式 theme · {{ curSid }}
-                  （版式 {{ (shotBase(curSid) || {}).card || "—" }}：改这一栏就是改这一镜的配色与字号）</label>
-                <div v-for="k in (themeCtl.colors || [])" :key="k" class="me-line">
-                  <span class="me-fl">{{ FIELD_LABEL[k] || k }}</span>
-                  <input class="me-color" type="color" :value="hexOf(curTheme[k])"
-                         @input="themeSet(k, $event.target.value)" />
-                  <input class="me-in" :value="curTheme[k] ?? ''"
-                         @input="themeSet(k, $event.target.value.trim())" />
+                <label>这一镜的质感 · {{ curSid }}</label>
+                <div class="me-line me-chips">
+                  <button v-for="k in ['', ...texEnum]" :key="k || '@default'"
+                          class="me-mini pick" :class="{ on: textureDeclared === k }"
+                          @click="setTexture(k)">{{ texLabel(k) }}</button>
                 </div>
-                <div v-for="(r, k) in (themeCtl.num || {})" :key="k" class="me-line">
-                  <span class="me-fl">{{ FIELD_LABEL[k] || k }}</span>
-                  <input class="me-range" type="range" :min="r[0]" :max="r[1]" :step="1"
-                         :value="Number(curTheme[k] ?? r[0])"
-                         @input="themeSet(k, Number($event.target.value))" />
-                  <input class="me-in num" type="number" :value="curTheme[k] ?? ''"
-                         @input="themeSet(k, Number($event.target.value))" />
+                <div class="me-sub">
+                  <template v-if="!texturePointer">（这一镜不在表里）</template>
+                  <template v-else>
+                    画面上实际是 <b>{{ texLabel(textureEffective) }}</b>
+                    <span v-if="textureDeclared === ''">（跟整片默认
+                      {{ texLabel(filmTexture) }}）</span>
+                    <button v-if="texturePointer in deepEdits" class="me-mini"
+                            @click="resetTexture">↺ 回到这一版的档</button>
+                  </template>
                 </div>
+                <div class="me-note">「跟整片默认」与「不加（原片直出）」<b>是两件事</b>：
+                  前者把决定权交回顶层那一档（整片改了质感，这一镜跟着变），后者是这一镜
+                  点名不要，即使整片加了。其余四档是这一镜自己要的观感，别的镜不受影响。<br />
+                  质感<b>不在按镜缓存键里</b>——切片缓存存的是加质感之前的像素，滤镜在缓存之后
+                  按镜各过一趟。所以换档（这一镜或整片默认）<b>一帧 Remotion 都不重烧</b>，
+                  代价只有加了档的这一镜多过一遍编码。</div>
+              </div>
+            </div>
+
+            <div v-else-if="tab === 'bgm'" class="me-form">
+              <div class="me-frow">
+                <label>配乐 ref</label>
                 <div class="me-line">
-                  <span class="me-fl">字体档</span>
-                  <select class="me-in" :value="curTheme.font ?? ''"
-                          @change="themeSet('font', $event.target.value)">
-                    <option v-for="f in enumOpts('font', curTheme.font)" :key="f" :value="f">
-                      {{ f }}
-                    </option>
-                  </select>
+                  <input class="me-in" :value="(hm?.spec?.bgm?.ref || '')"
+                         disabled placeholder="未设配乐" />
                 </div>
-                <div class="me-sub">底色留空 = 用模板自带的那张纸（不是白色）。
-                  字体只有这三档是真的装了字族，选别的名画面上会静默回落成宋体。</div>
+                <div class="me-sub">换歌在左侧音乐库里搜→导入→加入会话，提交时带新 bgm 参数。
+                  这里只读当前版本用的哪首。</div>
               </div>
-
               <div class="me-frow">
-                <label>叠加图层 overlay · {{ curOverlay.length }}/{{ ovlCtl.max_per_shot || 16 }} 层
-                  （画面上那圈带编号的虚框可以<b>按住拖</b>直接定位）</label>
-                <div v-for="(l, k) in curOverlay" :key="k" class="me-lyr">
-                  <div class="me-line">
-                    <b class="me-fl">层 {{ k + 1 }}</b>
-                    <select class="me-in" :value="l.type"
-                            @change="laySet(k, 'type', $event.target.value)">
-                      <option v-for="t in enumOpts('type', l.type)" :key="t" :value="t">{{ t }}</option>
-                    </select>
-                    <button class="me-mini" @click="delLayer(curSid, k)">✕ 删这层</button>
-                  </div>
-                  <input class="me-in" placeholder="文字（text 层用）" :value="l.text ?? ''"
-                         @input="laySet(k, 'text', $event.target.value)" />
-                  <input class="me-in" placeholder="素材引用 ref（image 层用）" :value="l.ref ?? ''"
-                         @input="laySet(k, 'ref', $event.target.value)" />
-                  <div class="me-grid">
-                    <div v-for="b in ['x', 'y', 'w', 'h']" :key="b" class="me-gcell">
-                      <label>盒 {{ b }} {{ FIELD_LABEL[b] }}
-                        （{{ rg(`box.${b}`)[0] }}~{{ rg(`box.${b}`)[1] }}）</label>
-                      <input class="me-in" type="number" step="0.01"
-                             :min="rg(`box.${b}`)[0]" :max="rg(`box.${b}`)[1]"
-                             :value="l.box?.[b] ?? ''"
-                             @input="laySet(k, `box.${b}`, Number($event.target.value))" />
-                    </div>
-                  </div>
-                  <div v-for="c in (ovlCtl.style_colors || [])" :key="c" class="me-line">
-                    <span class="me-fl">{{ FIELD_LABEL[c] || c }}</span>
-                    <input class="me-color" type="color" :value="hexOf(l.style?.[c])"
-                           @input="laySet(k, `style.${c}`, $event.target.value)" />
-                    <input class="me-in" :value="l.style?.[c] ?? ''"
-                           @input="laySet(k, `style.${c}`, $event.target.value.trim())" />
-                  </div>
-                  <div v-for="(r, s) in (ovlCtl.style_num || {})" :key="s" class="me-line">
-                    <span class="me-fl">{{ FIELD_LABEL[s] || s }}</span>
-                    <input class="me-range" type="range" :min="r[0]" :max="r[1]"
-                           :step="s === 'size' ? 1 : (r[1] - r[0] <= 1 ? 0.05 : 1)"
-                           :value="Number(l.style?.[s] ?? r[0])"
-                           @input="laySet(k, `style.${s}`, Number($event.target.value))" />
-                    <input class="me-in num" type="number" :value="l.style?.[s] ?? ''"
-                           @input="laySet(k, `style.${s}`, Number($event.target.value))" />
-                  </div>
-                  <div class="me-grid">
-                    <div class="me-gcell">
-                      <label>对齐</label>
-                      <select class="me-in" :value="l.style?.align ?? ''"
-                              @change="laySet(k, 'style.align', $event.target.value)">
-                        <option v-for="o in enumOpts('align', l.style?.align)" :key="o" :value="o">
-                          {{ o }}
-                        </option>
-                      </select>
-                    </div>
-                    <div class="me-gcell">
-                      <label>动效</label>
-                      <select class="me-in" :value="l.anim ?? ''"
-                              @change="laySet(k, 'anim', $event.target.value)">
-                        <option v-for="o in enumOpts('anim', l.anim)" :key="o" :value="o">{{ o }}</option>
-                      </select>
-                    </div>
-                    <div class="me-gcell">
-                      <label>层级</label>
-                      <select class="me-in" :value="l.z ?? 'front'"
-                              @change="laySet(k, 'z', $event.target.value)">
-                        <option v-for="o in enumOpts('z', l.z)" :key="o" :value="o">{{ o }}</option>
-                      </select>
-                    </div>
-                  </div>
-                  <div class="me-line">
-                    <span class="me-fl">起 (ms)</span>
-                    <input class="me-range" type="range" :min="rg('at_ms')[0]" :max="rg('at_ms')[1]"
-                           :step="10" :value="Number(l.at_ms ?? 0)"
-                           @input="laySet(k, 'at_ms', Number($event.target.value))" />
-                    <span class="me-fl">动效时长</span>
-                    <input class="me-range" type="range" :min="rg('dur_ms')[0]" :max="rg('dur_ms')[1]"
-                           :step="10" :value="Number(l.dur_ms ?? 600)"
-                           @input="laySet(k, 'dur_ms', Number($event.target.value))" />
-                  </div>
+                <label>音量 volume（0~0.6）</label>
+                <div class="me-line">
+                  <input class="me-range" type="range" min="0" max="0.6" step="0.02"
+                         :value="bgmEdit.volume !== null ? bgmEdit.volume : (hm?.spec?.bgm?.volume ?? 0.18)"
+                         @input="bgmEdit.volume = Number($event.target.value)" />
+                  <input class="me-in num" type="number" min="0" max="0.6" step="0.02"
+                         :value="bgmEdit.volume !== null ? bgmEdit.volume : (hm?.spec?.bgm?.volume ?? 0.18)"
+                         @input="bgmEdit.volume = Number($event.target.value)" />
                 </div>
-                <button class="me-mini" @click="addLayer(curSid)">＋ 加一层</button>
-                <div class="me-note">叠加层是画面上自由加的那一层：文字、色块、线、图都能加，
-                  也能盖在版式自己画的字上面。素材引用要写成这一版认得的 ref
-                  （比如已入库的素材号），写不出来的路径会被闸门退回。</div>
+                <div class="me-sub">配乐不进按镜缓存键，改音量只重走混音，一镜都不重烧。</div>
               </div>
+              <div class="me-frow">
+                <label>人声起时压低 duck</label>
+                <div class="me-line">
+                  <button class="me-mini"
+                          @click="bgmEdit.duck = !(bgmEdit.duck !== null ? bgmEdit.duck : (hm?.spec?.bgm?.duck ?? true))">
+                    {{ (bgmEdit.duck !== null ? bgmEdit.duck : (hm?.spec?.bgm?.duck ?? true)) ? '✓ 开' : '✗ 关' }}
+                  </button>
+                  <span class="me-sub">开：人声出现时自动压低配乐，人声停时恢复</span>
+                </div>
+              </div>
+              <div class="me-note">配乐参数挂在母带层，与单镜无关——改它们整片只重走一遍混音，
+                不烧任何一镜的像素。在时间线上点配乐轨也能跳到这里。</div>
             </div>
 
             <div class="me-submit">
@@ -1527,6 +1641,14 @@ loadHitmap(props.artifactId);
 .me-tabs button { border: 1px solid var(--line); background: #fff; border-radius: 6px;
   padding: 4px 10px; font-size: 12px; cursor: pointer; }
 .me-tabs button.on { border-color: var(--vermilion); color: var(--vermilion); }
+.me-tabs em { font-style: normal; color: var(--gold); margin-left: 4px; font-size: 10px; }
+/* 框住的那个旋钮在〈字段〉页里点亮这一行：反查的凭据要看得见，不然用户不知道
+   界面是按哪一格给的这行。 */
+.me-cell.hot { border-color: var(--vermilion); box-shadow: 0 0 0 1px rgba(200, 64, 31, .25); }
+.me-code { font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.35;
+  white-space: pre; resize: vertical; }
+.me-bool { display: flex; gap: 6px; align-items: center; font-size: 12px; cursor: pointer; }
+.me-bool input { width: 16px; height: 16px; }
 .me-vers { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; }
 .me-ver { border: 1px solid var(--line); background: #fff; border-radius: 5px; font-size: 11px;
   padding: 2px 6px; cursor: pointer; }
@@ -1549,6 +1671,8 @@ loadHitmap(props.artifactId);
 .me-line .me-in { width: auto; flex: 1 1 auto; min-width: 0; }
 .me-mini { border: 1px dashed var(--line); background: transparent; border-radius: 5px;
   font-size: 11px; padding: 2px 7px; cursor: pointer; color: var(--ink-soft); }
+.me-chips { flex-wrap: wrap; }
+.me-mini.on { border-style: solid; border-color: var(--vermilion); color: var(--vermilion); }
 .me-submit { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px;
   display: grid; gap: 8px; }
 .me-btn { border: 1px solid var(--line); background: #fff; border-radius: 6px; padding: 5px 10px;
@@ -1568,18 +1692,8 @@ loadHitmap(props.artifactId);
 .me-range { flex: 1 1 90px; min-width: 70px; }
 .me-in.num { flex: 0 0 78px; width: 78px; }
 .me-fl { font-size: 11px; color: var(--ink-soft); flex: 0 0 72px; }
-.me-lyr { border: 1px solid var(--line); border-radius: 6px; padding: 7px; margin-bottom: 8px;
-  display: grid; gap: 5px; background: var(--paper-deep); }
-.me-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
-.me-gcell label { display: block; font-size: 10px; color: var(--ink-soft); margin-bottom: 2px; }
 .me-askbar { border: 1px solid var(--vermilion); border-radius: 8px; padding: 8px; margin-bottom: 8px;
   background: rgba(200, 64, 31, .07); display: grid; gap: 5px; font-size: 12px; }
-.me-ovls { position: absolute; inset: 0; pointer-events: none; }
-.me-ovl { position: absolute; border: 1px dashed var(--gold); border-radius: 2px;
-  pointer-events: auto; cursor: move; }
-.me-ovl:hover { background: rgba(185, 138, 47, .18); }
-.me-ovl i { position: absolute; left: 0; top: -13px; font-size: 10px; font-style: normal;
-  color: var(--gold); }
 .me-note { font-size: 11px; color: var(--ink-soft); }
 .me-note.pad { padding: 14px 16px; }
 .me-err { font-size: 12px; color: var(--vermilion); padding: 14px 16px; }

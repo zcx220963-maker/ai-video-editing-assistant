@@ -26,13 +26,15 @@ _MUTATING_TOOLS = frozenset({"rerun_from", "start_subagent"})
 # 于是这条对应关系由服务端记着，校验器据此把技能补进卡面，执行轮照卡预注入。
 _IMPLICIT_SKILLS: dict[str, tuple[str, ...]] = {
     "plan_motion": ("motion_explainer_skill",),
-    "render_motion_video": ("motion_explainer_skill",),
+    # 出片与局部改带的是同一份技能：零素材通道没有任何素材事实可依赖（没有 ASR 文本、
+    # 没有镜头描述），代码镜怎么写、字段旋钮怎么声明、指针五条怎么用，全在那份正文里。
+    "render_motion_code": ("motion_explainer_skill",),
     # 局部改改的就是同一份归一后的分镜（字段名与必填项一字不差），
-    # 少了这份技能，模型会按 render_motion_video 的入参形状提交 edits，闸在入库前退它。
-    "patch_motion_video": ("motion_explainer_skill",),
+    # 少了这份技能，模型会按别的入参形状提交 edits，闸在入库前退它。
     # 口播链的 patch_video **不挂**技能：它的 edits 是「命中表指针 + 值」，指针形状与可改字段
     # 白名单全写在节点的 input_schema 里（执行轮模型本来就看得到），没有第二份需要随身带着的
     # 字段字典。motion 那一路要带技能，是因为改的就是同一份归一后的分镜字段名。
+    "patch_motion_code": ("motion_explainer_skill",),
 }
 
 

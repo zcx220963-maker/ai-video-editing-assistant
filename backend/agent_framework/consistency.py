@@ -52,10 +52,11 @@ WATCHED = (
     "load_media", "split_shots", "understand_clips", "filter_clips", "group_clips",
     "generate_script", "generate_voiceover", "select_BGM", "plan_timeline",
     "render_video", "submit_plan", "load_skill",
-    # 零素材那一路：render_motion_video 极易写错（render_motion / motion_render_video），
-    # 而技能正文与提示词都点名了它——错了就是模型照着不存在的工具排计划。
-    # patch_motion_video 同一条命：名字一改就变成「局部改」这条功能在模型眼里不存在。
-    "plan_motion", "render_motion_video", "patch_motion_video",
+    # 零素材那一路（代码镜）：**成对**盯——只列 render_motion_code 不列 patch_motion_code，
+    # 等于「局部改」这条功能在模型眼里不存在，计划里它就不会想到下补丁而是重烧整片。
+    # 这一族的名字极易写错（render_motion / motion_render_video），而技能正文与提示词都
+    # 点名了它们，错了就是模型照着不存在的工具排计划。
+    "plan_motion", "render_motion_code", "patch_motion_code",
     # 口播片那一路的局部改：同一条命——名字一漂移，模型排出来的计划里这条功能不存在。
     "patch_video",
 )
@@ -97,8 +98,8 @@ def schema_property_names(tools: Iterable[Any]) -> set[str]:
     「臆造工具」，启动时挂一条假告警；假告警比不报更坏，它教人忽略这个检查。
 
     为什么连 ``enum`` / ``const`` 的**取值**也收进来：技能正文讲参数怎么填时，
-    引用的是取值而不是键名（图形科普片那条路要说「版式选 dict_entry、字幕选
-    torn_highlight」）。这些词长得像工具名（小写下划线），却根本不是可调用的东西。
+    引用的是取值而不是键名（图形科普片那条路要说「字幕形态选 torn_highlight、
+    质感选 film」）。这些词长得像工具名（小写下划线），却根本不是可调用的东西。
     只在 schema 里明确列出的值才算，不做任何猜测——与 ``plan.support.enum_of`` 同一条口径。
 
     只放宽文案检查，不影响任何执行判定。

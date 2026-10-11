@@ -86,6 +86,9 @@ services:
       REGISTER_OPEN: ${REGISTER_OPEN:-1}
       QUOTA_LIMIT: ${QUOTA_LIMIT:-0}
       QUOTA_WINDOW: ${QUOTA_WINDOW:-86400}
+      # 图形科普片的代码渲染链（独立容器）。editor 与 app 都要能摸到：
+      # 出片节点跑在 editor，选区改的补丁口跑在 app。
+      REMOTION_URL: ${REMOTION_URL:-http://remotion:8010}
     volumes:
       - whisper-cache:/root/.cache
       - app-runtime:/app/.runtime
@@ -94,6 +97,27 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    profiles: ["app"]
+
+  # 图形科普片代码渲染链。与 editor 同构：独立常驻服务，Python 侧只是 HTTP 客户端。
+  # 为什么单独一个容器 —— Node + Remotion 只服务图形链，它崩了不该带走后端。
+  #
+  # 这里刻意**不**把 remotion 列进 app/editor 的 depends_on：
+  # 存储层没就绪服务必然起不来，而渲染服务没就绪只是「这一镜渲失败」——
+  # 把它做成启动依赖，等于让图形链的故障半径扩大到整站。
+  remotion:
+    build: ./remotion
+    image: creation-remotion:latest
+    container_name: creation-remotion
+    # 不映射宿主端口：只给应用容器在 compose 网络内用（remotion:8010）。
+    healthcheck:
+      # 镜像里没有 curl,用 node 自带的全局 fetch 真打一次 /healthz
+      # （端口开着不等于服务应答，探针要问同一个口）。
+      test: ["CMD", "node", "-e",
+             "fetch('http://127.0.0.1:8010/healthz').then((r)=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     profiles: ["app"]
 
   app:

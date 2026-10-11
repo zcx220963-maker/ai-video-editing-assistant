@@ -184,9 +184,9 @@ async function loadHistory(cid, force) {
       }
     }
     histories[cid] = list;
-    // 重放只是把旧会话摆出来，不是「刚剪完一条」——这里只切到时间线面板，
-    // 不自动弹任何编辑器（弹模态会盖住用户本来要看的对话）。
-    if (hasMedia && cid === active.value) activePanel.value = 'timeline';
+    if (hasMedia && cid === active.value) {
+      activePanel.value = 'timeline';
+    }
     scrollDown();
   } catch (_) {
     /* 回填失败不打断使用：新会话本来就还没有历史 */
@@ -301,7 +301,6 @@ const streamCur = {};        // convId -> 当前流式气泡
 const askedCards = reactive({});
 const connected = reactive({});
 const draft = ref("");
-const composerEl = ref(null);
 const scroller = ref(null);
 
 const toolLib = ref(null);
@@ -1366,50 +1365,13 @@ const PLAN_VALUE_TEXT = { true: "开", false: "关" };
 // 计划确认弹窗：待确认的计划卡自动弹出，用户操作后收起；消息流里留一条轻量状态行。
 const planModal = ref(null);
 
-// 「选区改」编辑器：只在成片卡带命中表时才开（两条剪辑链出片时都会量这张表）。
+// 「选区改」编辑器：只在成片卡带命中表时才开（图形科普片那条路的产物才有这张表）。
 const motionEditor = ref(null);
-// 卷宗栏收起前的状态：剪辑侧栏开着时把左栏让给画面，关掉后原样还回去。
-// 只改 railOpen、不写 localStorage——那是用户自己设的偏好，不该被一次剪辑改掉。
-const railWasOpen = ref(null);
-function yieldRail(open) {
-  if (open) {
-    if (railWasOpen.value === null) railWasOpen.value = railOpen.value;
-    railOpen.value = false;
-    activePanel.value = null;        // 右列同时只放一个面板
-  } else if (railWasOpen.value !== null) {
-    railOpen.value = railWasOpen.value;
-    railWasOpen.value = null;
-  }
-}
-// 当前会话最后一条成片卡：时间线面板那个按钮开得起来与否，只看它带没带命中表。
-const latestMediaCard = computed(() => {
-  const cid = active.value;
-  if (!cid) return null;
-  const list = msgs(cid) || [];
-  for (let i = list.length - 1; i >= 0; i--) if (list[i].kind === "media") return list[i];
-  return null;
-});
-// 唯一的开法：带命中表的成片都开自研编辑器——表单由表自己声明形态
-// （图形科普片有空间框能框选；口播/素材片没有，就在按轨道的时间线上点一段）。
-// 没有命中表 = 这一版出片时没量到，按区域选着改无从谈起，这里就是空操作。
-function openEditorFor(card) {
+function openMotionEditor(card) {
   if (!card || !card.hitmap || !card.artifactId) return;
   motionEditor.value = card;
-  yieldRail(true);
 }
-function closeMotionEditor() {
-  motionEditor.value = null;
-  yieldRail(false);
-}
-// 手工选中态 → 对话上下文：AI 改与手工改指着同一块，模型不用再回头猜「哪一句字幕」。
-function editorAsk(text) {
-  const t = String(text || "").trim();
-  if (!t) return;
-  draft.value = draft.value.trim() ? `${draft.value.trim()}\n${t}` : t;
-  const el = composerEl.value;
-  if (!el) return;
-  nextTick(() => { el.focus(); el.setSelectionRange(el.value.length, el.value.length); });
-}
+function closeMotionEditor() { motionEditor.value = null; }
 // 局部改出来的新版本也是一张成片卡：推进消息流，刷新后由 /convs/{id}/messages 重放接手续。
 function onMotionPatched(p) {
   const cid = active.value;
@@ -2206,21 +2168,17 @@ function onFrame(cid, p) {
     // 成片回投：MediaCardHook 从 render_video 工具结果捕获 media_url → 播放卡片
     if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
     closeRenderBar(cid, { state: "done", percent: 100, stage: "done" });
-    const card = {
+    msgs(cid).push({
       role: "assistant", kind: "media", state: "done",
       text: p.title || "成片已渲染",
       url: p.media_url, duration: p.duration, evidence: p.evidence || [],
-      // 「选区改」的开关：判据从产物里带出来（两条剪辑链的终态都带命中表键），
+      // 「选区改」的开关：判据从产物里带出来（只有图形科普片那条路的终态带命中表），
       // 不由前端猜——按钮摆上去点了却 404，等于骗用户这一版能选着改。
       artifactId: p.artifact_id, hitmap: !!p.hitmap,
-    };
-    msgs(cid).push(card);
+    });
     scrollDown();
     if (cid === active.value) {
-      // 出片即开剪辑侧栏（右侧那一列，不再是整屏弹窗）；这一版没量到命中表
-      // 就开不了选区改，退回时间线面板，总得让用户看得见刚出的这条片子。
-      openEditorFor(card);
-      if (!motionEditor.value) activePanel.value = 'timeline';
+      activePanel.value = 'timeline';
     }
   } else if (p.type === "tool_call") {
     if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
@@ -2406,15 +2364,6 @@ function removeAtt(cid, i) {
 const KIND_ICON = { video: "🎬", audio: "🎵", image: "🖼" };
 function kindIcon(kind) {
   return KIND_ICON[kind] || "📎";
-}
-
-// 素材来源的中文标签：render 是这次新出现的（渲染出的成片自动入素材库）。
-// 未知来源回空串——宁可少一个标签，也不把没翻译的枚举值露在界面上。
-const ORIGIN_LABELS = {
-  upload: "上传", url: "链接取料", library: "曲库", bgm: "配乐", render: "成片",
-};
-function originLabel(origin) {
-  return ORIGIN_LABELS[origin] || "";
 }
 
 // 工具名 → 用户能看懂的中文短语（工具卡片展示用，非程序员友好）
@@ -3109,11 +3058,6 @@ async function dropConv(cid) {
       method: "DELETE", headers: authHeaders(),
     });
     if (!r.ok) throw new Error("HTTP " + r.status);
-    const j = await r.json().catch(() => ({}));
-    if (j.gc_notice) {
-      msgs(active.value).push({ role: "assistant",
-                                text: "这册已删，但" + j.gc_notice + "；后台对账稍后会自动补收。" });
-    }
   } catch (e) {
     msgs(active.value).push({ role: "assistant", text: `这册没删掉（${cid}）：${e.message}`, state: "error" });
   }
@@ -3281,8 +3225,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                   <a :href="m.url" download>下载成片</a>
                   <!-- 开关来自产物自己带的命中表：没有表就只能整片重做，按钮摆上去点了也是 404 -->
                   <button v-if="m.hitmap && m.artifactId" class="clip mc-patch"
-                          title="点住要改的那处，只重烧受影响的那几段：图形科普片在画面上框，口播/素材片在轨道上点"
-                          @click="openEditorFor(m)">✂ 选区改</button>
+                          title="在画面上框住要改的那块，只重烧受影响的那几镜"
+                          @click="openMotionEditor(m)">✂ 选区改</button>
                   <span v-else class="mc-nopatch">这一版不能选着改（出片时没量到命中表）</span>
                 </div>
                 <!-- 证据分级：渲染完成不等于每条都验过，这里把「有证据 / 没验」摊开 -->
@@ -3542,8 +3486,6 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         </button>
         <button class="clip" :class="{ busy: fetchingLink, on: linkOpen }" title="按链接取素材" @click="toggleLink">＋链接</button>
         <textarea
-          id="composer-input"
-          ref="composerEl"
           v-model="draft"
           rows="1"
           placeholder="把想法落在此处，Enter 落笔，Shift+Enter 换行；素材点「＋素材」/拖入或「＋链接」贴网址，会挂在输入框上方随消息发出…"
@@ -4046,7 +3988,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             <audio v-else-if="item.kind === 'audio'" :src="item.url" class="lib-aud" controls preload="none"></audio>
             <div class="lib-meta">
               <b>{{ kindIcon(item.kind) }} {{ item.filename }}</b>
-              <span>{{ fmtSize(item.bytes) }}<template v-if="item.duration"> · {{ Math.round(item.duration) }}s</template><template v-if="originLabel(item.origin)"> · {{ originLabel(item.origin) }}</template></span>
+              <span>{{ fmtSize(item.bytes) }}<template v-if="item.duration"> · {{ Math.round(item.duration) }}s</template></span>
             </div>
             <button class="lib-add" @click="addFromLibrary(item)">加入本会话</button>
           </div>
@@ -4208,19 +4150,13 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 
         <template v-if="!editingTimeline">
           <div class="tl-toolbar">
-            <button class="clip" :disabled="!latestMediaCard || !latestMediaCard.hitmap"
-                    :title="latestMediaCard
-                             ? (latestMediaCard.hitmap ? '' : '这一版出片时没量到命中表：只能整片重做')
-                             : '当前会话还没有成片卡'"
-                    @click="openEditorFor(latestMediaCard)">✂ 可视化编辑（选区改）</button>
             <button class="clip ghost" @click="importLatestTimeline">从当前会话导入</button>
             <button class="clip ghost" @click="loadTimelineList" :disabled="loadingTimeline">
               {{ loadingTimeline ? "刷新中…" : "刷新" }}
             </button>
           </div>
           <div v-if="!timelineList.length && !loadingTimeline" class="lib-empty">
-            还没有保存的时间线。点击「从当前会话导入」获取 AI 生成的最新时间线；
-            出片后点「可视化编辑」直接进选区改（成片带命中表时才开得了，两条剪辑链都一样）。
+            还没有保存的时间线。点击「从当前会话导入」获取 AI 生成的最新时间线；要按画面框选局部改，用成片卡片上的「✂ 选区改」。
           </div>
           <div v-for="tl in timelineList" :key="tl.id" class="tl-item" @click="openTimeline(tl)">
             <b>{{ tl.name }}</b>
@@ -4442,14 +4378,10 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 
     <!-- 统一提问卡已改为内嵌在对话流里（见上方消息列表末尾），不再用弹窗挡住上下文 -->
 
-    <!-- 剪辑侧栏：成片卡上的「✂ 选区改」和渲染完成后的自动弹出都开在这一列，
-         不再用整屏弹窗挡住对话——剪片时也要看得见上下文。表单形态由那张命中表
-         自己声明：有空间框就框选，只有段落就在按轨道的时间线上点。 -->
-    <aside v-if="motionEditor" class="editor-dock">
-      <MotionEditor :artifact-id="motionEditor.artifactId"
-                    :conv-id="active" :media-url="motionEditor.url" :title="motionEditor.text"
-                    @close="closeMotionEditor" @patched="onMotionPatched" @ask="editorAsk" />
-    </aside>
+    <!-- 成片卡上的「✂ 选区改」：在画面上框住要改的那块，只重烧受影响的那几镜 -->
+    <MotionEditor v-if="motionEditor" :artifact-id="motionEditor.artifactId"
+                  :conv-id="active" :media-url="motionEditor.url" :title="motionEditor.text"
+                  @close="closeMotionEditor" @patched="onMotionPatched" />
   </div>
 </template>
 
@@ -4557,18 +4489,6 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 
 /* ---------- 稿纸区 ---------- */
 .desk { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-
-/* ---------- 剪辑侧栏（「选区改」）---------- */
-/* 剪映式：剪辑区吃大头，会话列压窄但**不收起**——手工选中态要能一键带去问，
-   上下限防极端屏（太窄时输入框没法打字）。 */
-.editor-dock {
-  flex: 0 1 70%; min-width: 520px; max-width: 1320px;
-  display: flex; flex-direction: column; overflow: hidden;
-  background: var(--paper); border-left: 1px solid var(--line);
-}
-@media (max-width: 1100px) {
-  .editor-dock { flex-basis: 62%; }
-}
 
 /* ---------- 右侧抽屉 ---------- */
 .drawer {

@@ -28,15 +28,39 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 渲染产物的账本与 dry_run 回执（技能正文按字段解释给模型看，不是可调用名）：
     "evidence", "evidence_rule", "render_plan", "blocking", "not_checked",
     "will_render", "timeline_digest", "src_start", "src_end",
-    # 零素材图形科普片那一路：plan_motion 的分镜账 + render_motion_video 的帧数回执
+    # 零素材图形科普片那一路：plan_motion 的分镜账 + 出片节点的帧数回执
     # （技能正文里「读 estimated_sec 与 target_warnings 对账」就是这些键）：
+    # motion_ledger 是逐镜账；field_checks 与 planned_frames 是每一镜上的闸⑥逐字段结论
+    # 与帧预算；changed_shots 是局部改账里「改了哪几镜」那一栏。都不是入参键，
+    # schema 扫不出来，不收就是假告警。
     "motion_spec", "estimated_sec", "target_warnings", "target_duration_sec",
     "plan_table", "char_count", "frames_total",
-    # 局部改那一路（patch_motion_video）：min_duration_sec 是归一后的镜头字段名
+    "motion_ledger", "field_checks", "planned_frames", "changed_shots",
+    # 出处闸与链身份：source_gate 是分镜卡上每一镜的凭据状态（verified /
+    # declared_unverified / no_source / ledger_absent），chain 标这一版画面出自哪条流水线
+    # （局部改拿它判旧产物），code_chars 是每一镜的代码字节数。三者都是产物里的键、不是入参，
+    # 技能正文要教模型「如实报每镜的凭据是哪一种」，不收就是假告警。
+    "source_gate", "chain", "code_chars",
+    # ↑ 那一栏的**取值本身**也要收（与 ``motion_plan.GATE_STATES`` 同源）：技能正文教模型
+    # 「照这四种如实复述每镜的凭据」，而判定值不在任何入参 enum 上（它只活在产物里），
+    # 不收就会被当成臆造工具名——教模型换个含糊说法反而更糟，「已核实」与「没查过」
+    # 在答复里必须是可以区分的两件事。
+    "verified", "declared_unverified", "no_source", "ledger_absent",
+    # 局部改那一路（patch_motion_code）：min_duration_sec 是归一后的镜头字段名
     # （duration_sec 归一就成了它），before_frames 是补丁账里的改前代表帧。
     # 两者都不是入参键，schema 扫不出来，不收就是假告警——技能正文教模型「拖镜头长度
     # 改的是 min_duration_sec」，被拦下来模型只能换个说法，读者反而看不到真字段名。
     "min_duration_sec", "before_frames",
+    # 闸⑦（整片风格配额）与闸④ 的第二半（带内填充度）的产物键：技能正文教模型
+    # 「照 style_channels 说出这版用了哪几条画法通道」「fill_warnings 那几镜要重排」，
+    # 这些值只出现在回执与分镜账里，schema 扫不出来，不收就是假告警。
+    "style_channels", "style_text_only", "style_warnings",
+    "fill_spans", "fill_warnings",
+    # 闸⑧（版面回读，记账不拦截）的产物键：layout_warnings 是逐镜带镜号的人话告警
+    # （叠字/被画面带切/引线悬空），layout_unscanned 点名的不是「干净」而是「这一镜没扫」。
+    # 技能正文教模型「有告警就照条目点名、有没扫的镜就如实说没验过」，这两个键只活在回执里，
+    # schema 扫不出来，不收就是假告警。
+    "layout_warnings", "layout_unscanned",
     # 口播 / 素材片那一路（patch_video）：segment_cache 是产物里的逐窗账
     # （windows/rebuilt/reused/ledger 那一整块的顶层键名），segment_id 是补丁条目里
     # 与指针交叉核对的段号。两者都不是入参键也不是工具名，不收就是假告警——

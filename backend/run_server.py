@@ -562,32 +562,43 @@ def build_runtime(
         elif not storyline_path.is_file():
             _warn(f"未找到 {storyline_path}：本服务无剪辑能力（剪辑节点只由 Storyline 提供）")
         else:
-            try:
-                cfg = load_storyline_config(storyline_path)
-                sc = MCPServerConfig(
-                    name="storyline",
-                    type="streamableHttp",
-                    url=storyline_server_url(cfg),
-                    enabled_tools=storyline_available_nodes(cfg) or ["*"],
-                    # 真实节点渲染可达分钟级——超时预算由 config [local_mcp_server].timeout 决定
-                    tool_timeout=int(
-                        cfg.get("local_mcp_server", {}).get("timeout", 600)),
-                )
-                client = await connect_server(sc)
-                # 契约先取：节点的读写集（并发分批）与下游集（rerun_from 作废范围）都靠它
-                contract = await load_contract(client, timeout=sc.tool_timeout)
-                names = await register_mcp_tools(
-                    registry, client, sc, name_prefix=False, contract=contract)
-                if names:
-                    editing_contract.fill(contract)
-                    mcp_clients.append(client)
-                    _info(f"Storyline 已接入 {len(names)} 个剪辑节点"
-                          f"（DAG 契约 {len(contract.nodes)} 节点，rerun_from 可用）")
-                else:
-                    await client.close()
-                    _warn("Storyline 未返回任何白名单工具：本服务无剪辑能力")
-            except Exception as exc:  # noqa: BLE001
-                _warn(f"Storyline MCP（{storyline_path}）未连通：本服务无剪辑能力。{exc}")
+            cfg = load_storyline_config(storyline_path)
+            sc = MCPServerConfig(
+                name="storyline",
+                type="streamableHttp",
+                url=storyline_server_url(cfg),
+                enabled_tools=storyline_available_nodes(cfg) or ["*"],
+                tool_timeout=int(
+                    cfg.get("local_mcp_server", {}).get("timeout", 600)),
+            )
+            # Storyline MCP 连接重试：editor 容器可能比 app 晚就绪，
+            # depends_on healthcheck 只验端口开不验 MCP 协议就绪，
+            # 启动时序竞态致「Connection refused」后不再重试=无剪辑能力。
+            storyline_ok = False
+            for attempt in range(5):
+                try:
+                    client = await connect_server(sc)
+                    contract = await load_contract(client, timeout=sc.tool_timeout)
+                    names = await register_mcp_tools(
+                        registry, client, sc, name_prefix=False, contract=contract)
+                    if names:
+                        editing_contract.fill(contract)
+                        mcp_clients.append(client)
+                        _info(f"Storyline 已接入 {len(names)} 个剪辑节点"
+                              f"（DAG 契约 {len(contract.nodes)} 节点，rerun_from 可用）")
+                        storyline_ok = True
+                    else:
+                        await client.close()
+                        _warn("Storyline 未返回任何白名单工具：本服务无剪辑能力")
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    if attempt < 4:
+                        _warn(f"Storyline MCP 连接失败（第 {attempt+1}/5 次），"
+                              f"2s 后重试：{exc}")
+                        await asyncio.sleep(2)
+                    else:
+                        _warn(f"Storyline MCP（{storyline_path}）5 次重试均未连通："
+                              f"本服务无剪辑能力。{exc}")
 
         # (d) 出口词表补全：远程节点的 title 与技能的 display 到这一步才拿得到。
         #     没装上也不影响服务——界面退回机器名是块 A 的既定降级。

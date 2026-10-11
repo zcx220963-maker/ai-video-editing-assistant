@@ -13,7 +13,7 @@
                              ▼
    ┌────────────────────────────────────────────┐   MCP(streamableHttp)   ┌──────────────────────────────┐
    │ :8000 主服务 = Agent 大脑                    │ ──────────────────────▶ │ :8001 剪辑服务 = 双手          │
-   │  登录鉴权 · 对话主循环 · 计划门 · 技能 · 记忆 │      tools/list         │  24 节点 DAG + 契约            │
+   │  登录鉴权 · 对话主循环 · 计划门 · 技能 · 记忆 │      tools/list         │  25 节点 DAG + 契约            │
    │  checkpoint · 工具注册表 · WS 回投 · 配额    │      tools/call         │  ffmpeg · MoviePy · whisper    │
    │  判断模型(第二意见) · 存储层                  │ ◀────────────────────── │  渲染提交+轮询+看门狗+证据账    │
    └───────────┬───────────────┬────────────────┘      产物/进度回传        └───────────────┬──────────────┘
@@ -23,14 +23,19 @@
 
 - **对外只有一个端口 :8000**——前端 build 后由主服务托管,没有独立前端端口;
 - :8001 是后端内部的剪辑工序端口,只监听本机。渲染是分钟级 CPU 重活,独立进程保证它卡死时不影响对话;
+- **图形科普片的像素不在 :8001 里烧**:那一侧只是 HTTP 客户端,真正逐帧执行的是第三个进程
+  `creation-remotion`(Node 24 + Remotion,:8010,**不做宿主机映射**,只在 compose 网内可达)。
+  它没就绪只让这一镜渲失败,不带走整站的剪辑能力——这也是它刻意不进 `depends_on` 的理由(§15);
 - **必须先起 :8001 再起 :8000**:主服务在启动阶段建立 MCP 连接并拉取节点清单与 DAG 契约,连不上就是
   "无剪辑能力"(启动日志会明说),而不是运行到一半才失败;
 - Redis 是**可选服务**:单副本不带 `--broadcast-redis-url` 是设计口径,不是欠账。
-- **编辑口只有一条,是自研的那条**:成片卡与「时间线」面板上的「🎬 可视化编辑」开的都是同一个
-  `MotionEditor` 选区改(§17)——它按成片自己带的命中表切形态:图形科普片露**画面上的框**
-  (`motion-hitmap/1`,有空间命中层),素材 / 口播片露**轨道上的段**(`segment-hitmap/1`,
-  `hit_mode="track"`,没有空间层);两者都只重烧受影响的那几块像素,第三方剪辑器已全部摘除,
-  也没有内嵌的外部编辑会话。
+- **可视化选区编辑口只有一条,是自研的那条**:成片卡上的「✂ 选区改」开 `MotionEditor`(§17)
+  ——它按成片自己带的命中表切形态:图形科普片露**画面上的框**(`motion-hitmap/1`,
+  有空间命中层),素材 / 口播片露**轨道上的段**(`segment-hitmap/1`,`hit_mode="track"`,
+  没有空间层);两者都只重烧受影响的那几块像素。第三方剪辑器 OpenChatCut 已全部摘除——服务、
+  MCP 注册、以及**前端那条打开外部 iframe 的「🎬 可视化编辑」入口**(2026-10-11 补齐,之前
+  按钮仍指向已删除的剪辑器)。「时间线」面板不再内嵌任何外部编辑会话,它只列出已保存的时间线,
+  点开是内联的字段表单(字幕 / 配乐等)。
 
 ## 目录结构
 
@@ -42,15 +47,20 @@ backend/                  后端(Python 3.12+)
     tools/                内置工具与 MCP 桥(mcp.py 把远程节点包成本地 Tool)
     storage/              PG 仓储 + MinIO 对象存储 + schema.sql(22 张表)
   storyline_server/       MCP 剪辑服务:25 个节点、渲染分发器、看门狗、能力配置
-                          (motion/ 子包 = 零素材出片的契约·净化·图示·排版·出片五层)
+                          (motion/ 子包 = 代码镜链:契约与闸⑦ code_spec、执行层与闸②③④⑤⑥
+                           code_render、局部改 code_patch、渲染容器客户端 remotion_client、
+                           与像素来源无关的共用件 render)
   prompts/                提示词库(8 份 markdown,改文案不改代码)
   examples/               剪辑服务配置(config.toml / config.docker.toml)+ 6 个示例技能
                           (含 motion_explainer:零素材出片的工作流技能)
   run_server.py           主服务入口(:8000)
   run_storyline.py        剪辑服务入口(:8001)
+remotion/                 图形链的代码渲染服务(Node 24 + Remotion,常驻容器 :8010)
+                          server.mjs(四张口)· lint.mjs/lint-rules.mjs(闸①)·
+                          src/{entry.tsx,FilmLayout.tsx,tokens.ts,user-shots/shot.tsx}
 frontend/                 前端(Vue 3 + Vite;构建产物 dist/ 由主服务托管)
 deploy/Caddyfile          公网反代(:80 → app:8000,HTTPS 块预留)
-docker-compose.yml        postgres + minio + redis(存储层);editor/app/caddy 走 profile "app"
+docker-compose.yml        postgres + minio + redis(存储层);editor/remotion/app/caddy 走 profile "app"
 Dockerfile                两阶段:node:20-alpine 出 dist → python:3.12-slim 跑后端
 .env.example              环境变量模板(复制为 .env)
 ```
@@ -81,10 +91,11 @@ Dockerfile                两阶段:node:20-alpine 出 dist → python:3.12-slim
 | 15 | 成片由 `MediaCardHook` 发 `media` 帧;卡片带五级证据账本(哪些机器验过、哪些只能人眼人耳) | `hooks.MediaCardHook` + `core_nodes.evidence_ledger` |
 | 16 | 收尾前:四条假称硬保证 + 判断模型第二意见;渲染未达终态**不许**结束本轮 | `agent._nudge_back` + `_follow_inflight_renders` |
 | 17 | 终答落 `messages`(含媒体部件),指针行置 `completed`;刷新后按 `qa.parts` 重放成片卡 | `agent._deliver` + `media_replay` |
-| 18 | **交付之后还有第二条回路**:成片卡带「✂ 选区改」→ 编辑器读这一版自带的命中表 → 零素材片在画面上框出一格、口播片在轨道上点住一段,拿到的都是**字段指针** → `POST /motion/patch` / `POST /timeline/patch` fork 新版本(**只重烧受影响的那几镜 / 那几窗**)→ 新版本又成一张卡 | `MotionEditor.vue` + `server.motion_patch` / `server.timeline_patch` + `nodes.PatchMotionVideoNode` / `nodes.PatchVideoNode`,详见"核心机制 17" |
+| 18 | **交付之后还有第二条回路**:成片卡带「✂ 选区改」→ 编辑器读这一版自带的命中表 → 零素材片在画面上框出一格、口播片在轨道上点住一段,拿到的都是**字段指针** → `POST /motion/patch` / `POST /timeline/patch` fork 新版本(**只重烧受影响的那几镜 / 那几窗**)→ 新版本又成一张卡 | `MotionEditor.vue` + `server.motion_patch` / `server.timeline_patch` + `nodes.PatchCodeMotionVideoNode` / `nodes.PatchVideoNode`,详见"核心机制 17" |
 
 **出片有两条终点通道**:素材在库里(或随消息给)走 `render_video`;用户只给一个**选题**、没有任何素材,
-走 `plan_motion` → `render_motion_video`——画面是排版画出来的,详见"核心机制 15"。**一条片子只走一条通道**,
+走 `plan_motion` → `render_motion_code`——画面是模型逐镜交的 React/TSX 代码,由 `creation-remotion`
+容器逐帧渲染,详见"核心机制 15"。**一条片子只走一条通道**,
 但"一个终点"不等于"一份产物":两条通道**都**能被选区改继续 fork 出版本链(§17),区别只在命中表
 是画面上的框还是轨道上的段。
 
@@ -252,92 +263,105 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
 各实例只投自己挂着连接的会话。**没挂 WS 的会话帧也进有界影子缓冲**,刷新/换副本后才看得见在途进度;
 `answer` 帧落定即清该 run 的缓冲,重放只补在途轮次。MQ 按会话哈希分区:同会话串行、不同会话并行。
 
-### 15. 零素材图形科普片:分镜是校验闸,画面是纯排版
+### 15. 零素材图形科普片:画面是模型逐镜写的代码,八道闸把它拦回可放映
 
-用户只给一个**选题**、没有任何视频素材时走这条通道(`plan_motion` → `render_motion_video`)。
-判据只有一条:这条片子的画面是不是排版就能画出来。给素材请走剪辑 DAG,一条片子只出一个终点通道。
+用户只给一个**选题**、没有任何视频素材时走这条通道(`plan_motion` → `render_motion_code`,
+局部改走 `patch_motion_code`)。判据只有一条:这条片子的画面排版画不出来,得由代码画。给素材请走剪辑 DAG,
+一条片子只出一个终点通道。旧的声明式链(22 张内置卡 + 参数展开 + SVG 净化 + 虚拟时钟截图)
+**已整条删除**,`motion/spec.py`/`art.py`/`diagrams.py`/`canvas.py`/`graphics.py`/`templates.py` 都不在了;
+它那条验收要求——每镜要有能认出的画面主体、整片版式要有配额、一处以上先后动效——与实现无关,
+现在由**闸④ + 闸⑦**接着判,依然成立。
 
 - **两个工具、两次决定**:`plan_motion` **不烧像素**——它校验、归一、把 spec 落进 Store,并回一份账
   (镜头数、总字数、按字数估的秒数区间、与目标时长的偏离提醒)。带病的 spec 不入库,所以永远不会
-  「渲了二十分钟才发现高亮词写错了」;改文案只需重调本工具。`render_motion_video` 才是唯一烧像素的口子;
+  「渲了二十分钟才发现高亮词写错了」;改文案只需重调本工具。`render_motion_code` 是唯一烧像素的口子;
+- **一镜一段代码,渲染在一旁的女仆容器里**:每镜交一段 React/TSX(`code` ≤ 40000 字节),
+  由常驻服务 `creation-remotion`(:8010)逐帧渲。它只开四个口——`/healthz`(报 node/remotion/chromium/gl,
+  以及**母版哈希与依赖锁哈希**)、`/lint`(闸①)、`/render-shot`(渲一镜,服务端**串行**,一次一镜进浏览器)、
+  `/artifact/{cache_key}`(取切片字节)。**这条链没有默认版式可退**:哪一镜没交代码,分镜校验就带镜号退回。
+  切片先由 Python 抓到本地再进缓存与拼接,因为闸③ 数的是**本地那份字节**,而混音在本地跑;
+  缓存对象落 MinIO `motion-shots/{会话}/{镜头键}/{文件}`,随会话级联回收;
+- **版式归母版 `<FilmLayout>`,模型只画带子里那一块**:母版 Composition 垄断字幕、画幅、字体与配色 token,
+  镜头代码**必须**包一层 `<FilmLayout>`(闸① 的强制规则之一),画面只能画在 `useBody()` 报回来的那条带子里,
+  坐标系已是设备像素——早先那批 12 镜每张自己猜 `1080×620`,横屏母题被压成整页的 9%,就是没有这条垄断的代价。
+  字幕容量随画幅分档,并由契约拦:竖屏/方屏 60 字(`MAX_TEXT_CHARS`)、横屏 110 字(`MAX_TEXT_CHARS_WIDE`);
+- **一帧 = `useCurrentFrame()` 的纯函数**:禁 `requestAnimationFrame`/`setTimeout`/`Date.now`(闸① 拦),
+  随机只许 `random(seed)`。理由是真机测出来的:headless Chrome 在 `--virtual-time-budget` 下只发得出
+  1~2 个 rAF 回调就饿死,挂在 rAF 上的动画会让每镜都截成起始帧;SMIL(`<animate>`)按墙钟走,同理渲不动;
 - **镜头时长不由模型给**:有旁白时时钟归 edge-tts 的**实测语音时长 + 词级时间轴**(话没说完画面不切走),
-  模型写的 `duration_sec` 在入库时就降级成 `min_duration_sec` 下限参考。字幕逐词点亮用的就是这份词时间轴
-  (`templates.align_words` 把 TTS 的分词贴回文案的字符区间);
-- **一帧 = 时刻 t 的纯函数**:页面把 `?t=毫秒` 在解析期同步算成画面状态,**不靠 rAF**——实测 headless
-  Chrome 在 `--virtual-time-budget` 下只发得出 1~2 个 rAF 回调就饿死,挂在 rAF 上的动画会让每镜都截成起始帧。
-  同理 **SMIL(`<animate>`/`<set>`)一律拒**:它们按墙钟走,逐帧截图推不动;
-- **四族版式 × 两套设计空间**(`motion/spec.py` 的 `CARD_KINDS` 共 22 个):
-  档案家族 10 个(archive/dict_entry/stamp/book/print/theatre/webpage/silhouette/plain/title,
-  写在 1080×1920 设计空间)、图示家族 7 个(flow/compare/timeline/levels/chart/scatter/orbit,
-  写在 `0 0 1000 560` 的 viewBox 里)、绘制家族 4 个(pixel 像素网格/burst 粒子群/net 节点连线/
-  brush 手绘笔触,与图示同用 `1000×560` 与同一份颜色白名单,公共坐标与净化在 `motion/canvas.py`)、
-  `custom` 自画一张。**竖屏与方屏共用**竖排版式(方屏四周是同一张纸);
-  **横屏是第二套版式**(1920×1080 + 中央 1760×658 画面带),`fit=box` 的档案卡**按自身像素落进带里**
-  (早先按高度把整张竖构图缩 .35,实测一张 640×520 的封面卡在 1920 宽的纸上只剩 224px)、`fit=fill`
-  的图示/绘制/自画按 viewBox 缩放——内置图示的 `1000×560`(1.79:1)在 2.67:1 的带里受**带高**卡住,
-  实得 1175×658、两侧各留 292 纸(竖屏带宽正好 1080,那边才吃满宽度)。字幕容量随之分档:竖屏 60 字、横屏 110 字;
-- **绘制家族扩的是词汇表,不是执行权**:模型交的是参数(`pixel` 给 `rows`/`poses`/`palette`,
-  `burst` 给 `count`/`dist`/`colors`/`seed`,`net` 给 `nodes`/`edges`/`mode`,`brush` 给 `strokes`),
-  服务端把它们**展开成 SVG** 再过同一道净化闸、同一本命中表、同一个按镜缓存。
-  因此四条治理保证一条没断:画不出来的参数(各行字数不齐、色板外字符、`shape` 不认识、
-  `mode` 越界、一笔没有)在分镜校验里**带镜号退回且不烧像素**;`burst` 的落点用**整数种子**的
-  `random.Random`,同输入必然同图,否则按镜缓存会拿旧片冒充新片;
-- **`card=custom` 有净化闸**(`motion/art.py`):白名单只放行绘图元素与绘图属性,`<script>`/
-  `<foreignObject>`/`<image>`/外链 href 一律拒,根节点必须带 viewBox,上限 20000 字 / 400 个元素。
-  不合格**带镜号硬报错**而不是"悄悄画少一块"——渲染层永远拿不到未清洗的字节(spec 入库前净化一次,
-  出片页编译时再净化一次);
-- **动效是声明式的**,13 种:`fade, rise, slide-x, draw, grow-x, grow-y, pop, count, wipe, orbit, pulse, pan`
-  加一个 `pose`,配 `data-at`/`data-dur`/`data-dist`(可负)/`data-count-to`/`data-dp`/`data-num-unit`(≤8 字的数量级后缀)/
-  `data-period`/`data-hold`。带 `data-anim` 的元素**自身不能再写 `transform`**(CSS 会盖掉表现属性);
-- **`pose` 是轮播不是入场**:`data-at` 起显示、停留 `data-hold` 毫秒后整格隐去(省略 `hold` 就一直显示,
-  所以只有末格能省)。`pixel` 卡的逐帧角色动画就是它——一格格 `<g data-anim="pose">` 靠 `at` 首尾相接。
-  因此 `anim_end_ms` 对离散动效取 `max(at + max(dur, hold))`:只算 `dur` 会把一轮姿势播到一半就冻住,
-  成片里等于只有一帧动画;
-- **成本口径**:帧数是这条链路唯一的成本项(`MAX_FRAMES_TOTAL = 4000` 硬报错,不静默砍)。
-  `settle_ms` 是「第一个什么都不变的时刻」,之后的帧直接复用末帧 PNG,所以花钱的是**动效的时长**而不是片子长度;
-  `orbit`/`pulse`/`pan` 是连续运动,永不 settle → 整镜每帧真截(账上 `captured_frames`/`frames` 看得见这笔);
-  绘制家族新增两笔:`burst` 的 `twinkle: true` 给粒子挂的就是 `pulse`,一开闪那一镜每帧都要截;
-  `pixel` 的 `poses` 播到「最后一格的 at+hold」才冻住,把姿势排到镜头末尾等于整镜活帧;
+  模型写的只降级成 `min_duration_sec` 下限参考。字幕逐词点亮用的就是这份词时间轴,
+  **字幕与逐词高亮是母版的事**,镜头代码不参与;
+- **八道闸,阈值都来自真机读数**（最后一道只记账不拦截）:
+
+  | 闸 | 判什么 | 判据 / 阈值 |
+  | --- | --- | --- |
+  | ① lint | 代码字节 | 容器里 7 条 `dg/*` 规则:禁墙钟、禁裸 DOM、import 白名单 `ALLOWED_IMPORTS`、必须包 `<FilmLayout>`、字段声明与代码读值对账。改代码**必重过**,只改字段值不重跑 |
+  | ② 帧预算 | 烧多少帧 | 全片 `MAX_FRAMES_TOTAL = 4000` 硬报错不静默砍,只累加**未命中缓存**的那几镜 |
+  | ③ 帧账回读 | 计划帧数 vs 实际 | 本地 ffprobe 数字节:>1 帧差或宽高/fps 对不上就点名那一镜 |
+  | ④ 画面两半 | 画了没、画开没 | 三帧取样(0.15 / 0.5 / 0.85)只在**画面带**内数非底色像素(字幕盒约占整幅 11%,量全帧等于给空画面发通行证)。空壳:最低占比 <2% **且** 内容外接盒铺开 <45%;小气:铺开 <30% **占比够也拦**;60% 是技能正文的目标值,只记账不打回 |
+  | ⑤ 跨镜一致性 | 母版回读 token | 逐键比,**容差 0**;判在 `concat` **之前**,红一次省掉母带那一趟编码 |
+  | ⑥ 字段对账 | 注入值 vs 画面自报 | 母版在 `durationInFrames - PROBE_TAIL`(=2)那一帧回读 `<F>` 盒,状态 `ok`/`no_geometry`/`unreported`/`mismatch` |
+  | ⑦ 风格配额 | 整片画风分布 | **判在烧像素之前**,判据是代码字节而不是模型自报的 `style`(自报会漂:写了 `style: rough` 而代码里一个 roughjs 都没有)。roughjs / three / katex 三条按 import 认,vector 按「代码里真在画几何图形」的标记认(裸 `<svg>`/`<path>` 算,`<div>` 加 `background` 的色块不算),纯文字色块是第五类 `text`。配额:≥6 镜至少 2 条非文字通道、≥10 镜至少 3 条;不足 6 镜整道关闭且显示「未判」而不是「通过」;纯文案镜占**中间镜**(去掉首尾)>1/3 拦,具体项占比 <40% 只提醒——那是需要分词的软判据,做硬闸等于把「什么算具体」写进代码 |
+  | ⑧ 版面回读 | 探针帧上的真 DOM 盒 | **八道里唯一只记账不拦截**:判据是几何猜的,刻意叠印、指向画面外的暗示都可能是合法设计,误报的代价是模型与用户开始无视整条通道。三条:两处文字盒交叠 ≥ 较小盒 **40%**、文字越出画面带任一边 ≥ **3px**、引线的某一端在 **max(带短边×2%, 20px)** 内既不挨字也不挨画得出的图元。坐标一律**带内**(与 `useBody()` 同系,`<g transform>` 里的线跟着 `getScreenCTM` 走)。**三态必须分开**:`missing`(容器压根没回传版面行=这一镜的版面等于没验过)/`unscanned`(收到行但 ref 没挂上,这一帧没扫)/`scanned`(真扫了,空表才是「扫过且干净」);阈值随读数一起回传,单源在 `remotion/src/tokens.ts` 的 `LAYOUT_PROBE`,Python 侧不抄常量表 |
+
+  出处闸不占编号:它判在分镜层(见 §16),局部改时只重判**被改过的那几镜**。
+- **起手模板 + 四条画法通道**:设计文档原列的六份「版式骨架」没做,换成了两样东西——
+  `remotion/src/user-shots/shot.tsx`(每次渲染前覆写的落点,同时是形状参考:强制包 `<FilmLayout>`、
+  坐标取 `useBody()`、时刻只从 `useCurrentFrame()` 拿、随机用 `random(seed)`)与技能正文点名的四条通道
+  (手绘 roughjs / 真 3D three / 公式 katex / 纯 SVG 图示)。这四条通道名与闸⑦ 的 import 表**逐行同源**
+  (`tests/test_code_spec.py` 第⑦节拿正文比对),所以教程与判据不可能各说一套;
+- **字段通道 = 画面上的旋钮**:一镜最多 12 个字段(`number`/`color`/`text`/`bool`/`select` 五种),
+  代码里读 `fields.xxx`、渲染点用 `<F>` 标注,闸⑥ 才比得上、命中表才给得出 `/shots/i/fields/<name>/value` 指针。
+  改一个数字只重烧那一镜——这条链的卖点就在这;
+- **缓存键按字节算,五段身份缺一不可**:`sha256(代码字节 + 该镜 `SHOT_KNOBS`(含字段值扁表) + 整片 `FILM_KNOBS` +
+  母版哈希 + 依赖锁哈希)[:16]`。后两段从 `/healthz` **现读、不在 Python 侧重算**——改一次母版 token 或换一版
+  依赖＝全片换像素,不进键就会命中旧母版渲出来的切片,而改动账和逐镜比较全都看不出来(与 `44`/`44.0` 那次键漂移
+  同族,所以按字节算的键要按字节断言)。命中表**跟着切片走**:切片没重烧就没有新命中表可给;
+- **质感是逐镜的,而且故意在缓存键之外**:档位名单在 `code_spec.TEXTURES`
+  (`none`/`film` 颗粒暗角暖偏 /`tv` 扫描线色偏 /`glow` 柔光泛开 /`bleach` 漂白硬对比),滤镜串单源在
+  `render.TEXTURE_FILTERS`,「这一镜到底跑哪档」只由 `code_spec.shot_texture(shot, film)` 一处回答。
+  一镜的 `texture` 有三种形态:**缺省或空串**跟随整片默认、`"none"` 明确不加、其余是点名换档——
+  `"none"` 与 `""` 是两件事,界面上也是两个格子(要撤回点名得写 `""`,指针做不了"删掉这一栏")。
+  质感**不进 `SHOT_KNOBS`/`FILM_KNOBS`**——进了它,用户选一次「老胶片」就等于 20 镜全部重烧;
+  **缓存里存的是加质感之前的像素**,所以命中切片的镜照样被加上新档。代价说清:这一趟是每一镜多一次
+  ffmpeg 编码(concat 本来就把每帧重编一遍),`glow` 那一路带 `gblur`+`blend` 最贵。账上把**整片默认档**、
+  **每镜实跑档**与**实际消费的滤镜串**分开记(`texture` / `texture_by_shot` / `texture_filter`,
+  后两样是运行时事实,只活在账上、不在缓存对象里),所以「选了 film 却原样拷贝」这类失败看得见,
+  不会退化成「跑了但没人知道」;
 - **七个开关走顶层入参**(aspect / fps / narration / voice / rate / subtitle_mode / texture):嵌在 spec 里的字段对
   计划卡不存在,卡上勾选的值**覆盖**模型写在 spec 里的同名字段——那是用户的决定;`narration` 的终值是字符串
   `"false"`,所以合并时用 None 哨兵判"有没有传"并按文本解析,否则会把开关读反;
-- **整片质感是母带层的一趟滤镜,不是某一镜的版式**:档位名单在 `spec.TEXTURES`
-  (`none`/`film` 颗粒暗角暖偏 /`tv` 扫描线色偏 /`glow` 柔光泛开 /`bleach` 漂白硬对比),
-  滤镜串单源在 `render.TEXTURE_FILTERS`,调用点排在 `concat` 之后、`_mux_bgm` 之前。
-  它与 `bgm` 同层,**故意不进 `_CACHE_KNOBS`**——进了它,用户选一次「老胶片」就等于 20 镜全部重烧;
-  代价也说清:这一趟是**二代编码**,母带再过一次 x264(画质略降、多花几十秒),`glow` 那一路带
-  `gblur`+`blend` 最贵。回执把**档位**与**实际消费的滤镜串**分开记(`texture` / `texture_filter`),
-  所以「选了 film 却原样拷贝」这一类失败看得见,不会退化成「跑了但没人知道」;
 - **配乐两种写法都收**:`bgm`(与 `spec.bgm.ref`)给 `obj:` 引用,或直接给**消息附件/曲库歌曲的
   material_id**——零素材链路里模型手上只有 material_id,而唯一产 `obj:` 引用的 `select_BGM` 绑在
   有素材那条链上(`required_nodes=generate_script`),调它会连带补齐 ASR 一串上游。取不到字节直接
   失败,不会静默出成无声片;不传就是纯人声。曲库条目**不挂会话**(`materials.conv_id` NULL),
   归属只认 owner——`resolve` 里曾按 `origin=bgm` 无条件放行,那等于任何人拿 6 位十六进制 id
   就能把别人的歌当自己附件解析并签出可播直链;后门已拆;
-- **`source` 如实填**:机器不判史实真伪。出处会如实出现在**分镜卡与逐镜账**上,但版式不会自动把它排进
-  画面(要进画面得写进所选 card 的 `visual`,档案卡的 `line3` 就是给这行留的弱色位);成片回执的五级证据
-  账本里「音画偏差/帧复用/降级」是机器验过的,「画面在动、无黑屏」标 UNVERIFIED 交人眼;
-- **空壳卡不许出片**:`text` 只进字幕条,卡片上看得见的字全在 `visual`(`title.zh`、`dict_entry.word`、
-  `compare.left/right`、`levels[].value`…)。模板对空输入不报错——它照画一张只有边框的纸,`ok=True`
-  的回包看不见,只有抽出成片帧才看得见,而那时像素已经烧完。所以 `spec._check_visual_content` 把三类
-  情况带镜号退回:该版式必需的字段一个没填、数组项数少于模板能画的、数值字段写成中文(会被按 0 画)。
-  真机第一版模型自写分镜 12 镜里空了 7 张卡,就是这一关补上的;
-- **读数跨量级时自动换刻度**(`motion/diagrams._axis`):`levels`/`chart` 的值**写原数**,
-  ≥1 万的读数自动收成 `万`/`亿`/`万亿` 后缀(靠 `data-count-to` + `data-dp` + `data-num-unit`
-  三件套,后缀跟着滚动数字一起拼),同组最大最小差到 **100 倍**以上自动切**对数刻度**并在题注补
-  「对数刻度:每格 10 倍」,`scale: "linear"|"log"` 可显式指定。起因是第一条真机样片:一座山
-  (1e12 千克)、一茶匙中子星物质(1e9)、一个人(70)同框,等比刻度下后两根条只剩 6px,而 13 位数的
-  `1000000000000` 直接糊在「单位:千克」那一行上——**条长不再等比,但读数永远是原数**;
-- **竖屏 levels 的读数列右对齐在 `x=990`**,最长一条只画到 780:CJK 单位是全角宽,原先从左对齐
-  `x=880` 起排时「1.00万亿」被裁出 viewBox 边缘,抽帧才看得见(离线用例断言的是不越界,看不见字宽)。
+- **`source` 如实填**:机器不判史实真伪。出处会如实出现在**分镜卡与逐镜账**上,但**不会自动排进画面**
+  (要进画面得自己画进那一镜的代码里);成片回执的五级证据账本里「音画偏差/帧复用/降级/质感」是机器验过的,
+  「画面在动、无黑屏」标 UNVERIFIED 交人眼——闸④ 量的是取样那三帧,不是整片;
+- **空画面不许出片**:这条链没有 `visual` 可校验,判据改成量像素(闸④)。当年卡片链上「`visual` 写了这张卡
+  不认的键 → `ok=True` 的空画面」那类缺陷(#102),现在由「三帧取样、带内数像素」接管:静默放过等于把缺陷
+  当产物交出去,所以**闸失败是失败,不是降级**,一律抛错带镜号回清单;
+- **成本口径**:帧数仍是唯一的成本项(`MAX_FRAMES_TOTAL = 4000`),但这一层没有 `settle_ms` 那种
+  「之后的帧复用末帧 PNG」的省法——Remotion 按注入的 `durationInFrames` 逐帧渲,所以动效做不做都在花这笔钱。
+  真机测到的固定成本是**每次请求打包 4.6~7.5 秒**(bundle 与镜头内容无关地贵),逐帧开销由账上的
+  `per_frame_ms_max` 报出来;软件 WebGL 只有 `DG_GL=swangle` 出得来画面,其余后端在容器里渲成黑帧;
+- **确定性 = 约定 + 实测**:同输入同图靠闸① 禁掉墙钟与 `Math.random`、要求 `random(seed)`,再加缓存键按字节算。
+  这不是运行时保证(浏览器与依赖版本会变),所以母版哈希与依赖锁进键、跨镜一致性按容差 0 比——
+  版本一漂移就有镜对不上,而不是悄悄出两片不一样的。
 
-代码位:契约 `motion/spec.py`、净化与动画 `motion/art.py`、图示 `motion/diagrams.py`、
-绘制四族的公共坐标与颜色白名单 `motion/canvas.py` 与参数展开 `motion/graphics.py`、
-排版与页面 `motion/templates.py`、出片 `motion/render.py`;节点 `nodes/motion_plan.py` 与
-`nodes/motion_nodes.py`;技能 `examples/skills/motion_explainer/SKILL.md`;
-样片冒烟 `.smoke/motion_film_smoke.py`(竖屏·档案家族)与 `.smoke/motion_wide_smoke.py`
-(横屏·图示·custom·连续运动);版式对照 `.smoke/motion_sheet_smoke.py`——22 个 card × 2 个画幅
-各截一帧落 PNG,专查离线用例查不见的那一类错(字掉出可视区、卡缩成邮票)。
+代码位:契约与闸⑦ `motion/code_spec.py`、执行层与闸②③④⑤⑥ `motion/code_render.py`、
+局部改 `motion/code_patch.py`、容器客户端 `motion/remotion_client.py`、命中表 `motion/hitmap.py`、
+与像素来源无关的共用件(质感滤镜串/混音/闪避) `motion/render.py`;
+节点 `nodes/motion_plan.py` / `nodes/motion_nodes.py` / `nodes/motion_code_nodes.py`;
+渲染服务 `remotion/server.mjs`、闸① 规则 `remotion/lint-rules.mjs`、母版
+`remotion/src/{FilmLayout.tsx,tokens.ts,entry.tsx}`、落点模板 `remotion/src/user-shots/shot.tsx`;
+技能 `examples/skills/motion_explainer/SKILL.md`;离线用例
+`tests/test_code_{spec,gates,fields,texture}.py` + 两条链共用的 HTTP 口 `tests/test_patch_endpoints.py`;
+样片冒烟
+`.smoke/b22_code_chain_render_smoke.py`(整链出片)与 `.smoke/b24_code_ui_smoke.py`(界面),
+旧声明式链的夹具归档在 `.smoke/_archived_p4_declarative/`。
 
 ### 16. 联网检索:后端按身份热读,出处要对上检索账
 
@@ -356,7 +380,7 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
   0 条时回「免 key 后端的覆盖面只有百科与通用网页,新近数字与长尾内容本来就不在其中——
   **查不到不等于事实不存在**」。工具描述与技能文档同时给出三条出路:换关键词、`fetch_url` 打开已知页面、
   去设置页配一把搜索 key;
-- **检索账与出处闸**(`agent_framework/retrieval.py` + `motion/spec.py`):`web_search` 命中的链接与
+- **检索账与出处闸**(`agent_framework/retrieval.py` + `nodes/motion_plan.py`):`web_search` 命中的链接与
   `fetch_url` 真打开过的页面按会话记进 PG `retrieval_hits`(带 backend 与时间)。分镜 `source` 里的 URL
   **只有能在这笔账里反查到才算查证过**,对不上就被出处闸退回——编一个看着像真的链接骗得过排版,骗不过账本;
   没查到的就标「未核实」,不许在答复里替它背书。
@@ -407,20 +431,23 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
   且不动 `ca.railOpen`(那是用户自己设的偏好,不该被一次剪辑改掉)。
   「渲染完成自动弹出」和「点卡片上的✂ 选区改」走同一个 `openEditorFor()`,两条路同一形态;
   面板实宽 <900px 时容器查询把右侧 400px 表单挪到画面下方,而不是把画面挤没;
-- **改动拼成一次补丁,四种动作**(`POST /motion/patch`,校验在 `motion/patch.py`):
+- **改动拼成一次补丁,四种动作**(`POST /motion/patch`,代码镜那条的校验在 `motion/code_patch.py`):
   ①`edits` 逐格指针改写(框选的主场) ②`shot_sets` 整镜栏位改写(前端 `setFor` 逐栏与原值比 JSON,
   没变的一栏不进补丁) ③`remove_shots` 删镜 ④`reorder` 换序。**空补丁直接拒**;
-  可改的镜内字段是白名单 `EDITABLE_SHOT_FIELDS` 那九项,**`id` 不许改**——它是命中表、缓存键与
+  可改的镜内字段是白名单 `EDITABLE_SHOT_FIELDS` 那七项(`code` / `text` / `highlight` / `fields` /
+  `min_duration_sec` / `texture` / `source`),**`id` 不许改**——它是命中表、缓存键与
   时间线三处共用的锚;
-- **重烧的账按缓存键算**:`shot_cache_key` 哈希整个镜的 dict + 九个顶层旋钮 `_CACHE_KNOBS`
-  (画幅/宽/高/fps/版式/旁白开关/配音/语速/字幕模式)。`voice`/`rate` 这类只在有旁白时才起作用的开关
+- **重烧的账按缓存键算**:`shot_cache_key` 哈希**代码字节** + 该镜 `SHOT_KNOBS`(`text`/`highlight`/
+  `min_duration_sec`/字段值扁表) + 整片 `FILM_KNOBS`(画幅/fps/旁白开关/配音/语速/字幕模式) +
+  **母版哈希** + **依赖锁哈希**。`voice`/`rate` 这类只在有旁白时才起作用的开关
   **也一律计入**——不玩「这次没旁白就可以不算」的条件哈希,少算一个键就是拿旧片冒充新片。
+  质感与配乐**故意不在名单里**(见 §15):换档、换 BGM 都一镜不重烧。
   所以改 `min_duration_sec` 会重烧那一镜,改文案会,而**删镜与换序零像素成本**——它们只是把已经烤好的
   切片重新拼一遍。顶部改动账就照这个口径报(「未提交:逐格 1 处 · 预计重烧 1 镜」/「重排不烧像素(拼而已)」);
 - **时长那一栏有地板**:`sec = max(min_duration_sec, 实测语音时长)`。有旁白时时钟归配音,
   拖到 `speech_sec` 以下**不会有任何效果**,轨道块当场写明「拖到 X.Xs 以下无效:这一镜的时钟归配音」,
   而不是让用户拖完再奇怪为什么片子没变;
-- **判据在轮询端**:局部改是长任务,闸门退回(比如把数值字段写成中文)也回一路 200 +
+- **判据在轮询端**:局部改是长任务,闸门退回(比如字段值写出该字段声明的范围、或改代码后没过闸①)也回一路 200 +
   `status=queued`,真判决在之后 `GET /render_status` 的 `error` 正文里——前端把那句话**原样贴出来**,
   不替它解释;等超时也不谎称取消:提示「这次局部改还在跑,关掉这里不会取消它」。
 - **改前/改后靠代表帧**:补丁视图带回 `before_frames`(基线那一版各镜代表帧的对象键),
@@ -429,8 +456,9 @@ OutBound 帧先给本进程登记的 WS 连接;`--broadcast-redis-url` 打开后
   因为 `<img>` 的 src 挂不上凭证。
 
 代码位——**图形科普片那条**：命中表 `backend/storyline_server/motion/hitmap.py`、切片缓存与代表帧
-`backend/storyline_server/nodes/motion_nodes.py`(缓存键 `motion/render.py::shot_cache_key`,
-对象前缀 `motion-shots/{会话}/{镜头键}/`)、补丁校验 `motion/patch.py`;
+`backend/storyline_server/nodes/motion_nodes.py`(缓存键 `motion/code_spec.py::shot_cache_key`,
+对象前缀 `motion-shots/{会话}/{镜头键}/`)、补丁校验与指针白名单 `motion/code_patch.py`,
+渲染与八道闸 `motion/code_render.py`;
 **素材 / 口播那条**：段 id 与命中表 `nodes/core_nodes.py`(`_seg_id` / `assign_segment_ids` /
 `_publish_segment_map`)+ `backend/storyline_server/timeline_edit.py`(窗口切分 `windows`、
 输入清单 `window_inputs`、缓存键 `segment_cache_key`、应重烧判定 `expected_rebuild_ids`、
@@ -442,16 +470,36 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 (`_hitmap_bundle` / `_frame_png` 只按会话 + 产物 + id 取字节,两条链的差别全在表里有没有空间层),
 只有 `/patch` 各走各的节点,
 前端 `frontend/src/MotionEditor.vue`(成片卡上的入口在 `App.vue` 的媒体气泡里)。
-真机验收 `.smoke/s3_ui_cdp.mjs`:本机 Chrome headless 经 CDP 驱动真实页面,注册一次性身份 →
-模型自己出分镜 → 等成片卡 → **鼠标按住拖出框选** → 改值 → 提交 → 轮询到新版本 → 看改前/改后帧 →
-拖块换序,截图落 `.smoke/s3_frames*/`。规划轮要十几二十分钟,所以有 `ATTACH=1` 的**接回模式**:
-不重开浏览器、不注册新身份,连到端口上那个还活着的页面(token 在 profile 里)。接回时**页面上已经躺着
-成片卡就不点任何确认**——那张待确认卡点下去等于白烧一遍像素(真机踩过两次,各多出一版渲染)。
-最新一轮干净收口:**30 PASS / 0 FAIL**(`.smoke/s3_ui_run8.log`,截图 `s3_frames8/`),
-覆盖"卡片带按钮 → 6 框叠在 3 段轨道上 → 框选出 `/shots/0/text` → 表单落值 → 出版本 A
-(改了 1 镜 · 基于 `_default`,旧版字节原位还在)→ 改前/改后两张真帧 → 新版本又成一张成片卡 →
-「接着改这一版」把基线换成 A → 切「整镜」改文案 → 出版本 B(基于 A)→ **故意把文案换成不含高亮词
-的一句,闸门原话贴在面板上且一帧都没开始渲** → 「清空改动」收干净清单 → 拖块换序只记顺序账"。
+图形链这半边的界面验收**两跑都在代码链的真实页面上**(旧声明式链那一档随 P4 删链一起归档在
+`.smoke/_archived_p4_declarative/`,它不再替现值背书):
+- **模型端到端那一跑** `.smoke/s3_ui_cdp.mjs`(本机 Chrome headless 经 CDP 驱动真实页面):注册一次性身份 →
+  挂一把可用的模型密钥(只报 uid,值不打印)→ 提需求 → 逐页点规划卡 → 等模型自己写出三镜代码分镜 → 成片卡 →
+  **鼠标按住拖出框选** → 改值 → 提交 → 轮询到新版本 → 看改前/改后帧 → 「接着改这一版」换基线 →
+  到〈文案 · 出处〉页改写整镜文案 → 再采纳 → **故意加一个不含在文案里的高亮词**(闸门原话逐字贴在面板上,
+  一帧都没开始渲,也没多出一个版本)→ 「清空改动」→ 拖块换序(只记顺序账,不烧像素)→ 关闭。
+  最新一轮 `.smoke/s3_ui_run12.log`:**45 PASS / 0 FAIL**(身份 `u-ebbfe7487e9a`,两版 `4ff5a567`(改一个字段,
+  只重烧 s01)与 `d0b31a35`(整镜改写,基于 `4ff5a567`),退回原话 `s01：高亮词 '绝无此词验收' 不是文案的子串,
+  画面上永远亮不起来`)。规划轮要十几二十分钟,所以脚本留着 `ATTACH=1` 的**接回模式**:不重开浏览器,不注册新身份,
+  连到端口上那个还活着的页面(token 在 profile 里)。接回时**页面上已经躺着成片卡就不点任何确认**——
+  那张待确认卡点下去等于白烧一遍像素(真机踩过两次)。
+- **夹具那一跑** `.smoke/s5_code_ui_cdp.mjs`(不要模型密钥,出片由容器里的夹具驱动):先把一条代码镜片子跑到终态
+  并按浏览器登录的那个身份入库,再到真实页面上量〈字段〉〈代码〉〈文案 · 出处〉〈质感〉〈配乐〉五个页签与
+  「点元素反查字段」,含**按控件形态落笔**(带 min/max/step 的 number→滑杆,color→取色块 + 那条 hex 文本框,
+  bool→开关,select→下拉,text→单行),`<F>` 标在 `display:none` 上→表里 `box: null` 且前端把它列进「无空间命中」,
+  把代码读的字段名改错→闸① 原话贴回面板且**红的那一趟不多出版本**,拖 `.me-edge` 改时长,配乐页音量滑杆按合同 0~0.6。
+  最新一轮 `.smoke/s5_run4.log`:**91 PASS / 0 FAIL**(身份 `u-564fe29890d2`,产物 `art-s5l97f5v`,
+  跑在母版哈希 `74325dff8d3184bc` 上——即下面那条字幕修复之后的母版)。
+
+这两跑之外,**真去看了渲染出来的帧**,查出两条与界面无关的画质账,都已落地并留了红→绿取证:
+- **高亮词被断行撕开**:母版 `Caption` 逐段渲染时把命中的词组折了行,粉色色块只落在前半截
+  (红证 `.smoke/caption-old2.png`,绿证 `.smoke/caption-new.png`,探针 `remotion/tests/caption-wrap-probe.mjs`)。
+  改成命中的词组逐段 `whiteSpace: nowrap`。母版字节变了 → `shot_cache_key` 里的 `master_hash`
+  从 `f70a1c13969ac71f` 变成 `74325dff8d3184bc`,**于是整片重烧,这是设计如此,不是回归**。
+- **跨量级读数丢了刻度纪律**:P4 删旧链时把「数值差到两个数量级必须换对数刻度」那条连同旧卡一起删了,
+  模型自己写代码后又画出线性柱状(5 克与 10 亿吨在同一根轴上,小的一根看不见)。这条纪律现在写在技能正文
+  `examples/skills/motion_explainer/SKILL.md`「# 数值画上画面:跨量级必须换对数刻度」一节,运行时以 PG 里那份为准
+  (`POST /skills/reload` 同步;已核过库内正文与文件正文只差加载器的 `.strip()`)。
+  **它是提示词层的纪律,不是闸**:现值仍然是模型可以交出线性轴,闸④ 只卡「内容铺开占带短边多少」,不认刻度。
 
 口播 / 素材那条的真机验收是**两半**:
 ① 后端半边 `.smoke/t5_track_patch_smoke.py --user <身份>`——现造一条 6s/3×2s 带音轨的测试素材、
@@ -502,12 +550,18 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 **边界(不粉)**:① 服务端还没有「列出某会话全部版本」的口子,跨刷新找回旧版要在对话里报产物号;
 ② `motion-shots/*` 与 `render-windows/*` 的切片、代表帧**都没有保留期**,一次改一版就多存一份,
 清理策略没定;
-③ 零素材那条的命中表只覆盖排版画出来的那几族版式,`custom` 自画里的文字同样能回指,但**框选精度取决于排版落点**;
+③ 零素材那条的表**只有两种条目**:整镜一条(`box` = 整画布,指针 `/shots/<i>/code`)+ 这一镜
+**声明出来的每个字段**一条。字段的盒是母版在闸⑥ 那趟浏览器回读里量 `[data-dg-field]` 元素顺手得到的
+(`code_render._shot_table`),量不到几何的字段**照样出一条**(`box=null` + `field_status` 记着为什么),
+前端把它们落进「无空间命中」栏——点不中但要能改是合法形态。所以能不能框中选中,取决于
+「模型有没有把这个旋钮声明成 `fields` 并用 `<F>` 标注挂在一个有尺寸的元素上」,**不是排版落点**;
+代码里自己画的、没声明成字段的图形与文字在表里**没有条目**,只能走整镜那条指针改代码;
 ④ 口播那条的表**带着框但不画框**:字幕条的框是按排版公式**估**出来的(`timeline_edit.subtitle_box`,
 `box_precision="estimated"`),其余轨道给整画布框(`derived`)——这张框只用来"万一以后要按空间点"时
 标明自己有多可信,当前 `hit_mode="track"` 下前端不画空间层,字段指针直接从 `doc` 取,与框无关;
-⑤ 画面上改了数字不会重跑配音——文案 `text` 与画面 `panel` 是两处,只改画面那一处时旁白仍念原话,
-这是选区改的语义,不是 bug,界面上两栏分开摆着。
+⑤ 画面上改了数字不会改旁白念的话——文案 `text` 与画面 `code`（含 `fields` 的值）是两处,
+只改画面那一处时这一镜会连配音一起重合成一遍(`code_render.narration_for`,缓存未命中就不复用音频),
+但念的仍是原句、这一镜的秒数也照原句算。这是选区改的语义,不是 bug,界面上两栏分开摆着。
 
 ### 18. 成片入库 + 按会话回收:删对话清的是工作区,不是用户已经拥有的东西
 
@@ -518,8 +572,9 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 
 - **入库落在渲染终态本身**(`agent_framework/render_library.py::register_render`),不在前端:
   只有出片那一侧知道「这一版字节确实烧出来了」,而登记晚一步就可能赶在删对话之后,把这版片子
-  当会话垃圾清掉。两个落点:口播链 `nodes/core_nodes.py::RenderVideoNode.process`(2450 前后)与
-  图形科普片链 `nodes/motion_nodes.py::_render`;两条「选区改」局部改链复用各自的出片体,
+  当会话垃圾清掉。两个落点:口播链 `nodes/core_nodes.py::RenderVideoNode.process`(2528 前后)与
+  图形科普片链 `nodes/motion_code_nodes.py::_render`(214 前后);两条「选区改」局部改链复用各自的出片体
+  (图形那条的 `PatchCodeMotionVideoNode` 直接继承出片节点,走的就是同一个 `_render`),
   对象键不变 → 按 `object_key` 命中同一行,不重复登记。`dry_run` 在写终态之前就 return,不入库。
   素材行 `origin='render'`(`materials.origin` 枚举扩了一格,schema 与 `migrations.sql` 同步),
   前端素材卡按 origin 显示「成片 / 上传 / 链接取料 / 曲库 / 配乐」;展示名取本次标题
@@ -558,9 +613,11 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 删身份时那版成片字节**不归它删**(实测报「对象 0 个」),要等下一轮对账:身份删掉后 `materials`
 行随级联消失、保护名单不再护它,`orphan_scopes` 就把它当无主字节收掉。
 
-**真机回执**(`.smoke/b21_render_persist_gc_smoke.py`,真 PG + 真 MinIO,27 条断言全过):
-零素材分镜走 `render_motion_video` 出 1080×1920 / 8.865s / 138,726B 的一版,
+**真机回执**(`.smoke/_archived_p4_declarative/b21_render_persist_gc_smoke.py`,真 PG + 真 MinIO,27 条断言全过):
+零素材分镜走**当时那条声明式链**的 `render_motion_video` 出 1080×1920 / 8.865s / 138,726B 的一版,
 回执带 `material_id`、库里 `origin='render'`、字节与 sha256 取自对象本身;
+(入库与级联回收这一层**不认像素来源**——它只认 `renders/{会话}/` 的对象键与 `artifacts` 行,
+所以那份回执对代码镜链同样成立;但**代码链上的端到端复验还没跑**,与 §15 那条「真机样片」同批补。)
 改标题重烧 → 同一 `object_key` 仍恰一行、id 不变、展示名刷新;`DELETE /convs/{cid}` 之后
 `artifacts`/`render_jobs`/`checkpoints`/`token_usage` 两副拼法都清零、`checkpoint_entries` 随 run 清、
 该会话前缀 11 个字节回收、**素材行留下且 `conv_id` 被真库置成 NULL、成片字节仍可 `get_stream` 读回并通过 ffprobe**。
@@ -573,10 +630,16 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 ## 剪辑节点(25 个 DAG 节点)
 
 `available_nodes` 白名单里是 **25 个 DAG 节点**(`core_nodes.py` 的 21 个 + `web_nodes.py` 的 `render_web`
-+ `motion_plan.py`/`motion_nodes.py` 的 `plan_motion`、`render_motion_video`、`patch_motion_video`)
++ `motion_plan.py`/`motion_code_nodes.py` 的 `plan_motion`、`render_motion_code`、`patch_motion_code`)
 **+ 2 个控制面工具**(`read_node_history`、`render_status`)—— 主服务那行启动日志报的
-「已接入 27 个剪辑节点」就是这 27 个。剪辑服务自己的 `nodes=25 tools=28` 多算了一个
-`dag_status`(编排预览用,没有包成模型工具)。★ = 必须显式调用(不会被自动补齐)。
+「已接入 27 个剪辑节点」就是这 27 个。剪辑服务自己那行 `[storyline] nodes=… tools=…` 是另一个口径:
+`nodes` 数**注册表里的节点类**(25),`tools` 数 MCP 口上挂的 handler(28 = 25 节点 + 两个控制面 +
+`dag_contract` 编排预览口,最后这个没有包成模型工具)。★ = 必须显式调用(不会被自动补齐)。
+2026-10-11 重烤镜像并 recreate 之后,两台服务的启动日志实测是:剪辑服务 `[storyline] nodes=25 tools=28`,
+主服务 `[startup] Storyline 已接入 27 个剪辑节点（DAG 契约 25 节点，rerun_from 可用）`。
+这里曾经有一个真缺陷:P4 删旧链之后有一段时间 `creation-editor` 跑的仍是旧镜像(报 `nodes=27 tools=30`,
+注册表里躺着已下线的 `render_motion_video` / `patch_motion_video`),白名单不含它们所以模型看不见,
+但读注册表的一切判据都对不上——镜像与工作树不同步时,以哪一版为准必须有日志作证,不能靠 README 的一句话。
 
 | 工具名 | 界面名 | 干什么 |
 |---|---|---|
@@ -603,10 +666,13 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 | `patch_video` | 口播片局部改 | 选区改的后端:读那一版自带的分段命中表 → 按指针改几段 → fork 新版本 → **只重烧受影响的那几窗**(其余按输入清单比对,从切片缓存直接取字节),`POST /timeline/patch` 提交的就是它 |
 | `render_web` | 网页渲染出片 | 浏览器侧出片路径 |
 | `plan_motion` | 图形科普片分镜 | 零素材通道第一站:校验/归一分镜 spec 并入库,回时长估算与偏离提醒(**不渲染**) |
-| `render_motion_video` | 图形科普片出片 | 逐帧截图出片(长耗时,提交后由 `render_status` 续问;支持顶层六开关覆盖) |
-| `patch_motion_video` | 图形科普片局部改 | 选区改的后端:fork 基线 spec → 按命中表指针改几格 → **只重烧受影响的那几镜**(其余从切片缓存直接取),`POST /motion/patch` 提交的就是它 |
+| `render_motion_code` | 图形科普片出片（代码镜） | 画面是模型逐镜交的 React/TSX,交给 `creation-remotion` 容器逐帧渲,出片前过八道闸,其中闸⑧ 只记账不拦截(长耗时,提交后由 `render_status` 续问;支持顶层七开关覆盖) |
+| `patch_motion_code` | 图形科普片局部改（代码镜） | 选区改的后端:fork 基线 spec → 按命中表指针改几格(五条指针) → **只重烧受影响的那几镜**(其余从切片缓存直接取),`POST /motion/patch` 提交的就是它。改 `code` 才重过闸①,改字段值/质感档不重过 |
 | `read_node_history` | 读取节点产物 | 控制面(非 DAG 节点):按节点名读该节点已产出的 Store 结果 |
-| `render_status` | 渲染进度查询 | 控制面:轮询出片与局部改提交的任务(`render_video` / `render_motion_video` / `patch_motion_video` / `patch_video`),回 `status/stage/percent`,`done` 时同批回成片。**选区改的判决也走这里**——闸门退回的话在 `error` 正文里 |
+| `render_status` | 渲染进度查询 | 控制面:轮询出片与局部改提交的任务(`render_video` / `render_motion_code` / `patch_motion_code` / `patch_video`),回 `status/stage/percent`,`done` 时同批回成片。**选区改的判决也走这里**——闸门退回的话在 `error` 正文里 |
+
+旧声明式链的两个工具 `render_motion_video` / `patch_motion_video` 已随 P4 下线(节点类、白名单行、
+界面入口一并摘掉);`patch_video` 的名字没变,它一直是素材 / 口播那条链的局部改。
 
 ## 数据模型(22 张表)
 
@@ -645,7 +711,7 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
   素材 / 口播 `GET /timeline/hitmap` · `GET /timeline/frame`(参数 `shot` 传的是**窗口 id**,与表里的行同名) ·
   `POST /timeline/patch`(轨道上点住的那一段 → fork 新版本,只重烧受影响的那几窗)。
   **读表与取帧两对共用同一份实现**(`server._hitmap_bundle` / `_frame_png`),只有 `/patch` 分头走
-  `patch_motion_video` 与 `patch_video`。**长任务,判据在轮询端的正文里**:
+  `patch_motion_code` 与 `patch_video`。**长任务,判据在轮询端的正文里**:
   闸门退回也表现为一路 200 + `status=failed` + `error`,HTTP 状态码不作判据
 - **扩展管理**:`/tools` · `/skills*`(含 .zip 技能包) · `/mcp/servers*`(热连热断)
 - **设置**:`/settings*`(模型密钥、主模型选型、判断模型三件套 + `POST /settings/judge/test` 连通性自检;
@@ -671,11 +737,12 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 | 缓存/广播 | Redis | 可选:仅跨副本回投广播 |
 | 剪辑 | ffmpeg + ffprobe(PATH) · MoviePy ≥2.0 | 两条渲染路径:MoviePy 主路 + ffmpeg 兜底 |
 | 语音 | faster-whisper ≥1.0(本地 ASR) · edge-tts ≥6.1(免费在线) | 首次运行需下载模型 |
-| 零素材出片 | headless Chrome/Edge 逐帧截图 + 自包含 HTML/SVG 排版 | 不引 Playwright/Selenium,也不引生成式图像模型:一帧 = 一次 `--screenshot`。容器里跑的是镜像自带的 `chromium`(root 身份自动补 `--no-sandbox`,恒带 `--disable-dev-shm-usage`);本机想用别的浏览器用 `STORYLINE_CHROME` 指过去 |
+| 零素材出片 | **Remotion 4.0.534** + React 19.2(TypeScript),常驻独立服务 `creation-remotion` | 画面是模型逐镜交的 TSX,由该容器逐帧渲(`@remotion/bundler` + `@remotion/renderer`,Node 侧一次一镜进浏览器)。风格通道依赖:`roughjs 4.6.6` / `three 0.186.1` + `@react-three/fiber 9.8.1` + `@remotion/three` / `katex 0.19.0` / `@remotion/shapes`+`@remotion/paths`。Python 侧只是一个 HTTP 客户端(`motion/remotion_client.py`),**它崩了不带走后端的剪辑能力**;地址走 `REMOTION_URL`(compose 内 `http://remotion:8010`,不映射宿主端口) |
+| 网页出片 | headless Chromium 逐帧截图 | `render_web` 仍走这条路:镜像自带的 `chromium`(root 身份自动补 `--no-sandbox`,恒带 `--disable-dev-shm-usage`);本机想用别的浏览器用 `STORYLINE_CHROME` 指过去。不引 Playwright/Selenium,也不引生成式图像模型 |
 | 视觉理解 | 与主 LLM 同源的多模态模型 | 默认 `deepseek-flash`(实测能吃 `image_url`) |
 | 链接取料 | yt-dlp ≥2026.8.19 | YouTube 需 JS 运行时 + 网络出口 |
 | 前端 | Vue 3.5 + Vite 6(无组件库、无路由/状态库) | 单文件 `App.vue`,build 产物由主服务托管 |
-| 部署 | Docker Compose · 两阶段 Dockerfile · Caddy | 反代 :80/:443;`fonts-noto-cjk` 供字幕渲染、`chromium` 供逐帧截图,都进镜像 |
+| 部署 | Docker Compose · 两阶段 Dockerfile · Caddy | 反代 :80/:443;三个常驻容器 `creation-app`(python:3.12-slim + ffmpeg + `fonts-noto-cjk` + `chromium` 供 `render_web`)、`creation-editor`(同镜像另一条命令)、**`creation-remotion`**(`node:24-slim` + chromium + `fonts-noto-cjk` + ffmpeg,`build: ./remotion`,不映射宿主端口)。字体两个镜像各自装一份——母版字体栈只认镜像里真装着的字族 |
 | 鉴权 | 手写 HS256 JWT + PBKDF2-HMAC-SHA256(30 万轮) | 不额外引 pyjwt/bcrypt:一个签发用途不值得多一个依赖 |
 
 ## 配置
@@ -751,7 +818,7 @@ Windows 下可用 `backend/start.bat`(pythonw 无窗口后台起,日志 `.storyl
 
 ```bash
 docker compose up -d                          # 存储层
-docker compose --profile app up -d --build    # + editor(:8001) + app(:8000) + caddy(:80)
+docker compose --profile app up -d --build    # + editor(:8001) + remotion(:8010，只走容器网) + app(:8000) + caddy(:80)
 ```
 
 - 存储端口**只绑 127.0.0.1**(PG 5432、MinIO 9000/9001),**Redis 不做宿主机映射**——本机原生 Redis
@@ -761,8 +828,13 @@ docker compose --profile app up -d --build    # + editor(:8001) + app(:8000) + c
   `Connection refused` → 整站「无剪辑能力」(计划门也不会出卡)。`config.docker.toml` 的唯一差别就是
   `connect_host = "editor"`;
 - `editor` 带 TCP 就绪探针、`app` 依赖它 `service_healthy`——两者同秒拉起时,不等就绪就会撞同一个坑;
-- 接线成功的判据(启动日志明说):`[startup] Storyline 已接入 26 个剪辑节点（DAG 契约 24 节点，rerun_from 可用）`
-  + 中文名词表从 29 条涨到 52 条;
+- `remotion` 反过来**刻意不进** `depends_on`:存储没就绪服务必然起不来,而渲染服务没就绪只是「这一镜渲失败」,
+  做成启动依赖等于让图形链的故障半径扩大到整站。它的 healthcheck 用 node 自带 fetch 真打 `/healthz`
+  (端口开着不等于应答),地址走 `REMOTION_URL`(默认 `http://remotion:8010`,`app` 与 `editor` 共用同一份环境锚);
+- 接线成功的判据(启动日志明说,2026-10-11 重烤后实测):
+  `[startup] Storyline 已接入 27 个剪辑节点（DAG 契约 25 节点，rerun_from 可用）`
+  + `[startup] 中文名词表已装载：57 条（工具 / 剪辑节点 / 技能），参数标签 92 条`;
+  数字跟着白名单走(`examples/storyline/config.toml`:25 个 DAG 节点 + 2 个控制节点),改名单就得回来看这一行;
 - `deploy/Caddyfile` 默认 `:80 reverse_proxy app:8000`,配 `SITE_DOMAIN` 后取消注释出 HTTPS;
 - `WHISPER_PRELOAD` 构建参数可预下载 ASR 权重;`caddy` 没有 healthcheck(它不是依赖项)。
 
@@ -770,13 +842,15 @@ docker compose --profile app up -d --build    # + editor(:8001) + app(:8000) + c
 
 | 层 | 内容 | 怎么跑 |
 |---|---|---|
-| 离线回归 | `backend/tests/` **88 份**脚本式套件——每份自带 `asyncio.run(main())` 与断言计数,pytest 把**整份脚本**收成一个用例、以子进程执行(全量输出落 `.tmp/reg_pytest/`)。pytest 从脚本内部还会解析出 15 个假用例(`async def` 缺插件 / 缺 `tmp` fixture),由 `conftest.py` 在收集后丢弃——否则标准入口的结论全是假故障 | `cd backend && python -m pytest`(或单跑 `python tests/test_xxx.py`) |
-| 真机冒烟 | `backend/.smoke/` **26 个** `*_smoke.py`(b3~b17 + `settings_key`/`thinking_off`/`vl_shared_key` + `motion_film`/`motion_wide`/`motion_sheet` 三条零素材样片 + `b21_render_persist_gc` 成片入库与回收)+ **26 个**探针/种子脚本(含 b18 搜索链六路探针、b19 跨量级读数抽帧对照) | 依赖模型的那批带 `credit_gate()` 前置闸:额度不就绪直接 SKIP 并打印原因,不会把"账户空了"报成"代码坏了" |
-| 关键路径的钉子 | 计划门(`test_plan_gate`)· 出口中文(`test_display_outlets`)· 存储契约(`test_storage_contract` 212 项)· 渲染跟随(`test_render_follow`)· dry-run 路由(`test_dry_run_dispatch`)· 修字(`test_transcript_correction`)· 复盘(`test_plan_retrospective`)· 判断模型(`test_judge_gate`)· 零素材通道(`test_motion_channel` 236 项:净化闸拒绝清单、动效停止时刻、横屏第二套版式、字幕容量分档、图示几何不越界、跨量级读数自动换对数刻度与「万/亿」收成)· 成片入库与按会话回收(`test_session_gc` 56 项:两种 `session_id` 拼法都清、同对象键重烧只更新一行、`materials.object_key` 的保护名单护住已入库字节、在途渲染拒绝回收、开机对账幂等) | 见各文件头的"钉住 N 件事" |
+| 离线回归 | `backend/tests/` **93 份**脚本式套件(2026-10-11 实测 **1105 条断言全过、红文件数 0**)——每份自带 `asyncio.run(main())` 与断言计数,pytest 把**整份脚本**收成一个用例、以子进程执行(全量输出落 `.tmp/reg_pytest/`)。pytest 从脚本内部还会解析出 15 个假用例(`async def` 缺插件 / 缺 `tmp` fixture),由 `conftest.py` 在收集后丢弃——否则标准入口的结论全是假故障 | **以 `creation-app` 容器内那一趟为准**:镜像里没装 pytest,逐份 `PYTHONPATH=/app python tests/test_xxx.py`(宿主机 python 的版本与依赖都不是运行时那份)。宿主机标准入口:`cd backend && python -m pytest` |
+| 渲染容器自闸 | `remotion/tests/gate1-lint.mjs`——闸① 的先证红再证绿:**落点模板 `src/user-shots/shot.tsx` 必须绿**(模板自己红,用户写第一镜就挨打),四类违规必须红并带规则名与行列号(未包裹 `<FilmLayout>`、越界 import、代码里取随机/时间/网络/外部字体、字段声明与代码读/标注三相对不上账)。**它跑在 Dockerfile 层末**——红就烤不出镜像,报警发生在构建期而不是模型写完代码那一趟 | `docker build -t creation-remotion:latest ./remotion`(或容器内 `cd /srv && node tests/gate1-lint.mjs`) |
+| 真机冒烟 | `backend/.smoke/` **24 个** `*_smoke.py`(b3~b16 + `settings_key`/`thinking_off`/`vl_shared_key` + `b22_code_chain_render`/`b23_field_patch`/`b24_code_ui` 这条代码链 + `t5_track_patch` 口播选区改)+ **23 个**探针/种子脚本(含 b18 搜索链六路探针);**旧声明式链的 17 份夹具与用例归档在 `.smoke/_archived_p4_declarative/`**(含 b17/b19/b21 与四条零素材样片),归档不是可跑路径,跑前先读那份 README | 依赖模型的那批带 `credit_gate()` 前置闸:额度不就绪直接 SKIP 并打印原因,不会把"账户空了"报成"代码坏了" |
+| 关键路径的钉子 | 计划门(`test_plan_gate`)· 出口中文(`test_display_outlets`)· 存储契约(`test_storage_contract` 212 项)· 渲染跟随(`test_render_follow`)· dry-run 路由(`test_dry_run_dispatch`)· 修字(`test_transcript_correction`)· 复盘(`test_plan_retrospective`)· 判断模型(`test_judge_gate`)· 代码镜契约与缓存键(`test_code_spec` 168 项:字节级幂等、闸⑦ 配额与技能正文逐行比对)· 八道闸本体(`test_code_gates` 109 项:每道判红的闸一条先证红再证绿)、闸⑧ 版面回读三态与只记账(`test_code_layout` 50 项:missing/unscanned/scanned 两两不同、畸形读数不许抛、措辞不抄常量表、layout 在缓存还原名单里)· 字段通道与闸⑥(`test_code_fields` 138 项)· 逐镜质感(`test_code_texture` 48 项)· 两条链的 HTTP 口(`test_patch_endpoints` 33 项:三口都在、点名跟着真实节点走)· 图形通道与链无关的那批约定(`test_motion_channel` 217 项:开关名单同源、七个开关真上计划卡、契约标签走到确认卡,外加旧链下线后由它代管的六件事——出处闸的凭据语义、局部改读哪一版、命中表与代表帧发布、切片缓存的收发协议与质感滤镜、JSON 指针工具、词时间轴贴字符)· 成片入库与按会话回收(`test_session_gc` 56 项:两种 `session_id` 拼法都清、同对象键重烧只更新一行、`materials.object_key` 的保护名单护住已入库字节、在途渲染拒绝回收、开机对账幂等) | 见各文件头的"钉住 N 件事" |
 | 提示词回归 | `tests/data/planning_round_golden.json` 金样逐字比对 + `scripts/run_eval.py` 的 prompt fingerprint | 改提示词后先跑这两个 |
 
 > **重要**:`backend/tests/`、`backend/.smoke/`、`backend/scripts/`、`backend/docs/`、`backend/pytest.ini`、
-> `backend/start.bat` 都在 `.gitignore` 里——**克隆出去的仓库不含这批**,`git ls-files backend` 只有 105 个文件。
+> `backend/start.bat` 都在 `.gitignore` 里——**克隆出去的仓库不含这批**,`git ls-files backend` 只有 117 个文件
+> (这是**已跟踪**的数;图形链新增的那几个文件此刻还在工作树里,入库后这个数还要涨)。
 > 想连测试一起分发,把它们移出排除清单。
 > 另一条已知足迹:离线套件默认用 `pg_minio` 装配,会往真 PG 写 `sess-*` 指针行(不进未完成集合,无害但可见)。
 
@@ -812,57 +886,43 @@ docker compose --profile app up -d --build    # + editor(:8001) + app(:8000) + c
 - Python 版本要求只在 `Dockerfile` 与本文声明,**代码里没有运行期版本校验**;
 - 多副本:MQ 分区是 `crc32 mod N` 的近似互斥,崩溃接手靠租约;跨副本接管有真机冒烟,
   但**没有做过大规模副本验证**;
-- **零素材图形科普片**:当前只实现 `archive_card` **一套**纸质模板(`spec.STYLES` 单值),方屏是复用竖屏版式
-  (四周留同一张纸)而不是第三套排版;
-- 横屏的档案卡**按自身像素落在 1760 宽的带里**(卡本身 560~860 宽),两侧留纸是设计而不是没排满;
-  图示卡在横屏也**铺不满带宽**(1000×560 的坐标按带高缩放 → 1175 宽)——真要吃满 1760 得自画宽幅
-  viewBox(`custom` + `0 0 1600 600`),内置那七种不为横屏重画一版;`theatre`/`silhouette` 是满带深色,
-  上沿正好接在状态面板第二行下面;
-- 图示卡的项数有上限(`MAX_ITEMS = 8`、散点 `MAX_POINTS = 30`),超出**截断**并保留前若干项——
-  一镜画不下 20 个数据点时应该拆镜,不是挤在一张图上;
-- 逐帧截图是**串行**的:本机实测每帧约 0.8~0.9 秒(含编码),一条 2 分钟 15fps 的片子约 1800 帧 = 二十分钟级;
-  整条片子的帧数上限 4000(`MAX_FRAMES_TOTAL`,超了直接报错不静默砍);
-- `orbit`/`pulse`/`pan` 是连续运动,**永不 settle** → 该镜每帧都得真截,帧数 = 时长 × 帧率,
-  别把它放在长镜头上(账上 `captured_frames == frames` 就是这笔);
-- `card=custom` 只放行**矢量绘图**:位图、外链字体、外部 CSS、SMIL 动画一律没有,自画的图只能用
-  SVG 基本形状 + `data-anim` 的 13 种声明式动效;
-- **绘制四族画的是「参数化的图形」,不是任意画面**:`pixel` 是字符网格、`burst` 是撒粒子、
-  `net` 是点与线、`brush` 是抖动的线/圆/方框/折线。要画一件具体的实物剖面(活字印刷机的侧视、
-  一枚字模的透视),这四族都画不出来,得走 `custom` 自画;
-- 这两处得自己调,闸不拦(画得出来但不好看):`pixel` 每格封顶 40 个坐标单位,所以小网格的角色
-  在横屏带里会偏小;`burst` 默认中心 `y=260` 而射程可到 460,配大了粒子会压到图题那一行——
-  下移 `y` 或收窄 `dist`/`dist-max`(版式对照帧实测);
-- **整片质感只有四档固定滤镜串**,不开放自定义参数(要自定义等于把滤镜链交给模型,那条链上
-  没有静态校验)。`glow` 那一路带 `gblur`+`blend`,是四档里最贵的一趟。而且质感加在**母带**上,
-  逐镜切片与代表帧都是加质感之前的像素——所以**编辑器里的缩略图与对比帧看不到这层观感**,
-  要看效果只能放成片;
-- 这一批(绘制四族 + pose + 整片质感)的证据:离线用例 395 条全绿(含先证红再证绿的破坏性探针)、
-  本机版式对照表 22 卡 × 2 画幅逐张看过帧、四条滤镜串各自跑过 ffmpeg 并量到与母带的 PSNR 17.6~21.4 dB。
-  **2026-10-10 容器内整片真机补上了最后一格**(`.smoke/motion_film_ac_smoke.py`,竖屏 1080×1920、
-  fps=10、五镜 pixel/burst/net/brush/archive 连排、`texture=film`):成片 17.13s、发布 168 帧、
-  真截 171 帧、命中表错误 0、音画偏差 0.0s;逐镜帧账按动效类型分开落定——`pixel` 32 帧只真截 18
-  (pose 是离散动效,settle=1700ms 后末帧复用)、`burst`(twinkle) 32 帧全真截(连续闪动 = 整镜活帧)、
-  `net` 34/17、`brush` 34/22、`archive` 39/5;每镜命中表可指字段 8~16 条,画面里的字确实回指
-  `/shots/i/visual/…`(`title`/`caption`/`nodes/N/label`)。质感层量到同帧**平均绝对像素差 51.12/255**
-  (中灰 203.4→151.6、墨色占比 0.34%→33.6%),抽帧肉眼看到四角压暗与颗粒。母带层开关的账也对上:
-  `film→tv` 换档**复用全部 5 镜、真截 0 帧**;只改一镜的 `count`(26→40)**只重烧那一镜**
-  (真截 32 帧 vs 整片 171),其余 4 镜 `cached=True` 且缓存键一字不差。
-  同一脚本再跑一轮 **`--narration`**(配音 + 字幕层参与,`subtitle_mode=torn_highlight`):成片
-  12.66s、发布 125 帧、真截 127 帧、`mix=voice_only`、音画偏差 0.0s、命中表错误 0、**降级为空**;
-  五镜逐条拿到词时间轴(3/2/4/3/3 词,语音 1.896/1.872/2.016/2.136/2.520s),成片音轨与画面同长
-  (12.66s);这一轮逐镜帧账 pixel 23/18、burst 23/23、net 25/17、brush 26/22、archive 30/17,
-  质感差 51.15/255,`film→tv` 仍复用 5 镜真截 0,局部改仍只重烧 s02(真截 127→23、其余 4 镜键不动)。
-  **listening 级证据已补上**:抽到 5315ms 那一帧能看到撕纸高亮条里的字按词推进(「字模连成」已上色、
-  「版」还是浅色),即字幕确实吃的是词时间轴而非整段文本。edge-tts 出网在容器内实测可用(离线环境仍会降级)。
-- **2026-10-10 修掉的静默失败(局部改其实整片重烧)**:容器里跑四族连排的整片渲染,账上出现
-  「只改一镜的数值,五镜全部重烧、缓存键全换」。根因是**分镜归一化不幂等**:`theme` 的像素栏
-  第一次过闸时由 `DEFAULT_THEME` 补成 int `44`,而用户显式填的值走 `_clean_num` 出的是 float
-  `44.0`;局部改必经「patch 后再过一遍闸」,第二趟就把**没动过的那几镜**也写成 `44.0`。
-  `44 == 44.0` 为真,所以补丁的改动账、逐镜字典比较、成片时长与帧数**全都看不出异常**,
-  而 `shot_cache_key` 认的是 JSON 字节——「局部改只重烧受影响的那几镜」这条合同于是是假的。
-  现在 `_norm_theme` 返回前把 `THEME_PX` 的每个键都过同一趟数值归一,默认值与显式值同一类型;
-  `tests/test_motion_channel.py` ⑯ 段守这条:**一律用 JSON 字节断言,不用 `==`**,并覆盖
-  全部 22 张卡逐张二次过闸字节相同 + 改一句文案后其余 21 镜缓存键一个不许动。
+- **零素材图形科普片(代码镜链)的质量上限就是模型 TSX 的上限**:这条链**没有内置版式可退**,
+  闸④ 只拦「带子里几乎没像素」与「内容挤成一团」,闸⑦ 只拦「通道扎堆」与「纯文字镜过半」,
+  **好不好看、构图对不对不在任何一道闸的判据里**——那一路只能靠技能正文与逐镜账交人眼;
+- **真 3D 靠软件 WebGL**:容器里只有 `DG_GL=swangle` 出得来画面,其余后端渲成黑帧。
+  **闸② 没有按通道限 3D 的帧率**(整片帧预算 4000 是唯一硬闸),一条 three 镜写 30fps 长镜头照样能
+  把整片预算吃光——这是设计文档 §10 记着的**未完项**,现在靠技能正文那句「3D 镜压 fps」兜着;
+- **渲染是串行的**:渲染服务一次只放一镜进浏览器(避开软件 WebGL 的内存峰),外加**每次请求 4.6~7.5 秒**
+  的打包固定成本(与镜头内容无关)。所以这条链的账是「镜数 × (打包 + 帧数 × 逐帧开销)」,
+  逐帧开销由账上 `per_frame_ms_max` 报出来,别拿旧链那句「每帧 0.8~0.9 秒」当现值——量法换了;
+- **质感只有那五档固定滤镜串**,不开放自定义参数(要自定义等于把滤镜链交给模型,那条链上没有静态校验),
+  `glow` 那一路带 `gblur`+`blend` 最贵。**2026-10-11 起质感跑在每一镜的切片上**(拼接之前、缓存之后),
+  代表帧也从加了质感的那份切片重抽(`code_render._shot_texture` 的第四个返回值),所以
+  **编辑器里的缩略图与改前/改后对比帧现在看得见这层观感**——旧声明式链那句「母带层滤镜、缩略图看不到」**已作废**;
+- **逐镜质感 ≠ 任意质感**:一档只有那五个取值(外加"跟随整片"与"这一镜不加"两种形态),
+  前端**不许自己重算** `code_spec.shot_texture`——两处各写一遍「镜头有就用、没有问整片」,
+  就会出现界面显示一档、账上是另一档、画面上是第三档;
+- **这一批的证据分两档,不许混着说**:
+  ①**离线全绿**(容器内 `PYTHONPATH=/app` 才算):`test_code_spec`(契约、缓存键字节级幂等、
+  闸⑦ 配额与技能正文逐行比对)、`test_code_gates` 109 条(判红的闸各一条先证红再证绿)、`test_code_layout` 50 条(闸⑧ 三态与不拦截)、
+  `test_code_fields` 138 条(字段通道 + 闸⑥)、`test_code_texture`(逐镜质感三形态、账与滤镜同源)、
+  `test_patch_endpoints`(两条链共用的三个 HTTP 口:读表/取帧/提交,钉的是三口都在、
+  点名跟着真实节点走、body 键原样透传、base 号一定换新);
+  ②**真渲过的**只有单镜级与短片级:`.smoke/b22_code_chain_render_smoke.py`(整链出片)、
+  `b23_field_patch_smoke.py`(改一个字段只重烧一镜、`cached_shots=1`)、B1-3 的三条风格通道 × 两画幅六支、
+  `remotion/tests/layout-probe.mjs` 六支(闸⑧:叠字/越带/引线悬空各真渲一镜,含两支**必须不响**的钉住 0.4 与
+  3px 那条线、一支把引线藏在 `<g transform>` 里钉住 `getScreenCTM` 映射)。同一批按纪律先证过红:
+  把母版的 `ref={bodyRef}` 摘掉再跑,六支全部退回「版面没扫:画面带 ref 未挂载」,恢复后 ALL PASSED。
+  **整片端到端的「多风格 + 配音」真机样片还没跑**——那句「可以生成高质量多风格视频」要等这一跑才能声称,
+  §15 与设计文档 §8 都记着这笔;
+- **旧声明式链的两份 2026-10-10 真机账已归档**(`.smoke/_archived_p4_declarative/`,代码与夹具一起):
+  一份是四族连排 + `texture=film` 的整片账(成片 17.13s、真截 171 帧、`film→tv` 换档复用全部 5 镜),
+  一份是「局部改其实整片重烧」那次静默失败的根因(归一化不幂等:`theme` 的默认值出 int `44`、
+  用户显式填的值走 `_clean_num` 出 float `44.0`,而 `44 == 44.0` 为真——改动账、逐镜比较、时长帧数全看不出异常,
+  只有 `shot_cache_key` 认 JSON 字节,于是「只重烧受影响镜」这条合同是假的)。
+  **教训与实现无关、今天仍然成立:按字节算的键必须按字节断言,`==` 看不见 `44` 与 `44.0`**;
+  但当时修它的代码(`_norm_theme`/`THEME_PX`/22 卡守卫)随那条链一起删了,新链上守这条的是
+  `tests/test_code_spec.py` 里「同镜同参数两次算出同一个键」那条字节断言。
 - 这条通道的配音依赖 edge-tts **出网**;离线环境里 `narration=true` 会失败,`narration=false` 仍可用;
 - 画面字体吃镜像里的 `fonts-noto-cjk`;本机没装 Noto Serif SC 时回落 SimSun/雅黑,版面观感会变(字宽不同,
   字幕换行位置随之挪)。
@@ -883,6 +943,14 @@ docker compose --profile app up -d --build    # + editor(:8001) + app(:8000) + c
   要稳定查证,必须在「设置」页配 brave / tavily / serpapi / 自建 SearXNG 其中一路;
 - **出处闸只对账,不判真伪**:它能保证"没真打开过的链接不许写成查证过",不能保证查到的内容是对的。
   史实对错仍归模型与人工;
+- **出处闸认的是标记表里的连续字样**,措辞差两个字就算"声称查证过":2026-10-10 真机上冒烟夹具把出处写成
+  「本机核对夹具(未对外查证)」被打回(标记表收「未核实 / 未查证 / 凭记忆」这类连续短语,中间插了「对外」就不认)。
+  方向是保守的——宁可错拦诚实的措辞,不错放声称查证的猜测——但写出处请照闸门给的原话
+  「未核实:<依据一句话>」;
+- **出处闸只挂在两处**:`plan_motion` 入库前(全量)与局部改(只复核本次改到的镜)。旧链靠渲染节点的
+  `required_nodes=["plan_motion"]` 保证任何进渲染的分镜都过过闸;**代码链今天还没有能过得去的计划门**
+  (清单 #159:`plan_motion` 还不收代码分镜),脚本直调 `render_motion_code` 出片那一趟不过这道闸。
+  根修是把 #159 做完,不是在渲染节点里再补一遍判据。
 - **冒烟留下的数据分两种清法**:身份可以点名叫 `scripts/purge_identities.py` 删(默认 dry-run,
   `--apply` 才真删;PG 行按 `ON DELETE CASCADE`,桶里 `users/<uid>/` 前缀一起收)。但
   `artifacts` / `checkpoints` 只按 `sess-*` 连接会话记账,schema 里**没有身份列也没有外键**,删身份带不走它们。
@@ -905,7 +973,19 @@ docker compose --profile app up -d --build    # + editor(:8001) + app(:8000) + c
 - 历史日志(早于本轮掩码改造的 `.tmp`/`.log`)里存在当时明文写下的 WS token,属历史数据,未回溯清洗。
 - **选区改「换配乐」会重烧全部窗口**:配乐混在母带那一层,`timeline_edit.window_inputs` 把它算进**每一窗**自己的缓存输入(`core_nodes.py` 的逐窗台账同源)——所以拧一次配乐音量,逐窗输入清单全部不同,没有一窗能复用。这不是退化成整片重烧的 bug,是"配乐影响整条片子"的正常结果;嫌慢就接受"换配乐=重新出片"。
 - **手改过的段,同步闸不再判、只能人眼验**:段上带 `manual` 标(`timeline_edit.MANUAL_MARK`)时,`resync_original_audio_timeline` 会跳过它不替用户改回去、`av_sync_check` 也跳过它不判——用户刚拧好的取景/音量不能被自动校准抹掉。代价是这一段的口型对不对,机器不再背书,账上如实记一条 UNVERIFIED(`eyeball`)。要机器重新接管,得去掉手动标重渲。
-- **图形科普片的样式同步只认同 `card`**:`MotionEditor.vue` 的 `shotSetFor` 把"全片同卡型"理解成"复制给**同 card** 的其他镜"(按 `shotBase().card` 匹配),跨 card 型不同步——同卡型才是用户眼里的一套版式。
+- **图形科普片的样式同步只认「同名 + 同类」的字段**:代码镜没有 card 也没有 theme,能同步的只有
+  **别的镜也交出来的同名字段**(`MotionEditor.vue::fieldSiblings`,name 与 type 都对上才算同一个旋钮)。
+  没交这个字段的镜不参与——硬塞进去等于替它改代码;取值还要过**它自己**声明的 min/max/options,
+  过不了就落进「没改」那一栏并写明数字(不拿这一镜的刻度去量另一镜)。范围在保存前必须问一次
+  (全片同名字段 / 只这一镜),默认任何一个方向都会替另一批用户做决定。
+  **旧声明式链在编辑器里的形状已于 2026-10-11 清掉**:「整镜」「样式」两块面板、画面上那圈带编号的
+  叠加图层框,以及询问条里「卡面样式同步到同 card 的镜」那一档。它们本来就不是「暂时没人点」而是
+  **渲染就会空掉**的分支——模板引用的 `themeCtl`/`themeSet`/`curTheme`/`curOverlay`/`laySet`/
+  `stageLayers`/`renameKey` 这批助手早随旧链一起从 `<script setup>` 删了,`v-for` 拿到 undefined
+  只是安静地画不出东西。同一趟还删了「按文字近似对上,请核对 / 多处同字」两档提示:现行两张表
+  (代码镜字段表、`segment-hitmap/1`)的指针**恒为 `confidence=exact`**,没有 ambiguous 这个键,
+  留着等于在界面上宣传一个已经不存在的数据缺陷。「选中段的字段」(口播轨)照旧。
+  前端产物烤进 `creation-app` 镜像(`Dockerfile` 的 web 阶段),所以这一条与重烤是同一批做完的。
 - **版本列表只活在本次编辑器会话内**:`MotionEditor.vue` 的 `chain` 是内存里的,只列"本次编辑器里走过的版本";服务端**没有**"列出某会话全部版本"的口,跨刷新/重开面板找旧版要在对话里报产物号(`adopt(artifact_id)` 才打得开)。
 - **工具调用气泡的参数值仍会露机器名**:参数**名**有三级中文兜底(`arg_labels` 帧内 → `/tools` 的 `params_display` → 本地 `ARG_LABELS` 白名单),`App.vue::summarizeArgs` 末尾 `|| k` 意味着**不在词表里的参数名直接露英文原名**;参数**值**按原样 `JSON.stringify`,对象键、段 id(`ev-…`/`su-…`)、机器枚举值都会原样出现在气泡里——这一条目前没有做,属如实保留的展示层粗糙。
 - **拧声音段的取源区间会把画面搬走、并按新内容改名**:`resync_original_audio_timeline` 为了让嘴型对上,把压在改过的声音段底下的画面段钉到新的声音位置;画面段 id 是按「素材 + 取源区间」算的,内容一换名就换(`ev-52cea4bed2` → `ev-12c33fa9e5` 是真机那一次)。若两段因此取到**同一段素材的同一区间**,`assign_segment_ids` 去重成 `ev-xxx#2`——而 `_safe()` 落对象键时把 `#` 换成 `_`,所以帧文件名与指针里的名字**写法不同**,跨机器比对要认段 id 而不是文件名。

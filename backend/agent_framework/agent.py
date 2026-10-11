@@ -37,8 +37,9 @@ from .plan import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_ste
                         reconcile, render_injections)
 from .plan_retro import (PlanRetrospective, plan_card_lines, rework_line,
                          revise_line)
-from .render_gate import (ADJUST_OPTION, CONFIRM_OPTION, KEEP_FULL_OPTION,
-                          MOTION_KNOBS, MOTION_NODE, RENDER_NODE, RENDER_NODES,
+from .render_gate import (ADJUST_OPTION, CONFIRM_OPTION,
+                          KEEP_FULL_OPTION, MOTION_KNOBS, MOTION_NODE, RENDER_NODE,
+                          RENDER_NODES,
                           TRUNCATE_OPTION, build_render_ask,
                           decision_is_confirm, decision_text,
                           ungated_render_nodes)
@@ -828,10 +829,12 @@ class AgentOnceRun:
                 if first == RENDER_NODE:
                     preview = await self._load_preview(sess)
                 elif first == MOTION_NODE:
+                    # 确认卡读的是分镜账（镜数/字数/估算/开关），标签来自这个节点的契约：
+                    # 主服务不再抄一份枚举表，否则两张卡会对同一个取值说两种话。
                     motion = await self._load_motion_plan(sess, resp.tool_calls, first)
                 ask = build_render_ask(
                     preview, motion=motion,
-                    labels=self._motion_value_labels() if motion else None,
+                    labels=self._motion_value_labels(first) if motion else None,
                     title="" if first == RENDER_NODE else
                     f"接下来要出的是「{get_catalog().label(first)}」，确认开始渲染吗？")
                 ask["render_node"] = first
@@ -1575,7 +1578,7 @@ class AgentOnceRun:
         return {**source, **{k: v for k, v in args.items()
                               if k in MOTION_KNOBS and v not in (None, "")}}
 
-    def _motion_value_labels(self) -> dict[str, dict[str, str]]:
+    def _motion_value_labels(self, node: str = MOTION_NODE) -> dict[str, dict[str, str]]:
         """确认卡回显开关取值时用的「人话」表：``{开关名: {取值: 标签}}``。
 
         为什么从词表读而不是在主服务再抄一份对照表：这份标签的源在剪辑服务端的参数
@@ -1588,7 +1591,7 @@ class AgentOnceRun:
         if vocab is None:
             return {}
         try:
-            props = vocab.props_for(MOTION_NODE) or {}
+            props = vocab.props_for(node) or {}
         except Exception:  # noqa: BLE001 - 标签只是好看，读不到不该拦住确认流程
             return {}
         out: dict[str, dict[str, str]] = {}

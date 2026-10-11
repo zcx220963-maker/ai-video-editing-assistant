@@ -22,8 +22,10 @@ from typing import Any, Mapping
 
 # 触发确认的节点名。做成常量而不是散落的字面量：将来要给别的节点加门只需改这里。
 RENDER_NODE = "render_video"
-#: 零素材图形科普片的出片通道（分镜 → 逐帧截图 → 合成）。
-MOTION_NODE = "render_motion_video"
+#: 零素材图形科普片的出片通道（代码分镜 → 渲染容器逐镜渲 → 母带）。
+#: 一次按下烧掉分钟级到十分钟级的不可逆算力，与 ``render_video`` 同一族——
+#: 门认的是这一族，不是某一条实现。
+MOTION_NODE = "render_motion_code"
 #: 网页（HTML/URL）逐帧截屏出片的通道。
 WEB_NODE = "render_web"
 #: 所有「一按就烧像素、且不可逆」的出片通道。门认的是**这一族**，不是某一个名字——
@@ -32,13 +34,13 @@ WEB_NODE = "render_web"
 #: 它不是 submit+poll 的长任务，所以只有门覆盖它，进度条那一路仍按长任务节点认。
 RENDER_NODES = frozenset({RENDER_NODE, MOTION_NODE, WEB_NODE})
 
-#: **局部改那一族**：``patch_motion_video``（图形科普片）与 ``patch_video``（口播/素材片）。
+#: **局部改那一族**：``patch_motion_code``（图形科普片）与 ``patch_video``（口播/素材片）。
 #: 名字在这里出现但**不进** ``RENDER_NODES``，是有意的：
 #: 门要拦的是「用户还没看过任何东西，模型就按下了一次几分钟、不可逆的算力」。
 #: 走到局部改时用户手里已经有一版成片，改哪一格是他自己点的（前端选区 → POST /motion/patch
 #: 或 /timeline/patch），而且这一版只重烧受影响的那几镜/那几个窗口——缓存命中的切片一个像素都不重烧。
-#: 要重做整片仍然只能走 ``render_motion_video`` / ``render_video``，那两道门照旧开着。
-PATCH_NODES = frozenset({"patch_motion_video", "patch_video"})
+#: 要重做整片仍然只能走 ``render_motion_code`` / ``render_video``，那两道门照旧开着。
+PATCH_NODES = frozenset({"patch_motion_code", "patch_video"})
 
 # 渲染确认的选项。key 会作为 decision 回喂给服务端并进模型上下文，
 # 所以用自解释的短词而不是 opt1/opt2。
@@ -74,7 +76,7 @@ def ungated_render_nodes(tool_calls: Any, *, enabled: bool,
     * 看参数：``dry_run`` 的那一次不出片，它本身就是给用户看的那一眼编排结果——
       再拦一道「确认渲染吗」是把同一道题问两遍。
     * 看**通道**：同一条 run 里用户答过 ``render_video`` 那道题，不等于批准了
-      ``render_motion_video``——那是另一笔不可逆的算力，所以记名不记一位布尔。
+      ``render_motion_code``——那是另一笔不可逆的算力，所以记名不记一位布尔。
       同一通道答过就不再重问（真机事故：同一道题问了几十遍，见
       ``RunState.render_gate_asked`` 的说明）。
     """
@@ -163,18 +165,21 @@ def preview_summary(preview: Mapping[str, Any] | None) -> dict[str, str]:
     return out
 
 
-#: 图形科普片在计划卡上的开关（名单与 ``storyline_server/motion/spec.py`` 的
-#: ``KNOB_FIELDS`` 同源；两份名单漂移由 tests/test_motion_channel.py 拦下）。
+#: 图形科普片在计划卡上的开关（名单与 ``storyline_server/motion/code_spec.py`` 的
+#: ``KNOB_FIELDS`` 同源；两份名单漂移由 tests/test_code_spec.py 拦下）。
 #: 为什么不在这里 import 那个模块：主服务不装配剪辑服务端的实现，而这里读错的后果
 #: 只是摘要少显示一个字段——它不参与任何执行判定。
 MOTION_KNOBS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode",
                 "texture")
 
 #: 卡面要给人看的词，不是枚举字面量（用户不需要背 portrait / torn_highlight）。
+#: 这三张表只是**拿不到契约 value_labels 时的兜底**，取值与措辞都必须和
+#: ``code_spec.KNOB_VALUE_LABELS`` 逐字一致——不一致时确认卡会把同一个决定显示成
+#: 两副面孔。契约在时走 ``props_for(节点名)``，这里不参与判定。
 _ASPECT_LABELS = {"portrait": "竖屏", "landscape": "横屏", "square": "方屏"}
-_SUBTITLE_LABELS = {"torn_highlight": "撕纸条·逐词点亮", "torn": "撕纸条",
-                    "bottom": "底部字幕", "none": "不上字幕"}
-_TEXTURE_LABELS = {"none": "不加质感", "film": "老胶片·颗粒与暗角",
+_SUBTITLE_LABELS = {"torn_highlight": "撕纸条·逐词点亮", "full": "整句字幕",
+                    "none": "不上字幕"}
+_TEXTURE_LABELS = {"none": "不加（原片直出）", "film": "老胶片·颗粒与暗角",
                    "tv": "老电视·扫描线与色偏", "glow": "柔光·高光处泛开",
                    "bleach": "漂白·硬对比低饱和"}
 
@@ -184,7 +189,7 @@ def motion_summary(source: Mapping[str, Any] | None,
     """图形科普片的「将要渲成什么样」——确认卡顶部那排小标签。
 
     ``source`` 认两种形状：``plan_motion`` 的产物（账已经算好，含 estimated_sec），
-    以及模型跳过分镜、直接传给 ``render_motion_video`` 的手写 spec（这时只有结构事实，
+    以及模型跳过分镜、直接传给 ``render_motion_code`` 的手写 spec（这时只有结构事实，
     估算区间**不在这儿重算**——那是剪辑服务端的口径，抄一遍迟早漂移）。
 
     调用方（``agent._load_motion_plan``）已把这次调用带的顶层开关盖进 source，
@@ -216,6 +221,10 @@ def motion_summary(source: Mapping[str, Any] | None,
         len(shots) if shots is not None else 0)
     if shot_count:
         out["镜头"] = f"{shot_count} 个"
+    if str(src.get("chain") or "") == "remotion":
+        # 这一行不再用来区分两条链（旧的那条已下线），它给用户的是「这次按下去烧的是
+        # 谁的算力、这一版能不能按字段改」：画面出自渲染容器里的代码，局部改能改代码与字段。
+        out["通道"] = "代码镜（渲染容器逐帧渲）"
     chars = src.get("char_count") or (
         sum(len(str(s.get("text") or "")) for s in shots if isinstance(s, Mapping))
         if shots else 0)
@@ -246,8 +255,20 @@ def motion_summary(source: Mapping[str, Any] | None,
     if sub:
         out["字幕"] = sub
     texture = word("texture", src.get("texture"), _TEXTURE_LABELS)
-    if texture and str(src.get("texture") or "").lower() != "none":
-        out["质感"] = texture
+    # 逐镜点名（B6）：整片那一档只是**默认**，一镜能点一档、也能点名不要。确认卡不许把
+    # 「整片不加、第 3 镜老电视」显示成「没加质感」——那是用户正要批准的一个观感决定。
+    # 两种来路共用一条判据：分镜产物的 plan_table 行带的是**实际生效**的档，手写 spec 的
+    # shots 行带的是**声明**的档（空串＝跟随，天然不等于任何档）。与整片不同才算换过。
+    film_tex = str(src.get("texture") or "").strip().lower() or "none"
+    rows = src.get("plan_table") if isinstance(src.get("plan_table"), list) else shots
+    n_override = len([r for r in (rows or []) if isinstance(r, Mapping)
+                      and (k := str(r.get("texture") or "").strip().lower())
+                      and k != film_tex])
+    if texture and film_tex != "none":
+        out["质感（整片默认）"] = texture + (
+            f"，{n_override} 镜点名换过档" if n_override else "")
+    elif n_override:
+        out["质感（逐镜点名）"] = f"整片不加，{n_override} 镜自己点了档"
     bgm = src.get("bgm") if isinstance(src.get("bgm"), Mapping) else {}
     ref = str(bgm.get("ref") or "") if bgm else ""
     out["配乐"] = Path(ref).name[:18] if ref else "纯人声（无配乐）"
@@ -270,6 +291,10 @@ def build_render_ask(preview: Mapping[str, Any] | None, *,
         # 分镜阶段算出的「比目标长/短不少」是这条通道唯一能提前给出的偏差——
         # 它必须出现在题面上：删镜还是加速，是用户在**开渲之前**该做的决定。
         warnings += [str(w) for w in (motion.get("target_warnings") or [])]
+        # 闸⑦ 的文案与风格提醒也上这一张卡：它们**故意不做硬闸**（词法认不出专名，
+        # 误伤的代价是一整轮重规划），而「不打回」不等于「用户看不见」——开渲之前是
+        # 唯一还能一句「这几镜太空，重写」的时机，出了片再改就是重烧。
+        warnings += [str(w) for w in (motion.get("style_warnings") or [])]
     conflict = duration_conflict(preview)
 
     if conflict:

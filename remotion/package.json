@@ -1,0 +1,31 @@
+{
+  "name": "creation-remotion",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "图形科普片的代码渲染链：模型逐镜交 React/TSX，本服务用 Remotion 逐帧渲成镜粒度切片",
+  "scripts": {
+    "serve": "node server.mjs",
+    "verify": "node tests/gate1-lint.mjs"
+  },
+  "dependencies": {
+    "@react-three/fiber": "9.8.1",
+    "@remotion/bundler": "4.0.534",
+    "@remotion/paths": "4.0.534",
+    "@remotion/renderer": "4.0.534",
+    "@remotion/shapes": "4.0.534",
+    "@remotion/three": "4.0.534",
+    "katex": "0.19.0",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "remotion": "4.0.534",
+    "roughjs": "4.6.6",
+    "three": "0.186.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.7",
+    "@typescript-eslint/parser": "8.48.0",
+    "eslint": "9.35.0",
+    "typescript": "5.9.2"
+  }
+}

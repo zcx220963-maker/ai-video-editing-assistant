@@ -1,13 +1,20 @@
-"""零素材图形科普片出片节点（motion 通道）：分镜 spec → 版式页面 → 逐帧截图 → 逐镜合成 → 混音。
+"""图形科普片出片节点的**共用流水线**：读哪一版分镜 → 校验 → 复闸 → 分叉 → 开任务行 → 渲 → 那份账。
 
-分工口径（README §5.2）：本节点是「能力」，Skill 只教模型什么时候选它。
-与 render_video 的关系：**另一条独立的终点路径**，而且比它更独立——那条路要先有素材文件，
-这条路的输入只有文案与版式（见 motion/ 包），起点即终点。
+这个文件里没有一个类会被注册成工具。注册的是 `motion_code_nodes.py` 的
+``render_motion_code`` / ``patch_motion_code``，它们从这里继承与「哪条链出画面」无关的那半段：
+产物形状（``renders/{会话}/{产物}/motion.mp4`` + ``frames/`` + ``hitmap.json``）、按镜切片缓存
+的对象实现（同一个对象前缀，所以 ``session_gc`` 的级联回收覆盖得到）、进度上账与看门狗、
+证据分级、局部改的指纹核验与分叉。
 
-节点层负责的四件事（渲染层 motion/render.py 一概不知道）：
-* **入参把关**：spec 先过 validate_spec，枚举越界、高亮词不在文案里这类错必须在**烧像素
-  之前**回清单——一次渲染是分钟级到十分钟级，跑完再报错不叫把关，叫事故；
-* **进度上账**：逐帧事件折成 render_jobs 的百分比（同值去重，146 帧不该写 146 行）。
+链专属的那半段（契约、闸①~⑥、命中表条目、代码链的证据）全在子类里。两条出片路曾经共用
+这个文件（声明式那一路在 2026-10-10 整条删掉），留下的钩子属性因此只有一个赋值点——仍然
+留在类属性上而不是写死进流程：**流程一旦开始出现「是代码链就跳过这一步」，两条链就会各自
+漏掉不同的闸**，而那要到抽帧时才看得见，那时像素已经烧完。现在这个位置管住的是下一族链。
+
+节点层负责的四件事（渲染层一概不知道）：
+* **入参把关**：spec 先过校验器，枚举越界、高亮词不在文案里这类错必须在**烧像素之前**
+  回清单——一次渲染是分钟级到十分钟级，跑完再报错不叫把关，叫事故；
+* **进度上账**：逐镜/逐帧事件折成 render_jobs 的百分比（同值去重，146 帧不该写 146 行）。
   这一步不只是给界面看：看门狗按「无进展时长」判死，不报进度会被误杀；
 * **产物落库**：成片经 workspace.publish 进对象存储，payload 只留对象键；``media_url``
   是会过期的 presigned 直链，标 ephemeral 只回调用方——与 render_video 同一条契约；
@@ -19,29 +26,47 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
 from agent_framework.orchestration import ArtifactStore, NodeState, _safe
-from agent_framework.render_library import register_render
 from agent_framework.storage import to_ref
 
 from ..motion import hitmap as mhit
-from ..motion import patch as mpatch
 from ..motion import render as motion
-from ..motion import spec as mspec
-from .core_nodes import (SYNC_TOLERANCE_SEC, StoryNode, _JobProgress, _ev,
-                         _frame_spotcheck, _obj, _resolve_target_duration)
-from .motion_plan import _source_errors, plan_payload
+from .core_nodes import (StoryNode, _ev, _frame_spotcheck,
+                         _resolve_target_duration, new_patch_scope_id)
+from .motion_plan import source_gate
 
-#: 目标时长的硬闸倍数：估算区间整体偏离到这个份上就别开工——逐帧截图按帧计费，
+#: 目标时长的硬闸倍数：估算区间整体偏离到这个份上就别开工——一次渲染是分钟级，
 #: 「先渲二十分钟再告诉你比目标长一倍」不是把关。
 BLOCK_LONG_FACTOR = 1.6
 BLOCK_SHORT_FACTOR = 0.5
 
 #: 每镜至少比自己的声音多留这么多秒（渲染层的呼吸余量是 0.10+0.35，留 0.05 给取整）
 BREATH_FLOOR_SEC = 0.40
+
+
+async def read_spec_input(state: NodeState, inputs: dict[str, Any]) -> Any:
+    """``spec`` 的三种来路：入参 → Store 里的 ``plan_motion`` → repo 里那一份（跨轮回）。
+
+    抽成一个函数而不是每个出片节点各写一遍：这三层回落是真机一件件补出来的（同一条
+    run 里 Store 还没落、跨轮续跑时只有 repo 有），少一层就变成「明明分过镜却说没分过」。
+    出片与局部改读的是同一份 ``plan_motion``，取数逻辑必须同源。
+    拿不到时回 ``None``——由调用方决定报哪句错（错误文案要带自己的节点名）。
+    """
+    raw = inputs.get("spec")
+    if isinstance(raw, Mapping) and raw:
+        return raw
+    raw = (await state.store.get("plan_motion") or {}).get("motion_spec")
+    if isinstance(raw, Mapping) and raw:
+        return raw
+    repo = getattr(state.store, "repo", None)
+    if repo is not None:
+        fresh = await repo.get("plan_motion")
+        if isinstance(fresh, Mapping):
+            return fresh.get("motion_spec")
+    return None
 
 
 class _ObjectShotCache(motion.ShotCache):
@@ -94,84 +119,40 @@ class _ObjectShotCache(motion.ShotCache):
                                   content_type=self._TYPES[name])
 
 
-class RenderMotionVideoNode(StoryNode):
-    name = "render_motion_video"
-    display_name = "图形科普片出片"
-    description = (
-        "没有素材也能出片：把分镜 spec 的文案排成版式画面（headless 浏览器逐帧截图），"
-        "镜头长度由真实 TTS 时长决定（话没说完画面不会切走），字幕逐词点亮，"
-        "人声起时 BGM 自动压低。适用：科普/历史/概念解释类短片，或用户明确说「没有素材，"
-        "你自己查资料写文案配画面」。有素材的剪辑仍走 plan_timeline → render_video。"
-        "spec 由 plan_motion 产出，也可自行手写。渲染是分钟级到十分钟级：返回 "
-        "status=queued/running 时须继续调 render_status（同 artifact_id）直到 done/failed")
-    required_nodes: list[str] = ["plan_motion"]
+class MotionRenderBase(StoryNode):
+    """出片类节点的共用件：inline 出处闸、BGM 归属、抽帧证据、代表帧发布。
+
+    这一族自己**不渲像素**：``_render`` / ``_result`` / ``_publish_hitmap`` / ``_percent``
+    由具体链的子类给出（见 ``motion_code_nodes.RenderCodeMotionVideoNode``）。
+    """
+
     # media_url 是一条一小时后就读不通的 presigned 直链：只回调用方，不落进共享库
     ephemeral = ("media_url",)
-    input_schema = _obj("零素材图形科普片出片", {
-        "spec": {
-            **mspec.spec_schema(),
-            "description": "分镜 spec（plan_motion 的产物；缺省从 Store 的 plan_motion 取，"
-                           "也可按下面的结构手写）。**别写每镜 duration_sec**——有旁白时"
-                           "时钟归声音，写了只被当作下限参考。"
-                           "aspect/fps/narration/voice/rate/subtitle_mode/texture 也能走下面的"
-                           "顶层开关，顶层的优先（用户在计划卡上勾的那一份）。"
-                           "texture 是整片一层的母带滤镜，换它只重过一遍母带，不重烧镜头",
-        },
-        **mspec.knob_props(),
-        "bgm": {
-            "type": "string",
-            "description": "背景音乐：消息附件/曲库歌曲的 material_id，或 select_bgm 返回的"
-                           " obj: 引用（覆盖 spec.bgm.ref）。传了就**必须**取得到字节，"
-                           "取不到直接失败——用户点了某条 BGM 却静默出成无声片是骗人。"
-                           "不传则按 spec.bgm.ref；两者都没有＝纯人声",
-        },
-        "target_duration_sec": {
-            "type": "number",
-            "description": "用户要的目标秒数。渲之前按字数估一遍，偏离太离谱（估算下限超目标 "
-                           "1.6 倍、或上限不足目标一半）就拦下不烧像素，回「该删镜还是加镜」的账",
-        },
-        "wait_sec": {
-            "type": "number",
-            "description": "本次调用内联等待的秒数（缺省用 [capabilities].render_grace_sec，"
-                           "上限 render_wait_max_sec）。传 0 表示只提交不等",
-        },
-    })
+    required_nodes: list[str] = ["plan_motion"]
 
-    async def process(self, state: NodeState, inputs: dict[str, Any]) -> dict[str, Any]:
-        raw = inputs.get("spec")
-        if not isinstance(raw, Mapping) or not raw:
-            raw = (await state.store.get("plan_motion") or {}).get("motion_spec")
-        if not isinstance(raw, Mapping) or not raw:
-            repo = getattr(state.store, "repo", None)
-            if repo is not None:
-                fresh = await repo.get("plan_motion")
-                if isinstance(fresh, Mapping):
-                    raw = fresh.get("motion_spec")
-        if not isinstance(raw, Mapping) or not raw:
+    async def _gate_inline(self, state: NodeState, inputs: dict[str, Any],
+                           spec: dict[str, Any], errors: list[str]) -> None:
+        """渲染口拿到的是**没过过分镜闸的那一份**时，就地补走一次出处闸。
+
+        为什么需要：``required_nodes=["plan_motion"]`` 保证的是「这个会话分过镜」，
+        不是「本次渲的就是那份分镜」。``read_spec_input`` 的第一层回落是**入参里的
+        inline spec**，它盖在 Store 那份上面——于是「分镜时查过出处，渲时换成一套没查过的
+        数字」这条路本来一直畅通（真机查出来时两条图形链都通）。这不是往渲染节点里再写
+        一遍判据：判据只有 ``motion_plan.source_gate`` 这一份，这里多出来的只是一个调用点。
+
+        分镜本身已经不合法时不走这一步：那种 spec 交给闸只会把「校验没通过」掩盖成
+        「出处有问题」，而调用方需要先看到前者。
+        """
+        inline = inputs.get("spec")
+        if errors or not (isinstance(inline, Mapping) and inline):
+            return
+        cited, _states = await source_gate(state.session_id, spec.get("shots") or [])
+        if cited:
             raise ValueError(
-                "render_motion_video：没有 spec 参数，Store 里也没有 plan_motion 产物——"
-                "先调 plan_motion 出分镜，或把 spec 直接传进来")
-        # 顶层开关再并一次：用户可能只在出片这一步改了画幅/帧率/音色，而 Store 里那份
-        # 是分镜时落的。并完照旧过 validate_spec——越界的值不会走到烧像素那一步。
-        spec, errors = mspec.validate_spec(mspec.overlay_knobs(dict(raw), inputs))
-
-        sess, artifact = state.session_id, state.artifact_id or "_default"
-        jobs = self.storage.render_jobs
-        # 与 render_video 同一条口径：**先开任务行**再校验。失败必须留下一行 failed，
-        # 否则「这次出片没成」在界面与 render_status 里压根不存在，错误就消失了。
-        row = await jobs.open(sess, artifact)
-        attempt = str((row or {}).get("attempt") or "")
-        try:
-            out = await self._render(
-                state, spec, errors,
-                target=_resolve_target_duration(state, inputs, None),
-                bgm_ref=str(inputs.get("bgm") or ""),
-                sess=sess, artifact=artifact, jobs=jobs, attempt=attempt)
-        except Exception as exc:
-            await jobs.fail(sess, artifact, str(exc)[:500], attempt or None)
-            raise
-        return {**out,
-                "media_url": await self.storage.objects.presign_get(out["video"])}
+                "出处闸未通过，一帧都没开始渲（这次传的是 inline 分镜，没经过 plan_motion，"
+                "所以在这里当场对账；本会话真打开过的页面才算出处）：\n"
+                + "\n".join(f"  · {e}" for e in cited[:12])
+                + (f"\n  · …另有 {len(cited) - 12} 条同类错误" if len(cited) > 12 else ""))
 
     async def _bgm_ref(self, state: NodeState, value: str) -> str:
         """bgm 入参 → 能取到字节的引用。两种写法都收：``obj:`` 引用、素材 material_id。
@@ -188,139 +169,6 @@ class RenderMotionVideoNode(StoryNode):
         if not got:
             raise ValueError(f"没有这条配乐素材：{value}")
         return to_ref(got[0]["object_key"])
-
-    async def _asset_ref(self, state: NodeState, value: str) -> str:
-        """素材引用 → 能取到字节的 ``obj:`` 引用（``material_id`` 也收）。"""
-        if value.startswith("obj:"):
-            return value
-        got, _denied = await self.storage.materials.resolve(
-            [value], user_id=state.user_id, conv_id=state.conversation_id or None)
-        if not got:
-            raise ValueError(f"没有这条素材：{value}")
-        return to_ref(got[0]["object_key"])
-
-    async def _overlay_assets(self, state: NodeState,
-                              spec: dict[str, Any]) -> dict[str, Path]:
-        """各镜叠加图片层的 ref → 本机文件（``{原始 ref: 路径}``，浏览器只吃路径）。
-
-        取不到字节就**整批在开渲之前拒收**，不等渲染到那一镜才发现：一张铺满画面的
-        背景层取不到图，用户看到的还是原来那张纸，而像素已经烧完、缓存也已经按这一镜
-        钉上——那一版片子会一直带着这个「改了却没变」的假象。
-        归属交给 ``materials.resolve`` 判：别人会话里的 material_id 一律算不存在。
-        """
-        want: list[str] = []
-        for shot in spec.get("shots") or []:
-            for lay in (shot.get("overlay") or []):
-                if isinstance(lay, dict) and str(lay.get("type")) == "image":
-                    ref = str(lay.get("ref") or "")
-                    if ref and ref not in want:
-                        want.append(ref)
-        out: dict[str, Path] = {}
-        bad: list[str] = []
-        for ref in want:
-            try:
-                out[ref] = await self._local(
-                    state, await self._asset_ref(state, ref), "motion", "ovl")
-            except Exception as exc:      # noqa: BLE001 - 一次说完缺哪几张，别挤牙膏
-                bad.append(f"{ref}（{type(exc).__name__}: {str(exc)[:120]}）")
-        if bad:
-            raise ValueError(
-                "叠加图层里的图片取不到字节：" + "、".join(bad)
-                + "——ref 写素材库的 material_id 或 obj: 引用；"
-                  "换一张能取到的图，或去掉这一层")
-        return out
-
-    async def _render(self, state: NodeState, spec: dict[str, Any],
-                      errors: list[str], *, target: float | None, bgm_ref: str,
-                      sess: str, artifact: str, jobs: Any,
-                      attempt: str, gate_note: str = "") -> dict[str, Any]:
-        if errors:
-            raise ValueError(
-                f"{gate_note}spec 校验未通过，一帧都没开始渲（照清单改完再来）：\n"
-                + "\n".join(f"  · {e}" for e in errors[:12])
-                + (f"\n  · …另有 {len(errors) - 12} 条同类错误" if len(errors) > 12 else ""))
-
-        low, high = mspec.estimate_sec(spec)
-        n = len(spec.get("shots") or [])
-        if target and (low > target * BLOCK_LONG_FACTOR or high < target * BLOCK_SHORT_FACTOR):
-            too_long = low > target * BLOCK_LONG_FACTOR
-            suggest = (f"删到约 {max(1, round(n * target / max(high, 0.1)))} 镜，"
-                       f"或把每镜文案缩短"
-                       if too_long else
-                       f"加到约 {max(n + 1, round(n * target / max(low, 0.1)))} 镜，"
-                       f"或放慢语速")
-            raise ValueError(
-                f"目标 {target:.0f}s，但这份分镜按字数估 {low:.0f}~{high:.0f}s（{n} 镜），"
-                f"偏离超过闸值——逐帧截图烧不起这一次：{suggest}。改完重调本工具")
-
-        bgm_conf = spec.get("bgm") or {}
-        ref = bgm_ref or str(bgm_conf.get("ref") or "")
-        bgm_path: Path | None = None
-        if ref:
-            try:
-                bgm_path = await self._local(state, await self._bgm_ref(state, ref),
-                                             "motion", "bgm")
-            except Exception as exc:
-                raise ValueError(
-                    f"BGM 取不到字节：{ref}（{type(exc).__name__}: {str(exc)[:160]}）"
-                    "——改传消息附件/曲库的 material_id，或 select_bgm 返回的 obj: 引用；"
-                    "或去掉 bgm 出纯人声片") from exc
-
-        work = self._work(state, "motion")
-        assets = await self._overlay_assets(state, spec)
-        total = max(1, len(spec.get("shots") or []))
-        probe = _JobProgress(jobs, asyncio.get_running_loop(), sess, artifact, attempt)
-        done = {"n": 0, "pct": -1}
-
-        async def on_event(ev: dict[str, Any]) -> None:
-            stage, pct = self._percent(ev, total, done["n"])
-            if stage == "shot":
-                done["n"] = int(ev.get("done") or 0)
-            if pct != done["pct"]:        # 帧级事件每 0.8 秒来一次，同值不写库
-                done["pct"] = pct
-                probe(stage, pct)
-
-        try:
-            out = await motion.render_motion(
-                spec, providers=self.providers, work=work, bgm=bgm_path,
-                progress=on_event, assets=assets,
-                cache=_ObjectShotCache(self.storage.workspace, sess))
-            await probe.drain()           # 迟到进度不能盖掉后面的终态
-            frames, frame_reason = await self._spotcheck(state, out)
-            object_key = f"renders/{_safe(sess)}/{_safe(artifact)}/motion.mp4"
-            await self.storage.workspace.publish(str(out["video"]), object_key,
-                                                 content_type="video/mp4")
-            shot_frames = await self._publish_frames(out, sess=sess, artifact=artifact)
-            hits_key = await self._publish_hitmap(state, spec, out,
-                                                  sess=sess, artifact=artifact,
-                                                  frames=shot_frames)
-        finally:
-            await probe.drain()
-            # 帧目录是纯垃圾（一次渲染上千张 PNG），成片已进对象存储——成败都收回，
-            # 不像 render_video 那样留源片中转字节：这条链路没有源片。
-            self.storage.workspace.cleanup(sess, state.artifact_id, "motion")
-
-        result = self._result(spec, out, target=target, low_high=(low, high),
-                              warnings=mspec.check_target(spec, target),
-                              bgm_ref=ref, object_key=object_key,
-                              frames=frames, frame_reason=frame_reason,
-                              hitmap_ref=hits_key,
-                              shot_frames=shot_frames,
-                              hitmap_errors=list(out.get("hitmap_errors") or []))
-        # 成片入素材库：这条路径没有素材，产物就是这条片子的唯一交付物，
-        # 不入库就只是「会话删掉一起没」的临时字节。入库失败只补一句说明——
-        # 像素已经烧出来了，记账失败不该把一次成功渲染改判成失败。
-        mat_id, mat_note = await register_render(
-            self.storage, sess, object_key,
-            title=str(spec.get("title") or "未命名"),
-            duration_sec=float(out["duration"]))
-        if mat_id:
-            result["material_id"] = mat_id
-        if mat_note:
-            result.setdefault("notes", []).append(mat_note)
-        await jobs.succeed(sess, artifact, object_key, float(out["duration"]),
-                           result=result, attempt=attempt or None)
-        return result
 
     async def _publish_frames(self, out: dict[str, Any], *,
                               sess: str, artifact: str) -> dict[str, str]:
@@ -348,82 +196,6 @@ class RenderMotionVideoNode(StoryNode):
                     f"{sid}：代表帧没发布（{type(exc).__name__}: {str(exc)[:120]}）")
         return refs
 
-    async def _publish_hitmap(self, state: NodeState, spec: dict[str, Any],
-                              out: dict[str, Any], *, sess: str, artifact: str,
-                              frames: dict[str, str] | None = None) -> str:
-        """命中表落对象存储，返回对象键（落不成回空串，不牵连这次出片）。
-
-        为什么不塞进 ``motion_ledger``：那是给模型看的工具返回。一张命中表有几百条带
-        像素盒与计算样式的条目，模型既不需要它、也不该照着它改字段——它是前端画选区、
-        以及局部改那一头验指纹的原料，走 HTTP 直读，不经模型的上下文。
-
-        文件必须**自足**：除了框与指针，还带上**这一版分镜本身**、它的指纹与逐镜秒数。
-        少了指纹与 spec，局部改就无从判断这张表是不是当前这版分镜量出来的，只能退回去
-        拿会话里的 ``plan_motion`` 猜「这一版片子当初渲的是什么」——而那份可能被后来的
-        分镜覆盖过；少了秒数，前端得回头拼时间线，而拼出来的偏移与成片差多少没人知道。
-        """
-        tables = out.get("hitmap") or {}
-        if not tables:
-            return ""
-        timeline, start = [], 0.0
-        for rec in out["shots"]:
-            sec = float(rec.get("sec") or 0.0)
-            sid = rec.get("id")
-            timeline.append({"id": sid, "sec": sec,
-                             "start_sec": round(start, 3),
-                             "speech_sec": rec.get("speech_sec"),
-                             "settle_ms": rec.get("settle_ms"),
-                             "cached": bool(rec.get("cached")),
-                             "cache_key": rec.get("cache_key") or "",
-                             "frame": (frames or {}).get(sid) or ""})
-            start += sec
-        payload = {
-            "schema": "motion-hitmap/1",
-            "spec": spec,
-            "spec_fingerprint": mhit.fingerprint(spec),
-            "hit_mode": "space",             # 与口播链的 "track" 相对：这条有像素命中层
-            "editable_fields": {"shot": list(mpatch.EDITABLE_SHOT_FIELDS)},
-            "controls": mspec.form_controls(),
-            "width": int(out["width"]), "height": int(out["height"]),
-            "fps": float(out["fps"]), "duration": float(out["duration"]),
-            "settle_unit": "shot_relative_ms",
-            "timeline": timeline, "shots": tables,
-        }
-        path = self._work(state, "motion") / "hitmap.json"
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload, ensure_ascii=False),
-                            encoding="utf-8")
-            key = f"renders/{_safe(sess)}/{_safe(artifact)}/hitmap.json"
-            await self.storage.workspace.publish(str(path), key,
-                                                 content_type="application/json")
-            return key
-        except Exception as exc:  # noqa: BLE001 - 命中表是编辑用的附加产物
-            out.setdefault("hitmap_errors", []).append(
-                f"命中表没落进对象存储（{type(exc).__name__}: {str(exc)[:160]}）："
-                "成片照常，但这次不能按区域选着改")
-            return ""
-
-    @staticmethod
-    def _percent(ev: dict[str, Any], total: int, done_shots: int) -> tuple[str, int]:
-        """事件 → (阶段名, 百分比)。0~4 给窗口校准，93/96 给拼接与混音，中间 88% 按镜头走。
-
-        帧级事件只推进「本镜内部」那一小段，所以整片百分比永远单调：
-        一镜的最后一帧不会比下一镜的第一帧更高。
-        """
-        stage = str(ev.get("stage") or "motion")
-        if stage == "shot":
-            return stage, 4 + int(88 * int(ev.get("done") or 0) / total)
-        if stage == "capture":
-            frames = max(1, int(ev.get("shot_frames") or 1))
-            frac = min(1.0, float(ev.get("frame") or 0) / frames)
-            return stage, 4 + int(88 * (done_shots + frac) / total)
-        if stage == "assemble":
-            return stage, 93
-        if stage == "mux":
-            return stage, 96
-        return stage, 2
-
     async def _spotcheck(self, state: NodeState,
                          out: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
         """从**要发布的那个文件**真取几帧：机器能够到的最高一级证据。
@@ -440,156 +212,13 @@ class RenderMotionVideoNode(StoryNode):
             return None, (f"抽帧这一步没跑成（{type(exc).__name__}: {str(exc)[:160]}），"
                           "所以「不是黑屏/画面在不在动」没有像素级证据")
 
-    def _result(self, spec: dict[str, Any], out: dict[str, Any], *,
-                target: float | None, low_high: tuple[float, float],
-                warnings: list[str], bgm_ref: str, object_key: str,
-                frames: Mapping[str, Any] | None, frame_reason: str,
-                hitmap_ref: str = "",
-                shot_frames: Mapping[str, str] | None = None,
-                hitmap_errors: list[str] | None = None) -> dict[str, Any]:
-        ledger = out["shots"]
-        want = (int(spec["width"]), int(spec["height"]), float(spec["fps"]))
-        got = (int(out["width"]), int(out["height"]), float(out["fps"]))
-        voiced = [r for r in ledger if int(r.get("words") or 0) > 0]
-        held = [r for r in voiced
-                if float(r["sec"]) >= float(r["speech_sec"]) + BREATH_FLOOR_SEC]
-        degraded = list(out.get("degraded") or [])
-        drift = float(out.get("av_drift_sec") or 0.0)
-        tol = SYNC_TOLERANCE_SEC
-        words = sum(int(r.get("words") or 0) for r in ledger)
-        copied = sum(int(r["frames"]) - int(r["captured_frames"]) for r in ledger)
 
-        pixel_ok = bool(frames) and not frames.get("black_indices")
-        published = int(out.get("published_frames") or 0)
-        cached = [r for r in ledger if r.get("cached")]
-        refs = dict(shot_frames or {})
-        evidence = [
-            _ev(f"成片字节量到的：{got[0]}x{got[1]}@{got[2]:g}fps、{out['duration']:.1f}s、"
-                f"{len(ledger)} 镜 {published} 帧"
-                f"（本次逐帧截图 {out['frames_total']} 帧，其中 "
-                f"{copied} 帧是动画停摆后复用末帧省下的；复用切片的不计帧数；"
-                f"每镜画面按语音时长收口，所以成片少于计划）",
-                "machine", verified=got == want,
-                proof="probe 的就是要发布的那个文件，与 spec 要求一致" if got == want
-                else f"与 spec 要求 {want[0]}x{want[1]}@{want[2]:g} 不符"),
-            _ev(f"时钟归声音：{len(held)}/{len(voiced)} 个带声镜头的长度 ≥ 自己语音时长 + "
-                f"{BREATH_FLOOR_SEC}s，没有一镜在话说到一半时切走",
-                "machine", verified=bool(voiced) and len(held) == len(voiced),
-                proof="每镜秒数由 TTS 实测回填（不是模型写的 duration_sec）"
-                if voiced else "这份分镜没有带旁白的镜头（narration=false）"),
-            _ev(f"字幕逐词点亮：{words} 个词锚在 TTS 返回的词时间戳上",
-                "machine", verified=bool(voiced),
-                proof="align_words 按文案顺序把词时间戳贴到字上，页面上是 data-at 属性"
-                if voiced else "没有旁白就没有词时间戳，字幕退化成整条显示"),
-            _ev(f"混音走的是 {out['mix_mode']}"
-                + (f"（BGM={bgm_ref}，人声起时压低）" if "duck" in out["mix_mode"] else ""),
-                "machine", verified=True,
-                proof="sidechaincompress 压的是 BGM 那一路，触发信号是人声"
-                if "duck" in out["mix_mode"] else "本次没有 BGM 输入"),
-            _ev(f"音画漂移 {drift:.3f}s（闸值 {tol}s）",
-                "machine", verified=drift <= tol,
-                proof="拼接与混音都按主轨时长收口，量的是成片与母带之差"),
-            _ev("TTS 全部走通，没有静音降级的镜头",
-                "machine", verified=not degraded,
-                proof="降级会逐镜记在 motion_ledger[].degraded" if not degraded
-                else "；".join(degraded[:3])),
-        ]
-        texture = str(out.get("texture") or "none")
-        chain = str(out.get("texture_filter") or "")
-        if texture == "none":
-            evidence.append(_ev("整片质感：没加（母带原样直出）", "machine",
-                                verified=True, proof="texture=none 时那一趟直接 -c copy 跳过"))
-        else:
-            evidence.append(_ev(
-                f"整片质感：{texture} 档"
-                + (f"，实际消费的滤镜链 {chain[:70]}…" if chain else "，但滤镜链是空的"),
-                "machine", verified=bool(chain),
-                proof="质感挂在母带那一层（与 BGM 同层）：换档只重过一遍母带，不重烧任何镜头；"
-                      "串跑没跑得出这行账，好不好看仍是人眼的事"
-                if chain else f"选了 {texture} 却没拿到滤镜串——成片是原片，请核对 "
-                              f"render.TEXTURE_FILTERS 里有没有这一档"))
-        if frames:
-            evidence.append(_ev(
-                f"抽帧实测不黑屏：取样点 {frames['at']}s 的亮度 "
-                f"{frames['luma']}（最低 {frames['min_luma']}）",
-                "frame", verified=pixel_ok,
-                proof="ffmpeg 出灰度裸流按字节算均值" if pixel_ok else "有取样点亮度低于 6"))
-            evidence.append(_ev("画面在动（取样点之间像素不同）", "frame",
-                                verified=bool(frames.get("distinct")),
-                                proof="三个取样点的灰度指纹互不相同"
-                                if frames.get("distinct") else
-                                "取样点撞进了同一张静止版式——这类片子本就常停着读字，"
-                                "要确认动感请看中间几秒"))
-        else:
-            evidence.append(_ev("抽帧看有没有黑屏", "frame", verified=False,
-                                proof=frame_reason))
-        tables = out.get("hitmap") or {}
-        elems = sum(len(tab.get("entries") or []) for tab in tables.values())
-        anchored = sum(int(tab.get("resolved") or 0) for tab in tables.values())
-        hit_errors = list(hitmap_errors or [])
-        evidence.append(_ev(
-            f"按区域选着改的命中表：{len(tables)} 镜 {elems} 个可见元素已量到位置，"
-            f"其中 {anchored} 个能确定对回分镜字段（其余只给「改这一镜」的入口，"
-            f"不猜字段）",
-            "machine", verified=bool(hitmap_ref),
-            proof="框由页面自己 getBoundingClientRect 量、归一化到画面带；"
-                  "字段按文本在 role 圈定的范围内反查，对不上就标 none"
-            if hitmap_ref else "；".join(hit_errors[:3]) or "命中表没有落进对象存储"))
-        saved = sum(int(r["frames"]) for r in cached)
-        evidence.append(_ev(
-            f"按镜切片缓存：{len(cached)}/{len(ledger)} 镜直接复用了已有切片"
-            f"（省掉 {saved} 次逐帧截图的浏览器启动）",
-            "machine", verified=True,
-            proof="缓存键 =「这一镜的内容 + 决定排版与配音的顶层开关」的哈希；"
-                  "改一个字即未命中，只重烧那一镜。换 BGM 不动切片"
-                  if cached else
-                  "首次出片，每镜都真烧了一遍；同一会话里再渲相同镜头就会命中"))
-        evidence.append(_ev(
-            f"每镜代表帧已留存 {len(refs)}/{len(ledger)}（时间线缩略图与改前改后对比取它）",
-            "machine", verified=len(refs) == len(ledger) and bool(ledger),
-            proof="取入场落定（settle）那一帧，与命中表量的是同一时刻"
-                  if len(refs) == len(ledger) else
-                  f"缺：{sorted({str(r['id']) for r in ledger} - set(refs))}"))
-        evidence += [
-            _ev("听感：语速舒不舒服、BGM 压得够不够、有没有爆音", "listening",
-                verified=False, proof="机器没有听觉——音量曲线只能证明压了，不能证明好听"),
-            _ev("版式对不对味：印章有没有压住字、留白与断行好不好看", "eyeball",
-                verified=False, proof="抽帧只比亮度与指纹，读不出排版，需要人这一眼"),
-            _ev("内容对不对题、史实与数字准不准", "eyeball", verified=False,
-                proof="spec.shots[].source 记了出处，但机器不判真伪"),
-        ]
-        return {
-            "video": object_key,
-            "duration": out["duration"],
-            "width": out["width"],
-            "height": out["height"],
-            "fps": out["fps"],
-            "title": spec.get("title") or "未命名",
-            "style": spec.get("style"),
-            "mix_mode": out["mix_mode"],
-            "texture": str(out.get("texture") or "none"),
-            "frames_total": out["frames_total"],
-            "motion_ledger": ledger,
-            "hitmap": hitmap_ref,
-            "cached_shots": len(cached),
-            "shot_frames": refs,
-            "hitmap_errors": hit_errors,
-            "degraded": degraded,
-            "target_duration_sec": target,
-            "estimated_sec": list(low_high),
-            "target_warnings": warnings,
-            "evidence": evidence,
-            "evidence_rule": "只有 status=verified 的条目能对用户声称验过；"
-                             "UNVERIFIED 的那几条要如实说没验过，别替它们背书",
-        }
-
-
-class PatchMotionVideoNode(RenderMotionVideoNode):
-    """局部改（选区改后端）：按命中表给的指针改几格，只重烧受影响的那几镜。
+class MotionPatchBase(MotionRenderBase):
+    """局部改（选区改后端）的共用编排：按指针改几格，只重烧受影响的那几镜。
 
     为什么复用出片节点而不是另写一条渲染路：局部改的全部价值就在于**它走的是同一条
-    流水线**——同一套闸门（validate_spec、目标时长、音画同步、抽帧证据）、同一种产物
-    形状、同一份按镜切片缓存。另写一条必然出现「局部改出来的这一版少了某道校验」
+    流水线**——同一套闸门（分镜校验、目标时长、音画同步、抽帧证据）、同一种产物形状、
+    同一份按镜切片缓存。另写一条必然出现「局部改出来的这一版少了某道校验」
     这种漂移，而漂移要到抽帧时才看得见，那时像素已经烧完。
 
     真正的差异只有三处，全在这一层：
@@ -599,95 +228,35 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
     * **落在哪个产物号**：分叉成一个新作用域，旧版的成片/表/代表帧一个字节都不动
       （所以「改坏了回去」不需要重渲，直接播旧版）；
     * **多出来的那份账**：改了哪几镜、真烧了几镜、旧版还在不在原位。
+
+    下面五样是**链专属数据源**，由具体链的子类赋值（见
+    ``motion_code_nodes.PatchCodeMotionVideoNode``）：装配器、校验器、产物形状装配函数、
+    链身份，以及三处要点名工具名的文案。做成类属性而不是在 ``process`` 里 ``if 链名: …``
+    的理由在文件头。
     """
 
-    name = "patch_motion_video"
-    display_name = "图形科普片局部改"
-    description = (
-        "改一版**已经出过片**的图形科普片，不重做分镜也不整片重渲：edits 按命中表给的"
-        "指针改某几格（画面上的字、图示里的数值、字幕文案），shot_sets 整镜改写"
-        "（给一张卡补上它缺的那一栏），remove_shots 删镜，reorder 重排顺序。"
-        "只有受影响的那几镜重新烧像素，其余镜头直接复用已有切片，然后重新拼接、混音，"
-        "产出一条**新版本**（新 artifact_id）——旧版原样留着，可以逐镜比较也可以直接回去。"
-        "必须带 base_artifact_id，且它自带的命中表指纹要与所改的那版分镜一致；"
-        "不一致就是「拿着旧表改新片」，会被拒收，此时唯一出路是重新出片（顺带重新量表）。"
-        "画幅/帧率/音色/语速/字幕形态不在本工具范围内：改它们等于每一镜都要重烧，"
-        "那是重新出片而不是局部改——质感与配乐是例外，两者都挂在母带那一层，"
-        "换它们一镜都不重烧，所以本工具收 texture 与 bgm。"
-        "改完的清单照旧过分镜闸门（版式空壳、高亮词不是文案子串、"
-        "这张卡不读的 visual 死键、枚举越界都会带镜号退回，且不烧像素）。"
-        "渲染是分钟级：返回 status=queued/running 时须继续调 render_status"
-        "（同 artifact_id）直到 done/failed")
+    payload_builder: Any
+    patch_validator: Any
+    patch_planner: Any
+    #: base 那一版编辑包必须声明的链。
+    patch_chain: str
+    #: 退回文案里那句「请重新出片」要点名的工具名。
+    patch_render_node: str
+    #: 证据文案里那句「缓存键在哪把函数里算」的出处。它不参与任何判定，只是必须说真话。
+    patch_cache_key_fn: str
+    #: 分叉之后写给模型的下一次指引。各链点名自己的 patch 节点，共用一份文案
+    #: 就是教它调错一条链的工具——那会撞上「链身份不符」，看起来像 bug。
+    patch_next_hint: str
+
     # 没有 DAG 上游：要改的东西全在 base_artifact_id 指向的那一版里，
-    # 而 required_nodes 一旦写了 render_motion_video，拦截器补齐依赖时会**重跑一次整片出片**。
+    # 而 required_nodes 一旦写了出片节点，拦截器补齐依赖时会**重跑一次整片出片**。
     required_nodes: list[str] = []
     require_explicit_call = True
-    ephemeral = ("media_url",)
-    input_schema = _obj("图形科普片局部改（只重烧受影响的镜）", {
-        "base_artifact_id": {
-            "type": "string",
-            "description": "要改的那一版成片的产物号（render_motion_video 或"
-                           " patch_motion_video 返回体顶层的 artifact_id）。"
-                           "这一版必须带命中表——没有表就不知道屏幕上这一块对回哪一格",
-        },
-        "edits": {
-            "type": "array",
-            "description": "逐格改值。每条 {pointer, value[, shot]}：pointer **必须原样取自"
-                           "命中表条目的 field**（形如 /shots/1/visual/levels/2/value），"
-                           "不自己拼字段名；value 是这一格的新值；shot 建议带上该条目的镜号"
-                           "（带了指针与镜号不符就拒收，防止拿旧表改新片）。"
-                           "只认已有字段：要给一镜补上原本没有的一栏请走 shot_sets",
-            "items": {"type": "object",
-                      "properties": {
-                          "pointer": {"type": "string"},
-                          "value": {"description": "这一格的新值（类型按分镜契约：图示的 "
-                                                   "value/x/y 必须是数字）"},
-                          "shot": {"type": "string"}},
-                      "required": ["pointer", "value"]},
-        },
-        "shot_sets": {
-            "type": "array",
-            "description": "整镜改写。每条 {shot, set}：set 里给这镜要改的那几栏"
-                           f"（可改字段：{', '.join(mpatch.EDITABLE_SHOT_FIELDS)}）。"
-                           "与 edits 的区别是这里**允许新增**这张卡认识的键"
-                           "（比如给 archive 卡补 visual.line3）；镜号 id 不许改——"
-                           "它是命中表、按镜缓存与对比帧共同的锚点",
-            "items": {"type": "object",
-                      "properties": {"shot": {"type": "string"},
-                                     "set": {"type": "object"}},
-                      "required": ["shot", "set"]},
-        },
-        "remove_shots": {
-            "type": "array", "items": {"type": "string"},
-            "description": "按镜号删镜（不许删光）。删掉的镜的旧代表帧仍在 base 那一版里",
-        },
-        "reorder": {
-            "type": "array", "items": {"type": "string"},
-            "description": "重排后的**完整**镜号清单（必须与现有镜号成套，漏一个就当错误）。"
-                           "只做顺序、不改内容，所以一镜都不用重烧——拼接而已",
-        },
-        "bgm": {
-            "type": "string",
-            "description": "换配乐：material_id 或 obj: 引用（覆盖这一版 spec 里的 bgm.ref）。"
-                           "配乐不进按镜缓存键，所以换它只重走混音，一镜都不重烧",
-        },
-        "texture": {
-            "type": "string", "enum": list(mspec.TEXTURES),
-            "description": "换整片质感（覆盖这一版 spec 里的 texture）。与配乐同理："
-                           "它挂在母带那一层、不进按镜缓存键，所以换档**一镜都不重烧**，"
-                           "只重过一遍滤镜；不传就沿用 base 那一版的档",
-        },
-        "target_duration_sec": {
-            "type": "number",
-            "description": "目标秒数。**缺省沿用 base 那一版当初的承诺值**（从它的渲染任务行读），"
-                           "因为「把那个数字改对」不该顺手把时长承诺也换掉；显式传了才改口",
-        },
-        "wait_sec": {
-            "type": "number",
-            "description": "本次调用内联等待的秒数（缺省用 [capabilities].render_grace_sec，"
-                           "上限 render_wait_max_sec）。传 0 表示只提交不等",
-        },
-    }, required=["base_artifact_id"])
+    #: 告诉 MCP 入口：本节点会在体里分叉出一个新产物作用域，渲染任务行必须开在**那个新号**上，
+    #: 而不是调用方传来的号（模型通常不传，于是落到 ``_default``＝base 那一版）。
+    #: 不预发就是「任务行开在 base、终态写在新版」：base 的出片账被抹回 queued，
+    #: 一次成功的局部改在轮询端等不到终态、被看门狗按停滞判死。
+    forks_artifact_scope = True
 
     async def process(self, state: NodeState, inputs: dict[str, Any]) -> dict[str, Any]:
         sess = state.session_id
@@ -700,31 +269,46 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
 
         bundle = await self._bundle(sess, base)
         spec_base, whence, fp = await self._base_spec(sess, base, bundle)
-        patched, report = mpatch.plan_patch(
+        patched, report = self.patch_planner(
             spec_base,
             edits=inputs.get("edits") or (),
             shot_sets=inputs.get("shot_sets") or (),
             remove_shots=inputs.get("remove_shots") or (),
             reorder=inputs.get("reorder") or ())
-        # 质感在这一层覆盖，与 bgm 的「传了才改口」同一条口径：它不进按镜缓存键，
+        # 质感在这一层覆盖（顶层是**整片默认档**，逐镜的 shots[].texture 覆盖它），与 bgm 的
+        # 「传了才改口」同一条口径：它不进按镜缓存键，滤镜跑在取到切片之后的那一趟上，
         # 覆盖它不会让任何一镜重烧，所以「换一档看看」也算局部改。
         want_texture = str(inputs.get("texture") or "").strip()
         if want_texture:
             patched["texture"] = want_texture
+        # 配乐音量与人声压低开关同 texture 一样在烧完像素之后的那一趟上（配乐在母带合流、
+        # 质感在每一镜切片的滤镜上），都不进按镜缓存键，改它们一镜都不重烧，所以也算局部改。
+        bgm_conf = dict(patched.get("bgm") or {})
+        if "bgm_volume" in inputs and inputs["bgm_volume"] is not None:
+            bgm_conf["volume"] = inputs["bgm_volume"]
+        if "bgm_duck" in inputs and inputs["bgm_duck"] is not None:
+            bgm_conf["duck"] = inputs["bgm_duck"]
+        if bgm_conf:
+            patched["bgm"] = bgm_conf
         # 补丁后的分镜照样过出片那道闸门：局部改不是「免检通道」，
-        # 改完照样可能把高亮词改到文案外面、把图示值写成中文。
-        spec, errors = mspec.validate_spec(patched)
+        # 改完照样可能把高亮词改到文案外面、把字段值改到声明区间外面。
+        spec, errors = self.patch_validator(patched)
+        # 落盘之前的链专属闸门。代码镜链在这里**只为代码字节变了的镜**复跑闸①：
+        # 必须跑在校验之后（字段名单要取归一后的那份）、分叉之前（验不过的字节一寸不落）。
+        await self._pre_gate(state, base=spec_base, spec=spec, report=report,
+                             errors=errors)
         # 出处闸只管**本次改到的**镜：闸的职责是拦住「新写上去的猜测冒充查证过的出处」，
         # 而不是替整片重新审计一遍旧账（旧版里那些出处当初已经过一次这道闸）。
         cited_ids = [sid for sid in report["changed_shots"]
                      if any(shot.get("id") == sid and shot.get("source")
                             for shot in spec["shots"])]
-        errors = errors + await self._sources(state, spec, cited_ids)
+        gate_err, gate = await self._sources(state, spec, cited_ids)
+        errors = errors + gate_err
 
         target = _resolve_target_duration(
             state, inputs, await self._base_target(sess, base))
         artifact = await self._fork(state, sess=sess, base=base, spec=spec,
-                                    target=target)
+                                    target=target, gate=gate)
 
         jobs = self.storage.render_jobs
         # 与出片同一条口径：先开任务行再校验，失败必须留下一行 failed，
@@ -758,6 +342,20 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
         return {**out,
                 "media_url": await self.storage.objects.presign_get(out["video"])}
 
+    # ---- 落盘之前的链专属闸门（子类在这里复跑闸①）----
+
+    async def _pre_gate(self, state: NodeState, *, base: dict[str, Any],
+                        spec: dict[str, Any], report: dict[str, Any],
+                        errors: list[str]) -> None:
+        """为什么要留这个位置而不是让子类重写 ``process``：局部改的编排顺序（读哪一版 →
+        装配 → 校验 → 复跑链专属闸 → 出处闸 → 分叉 → 开任务行 → 渲）必须**逐字同序**，
+        子类重写 process 换来的是一条少了某一步的链路，而那一步的缺失只在像素里看得见。
+
+        ``errors`` 是校验已经攒下的退回清单：分镜本身还不合法时子类**不该**拿它去外呼
+        （一份连字段名单都对不上的代码交给闸①，只会把「改错了什么」掩盖成「lint 报错」）。
+        """
+        return None
+
     # ---- 那一版成片自己带的编辑包 ----
 
     async def _bundle(self, sess: str, base: str) -> dict[str, Any]:
@@ -773,7 +371,7 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
                 raise ValueError(
                     f"局部改：{base} 这一版没有命中表（{key} 读不到：出片时没量到，"
                     "或产物已过期）。没有表就不知道屏幕上这一块对应分镜的哪一格，"
-                    "指针只能靠猜——请重新出片（render_motion_video 会顺带重新量表）")
+                    f"指针只能靠猜——请重新出片（{self.patch_render_node} 会顺带重新量表）")
             raw = b"".join([c async for c in self.storage.objects.get_stream(key)])
             bundle = json.loads(raw.decode("utf-8"))
         except ValueError:
@@ -784,6 +382,16 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
                 f"{str(exc)[:160]}）——请重新出片") from exc
         if not isinstance(bundle, dict):
             raise ValueError(f"局部改：{base} 的命中表不是一个对象")
+        # 链身份：这一栏写在表上，是为了让「拿着别的链的表下补丁」在一句话里说清楚，
+        # 而不是让用户得到一份谁都看不懂的退回清单（各链的指针形状不同）。
+        got_chain = str(bundle.get("chain") or "")
+        if got_chain != self.patch_chain:
+            raise ValueError(
+                f"局部改：{base} 这一版的编辑包写的是「{got_chain or '没有链身份'}」，"
+                f"本工具只改「{self.patch_chain}」那一路，且只认 {self.patch_render_node} "
+                "出的片。链身份缺失的那一批是老产物（出片时还没写这一栏），"
+                "它们对应的渲染流水线已经下线——请重新 plan_motion → "
+                f"{self.patch_render_node} 出一版新片子")
         return bundle
 
     async def _base_spec(self, sess: str, base: str,
@@ -791,9 +399,9 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
         """→ (那一版渲的分镜, 从哪儿读到的, 指纹)。
 
         首选编辑包自带的 spec（与表同源，天然是「这一版片子渲的那一份」）；
-        包是这次改动之前出的片（不带 spec）时才退到会话产物，而**退的那一路必须验指纹**：
-        ``plan_motion`` 会被后来的分镜覆盖，拿它冒充旧版就是拿新分镜去配旧命中表，
-        指针落下去改的就是别的字。
+        包是**不带 spec** 的老片子（那一栏是后来才加的）时才退到会话产物，而
+        **退的那一路必须验指纹**：``plan_motion`` 会被后来的分镜覆盖，拿它冒充旧版就是
+        拿新分镜去配旧命中表，指针落下去改的就是别的字。
         """
         fp = str(bundle.get("spec_fingerprint") or "")
         embedded = bundle.get("spec")
@@ -810,23 +418,26 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
             if not spec:
                 raise ValueError(
                     f"局部改：读不到 {base} 这一版渲的是什么分镜——成片自带的编辑包里没有 spec，"
-                    "会话里也没有 plan_motion 产物。请重新 plan_motion → render_motion_video")
+                    f"会话里也没有 plan_motion 产物。请重新 plan_motion → "
+                    f"{self.patch_render_node}")
         got_fp = mhit.fingerprint(spec)
         if not fp or fp != got_fp:
             raise ValueError(
                 f"局部改：{base} 的命中表量的是另一版分镜（表指纹 {fp or '没有'}、"
                 f"读到的分镜指纹 {got_fp}）——中间分镜被改过，指针会把新分镜的字认错。"
-                "重新出片（render_motion_video，会按当前分镜重新量表）是唯一出路")
+                f"重新出片（{self.patch_render_node}，会按当前分镜重新量表）是唯一出路")
         return spec, whence, fp
 
     async def _sources(self, state: NodeState, spec: dict[str, Any],
-                       ids: list[str]) -> list[str]:
-        """只对**本次改到**的镜走出处闸（闸的本体在分镜那一层，这里只是复用同一份判据）。"""
-        if not ids:
-            return []
-        return await _source_errors(
-            state.session_id,
-            [s for s in spec["shots"] if str(s.get("id")) in set(ids)])
+                       ids: list[str]) -> tuple[list[str], dict[str, str]]:
+        """→ (打回清单, 每镜判定)。
+
+        闸只对**本次改到**的镜走（闸的本体在分镜那一层，旧版里那些出处当初已经过一次），
+        判定却整片都标：这一趟之后要把逐镜行改写回 ``plan_motion``，漏标的镜在账上会
+        显示成「没出处」——那是把「查过」写丢，另一种假。
+        """
+        return await source_gate(state.session_id, spec["shots"],
+                                 audit_ids=set(str(i) for i in ids))
 
     async def _base_target(self, sess: str, base: str) -> float | None:
         row = await self.storage.render_jobs.get(sess, base)
@@ -845,7 +456,8 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
     # ---- 分叉：新版本落进新作用域，旧版本一个字节都不动 ----
 
     async def _fork(self, state: NodeState, *, sess: str, base: str,
-                    spec: dict[str, Any], target: float | None) -> str:
+                    spec: dict[str, Any], target: float | None,
+                    gate: dict[str, str] | None = None) -> str:
         """换一份产物作用域，并把改动同步成「会话当前分镜」；→ 新产物号。
 
         为什么必须换作用域：渲染任务行、成片字节、命中表、代表帧全都按 artifact_id 落位，
@@ -853,7 +465,7 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
         而局部改本来就是为了不重渲。
 
         为什么同时把改动写回 ``_default`` 作用域的 plan_motion：那一份是**模型**下一次
-        调 render_motion_video 时读的。不写，就会出现「用户已经局部改过三处，
+        调出片节点时读的。不写，就会出现「用户已经局部改过三处，
         而模型换配乐重渲时把三处改动全丢了」——那是把用户的编辑当草稿。
         旧版片子自己不受影响：它的分镜存在自己那份编辑包里。
         """
@@ -861,11 +473,9 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
         if artifact in ("", "_default") or artifact == base:
             # 等于 base 的那一种必须换号：沿用就是把旧版覆盖掉，而旧版留着才能
             # 「改坏了直接播回去」——那一版片子是这次局部改唯一的退路。
-            artifact = f"p{uuid.uuid4().hex[:8]}"
-        payload = plan_payload(
-            spec, target=target,
-            next_hint="这一版局部改已入库：继续改请带**本次返回的 artifact_id** 再调 "
-                      "patch_motion_video；要大改结构（加镜、换叙事）请重走 plan_motion")
+            artifact = new_patch_scope_id()
+        payload = self.payload_builder(
+            spec, target=target, next_hint=self.patch_next_hint, gate=gate)
         repo = self.storage.artifacts(sess, artifact)
         try:
             # 上游产物整份带进新作用域（拦截器看到 has(dep) 命中，才谈得上只跑这一步）
@@ -929,11 +539,12 @@ class PatchMotionVideoNode(RenderMotionVideoNode):
                 f"（{('、'.join(rebuilt) or '没有')}），"
                 f"其余 {out['cached_shots']} 镜直接复用已有切片",
                 "machine", verified=set(rebuilt) <= expected,
-                proof="缓存键 = 镜头内容 + 全局开关的哈希（见 render.shot_cache_key），"
+                proof="缓存键 = 镜头内容 + 全局开关的哈希（见 "
+                      f"{self.patch_cache_key_fn}），"
                       "没被改动的镜内容一字不差，于是整段跳过"
                 if set(rebuilt) <= expected else
                 f"没改动的镜里有 {sorted(set(rebuilt) - expected)} 被重烧了——"
-                "缓存键漏算了某个影响画面的输入，该修 render.shot_cache_key",
+                f"缓存键漏算了某个影响画面的输入，该修 {self.patch_cache_key_fn}",
             ),
             _ev(f"旧版本没有被覆盖：{base} 的成片"
                 + ("仍在原位" if still_there else "字节已不在")

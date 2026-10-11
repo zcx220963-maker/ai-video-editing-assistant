@@ -53,7 +53,7 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from . import model_probe, secrets, session_gc, uploads
+from . import model_probe, secrets, uploads
 from .agent import Agent
 from .auth import Authenticator
 from .catalog import get_catalog
@@ -64,7 +64,6 @@ from .consumer import CHAT_TOPIC, SessionConsumer, session_key
 from .heartbeat import Heartbeat
 from .ingest import IngestRejected, ingest_bytes
 from .identity import storyline_session_id
-from .hooks import _evidence_view
 from .orchestration import _safe
 from . import judge as judge_mod
 from .llm_openai import (DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_THINKING,
@@ -208,38 +207,33 @@ async def _attachment_views(storage: Storage, user_id: str, conv_id: str,
              "url": await storage.objects.presign_get(m["object_key"])} for m in rows]
 
 
-def _version_id(video: Any = "", hitmap: Any = "", fallback: Any = "") -> str:
-    """这一版成片的版本号：认它自己的对象键，不认 ``artifacts`` 表的列，也不认卡片上带来的号。
+def _render_version(video_key: str) -> str:
+    """成片对象键里的那一段版本名 = 这一版的 ``artifact_id``。
 
-    出片节点写产物只有两种形状——``renders/{会话}/{版本}/…``（图形链的 motion.mp4、
-    hitmap.json、frames/）与 ``renders/{会话}/{版本}.mp4``（口播链），而编辑器取表取帧
-    走的正是 ``renders/{会话}/{artifact_id}/…``。所以对象键里那一段才是「点这张卡要加载
-    哪一版」的唯一答案。
+    为什么认键不认列：局部改的 fork 会把 base 那一版的 render 产物行**整套复制**到新
+    版本号下（对象键仍指 base 目录，字节也就是 base 的字节）。照 ``artifacts.artifact_id``
+    那一列回号，用户点 base 那张卡加载到的就是补丁版的命中表——按旧表下补丁会改错格。
 
-    真机缺口两条，都出在这段身份上：
-      1. 局部改的 fork 会把 base 那一版的 ``render_motion_video`` 行整套复制到新版本号下
-         （字节不动，产物键仍指向 base 目录），照表里的列回号，点 base 卡加载到的是
-         **补丁版**的命中表，指针全改到别的镜上。
-      2. messages 里的持久片段存的是 ``video_object_key``，去重却拿 ``artifact_id`` 比，
-         两边不同域 → 刷新后同一版成片出现两张卡。
+    两种键形状都认：图形代码链 ``renders/{会话}/{版本}/motion.mp4``（版本是一段目录），
+    口播整片 ``renders/{会话}/{版本}.mp4``（版本是文件名，得摘掉扩展名）。
     """
-    for key in (hitmap, video):
-        if not isinstance(key, str) or not key.startswith("renders/"):
-            continue
-        parts = key.split("/")
-        if len(parts) < 3 or not parts[2]:
-            continue
-        seg = parts[2]
-        return seg[:-4] if seg.endswith(".mp4") else seg
-    return str(fallback or "")
+    parts = str(video_key or "").split("/")
+    if len(parts) < 3 or parts[0] != "renders":
+        return ""
+    seg = parts[2]
+    return seg.rsplit(".", 1)[0] if "." in seg else seg
 
 
-async def _render_media_views(storage: Storage, qa: Any) -> list[dict[str, Any]]:
+async def _render_media_views(storage: Storage, qa: Any,
+                              seen_keys: set[str] | None = None) -> list[dict[str, Any]]:
     """assistant 历史里的成片持久链接 → 可播卡片（与 MediaCardHook 当轮回投同形状）。
 
     链接在渲染完成当轮由 MediaCardHook 落进 qa.parts 的 media 片段（存对象键，见 §6 修复）。
     presigned 直链读取时现签，所以刷新后照样能播；形状与实时 WS 的 media 帧一致
     （media_url/title/duration），前端复用同一张卡片组件，无需第二套渲染。
+
+    ``seen_keys`` 会把这里发出的每一键（**对象键**）登记进去——orphan 补卡拿同一个集合
+    去重，两路比得出重复，同一版才不会出两张卡。
     """
     parts = (qa or {}).get("parts") if isinstance(qa, dict) else None
     out: list[dict[str, Any]] = []
@@ -249,11 +243,14 @@ async def _render_media_views(storage: Storage, qa: Any) -> list[dict[str, Any]]
         key = p.get("video_object_key")
         if not isinstance(key, str) or not key:
             continue
+        if seen_keys is not None:
+            seen_keys.add(key)
         out.append({
             "media_url": await storage.objects.presign_get(key),
             "title": p.get("title") or "",
             "duration": p.get("duration"),
-            "artifact_id": _version_id(video=key, fallback=p.get("artifact_id")),
+            # 版本号认对象键里那一段（片段里存的那一份只作兜底）
+            "artifact_id": _render_version(key) or p.get("artifact_id"),
             # 刷新重放也要说得出「这一版能选着改」——判据与当轮 WS 帧同一份
             "hitmap": bool(p.get("hitmap")),
             # 证据分级随卡片一起持久在片段里：刷新后这张卡仍然说得出「哪几条验过」
@@ -263,21 +260,24 @@ async def _render_media_views(storage: Storage, qa: Any) -> list[dict[str, Any]]
 
 
 async def _orphan_render_media(
-    storage: Storage, user_id: str, conv_id: str, seen_versions: set[str],
+    storage: Storage, user_id: str, conv_id: str, seen_keys: set[str],
 ) -> list[dict[str, Any]]:
     """执行轮还在 awaiting_approval 时 assistant 消息没落 messages 表，
     但成片已在 artifacts 里——刷新后从这里补一张可播卡片，不让用户的成片"消失"。
 
-    只补 messages 里还没出现过的（按**版本号**去重，与 ``_render_media_views`` 回给卡片
-    的那一个号同域；早先拿对象键比、那边拿版本号比，两边比不出重复）。
+    只补 messages 里还没出现过的（按 video 对象键去重），避免重复。
     """
     sid = storyline_session_id(user_id, conv_id)
     try:
         rows = await storage.db.select(
             "artifacts",
             where=[Cond("session_id", "eq", sid),
-                   Cond("node", "in", ["render_motion_video", "patch_motion_video",
-                                       "render_video", "patch_video"])],
+                   # 图形链在 P4 换成代码链：出片/局部改落在 *_motion_code 名下。
+                   # 旧声明式链那两枚名字不保留——库里那批行已随 P4 清空（psql 实测
+                   # artifacts.node 只剩 plan_motion / render_motion_code /
+                   # patch_motion_code / render_video），留着只会让人以为还有第二条链。
+                   Cond("node", "in", ["render_motion_code", "patch_motion_code",
+                                       "render_video"])],
             order_by=["-updated_at"], limit=5)
     except Exception:  # noqa: BLE001
         return []
@@ -290,11 +290,9 @@ async def _orphan_render_media(
         if not isinstance(payload, dict):
             continue
         key = payload.get("video") or ""
-        version = _version_id(video=key, hitmap=payload.get("hitmap"),
-                              fallback=row.get("artifact_id") or payload.get("artifact_id"))
-        if not key or not version or version in seen_versions:
+        if not key or key in seen_keys:
             continue
-        seen_versions.add(version)
+        seen_keys.add(key)
         try:
             url = await storage.objects.presign_get(key)
         except Exception:  # noqa: BLE001
@@ -307,11 +305,12 @@ async def _orphan_render_media(
             # ``hitmap && artifact_id``，缺了就等于告诉用户这一版不能选着改。
             # 真机事故：执行轮停在待确认时成片只存在于 artifacts 表（messages 里
             # 还没有 assistant 行），刷新一次按钮就凭空消失——而它刚刚还能用。
-            "artifact_id": version,
+            # 版本号与 _render_media_views 同一口径：**认对象键，不认表里那一列**
+            # （fork 的复制行就顶在这一列上，照它回号 base 卡会加载到补丁版的表）。
+            "artifact_id": (_render_version(key) or row.get("artifact_id")
+                            or payload.get("artifact_id")),
             "hitmap": bool(payload.get("hitmap")),
-            # 卡片只认 {claim,label,verified} 这一份形状，而 artifacts 里存的是节点原始
-            # 出账（status 字段）——不折算就等于把「验过的」全显示成「没验」。
-            "evidence": _evidence_view(payload.get("evidence")),
+            "evidence": list(payload.get("evidence") or []),
         })
     return out
 
@@ -548,7 +547,6 @@ async function load() {
     tb.innerHTML = "";
     for (const s of data.skills) {
       const tr = document.createElement("tr");
-      const tr = document.createElement("tr");
       tr.innerHTML = `<td>${s.name}</td><td>${s.display || "—"}</td>
         <td>${s.always ? "是" : "否"}</td>
         <td class="${s.available ? "ok" : "bad"}">${s.available ? "可用" : (s.unavailable_reason || "不可用")}</td>
@@ -685,13 +683,12 @@ def create_app(
     )
     auth = Authenticator(storage)
 
-    async def _reap_garbage() -> None:
-        """回收「再没人认领」的字节与行：放弃的上传分片 + 对话已不存在的孤儿会话。
+    async def _reap_uploads() -> None:
+        """回收「再没人接着传」的分片：桶里那些字节只有这里会清。
 
         启动先扫一次（与两个服务的启动对账同形），之后按间隔再扫——实例可以几天不重启，
-        只靠启动扫描等于让中途放弃的上传、以及「删对话时渲染还在途所以那次回收被跳过」
-        的产物一直占着桶。扫不动只是垃圾多留一轮，不该拖垮服务，所以异常只记进
-        app.state 一次，不外抛。
+        只靠启动扫描等于让中途放弃的上传一直占着桶。扫不动只是垃圾多留一轮，
+        不该拖垮服务，所以异常只记进 app.state 一次，不外抛。
         """
         while True:
             try:
@@ -699,20 +696,6 @@ def create_app(
                     storage, max_age_sec=upload_ttl_sec)
             except Exception as e:  # noqa: BLE001 - 存储抖动：下一轮再试
                 app.state.upload_sweep = {"error": str(e)[:200]}
-            try:
-                swept = await session_gc.sweep_orphans(storage)
-                app.state.session_sweep = swept
-                if swept:
-                    rows = sum(sum(int(n or 0) for n in (e.get("rows") or {}).values())
-                               for e in swept)
-                    print(f"[agent] 孤儿会话对账：回收 {len(swept)} 个作用域"
-                          f"（删行 {rows} 条、删对象 "
-                          f"{sum(int(e.get('objects') or 0) for e in swept)} 个、"
-                          f"护住已入库素材 "
-                          f"{sum(int(e.get('kept') or 0) for e in swept)} 个、"
-                          f"在途跳过 {sum(1 for e in swept if e.get('skipped'))} 个）")
-            except Exception as e:  # noqa: BLE001 - 同上：垃圾多留一轮，服务照常
-                app.state.session_sweep = {"error": str(e)[:200]}
             await asyncio.sleep(upload_sweep_sec)
 
     @asynccontextmanager
@@ -727,15 +710,15 @@ def create_app(
         # on_startup 必须先跑：它负责 storage.start()（建表 / 迁移）。
         # 依赖存储表的两件事都得排在它后面：
         #   · heartbeat.start() 第一件事就是查 scheduled_jobs 表；
-        #   · _reap_garbage() 启动即扫一遍 upload_sessions 表与孤儿会话。
+        #   · _reap_uploads() 启动即扫一遍 upload_sessions 表。
         # 空库上这两个都会撞 UndefinedTableError。heartbeat 会直接冒泡出 lifespan
-        # （uvicorn 起不来），后台清扫则被自身 try 吞掉、退化成「第一次什么都没扫到」
+        # （uvicorn 起不来），upload 清扫则被自身 try 吞掉、退化成「第一次什么都没扫到」
         # ——后者正是 test_upload_resume 第 ⑫ 条抓到的：app.state.upload_sweep 恒为 0。
         if on_startup is not None:
             await on_startup()
         if heartbeat is not None:
             await heartbeat.start()
-        sweeper = (asyncio.create_task(_reap_garbage())
+        sweeper = (asyncio.create_task(_reap_uploads())
                    if upload_sweep_sec > 0 else None)
         try:
             yield
@@ -777,7 +760,6 @@ def create_app(
     app.state.storage = storage
     app.state.auth = auth
     app.state.upload_sweep = None   # 上一次分片清扫的结果（后台任务的唯一可见出口）
-    app.state.session_sweep = None  # 上一次孤儿会话对账的结果（同上）
 
     @app.exception_handler(IntegrityConflict)
     async def integrity_conflict(_: Request, exc: IntegrityConflict) -> JSONResponse:
@@ -1237,18 +1219,16 @@ def create_app(
         """回填某个会话的历史：非本人直接回空（不报 403，避免会话存在性探测）。"""
         rows = await storage.messages.history(user_id, conversation_id)
         out = []
-        seen_versions: set[str] = set()
+        seen_video_keys: set[str] = set()
         for r in rows:
             entry = {"role": r["role"], "text": r["content"],
                      "attachments": await _attachment_views(
                          storage, user_id, conversation_id, r["attachments"])}
-            media = await _render_media_views(storage, r.get("qa"))
+            # 去重域是**对象键**：这里发出的每一键由 _render_media_views 自己登记进集合，
+            # orphan 补卡拿同一份集合筛——登记版本号的话两路比不出重复，同一版会出两张卡。
+            media = await _render_media_views(storage, r.get("qa"), seen_video_keys)
             if media:
                 entry["media"] = media
-                for m in media:
-                    k = m.get("artifact_id") or ""
-                    if k:
-                        seen_versions.add(k)
             plan_cards = _plan_views(r.get("qa"))
             if plan_cards:
                 entry["plan"] = plan_cards
@@ -1256,7 +1236,7 @@ def create_app(
             if audit:
                 entry["plan_audit"] = audit
             out.append(entry)
-        orphan_media = await _orphan_render_media(storage, user_id, conversation_id, seen_versions)
+        orphan_media = await _orphan_render_media(storage, user_id, conversation_id, seen_video_keys)
         if orphan_media and out:
             last_user = max((i for i, e in enumerate(out) if e["role"] == "user"), default=-1)
             if last_user >= 0:
@@ -1604,17 +1584,11 @@ def create_app(
 
     @app.delete("/convs/{conversation_id}")
     async def conv_drop(conversation_id: str,
-                        user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+                        user_id: str = Depends(auth.http_user_id)) -> dict[str, str]:
         await storage.conversations.claim(user_id, conversation_id)
         await storage.db.delete("messages", where={"conv_id": conversation_id})
         await storage.conversations.drop(user_id, conversation_id)
-        # 对话名下的产物、切片缓存与按会话挂的账跟着走；素材库登记过的字节留下。
-        # 在途渲染不回收（那是别人正在写的行），这一条如实回出去，下次开机对账兜住。
-        gc = await session_gc.purge_conversation(storage, user_id, conversation_id)
-        out: dict[str, Any] = {"status": "ok", "gc": gc}
-        if gc.get("skipped"):
-            out["gc_notice"] = gc["skipped"]
-        return out
+        return {"status": "ok"}
 
     @app.post("/upload")
     async def upload(request: Request, conversation_id: str, filename: str,
@@ -2234,16 +2208,15 @@ def create_app(
         return {"timeline": payload, "source": node}
 
     async def _hitmap_bundle(artifact_id: str, conv_id: str, user_id: str) -> dict[str, Any]:
-        """产物作用域里的命中表（两条剪辑链共用同一份对象键布局）。
+        """这一版成片的命中表（前端画选区、局部改验指纹都读这一份）。
 
         为什么走本服务读字节而不发 presigned 直链：那是第二个 origin，CORS 与
         「一小时后读不通」都得在前端再处理一遍，而直链一旦进浏览器历史就等于把
         会话作用域的对象键交给了别人；这份 JSON 只在打开编辑器时读一次，几百 KB，
         直投更省事。对象键按调用者身份拼，别人会话里的表在这里同样是 404。
 
-        两条路径同实现：``render_motion_video`` 与 ``render_video`` 都把表写在
-        ``renders/{会话}/{产物}/hitmap.json``，表里的 ``schema`` 字段告诉前端这是
-        哪一种（``motion-hitmap/1`` 有空间框，``segment-hitmap/1`` 只有段与字段）。
+        两条链共用同一份：图形科普片那份带空间框，口播/素材那份（``segment-hitmap/1``）
+        只有段与可改字段、没有空间框——差别在表里，不在口上。
         """
         sid = storyline_session_id(user_id, conv_id)
         key = f"renders/{_safe(sid)}/{_safe(artifact_id)}/hitmap.json"
@@ -2255,27 +2228,11 @@ def create_app(
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise HTTPException(500, f"命中表读出来不是合法 JSON：{exc}") from exc
 
-    async def _frame_png(artifact_id: str, shot: str, conv_id: str,
-                         user_id: str) -> Response:
-        """某一段（或某一键）的代表帧：时间线缩略图与「改前 / 改后」对比都取这一张。
-
-        与 ``_hitmap_bundle`` 同一口径：对象键按调用者身份拼，别人的产物在这里是 404；
-        发直链会把会话作用域的键漏进浏览器历史。为什么单独一口而不让前端从成片抽帧：
-        那要每个缩略图开一次 ffmpeg/一次 seek，而代表帧在出片时就量好了——
-        它和命中表是同一时刻的像素，正是点选与对比需要的那个时刻。
-        """
-        sid = storyline_session_id(user_id, conv_id)
-        key = f"renders/{_safe(sid)}/{_safe(artifact_id)}/frames/{_safe(shot)}.png"
-        if await storage.objects.head(key) is None:
-            raise HTTPException(404, "没有这一段的代表帧（这片子出片时没留，或产物已过期）")
-        raw = b"".join([c async for c in storage.objects.get_stream(key)])
-        return Response(content=raw, media_type="image/png")
-
     @app.get("/motion/hitmap")
     async def motion_hitmap(artifact_id: str, conv_id: str = "",
                             user_id: str = Depends(auth.http_user_id)
                             ) -> dict[str, Any]:
-        """图形科普片的元素命中表（前端画选区、局部改验指纹都读这一份）。"""
+        """图形科普片的元素命中表（带空间框的那一份）。"""
         return await _hitmap_bundle(artifact_id, conv_id, user_id)
 
     @app.get("/timeline/hitmap")
@@ -2284,6 +2241,24 @@ def create_app(
                               ) -> dict[str, Any]:
         """口播/素材片的分段命中表（``segment-hitmap/1``：段 + 可改字段，没有空间框）。"""
         return await _hitmap_bundle(artifact_id, conv_id, user_id)
+
+    async def _frame_png(artifact_id: str, shot: str, conv_id: str,
+                         user_id: str) -> Response:
+        """某一键的代表帧（时间线缩略图与「改前 / 改后」对比都取这一张）。
+
+        与 ``_hitmap_bundle`` 同一口径：对象键按调用者身份拼，别人的产物在这里是 404；
+        发直链会把会话作用域的键漏进浏览器历史。为什么单独一口而不让前端从成片抽帧：
+        那要每个缩略图开一次 ffmpeg/一次 seek，而代表帧在出片时就量好了——
+        它和命中表是同一时刻的像素，正是点选与对比需要的那个时刻。
+
+        两条链共用：图形链的 ``shot`` 是镜号，口播链是窗口 id（与表里的行同名）。
+        """
+        sid = storyline_session_id(user_id, conv_id)
+        key = f"renders/{_safe(sid)}/{_safe(artifact_id)}/frames/{_safe(shot)}.png"
+        if await storage.objects.head(key) is None:
+            raise HTTPException(404, "没有这一段的代表帧（这片子出片时没留，或产物已过期）")
+        raw = b"".join([c async for c in storage.objects.get_stream(key)])
+        return Response(content=raw, media_type="image/png")
 
     @app.get("/motion/frame")
     async def motion_frame(artifact_id: str, shot: str, conv_id: str = "",
@@ -2308,8 +2283,9 @@ def create_app(
 
         **拒绝也在 200 里**：这些节点是长任务，闸门的话落在轮询端的 ``status=failed`` +
         ``error`` 正文（真机验过：POST 立刻 200 queued，几秒后 error 说「请重新出片」）。
-        所以前端认的是那份正文，不是 HTTP 状态码——下面那两条 422/500 只在**提交前**
-        （注册表同进程、且异常是 ValueError）才可能走到，别把它们当判据。
+        所以前端认的是那份正文，不是 HTTP 状态码。提交这一侧只有一种失败形状：注册表把
+        节点抛出的任何异常（含判定的 ValueError）统一包成 ``ToolError`` 回执，这里一律
+        透出成 500——**没有**「提交前同步校验回 422」这一档，校验随节点体一起进了后台。
         """
         base = str(body.get("base_artifact_id") or "").strip()
         if not base:
@@ -2335,13 +2311,10 @@ def create_app(
                 args[k] = body[k]
         try:
             raw = await reg.execute(node, args)
-        except ValueError as e:
-            # 只有注册表在同进程时才会走到这里（隔 MCP 时已是工具错误）。
-            # 消息本身就是一份「哪一格改成什么」的清单，原样透出，不另编文案。
-            raise HTTPException(422, str(e)) from e
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - 注册表已把节点异常包成 ToolError，走到这只剩装配故障
             raise HTTPException(500, f"局部改失败：{e}") from e
         if is_tool_error(raw):
+            # 回执正文本身就是一份「哪一格改成什么」的清单，原样透出，不另编文案。
             raise HTTPException(500, str(raw))
         return json.loads(raw) if isinstance(raw, str) else raw
 
@@ -2351,15 +2324,16 @@ def create_app(
         """图形科普片的局部改：前端按命中表下补丁，只重烧受影响的那几镜。
 
         body：``base_artifact_id`` 必填，外加 edits / shot_sets / remove_shots / reorder /
-        bgm / target_duration_sec / wait_sec（语义见节点 input_schema）。返回体是工具回执：
-        顶层的 ``artifact_id`` 是**新版本**的号（轮询与播它都用这一个），``status`` 为
+        bgm / bgm_volume / bgm_duck / texture / target_duration_sec / wait_sec
+        （语义见节点 input_schema，这里原样透传）。返回体是工具回执：顶层的
+        ``artifact_id`` 是**新版本**的号（轮询与播它都用这一个），``status`` 为
         queued/running 时前端改轮询 ``GET /render_status?artifact_id=…``；done 时那里的
         ``patch.before_frames`` 就是改前代表帧，可直接摆对比。
         """
         return await _patch_submit(
-            "patch_motion_video", await request.json(), user_id,
-            ("edits", "shot_sets", "remove_shots", "reorder", "bgm",
-             "target_duration_sec", "wait_sec"))
+            "patch_motion_code", await request.json(), user_id,
+            ("edits", "shot_sets", "remove_shots", "reorder", "bgm", "bgm_volume",
+             "bgm_duck", "texture", "target_duration_sec", "wait_sec"))
 
     @app.post("/timeline/patch")
     async def timeline_patch(request: Request,
@@ -2382,3 +2356,4 @@ def create_app(
         app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="frontend")
 
     return app
+

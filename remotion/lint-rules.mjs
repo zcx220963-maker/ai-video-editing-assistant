@@ -1,0 +1,485 @@
+/**
+ * 闸① 的自定义规则（四条文件级 + 三条字段对账）。
+ *
+ * 为什么禁项走 ESLint 内置的 `no-restricted-*`，而这些要自研：
+ * 它们问的不是「用了哪个危险 API」，而是「这个文件整体上像不像一个合法镜头」——
+ * 白名单、包裹、外链都是**文件级**事实，选择器表达不了。
+ *
+ * 三条字段对账规则另有一层：它们要拿**分镜契约里声明的字段名清单**比，而那份清单
+ * 不在代码字节里。所以 lint 的入参是 `(code, declaredFields)`（`lint.mjs` 把它
+ * 塞进规则的配置项），漏传就等于把这三条闸关掉——这是它们与上面四条唯一的差别，
+ * 也是为什么这一份清单必须由调用方（Python 侧的 `code_spec`）交过来而不是从代码里猜。
+ */
+
+/** 预装进 creation-remotion 镜像的那批包 —— 白名单外的 import 一律退回。
+ *
+ * 这份名单的**唯一判据是「镜像里真装着了」**，不是「Remotion 有这个东西」。
+ * 曾经列过两个没装的：`@remotion/sequence` 在 npm 上根本不存在（`<Sequence>`
+ * 是 `remotion` 核心的导出，已经在下面），`@remotion/preload` 是浏览器侧
+ * 预加载用的、服务端这条链没有用途。留着它们等于闸① 放行一写就必然在
+ * 打包期报「解析失败」的 import——而且报错发生在 lint 通过之后，模型收到的
+ * 是一句谁也看不懂的 bundle 错误。谁想开新包，先装进镜像再来加这一行，
+ * 构建层末尾的那条 resolve 检查会替两边盯着。
+ */
+export const ALLOWED_IMPORTS = new Set([
+  'react',
+  'react-dom',
+  'remotion',
+  'three',
+  '@react-three/fiber',
+  '@remotion/three',
+  '@remotion/paths',
+  '@remotion/shapes',
+  'roughjs',
+  'katex',
+  'katex/dist/katex.min.css',
+  // 母版与 token 走别名，镜头代码不许相对路径摸到服务内部文件
+  '@dg/film',
+  '@dg/tokens',
+]);
+
+const isRelative = (src) => typeof src === 'string' && (src.startsWith('.') || src.startsWith('/'));
+
+/** 字段通道三条规则的共用静态分析。
+ *
+ * 它只做一件做得到的事：**从代码字节里认出「哪些字段被读了、被标在哪」**。
+ * 认不出来的写法（`fields[k]` 的 k 是变量、`...fields`、把 fields 整个传给函数）
+ * 一律置 `dynamic`，让「声明了却没人读」这条规则**让路**而不是报错——
+ * 一条会误伤的闸最后只会被人整条关掉，而闸⑥ 在动态那一侧本来就要再对一次账。
+ */
+function newFieldAnalysis(declared) {
+  const declaredSet = new Set(declared);
+  const roots = new Set(['fields']);          // 注入表的根名（含别名）
+  const reads = new Map();                     // fieldName -> [node]
+  const bindings = new Map();                  // 局部变量名 -> fieldName
+  const marks = [];                            // {node, name|dynamicName, valueNode|missing}
+  const fNames = new Set();                    // 从 @dg/film 导入的 F / Field 的局部名
+  const rootRefs = [];                          // 所有叫根名的标识符节点
+  const consumed = new Set();                   // 被识别成「读表动作」的根节点
+  const state = { dynamic: false, declaredSet, reads, bindings, marks, fNames };
+
+  const isRoot = (node) => !!node && node.type === 'Identifier' && roots.has(node.name);
+  const noteRead = (name, node) => {
+    if (!name) return;
+    if (!reads.has(name)) reads.set(name, []);
+    reads.get(name).push(node);
+  };
+
+  return Object.assign(state, {
+    onImport(node) {
+      if (node.source.value !== '@dg/film') return;
+      for (const s of node.specifiers || []) {
+        if (s.type === 'ImportSpecifier' && (s.imported.name === 'F' || s.imported.name === 'Field')) {
+          fNames.add(s.local.name);
+        }
+      }
+    },
+
+    onIdentifier(node) {
+      if (!roots.has(node.name)) return;
+      const p = node.parent;
+      if (!p) return;
+      // `a.fields` 里那个 property、`{fields: x}` 里那个 key 都不是「表本身」
+      if (p.type === 'MemberExpression' && p.property === node && !p.computed) return;
+      if (p.type === 'Property' && p.key === node && !p.computed) return;
+      // 下面两处同样是**绑定位置**而不是读表动作。漏掉它们的后果实测过：
+      // 起手契约教的 `const Shot = ({ fields = {} }) => …` 会因为这个带默认值的
+      // 解构项被判成「整块用掉了表」，于是「声明了却没人读」这条闸对**所有**镜头
+      // 静默让路——三条对账剩两条，而打印出来一切正常。
+      if (p.type === 'AssignmentPattern' && p.left === node) return;
+      if (p.type === 'VariableDeclarator' && p.id === node) return;
+      if (Array.isArray(p.params) && p.params.includes(node)) return;
+      rootRefs.push(node);
+    },
+
+    onMember(node) {
+      if (!isRoot(node.object)) return;
+      consumed.add(node.object);
+      if (!node.computed && node.property.type === 'Identifier') {
+        noteRead(node.property.name, node);
+      } else if (node.computed && node.property.type === 'Literal'
+                 && typeof node.property.value === 'string') {
+        consumed.add(node.property);
+        noteRead(node.property.value, node);
+      } else {
+        state.dynamic = true;   // fields[变量]：不知道读的是哪个，只能让路
+      }
+    },
+
+    onDeclarator(node) {
+      const init = node.init;
+      if (!init) return;
+      if (isRoot(init)) {
+        consumed.add(init);
+        if (node.id.type === 'ObjectPattern') {
+          for (const p of node.id.properties) {
+            if (p.type === 'RestElement') { state.dynamic = true; continue; }
+            const key = p.key;
+            const fieldName = key.type === 'Identifier' ? key.name
+              : (key.type === 'Literal' ? String(key.value) : null);
+            if (!fieldName) { state.dynamic = true; continue; }
+            consumed.add(key);
+            noteRead(fieldName, node);
+            const local = p.value && p.value.type === 'Identifier' ? p.value.name
+              : (key.type === 'Identifier' ? key.name : null);
+            if (local) bindings.set(local, fieldName);
+          }
+        } else if (node.id.type === 'Identifier') {
+          roots.add(node.id.name);   // const f = fields —— f.a 也算读表
+        }
+        return;
+      }
+      // const x = fields.a / const x = f.a
+      if (init.type === 'MemberExpression' && isRoot(init.object)
+          && !init.computed && init.property.type === 'Identifier'
+          && node.id.type === 'Identifier') {
+        bindings.set(node.id.name, init.property.name);
+      }
+    },
+
+    onSpread(node) {
+      if (isRoot(node.argument)) { consumed.add(node.argument); state.dynamic = true; }
+    },
+
+    onJsx(node) {
+      const id = node.name && node.name.type === 'JSXIdentifier' ? node.name.name : null;
+      if (!id || !fNames.has(id)) return;
+      const attrs = new Map();
+      for (const a of node.attributes || []) {
+        if (a.type !== 'JSXAttribute' || !a.name) continue;
+        attrs.set(a.name.name, a);
+      }
+      const nameAttr = attrs.get('name');
+      const valueAttr = attrs.get('value');
+      let name = null;
+      let dynamicName = false;
+      if (nameAttr && nameAttr.value && nameAttr.value.type === 'Literal'
+          && typeof nameAttr.value.value === 'string') {
+        name = nameAttr.value.value;
+      } else if (nameAttr) {
+        dynamicName = true;
+      }
+      // 「value 是写死的」有两种写法，都得算同一种错：`value="40"` 与 `value={40}`。
+      // 只认前者的话，后者会掉进「假指针」分支——同样是红，但报的是另一条理由，
+      // 模型照着错误信息去改就会改成 `value={40.0}` 那一类，白返工一轮。
+      const rawValue = valueAttr && valueAttr.value;
+      const expr = rawValue && rawValue.type === 'JSXExpressionContainer'
+        ? rawValue.expression : null;
+      const isFixed = expr
+        ? (expr.type === 'Literal' ||
+           (expr.type === 'TemplateLiteral' && (expr.expressions || []).length === 0))
+        : true;
+      const valueLiteral = expr
+        ? (expr.type === 'Literal' ? expr.value : undefined)
+        : (rawValue && rawValue.type === 'Literal' ? rawValue.value : undefined);
+
+      marks.push({
+        node,
+        name,
+        dynamicName,
+        missingName: !nameAttr,
+        valueNode: expr && !isFixed ? expr : null,
+        valueLiteral,
+        hasValue: !!valueAttr,
+      });
+    },
+
+    /** 表达式是不是「就是这个字段的那份值」。 */
+    valueCarries(mark, fieldName) {
+      const e = mark.valueNode;
+      if (!e) return false;
+      if (e.type === 'Identifier') return bindings.get(e.name) === fieldName;
+      if (e.type === 'MemberExpression' && !e.computed && e.property.type === 'Identifier') {
+        if (isRoot(e.object)) return e.property.name === fieldName;
+        const bound = e.object.type === 'Identifier' ? bindings.get(e.object.name) : null;
+        if (bound) return false;              // fields.a.b 这类：不是表本身，判不出来
+      }
+      return false;
+    },
+
+    finish(context, kind) {
+      // 没被识别成读表动作的根引用＝这份表被整块用掉了，静态判不了
+      for (const node of rootRefs) if (!consumed.has(node)) state.dynamic = true;
+
+      const loc = (node) => (node && node.loc ? { line: node.loc.start.line, column: node.loc.start.column } : { line: 1, column: 0 });
+
+      if (kind === 'unused') {
+        if (state.dynamic || !declared.length) return;
+        const dead = declared.filter((n) => !reads.has(n));
+        if (dead.length) {
+          context.report({
+            loc: { line: 1, column: 0 },
+            messageId: 'unused',
+            data: { names: dead.join(', '), reads: dead.map((n) => `fields.${n}`).join('、') },
+          });
+        }
+      }
+
+      if (kind === 'undeclared') {
+        for (const [name, nodes] of reads) {
+          if (declaredSet.has(name)) continue;
+          context.report({
+            loc: loc(nodes[0]),
+            messageId: 'undeclared',
+            data: { name, alt: [...declaredSet].join(', ') || '（这一镜没声明任何字段）' },
+          });
+        }
+      }
+
+      if (kind === 'mark') {
+        for (const mark of marks) {
+          if (mark.missingName) { context.report({ loc: loc(mark.node), messageId: 'noName' }); continue; }
+          if (mark.dynamicName) { context.report({ loc: loc(mark.node), messageId: 'dynName' }); continue; }
+          if (!declaredSet.has(mark.name)) {
+            context.report({
+              loc: loc(mark.node), messageId: 'markUndeclared',
+              data: { name: mark.name, alt: [...declaredSet].join(', ') || '（这一镜没声明任何字段）' },
+            });
+            continue;
+          }
+          if (!mark.hasValue || mark.valueNode === null) {
+            context.report({
+              loc: loc(mark.node), messageId: 'noReading',
+              data: { name: mark.name, lit: mark.hasValue ? ` value="${mark.valueLiteral}"` : '' },
+            });
+            continue;
+          }
+          if (!this.valueCarries(mark, mark.name)) {
+            context.report({
+              loc: loc(mark.node), messageId: 'notThis',
+              data: { name: mark.name },
+            });
+          }
+        }
+      }
+    },
+  });
+}
+
+const FIELD_RULE_SCHEMA = [{
+  type: 'object',
+  properties: { declared: { type: 'array', items: { type: 'string' } } },
+  additionalProperties: false,
+}];
+
+const fieldRule = (kind, messages) => ({
+  meta: { type: 'problem', schema: FIELD_RULE_SCHEMA, messages },
+  create(context) {
+    const declared = (context.options[0] && context.options[0].declared) || [];
+    const a = newFieldAnalysis(declared);
+    return {
+      ImportDeclaration: (n) => a.onImport(n),
+      Identifier: (n) => a.onIdentifier(n),
+      MemberExpression: (n) => a.onMember(n),
+      VariableDeclarator: (n) => a.onDeclarator(n),
+      SpreadElement: (n) => a.onSpread(n),
+      JSXOpeningElement: (n) => a.onJsx(n),
+      'Program:exit'() { a.finish(context, kind); },
+    };
+  },
+});
+
+export const dgPlugin = {
+  rules: {
+    'only-allowed-imports': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          denied:
+            'import 了白名单外的 "{{source}}"。新链只预装了这些包：{{allowed}}。' +
+            '要用别的库请先装进渲染容器——在这里写 import 只会在浏览器里报解析失败。',
+        },
+      },
+      create(context) {
+        return {
+          ImportDeclaration(node) {
+            const src = node.source.value;
+            if (isRelative(src) || ALLOWED_IMPORTS.has(src)) return;
+            context.report({
+              node,
+              messageId: 'denied',
+              data: { source: src, allowed: [...ALLOWED_IMPORTS].join(', ') },
+            });
+          },
+          // require() 也在禁项里，但万一有人从 CommonJS 绕
+          CallExpression(node) {
+            if (node.callee.name !== 'require' || !node.arguments.length) return;
+            const arg = node.arguments[0];
+            const src = arg.type === 'Literal' ? arg.value : undefined;
+            if (src === undefined || isRelative(src) || ALLOWED_IMPORTS.has(src)) return;
+            context.report({
+              node,
+              messageId: 'denied',
+              data: { source: src, allowed: [...ALLOWED_IMPORTS].join(', ') },
+            });
+          },
+        };
+      },
+    },
+
+    'must-wrap-film-layout': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          noImport:
+            '镜头代码必须 import 母版：`import { FilmLayout } from "@dg/film"`。' +
+            '排版权（字幕带、安全区、字阶、配色）只在母版里，各镜自己排版必然逐镜漂。',
+          noWrap:
+            '顶层 JSX 必须被 <FilmLayout> 包住。渲染只画母版给的那条画面带，' +
+            '不包就等于这一镜没有字幕、没有安全区，且闸⑤ 读不到它的 token。',
+        },
+      },
+      create(context) {
+        let imported = false;
+        let wrapped = false;
+        return {
+          ImportDeclaration(node) {
+            if (node.source.value !== '@dg/film') return;
+            if (node.specifiers.some((s) =>
+              s.type === 'ImportSpecifier' && s.imported.name === 'FilmLayout')) imported = true;
+          },
+          JSXOpeningElement(node) {
+            const name = node.name && node.name.name;
+            if (name === 'FilmLayout' || name === 'dg:FilmLayout') wrapped = true;
+          },
+          'Program:exit'() {
+            if (!imported) context.report({ loc: { line: 1, column: 0 }, messageId: 'noImport' });
+            else if (!wrapped) context.report({ loc: { line: 1, column: 0 }, messageId: 'noWrap' });
+          },
+        };
+      },
+    },
+
+    'needs-shot-export': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          noExport:
+            '镜头文件没有可挂载的导出。请写 `export default Shot;`' +
+            '（兼容写法 `export const UserShot = Shot;` 也认）。' +
+            '没有默认导出时 Remotion 只会说「component 收到了 undefined」，' +
+            '那句错隔了打包与渲染两层，看不出是你这一行没写。',
+        },
+      },
+      create(context) {
+        let hasDefault = false;
+        let hasNamed = false;
+        return {
+          ExportDefaultDeclaration() {
+            hasDefault = true;
+          },
+          ExportNamedDeclaration(node) {
+            const decl = node.declaration;
+            if (decl && decl.type === 'VariableDeclaration') {
+              if ((decl.declarations || []).some((d) =>
+                d.id && d.id.name === 'UserShot')) hasNamed = true;
+            }
+            (node.specifiers || []).forEach((s) => {
+              if (s.exported && s.exported.name === 'UserShot') hasNamed = true;
+            });
+          },
+          'Program:exit'() {
+            if (!hasDefault && !hasNamed) {
+              context.report({ loc: { line: 1, column: 0 }, messageId: 'noExport' });
+            }
+          },
+        };
+      },
+    },
+
+    'no-external-urls': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          external:
+            '引用了外部资源 "{{url}}"。渲染容器离线运行，外链字体/图片/脚本会**静默回落**：' +
+            '你在代码里写的字体和画面上出现的不是一回事。字体只用镜像里已有的 Noto CJK。',
+        },
+      },
+      create(context) {
+        const RE = /https?:\/\/[^\s"'`)<]+|url\(\s*['"]?https?:|@import/gi;
+        const check = (node, value) => {
+          if (typeof value !== 'string') return;
+          const hit = value.match(RE);
+          if (hit) {
+            context.report({
+              node,
+              messageId: 'external',
+              data: { url: hit[0].slice(0, 80) },
+            });
+          }
+        };
+        return {
+          Literal: (node) => check(node, node.value),
+          TemplateElement: (node) => check(node, node.value.raw),
+        };
+      },
+    },
+
+    // ---- 字段参数通道的三条对账（spec §12.5）----
+    // 这一族与上面四条的唯一区别是它们要拿分镜声明的字段名比，所以 lint 的调用方
+    // 必须把那份名单传进来（`lint.mjs` 塞进规则配置）。名单漏传时 declared 是空数组：
+    // 规则 1 无事可判、规则 3 会把每一处标注都报成「没声明」——**不会静默放行**。
+    'fields-declared-unused': fieldRule('unused', {
+      unused:
+        '分镜声明了字段 {{names}}，但这段代码一次都没读它（读法要写成 {{reads}}）。' +
+        '于是界面上这一栏改了值、重烧了这一镜，画面上却一点没变——声明了就得真用它，' +
+        '用不上的旋钮别交出来。',
+    }),
+
+    'fields-undeclared-read': fieldRule('undeclared', {
+      undeclared:
+        '代码读了 fields.{{name}}，但这一镜的 fields 里没有这一项（已声明：{{alt}}）。' +
+        '于是界面没有控件能改它，闸⑥ 也没有期望值可对——要么在分镜里声明它，' +
+        '要么把这个读取去掉。',
+    }),
+
+    'field-mark-not-reading': fieldRule('mark', {
+      noName:
+        '<F> 标注没写 name，母版回读时不知道这是哪个字段——闸⑥ 与字段级命中表都只能' +
+        '把它当没标。写 `<F name="字段名" value={fields.字段名}>`。',
+      dynName:
+        '<F> 的 name 写成了表达式。静态这一层跟不住变量，这一处标注无法对账；' +
+        '请写成字符串字面量。',
+      markUndeclared:
+        '<F name="{{name}}"> 标的字段没在分镜里声明（已声明：{{alt}}）。' +
+        '标出来的东西界面改不到、闸⑥ 也没有期望值——声明它，或去掉这处标注。',
+      noReading:
+        '<F name="{{name}}">{{lit}}…</F> 的 value 没带上注入的那份值。' +
+        '这样闸⑥ 比的是字面量自己（永远相等），而不是「我们注入的是几、画上用的是几」' +
+        '——整条通道的证据就没了。写 `value={fields.{{name}}}`。',
+      notThis:
+        '<F name="{{name}}"> 的 value 不是 `fields.{{name}}`，也不是绑到它的那个变量。' +
+        '这是一个假指针：盒指着这个字段，像素却来自别处，改值时画面上动的不是它。',
+    }),
+  },
+};
+
+/** 确定性禁项：任何按墙钟走的东西都会让「同输入同像素」变成运气。 */
+export const RESTRICTED_GLOBALS = [
+  'fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource',
+  'localStorage', 'sessionStorage', 'indexedDB', 'navigator',
+  // performance.now() 也是墙钟。本来想用选择器拦 CallExpression，esquery 不接受
+  // 那种点号路径（会把整条规则集弄崩），改成禁这个全局标识符。
+  'performance',
+];
+
+export const RESTRICTED_SYNTAX = [
+  { selector: "CallExpression[callee.object.name='Math'][callee.property.name='random']",
+    message: 'Math.random() 按墙钟播种，两次渲染不同像素。要用随机请写 remotion 的 random(seed)。' },
+  { selector: "CallExpression[callee.object.name='Date'][callee.property.name='now']",
+    message: 'Date.now() 是墙钟，逐帧 seek 下不确定。' },
+  { selector: 'NewExpression[callee.name="Date"]',
+    message: 'new Date() 是墙钟，逐帧 seek 下不确定。' },
+  { selector: "CallExpression[callee.name=/^(setTimeout|setInterval|requestAnimationFrame|requestIdleCallback)$/]",
+    message: '定时器/rAF 驱动动画在本容器里推不动（实测 Chrome 一次只发得出 1~2 个 rAF 就饿死），' +
+             '而且按墙钟走。时刻只能来自 useCurrentFrame()。' },
+  { selector: "CallExpression[callee.name='eval']", message: 'eval 一律禁。' },
+  { selector: "NewExpression[callee.name='Function']", message: 'new Function 是换了个名字的 eval。' },
+  { selector: "CallExpression[callee.object.name='process']",
+    message: '镜头代码拿不到宿主进程。' },
+];

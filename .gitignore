@@ -35,6 +35,10 @@ __pycache__/
 venv/
 frontend/node_modules/
 frontend/dist/
+# creation-remotion：npm ci 出来的 297 个包，权威是 package-lock.json
+remotion/node_modules/
+# 渲染服务按 cache_key 自己堆的切片目录（本机预检也写这里），入库等于把缓存当源码
+remotion/out/
 
 # ---- 离线依赖包（体积大，且 requirements*.txt 才是权威）----
 *.whl
@@ -61,6 +65,8 @@ backend/tests/
 backend/docs/
 backend/scripts/
 backend/.smoke/
+# 仓库根那一份同样是取证残渣（真渲样片 mp4 + 一次性探针脚本），不是源码
+.smoke/
 backend/pytest.ini
 backend/start.bat
 

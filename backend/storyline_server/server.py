@@ -29,7 +29,7 @@ from agent_framework.orchestration import (
 from agent_framework.storage import Storage, build_storage
 
 from .nodes.core_nodes import build_real_registry
-from .nodes.core_nodes import _flag_on
+from .nodes.core_nodes import _flag_on, new_patch_scope_id
 from .providers import build_providers
 from .render_jobs import (STALL_CHECK_SEC, TERMINAL, RenderDispatcher, tool_view)
 from .settings import Settings
@@ -40,8 +40,8 @@ HANGING_TIMEOUT_SEC = 30 * 60   # spec §9：running 超 30 分钟视为进程�
 # 分钟级耗时的节点：改成「提交 + 轮询」，不让一次 JSON-RPC 往返等一部片子。
 # 出片与局部改都在这一集合里——局部差的那一版通常只重烧几镜，但「几镜」也可能是
 # 全部（用户改了全局字号那类），按最坏耗时归类。后续若 ASR/VL 批也顶不住，加进来即可。
-LONG_RUNNING_NODES = frozenset({"render_video", "render_motion_video",
-                                "patch_motion_video", "patch_video"})
+LONG_RUNNING_NODES = frozenset({"render_video", "render_motion_code",
+                                "patch_motion_code", "patch_video"})
 
 _JSON_TYPE_MAP = {"string": str, "integer": int, "number": float,
                   "boolean": bool, "array": list, "object": dict}
@@ -169,6 +169,16 @@ class StorylineServer:
                 sid = f"u:{uid}:c:{cid}"
             elif sid == DEFAULT_SESSION and args.get("user_request"):
                 sid = f"storyline:{args['user_request'][:16]}"  # 匿名调用也彼此隔离
+            if node.name in LONG_RUNNING_NODES and getattr(node, "forks_artifact_scope", False):
+                # 预发分叉作用域号：执行位（``renders.submit``）在**提交那一刻**就要决定渲染
+                # 任务行开在哪个 artifact_id 上，而节点体要到分叉那一步才产生新号。模型调
+                # 局部改通常不带 artifact_id（带了也常是 base 那一版的号），于是任务行开在
+                # ``_default``＝base 上：base 的出片账被抹回 queued、终态却写在新版行里，
+                # 轮询端等不到终态、看门狗把一次成功的局部改按停滞判死。
+                # 前端那条路早就自己做这件事（提交前就分配好产物号），这里补的是 MCP 入口。
+                base_art = str(args.get("base_artifact_id") or "")
+                if artifact_id in ("", "_default") or artifact_id == base_art:
+                    artifact_id = new_patch_scope_id()
             state = await server._make_state(sid, artifact_id)
             state.user_request = str(args.get("user_request") or "")
             state.user_id = uid
@@ -301,8 +311,9 @@ class StorylineServer:
         self.mcp.tool(
             name="render_status",
             title="渲染进度查询",
-            description=("查询出片节点（render_video / render_motion_video /"
-                         " patch_motion_video）提交的渲染任务："
+            description=("查询出片节点（render_video / render_motion_code /"
+                         " patch_motion_code / patch_video）"
+                         "提交的渲染任务："
                          "返回 status/stage/percent，"
                          "status=done 时同批回成片对象键、现签播放直链与时长（与直接渲染同形状），"
                          "status=failed 时回错误原因。渲染未完成就接着轮询，不要提前收尾"))(
