@@ -70,6 +70,8 @@ from . import judge as judge_mod
 from .hooks import quota_status
 from .tools.web import (KEYED_SEARCH_PROVIDERS, auto_provider, keyed_provider,
                         provider_refusal)
+
+KEYED_IMAGE_PROVIDERS = ("siliconflow", "minimax", "zhipu", "aliyun", "volc")
 from .llm_openai import (DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_THINKING,
                          get_default_llm)
 from .media_fetch import FetchPolicy, FetchRejected, fetch_media
@@ -653,6 +655,20 @@ class SearchTestRequest(BaseModel):
     """POST /settings/search/test：测试查询词可自带，留空则用一句固定的中文查询。"""
 
     query: str = ""
+
+
+class ImageBackendRequest(BaseModel):
+    """POST /settings/image：图像出图后端三件套。api_key 传空 = 清除已存密钥。"""
+
+    provider: str = ""      # siliconflow|minimax|zhipu|aliyun|volc；空 = 降级为素材库检索
+    base_url: str = ""      # 自建实例地址；填了才生效
+    api_key: str = ""
+
+
+class ImageTestRequest(BaseModel):
+    """POST /settings/image/test：出图自检——真发一条出图请求看有没有图回来。"""
+
+    prompt: str = ""
 
 
 class QuotaRequest(BaseModel):
@@ -1978,6 +1994,11 @@ def create_app(
         s_key_row = await storage.secrets.row(user_id, secrets.SEARCH_API_KEY_NAME)
         s_key = (s_key_row or {}).get("value", "")
         eff_provider, _, _, s_source = await secrets.resolve_search_config(user_id)
+        i_provider = await secrets.get_user_key(user_id, secrets.IMAGE_PROVIDER_KEY)
+        i_base = await secrets.get_user_key(user_id, secrets.IMAGE_BASE_KEY)
+        i_key_row = await storage.secrets.row(user_id, secrets.IMAGE_API_KEY_NAME)
+        i_key = (i_key_row or {}).get("value", "")
+        _, _, _, i_source = await secrets.resolve_image_config(user_id)
         q_limit, q_window, q_source = await secrets.resolve_quota(
             user_id, default_limit=quota_limit, default_window=quota_window)
         q_status = await quota_status(storage.db, user_id, limit=q_limit, window=q_window)
@@ -2010,6 +2031,15 @@ def create_app(
                 "source": s_source,
                 "overridden": bool(s_provider or s_base or s_key),
                 "providers": list(KEYED_SEARCH_PROVIDERS),
+            },
+            "image": {
+                "provider": i_provider or "",
+                "base_url": i_base or "",
+                "configured": bool(i_key or i_base),
+                "masked": secrets.mask(i_key) if i_key else "",
+                "source": i_source,
+                "overridden": bool(i_provider or i_base or i_key),
+                "providers": list(KEYED_IMAGE_PROVIDERS),
             },
             "quota": {
                 "limit": q_limit,
@@ -2223,6 +2253,90 @@ def create_app(
                 "sample": titles, "latency_ms": latency,
                 "message": ("后端有响应" if rows else "后端连通但这条查询没回结果——"
                             "换关键词再试，或改走别的路")}
+
+    @app.post("/settings/image")
+    async def settings_image(req: ImageBackendRequest,
+                             user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """图像出图后端三件套：provider/base_url/api_key 各写各的，空串即清除该项。
+
+        与 /settings/search 同一套模式：provider 为空 = 没配出图后端，整条出图路径
+        优雅降级为素材库检索（§5.3）。
+        """
+        provider = (req.provider or "").strip().lower()
+        base = (req.base_url or "").strip().rstrip("/")
+        key = (req.api_key or "").strip()
+        if provider and provider not in KEYED_IMAGE_PROVIDERS:
+            raise HTTPException(
+                400, f"不认识的出图后端 {provider!r}（可用：{', '.join(KEYED_IMAGE_PROVIDERS)}；"
+                     f"留空 = 降级为素材库检索）")
+        if base and not base.startswith(("http://", "https://")):
+            raise HTTPException(400, "自建实例地址要带协议：http:// 或 https://")
+        if any(c.isspace() for c in key):
+            raise HTTPException(400, "密钥格式不对：不能包含空格或换行")
+        if (key or base) and not provider:
+            raise HTTPException(400, "填了密钥或实例地址但没选后端——无法判断该把 key 交给谁")
+        for name, value in ((secrets.IMAGE_PROVIDER_KEY, provider),
+                             (secrets.IMAGE_BASE_KEY, base),
+                             (secrets.IMAGE_API_KEY_NAME, key)):
+            if value:
+                await secrets.put_user_key(user_id, name, value)
+            else:
+                await secrets.drop_user_key(user_id, name)
+        secrets.invalidate(user_id)
+        view = await _settings_view(user_id)
+        view["status"] = "saved"
+        return view["image"]
+
+    @app.post("/settings/image/test")
+    async def settings_image_test(req: ImageTestRequest,
+                                  user_id: str = Depends(auth.http_user_id)
+                                  ) -> dict[str, Any]:
+        """出图自检：真发一条出图请求看有没有图回来。
+
+        自检口径照 L2 教训：没有真出图就报 ok:false + 原因，不许回 ok:true「后端有响应」。
+        未配 key 时报 ok:false 并提示"未配出图后端，当前走素材库检索降级"。
+        """
+        provider, key, base, source = await secrets.resolve_image_config(user_id)
+        provider = (provider or "").strip().lower()
+        prompt = (req.prompt or "").strip() or "一只蓝色的鸟站在树枝上"
+        if not (provider or key or base):
+            return {"ok": False, "provider": "", "source": source,
+                    "message": "未配出图后端，当前走素材库检索降级（§5.3）"}
+        if not provider:
+            return {"ok": False, "provider": "", "source": source,
+                    "message": "填了密钥或实例地址但没选后端，无法判断该把 key 交给谁"}
+        started = time.monotonic()
+        try:
+            import urllib.request
+            api_base = base or {
+                "siliconflow": "https://api.siliconflow.cn/v1",
+                "minimax": "https://api.minimax.chat/v1",
+                "zhipu": "https://open.bigmodel.cn/api/paas/v4",
+                "aliyun": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "volc": "https://ark.cn-beijing.volces.com/api/v3",
+            }.get(provider, "")
+            if not api_base:
+                return {"ok": False, "provider": provider, "source": source,
+                        "message": f"未知 provider {provider!r}，没有默认 base_url"}
+            url = f"{api_base.rstrip('/')}/images/generations"
+            body = json.dumps({"model": "doubao-seedream-5-0-pro", "prompt": prompt,
+                               "n": 1, "size": "1024x1024"}).encode("utf-8")
+            request = urllib.request.Request(url, data=body, method="POST")
+            request.add_header("Content-Type", "application/json")
+            request.add_header("Authorization", f"Bearer {key}")
+            resp = await asyncio.to_thread(urllib.request.urlopen, request, 30)
+            data = json.loads(resp.read(65536))
+            latency = int((time.monotonic() - started) * 1000)
+            has_image = bool(data.get("data") and data["data"][0].get("url"))
+            return {"ok": has_image, "provider": provider, "source": source,
+                    "latency_ms": latency,
+                    "message": ("出图成功" if has_image
+                                else f"后端有响应但没回图：{json.dumps(data)[:200]}")}
+        except Exception as e:  # noqa: BLE001
+            latency = int((time.monotonic() - started) * 1000)
+            return {"ok": False, "provider": provider, "source": source,
+                    "latency_ms": latency,
+                    "message": f"{type(e).__name__}: {e}"}
 
     @app.websocket("/ws/{conversation_id}")
     async def ws_endpoint(websocket: WebSocket, conversation_id: str) -> None:

@@ -1326,3 +1326,98 @@ class RetrievalRepo(_Repo):
 
     async def drop_for_user(self, user_id: str) -> int:
         return await self.db.delete(self.table, where={"user_id": user_id})
+
+# --------------------------------------------------------------------------
+# 内置素材库（R3：Wikimedia Commons / Iconify / Poly Haven / ambientCG / Open Peeps / Humaaans / Kenney / Quaternius）
+# --------------------------------------------------------------------------
+
+
+class AssetLibraryRepo(_Repo):
+    """``asset_library``：全局共享的内置素材库，不属任何用户。
+
+    与 ``MaterialsRepo`` 的区别：materials 是用户上传/产出的素材（属用户），
+    asset_library 是从外部 CC0/PD 源批量入库的素材（全局共享）。检索时
+    ``search_illustration`` 走这里，``search_media`` 走 materials。
+    """
+
+    table = "asset_library"
+
+    async def add(self, *, sha256: str, bytes_: int, mime: str, ext: str,
+                  object_key: str, source: str, license: str,
+                  attribution_required: bool = False,
+                  src_id: str = "", license_url: str = "",
+                  subject: str = "", style_family: str = "",
+                  tags: str = "[]", caption: str = "", era: str = "",
+                  width: int | None = None, height: int | None = None,
+                  asset_id: str | None = None) -> dict[str, Any]:
+        """入库一行素材。每行必须带 license（§5.2 硬约束）。"""
+        return await self.db.upsert(self.table, {
+            "id": asset_id or f"ast-{sha256[:12]}",
+            "sha256": sha256, "bytes": bytes_, "mime": mime, "ext": ext,
+            "width": width, "height": height, "object_key": object_key,
+            "source": source, "src_id": src_id, "license": license,
+            "attribution_required": attribution_required,
+            "license_url": license_url, "subject": subject,
+            "style_family": style_family, "tags": tags, "caption": caption,
+            "era": era, "enabled": True, "fetched_at": _now(),
+        })
+
+    async def get(self, asset_id: str) -> dict[str, Any] | None:
+        return await self.db.get_by_pk(self.table, {"id": asset_id})
+
+    async def get_by_sha(self, sha256: str) -> dict[str, Any] | None:
+        rows = await self.db.select(self.table, where={"sha256": sha256}, limit=1)
+        return rows[0] if rows else None
+
+    async def list_assets(self, *, source: str | None = None,
+                          subject: str | None = None,
+                          style_family: str | None = None,
+                          enabled: bool = True,
+                          limit: int = 100,
+                          offset: int = 0) -> list[dict[str, Any]]:
+        """列素材（可按源/主体/风格族过滤）。"""
+        where: dict[str, Any] = {"enabled": enabled}
+        if source:
+            where["source"] = source
+        if subject:
+            where["subject"] = subject
+        if style_family:
+            where["style_family"] = style_family
+        return await self.db.select(self.table, where=where,
+                                    order_by=["-created_at"],
+                                    limit=limit, offset=offset)
+
+    async def search(self, query: str, *, subject: str | None = None,
+                     style_family: str | None = None,
+                     source: str | None = None,
+                     limit: int = 20) -> list[dict[str, Any]]:
+        """检索内置素材库：2-gram 文件名/caption/subject 匹配 + 可选过滤。
+
+        只返回 ``attribution_required=false`` 的资产（§5.2：需署名的不进检索结果）。
+        """
+        where: dict[str, Any] = {"attribution_required": False, "enabled": True}
+        if subject:
+            where["subject"] = subject
+        if style_family:
+            where["style_family"] = style_family
+        if source:
+            where["source"] = source
+        rows = await self.db.select(self.table, where=where,
+                                    order_by=["-created_at"], limit=limit * 3)
+        if query:
+            q = query.lower()
+            pool = [r for r in rows
+                    if q in (r.get("caption") or "").lower()
+                    or q in (r.get("subject") or "").lower()
+                    or q in (r.get("src_id") or "").lower()
+                    or _grams(q) & _grams((r.get("caption") or "").lower())]
+        else:
+            pool = rows
+        return rank_by_request(pool, query, field="caption")[:limit]
+
+    async def count(self, *, source: str | None = None) -> int:
+        where: dict[str, Any] = {}
+        if source:
+            where["source"] = source
+        rows = await self.db.select(self.table, where=where, limit=100000)
+        return len(rows)

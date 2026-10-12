@@ -31,6 +31,14 @@ SEARCH_BASE_KEY = "search_base_url"       # searxng 实例地址；填了才生�
 ENV_SEARCH_KEY_NAME = "SEARCH_API_KEY"
 ENV_SEARCH_PROVIDER = "SEARCH_PROVIDER"
 ENV_SEARCH_BASE = "SEARCH_BASE_URL"
+# 图像出图后端三件套（R3 §5.3）：照 search_* 那套模式，含"自建实例有地址无 key"那一档。
+# provider 为空 = 没配出图后端，整条出图路径优雅降级为素材库检索。
+IMAGE_PROVIDER_KEY = "image_provider"     # siliconflow|minimax|zhipu|aliyun|volc（空 = 降级为素材库检索）
+IMAGE_API_KEY_NAME = "image_api_key"
+IMAGE_BASE_KEY = "image_base_url"         # 自建实例地址；填了才生效
+ENV_IMAGE_KEY_NAME = "IMAGE_API_KEY"
+ENV_IMAGE_PROVIDER = "IMAGE_PROVIDER"
+ENV_IMAGE_BASE = "IMAGE_BASE_URL"
 # 配额也走同一套按身份热读：以前它只有 env 一处，超限的用户只能改编排文件 + 重建容器，
 # 而页面上一句「配额已用尽」连出路都没有。现在页面填的值压过 env，保存即生效。
 QUOTA_LIMIT_KEY = "quota_limit"           # 窗口内 token 上限，0 或空 = 只记账不拦
@@ -135,9 +143,12 @@ async def resolve_api_key(user_id: str = "", *, fallback: str = "") -> tuple[str
 __all__ = ["API_KEY_NAME", "CACHE_TTL_SEC", "ENV_KEY_NAME", "ENV_KEY_NAMES", "SOURCE_PG",
            "SOURCE_ENV", "SOURCE_FALLBACK", "SOURCE_NONE", "bind_storage", "unbind_storage",
            "bound_storage", "current_user_id", "env_api_key", "invalidate",
-           "resolve_api_key", "resolve_search_config", "resolve_quota", "parse_int", "mask",
+           "resolve_api_key", "resolve_search_config", "resolve_image_config",
+           "resolve_quota", "parse_int", "mask",
            "SEARCH_PROVIDER_KEY", "SEARCH_API_KEY_NAME", "SEARCH_BASE_KEY",
            "ENV_SEARCH_KEY_NAME", "ENV_SEARCH_PROVIDER", "ENV_SEARCH_BASE",
+           "IMAGE_PROVIDER_KEY", "IMAGE_API_KEY_NAME", "IMAGE_BASE_KEY",
+           "ENV_IMAGE_KEY_NAME", "ENV_IMAGE_PROVIDER", "ENV_IMAGE_BASE",
            "QUOTA_LIMIT_KEY", "QUOTA_WINDOW_KEY", "ENV_QUOTA_LIMIT", "ENV_QUOTA_WINDOW"]
 
 
@@ -185,6 +196,32 @@ async def resolve_search_config(user_id: str = "") -> tuple[str, str, str, str]:
     env_base = os.environ.get(ENV_SEARCH_BASE, "").strip()
     if env_provider or env_key or env_base:
         return env_provider, env_key, env_base, f"环境变量 {ENV_SEARCH_PROVIDER or ENV_SEARCH_KEY_NAME}"
+    return "", "", "", SOURCE_NONE
+
+
+async def resolve_image_config(user_id: str = "") -> tuple[str, str, str, str]:
+    """图像出图后端的按身份热读，返回 (provider, api_key, base_url, 来源名)。
+
+    照 ``resolve_search_config`` 同一套模式：前端「设置」压过环境变量。
+    provider 为空 = 没配出图后端，调用方走**素材库检索降级**（§5.3）。
+    自建实例只有 base_url 就够（无 key）。
+    """
+    uid = user_id or current_user_id()
+    provider = key = base = ""
+    if _storage is not None and uid:
+        try:
+            provider = ((await _storage.secrets.get(uid, IMAGE_PROVIDER_KEY)) or "").strip()
+            key = ((await _storage.secrets.get(uid, IMAGE_API_KEY_NAME)) or "").strip()
+            base = ((await _storage.secrets.get(uid, IMAGE_BASE_KEY)) or "").strip()
+        except Exception:  # noqa: BLE001
+            provider = key = base = ""
+        if provider or key or base:
+            return provider, key, base, SOURCE_PG
+    env_provider = os.environ.get(ENV_IMAGE_PROVIDER, "").strip()
+    env_key = os.environ.get(ENV_IMAGE_KEY_NAME, "").strip()
+    env_base = os.environ.get(ENV_IMAGE_BASE, "").strip()
+    if env_provider or env_key or env_base:
+        return env_provider, env_key, env_base, f"环境变量 {ENV_IMAGE_PROVIDER or ENV_IMAGE_KEY_NAME}"
     return "", "", "", SOURCE_NONE
 
 

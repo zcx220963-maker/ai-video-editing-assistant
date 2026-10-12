@@ -2414,6 +2414,8 @@ const TOOL_LABELS = {
   create_cron_job: "创建定时任务",
   list_cron_jobs: "查看定时任务",
   delete_cron_job: "删除定时任务",
+  search_illustration: "检索配图",
+  select_illustration: "选用配图",
 };
 function toolLabel(name, display) {
   if (display) return display;                       // 帧里自带的 *_display：第一来源
@@ -2891,6 +2893,11 @@ const searchDraft = ref({ provider: "", base_url: "", api_key: "" });
 const savingSearch = ref(false);
 const testingSearch = ref(false);
 const testSearchResult = ref(null);
+// 图像出图后端：provider + 密钥/自建地址，全空 = 降级为素材库检索
+const imageDraft = ref({ provider: "", base_url: "", api_key: "" });
+const savingImage = ref(false);
+const testingImage = ref(false);
+const testImageResult = ref(null);
 
 async function loadSettings() {
   await ensureIdentity();
@@ -2915,6 +2922,12 @@ async function loadSettings() {
     api_key: "",
   };
   testSearchResult.value = null;
+  imageDraft.value = {
+    provider: j.image?.provider || "",
+    base_url: j.image?.base_url || "",
+    api_key: "",
+  };
+  testImageResult.value = null;
   return j;
 }
 
@@ -3172,6 +3185,76 @@ async function testSearchConn() {
     keyError.value = "检索自检没跑成：" + e.message;
   } finally {
     testingSearch.value = false;
+  }
+}
+
+async function saveImage() {
+  if (savingImage.value) return;
+  savingImage.value = true;
+  keyError.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch("/settings/image", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        provider: imageDraft.value.provider,
+        base_url: imageDraft.value.base_url.trim(),
+        api_key: imageDraft.value.api_key.trim(),
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    testImageResult.value = null;
+    await loadSettings();
+  } catch (e) {
+    keyError.value = "图像后端保存失败：" + e.message;
+  } finally {
+    savingImage.value = false;
+  }
+}
+
+async function clearImageOverride() {
+  if (savingImage.value) return;
+  savingImage.value = true;
+  keyError.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch("/settings/image", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ provider: "", base_url: "", api_key: "" }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    testImageResult.value = null;
+    await loadSettings();
+  } catch (e) {
+    keyError.value = "清除图像后端失败：" + e.message;
+  } finally {
+    savingImage.value = false;
+  }
+}
+
+async function testImageConn() {
+  if (testingImage.value) return;
+  testingImage.value = true;
+  keyError.value = "";
+  testImageResult.value = null;
+  try {
+    await ensureIdentity();
+    const r = await fetch("/settings/image/test", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ prompt: "" }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    testImageResult.value = j;
+  } catch (e) {
+    keyError.value = "出图自检没跑成：" + e.message;
+  } finally {
+    testingImage.value = false;
   }
 }
 
@@ -4391,6 +4474,51 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <div v-if="testSearchResult.sample && testSearchResult.sample.length"
                class="set-note">{{ testSearchResult.sample.join(" ／ ") }}</div>
           <div v-if="testSearchResult.ok" class="set-note">{{ testSearchResult.message }}</div>
+        </div>
+
+        <!-- 图像出图后端：未配时整条出图路径优雅降级为素材库检索 -->
+        <div class="set-line set-head">
+          图像出图后端
+          <span v-if="settings && settings.image" :class="settings.image.provider ? 'set-v' : 'set-note'">
+            {{ settings.image.provider
+               ? `走 ${settings.image.provider}（来源 ${settings.image.source}）`
+               : "未配置 —— 出图走素材库检索降级（§5.3）" }}
+            <template v-if="settings.image.masked"> · {{ settings.image.masked }}</template>
+          </span>
+        </div>
+        <div class="set-line">
+          <select v-model="imageDraft.provider" :disabled="savingImage">
+            <option value="">素材库检索降级（不指定出图后端）</option>
+            <option v-for="p in (settings && settings.image && settings.image.providers) || []"
+                    :key="p" :value="p">{{ p }}</option>
+          </select>
+          <input v-model.trim="imageDraft.base_url" spellcheck="false"
+                 placeholder="自建实例地址 http(s)://…（留空用默认）"
+                 :disabled="savingImage" />
+          <input v-model="imageDraft.api_key" type="password" autocomplete="off"
+                 spellcheck="false" placeholder="出图 API Key（不改则留空）"
+                 :disabled="savingImage" />
+        </div>
+        <div class="set-line">
+          <button class="clip" :disabled="savingImage" @click="saveImage">
+            {{ savingImage ? "保存中…" : "保存" }}
+          </button>
+          <button class="clip" :disabled="testingImage" @click="testImageConn">
+            {{ testingImage ? "自检中…" : "测试出图" }}
+          </button>
+          <button v-if="settings && settings.image && settings.image.overridden"
+                  class="clip ghost" :disabled="savingImage" @click="clearImageOverride">清除页面覆盖</button>
+        </div>
+        <p class="set-note">
+          siliconflow / minimax / zhipu / aliyun / volc 都要 API Key；留空即降级为素材库检索，保存即生效不重启。
+        </p>
+        <div v-if="testImageResult" class="probe">
+          <div>
+            <b :class="testImageResult.ok ? 'ok' : 'bad'">{{ testImageResult.provider || "未配置" }}</b>
+            {{ testImageResult.ok
+               ? `出图成功 · ${testImageResult.latency_ms || 0}ms`
+               : "不通 · " + (testImageResult.message || "未知错误") }}
+          </div>
         </div>
         <div v-if="keyError" class="set-v bad">{{ keyError }}</div>
       </div>

@@ -3988,10 +3988,12 @@ def build_real_registry(settings: Settings, providers: Providers, storage: Stora
                                     RenderCodeMotionVideoNode)
     from .motion_plan import PlanMotionNode
     from .web_nodes import RenderWebNode
+    from .asset_nodes import ASSET_NODE_CLASSES
     reg = NodeRegistry()
     name_to_cls = {cls.name: cls
                    for cls in [*REAL_NODE_CLASSES, RenderWebNode, PlanMotionNode,
-                               RenderCodeMotionVideoNode, PatchCodeMotionVideoNode]}
+                               RenderCodeMotionVideoNode, PatchCodeMotionVideoNode,
+                               *ASSET_NODE_CLASSES]}
     for nm in (allowed or list(name_to_cls)):
         cls = name_to_cls.get(nm)
         if cls is not None:
