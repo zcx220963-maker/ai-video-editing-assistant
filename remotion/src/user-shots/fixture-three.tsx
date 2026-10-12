@@ -11,9 +11,11 @@ import { useCurrentFrame } from 'remotion';
 import { ThreeCanvas } from '@remotion/three';
 import { FilmLayout, F, useBody } from '@dg/film';
 import { TOKENS } from '@dg/tokens';
+import { E } from '@dg/motion';
 
 const RADIUS = 1.5;
 const HALF_H = 1.4;
+const _ease = E.linear(0);
 
 const VERTICES: { label: string; pos: [number, number, number] }[] = [
   { label: 'S', pos: [0, HALF_H, 0] },

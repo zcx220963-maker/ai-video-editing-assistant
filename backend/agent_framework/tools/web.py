@@ -421,6 +421,10 @@ class SearchResult:
     snippet: str
     # 哪一路后端出的这一条（免 key 链是多路的，用户与模型都得看得见结果从哪来）
     backend: str = ""
+    # 与查询词的重合判定。默认 True：只有免 key 回落链会显式标 False——
+    # 它按字面匹配，「一条都不重合」是能被机器证明的事实；带 key 的搜索引擎有排序，
+    # 同义改写的相关页会死在这种判据上，所以那条路不做这个判断。
+    relevant: bool = True
 
     def format(self) -> str:
         line = f"- {self.title}"
@@ -636,6 +640,55 @@ def _has_cjk(text: str) -> bool:
     return bool(_CJK.search(text or ""))
 
 
+_LATIN_WORD = re.compile(r"[a-z0-9]{2,}")
+_CJK_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
+
+
+def _query_terms(query: str) -> tuple[set[str], set[str]]:
+    """查询拆成两组：强词（拉丁词 + 中文 2 字组）与弱字（单个汉字/假名）。
+
+    这里没有分词器可用，bigram 是不依赖词表的唯一取法：「薄肌训练原理」→
+    {薄肌, 肌训, 训练, 练原, 原理}。强词对一个都碰不上时再放宽到单个字——
+    放宽是为了不错杀**同义改写**（查「薄肌」回「肌肉」：bigram 零重合但共享一个「肌」），
+    而闸真正要杀的是「连一个字都不相干」（查「薄肌训练原理」回「2021年香港」）。
+    两组词能碰的部位不一样：强词标题与摘要都算，弱字组只算标题（为什么这么切见
+    `_mark_relevance`）。
+    """
+    text = (query or "").lower()
+    strong = set(_LATIN_WORD.findall(text))
+    weak: set[str] = set()
+    for run in _CJK_RUN.findall(text):
+        weak.update(run)
+        strong.update(run[i:i + 2] for i in range(len(run) - 1))
+    return strong, weak
+
+
+def _mark_relevance(query: str, rows: list[SearchResult]) -> list[SearchResult]:
+    """给每条结果打上 `relevant`：与查询词够不上重合的标 False。
+
+    **两组词比对的部位不一样**：强词（拉丁词 / 中文二字组）在标题或摘要里命中都算，
+    弱字组（单个汉字/假名）只许命中标题。摘要的位置这么切不是收紧偏好，是真机量出来的:
+    2026-10-11 查「薄肌 训练 原理」，免 key 链交回《医学词汇表》《火影忍者角色列表》
+    《FAIRY TAIL角色列表》，它们与查询的唯一字面重合是**摘要里的一个单字**（「骨骼肌」的
+    「肌」）。摘要是上百字的正文片段，任何中文查询都能在里面捞到一个共用字——按摘要算单字
+    重合，等于这条闸对中文长尾查询不判。标题是页面自己声明的主题，所以「薄肌」对上「肌肉」
+    还是走标题里的「肌」，同义改写救得回来。
+
+    判据到字面重合为止——它是能被机器证明的事实，不是相关性排序。排序要懂语义，这条链没有
+    那个能力；所以这条闸治的是「把无关页当证据」，治不了「相关但不够权威」。
+    """
+    strong, weak = _query_terms(query)
+    if not (strong or weak):        # 查询里一个可比对的词都没有：不判，全留
+        for row in rows:
+            row.relevant = True
+        return rows
+    for row in rows:
+        title = (row.title or "").lower()
+        hay = f"{row.title} {row.snippet}".lower()
+        row.relevant = any(t in hay for t in strong) or any(c in title for c in weak)
+    return rows
+
+
 def wikipedia_provider(query: str, max_results: int, timeout: float = 20.0,
                        transport: Callable[..., _Fetched] | None = None, *,
                        lang: str = "zh") -> list[SearchResult]:
@@ -707,6 +760,11 @@ def auto_provider(query: str, max_results: int, timeout: float = 20.0,
     路由规则来自真机探点而不是猜测：中文走维基 API（Bing RSS 会把中文查询截成一个
     词头），拉丁文字走 Bing RSS（覆盖面比百科广）；DDG 排最后——它从这台机器两个端点
     都被人机验证挡住，换 UA、改 POST 都一样，那是出口 IP 的信誉问题。
+
+    第三条规则是「什么才算出结果」：某一路回了条目不等于查到了——**至少要有一条与
+    查询词字面重合**才算命中，否则接着试下一路。重合判据只认字面（拉丁词 / 中文
+    2 字组，兜底到单个汉字），不判语义，所以它拦得住《2021年香港》这种彻底不相干的
+    页，拦不住「相关但不够权威」——那是另一条链（人审 + 出处闸）的活。
     """
     stages: list[tuple[str, Callable[[], list[SearchResult] | tuple[None, str]]]] = []
     if _has_cjk(query):
@@ -723,6 +781,7 @@ def auto_provider(query: str, max_results: int, timeout: float = 20.0,
                    lambda: duckduckgo_provider(query, max_results, timeout, transport)))
 
     notes: list[str] = []
+    unrelated_total = 0
     for label, run in stages:
         try:
             got = run()
@@ -739,14 +798,41 @@ def auto_provider(query: str, max_results: int, timeout: float = 20.0,
             notes.append(f"{label}：{str(got[1]).removeprefix('Error: ')}")
             continue
         if got:
-            for row in got:
-                row.backend = row.backend or label
-            return got
+            # 「后端回了条目」≠「查到了」：真机实测免 key 链对「薄肌训练原理」
+            # 回过一篇《2021年香港》，模型把它当出处继续往下写。零重合的条目在这里就丢，
+            # 不进结果、也不进检索账（那条账是「出处真实」闸的唯一凭据）。
+            _mark_relevance(query, got)
+            kept = [row for row in got if row.relevant]
+            dropped = len(got) - len(kept)
+            unrelated_total += dropped
+            if kept:
+                for row in kept:
+                    row.backend = row.backend or label
+                if unrelated_total:
+                    # 丢弃数挂在首条的后端标签上：SearchTool 的回执首行就是从这里取的。
+                    # 用「链上累计」而不是「本路」——被丢的可能来自更早那一路，
+                    # 而下一路自己也有更精确的后端名（DDG 分 lite/html），都不该被覆盖掉。
+                    kept[0].backend = (f"{kept[0].backend}"
+                                       f"｜链上已丢弃 {unrelated_total} 条零重合结果")
+                return kept
+            notes.append(f"{label}：回的 {len(got)} 条与查询词**零重合**（这条链按字面匹配，"
+                         f"不认同义改写）")
+            continue
         notes.append(f"{label}：0 条")
 
     detail = "；".join(notes)
     hint = ("想稳定查中文长尾与新近数据，请在前端「设置」配搜索后端"
             "（brave / tavily / serpapi / 自建 SearXNG）")
+    if unrelated_total:
+        # 各路都回了东西、但没一条对得上查询词。这条要说清楚「不是后端坏了」：
+        # notes 里已经带上各路的原话（0 条 / 被挡 / 结构不对），这里只补最相关的那句。
+        return None, (
+            f"Error: 免 key 检索链各路都只回了**与查询词零重合**的页面"
+            f"（共丢弃 {unrelated_total} 条，一条都没记进本会话的检索账——"
+            f"没记进去的页面不能当出处引用）。{detail}。"
+            f"这条闸只认字面重合，不判语义，所以**查不到不等于事实不存在**："
+            f"换更具体或更宽泛的关键词再试、用 fetch_url 打开你已知的页面，或{hint}；"
+            f"没查证到的内容不要写成查证过的出处。同一句查询原样重打没有用。")
     if any("人机验证" in n or "限流" in n for n in notes):
         return None, (f"Error: 免 key 检索链被后端挡住（{detail}）。这是**这台机器的出口被判成爬虫**，"
                       f"不代表网上查不到——可稍后重试、用 fetch_url 打开已知页面，或{hint}。")
@@ -754,6 +840,15 @@ def auto_provider(query: str, max_results: int, timeout: float = 20.0,
                   f"新近数字与长尾内容本来就不在其中——**查不到不等于事实不存在**，"
                   f"换关键词再试、用 fetch_url 打开已知页面，或{hint}；"
                   f"没查证到的内容不要写成查证过的出处。")
+
+
+def provider_refusal(out: Any) -> str:
+    """检索链用 `(None, 说明)` 表达「跑完了但一条都没留下」，其余形状不算拒绝。
+
+    单源：工具的执行口和设置页的连通自检读同一句话——不然会出现「工具回 Error，
+    自检却说后端有响应」这种自相矛盾的回执（零相关闸落地后真就差一步撞上）。
+    """
+    return str(out[1]) if isinstance(out, tuple) else ""
 
 
 class SearchTool(Tool):
@@ -783,6 +878,7 @@ class SearchTool(Tool):
                 "可据结果再用 fetch_url 深入抓取。返回 0 条只代表这些后端没有命中，"
                 "不代表事实不存在：换关键词、用 fetch_url 打开已知页面，"
                 "或在设置页配置搜索后端（brave / tavily / serpapi / 自建 SearXNG）。"
+                "免 key 回落链按字面匹配，与查询词零重合的条目会被丢弃、也不记进检索账。"
                 "本工具与 fetch_url 真打开过的页面会记进会话的检索账，"
                 "分镜里的出处只有能对上一笔账才算查证过——没查过就标「未核实」。")
 
@@ -828,8 +924,9 @@ class SearchTool(Tool):
             out = await asyncio.to_thread(runner, query, max_results)
         except Exception as e:  # noqa: BLE001
             return f"Error: 搜索失败: {e}"
-        if isinstance(out, tuple):  # (None, error)
-            return out[1]
+        refusal = provider_refusal(out)
+        if refusal:
+            return refusal
         results: list[SearchResult] = out
         if not results:
             return f"未找到结果：query={query!r}（后端：{label}）"

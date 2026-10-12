@@ -51,12 +51,41 @@ CREATE TABLE IF NOT EXISTS materials (
   height        integer,
   has_audio     boolean NOT NULL DEFAULT false,
   origin        text NOT NULL DEFAULT 'upload'
-                CHECK (origin IN ('upload','library','bgm','url','render')),
+                CHECK (origin IN ('upload','library','bgm','url','render','art')),
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS mat_owner_idx  ON materials(owner_user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS mat_conv_idx   ON materials(conv_id);
 CREATE INDEX IF NOT EXISTS mat_origin_idx ON materials(origin);
+
+-- R2: 内置素材库（全局，不属任何用户）。§6.2-1 的 schema 决定。
+-- materials.origin='art' 是用户产出的图（出图服务/上传/抠图中间产物），属用户；
+-- asset_library 是内置库（Wikimedia Commons/Iconify 等），全局共享。
+CREATE TABLE IF NOT EXISTS asset_library (
+  id                   text PRIMARY KEY,
+  sha256               text NOT NULL UNIQUE,
+  bytes                bigint NOT NULL,
+  mime                 text NOT NULL,
+  ext                  text NOT NULL,
+  width                integer, height  integer,
+  object_key           text NOT NULL,
+  source               text NOT NULL,
+  src_id               text NOT NULL DEFAULT '',
+  license              text NOT NULL,
+  attribution_required boolean NOT NULL DEFAULT false,
+  license_url          text NOT NULL DEFAULT '',
+  subject              text NOT NULL DEFAULT '',
+  style_family         text NOT NULL DEFAULT '',
+  tags                 text NOT NULL DEFAULT '[]',
+  caption              text NOT NULL DEFAULT '',
+  era                  text NOT NULL DEFAULT '',
+  enabled              boolean NOT NULL DEFAULT true,
+  fetched_at           timestamptz NOT NULL DEFAULT now(),
+  created_at           timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS asset_subject_idx ON asset_library(subject, enabled);
+CREATE INDEX IF NOT EXISTS asset_style_idx   ON asset_library(style_family, enabled);
+CREATE INDEX IF NOT EXISTS asset_source_idx  ON asset_library(source, enabled);
 
 -- 分片续传账本：一行 = 一次「谁、往哪个会话、传多大文件、切成几块」。
 -- 只记计划不记进度：分片本身就放在对象存储的 uploads/ 前缀下，一块一个对象，

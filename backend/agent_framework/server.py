@@ -68,7 +68,8 @@ from .identity import storyline_session_id
 from .orchestration import _safe
 from . import judge as judge_mod
 from .hooks import quota_status
-from .tools.web import KEYED_SEARCH_PROVIDERS, auto_provider, keyed_provider
+from .tools.web import (KEYED_SEARCH_PROVIDERS, auto_provider, keyed_provider,
+                        provider_refusal)
 from .llm_openai import (DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_THINKING,
                          get_default_llm)
 from .media_fetch import FetchPolicy, FetchRejected, fetch_media
@@ -2178,8 +2179,10 @@ def create_app(
                                    ) -> dict[str, Any]:
         """连通性自检：按当前生效配置**真发一条查询**，回后端名、条数、样题与时延。
 
-        判据只有一条「后端有没有回结果」，所以 0 条也算通路活着——那说明 key、地址、
-        网络都对，只是这条查询没命中。后端本身报错才是失败。
+        判据是「后端有没有回**可留下的**结果」：真回 0 条算通路活着（key、地址、网络
+        都对，只是这条查询没命中）；但检索链交回 `(None, 说明)` 时不算活着——那是它
+        跑完了却一条都没敢留下（全被字面相关闸丢弃、或被反爬挡下），工具在那头回的就是
+        `Error:`，自检端点不能在这一头说「一切正常」。两头的口径必须一致。
         """
         name, key, base, source = await secrets.resolve_search_config(user_id)
         name = (name or "").strip().lower()
@@ -2199,10 +2202,21 @@ def create_app(
         try:
             rows = await asyncio.to_thread(runner, query, 3)
         except Exception as e:  # noqa: BLE001 - 自检端点：任何后端异常都要如实回给用户
-            return {"ok": False, "provider": name, "source": source, "results": 0,
+            return {"ok": False, "refused": False, "provider": name, "source": source,
+                    "results": 0,
                     "latency_ms": int((time.monotonic() - started) * 1000),
                     "message": f"{type(e).__name__}: {e}"}
         latency = int((time.monotonic() - started) * 1000)
+        refusal = provider_refusal(rows)
+        if refusal:
+            # 链跑完了却一条都没留下（全被字面相关闸丢弃 / 被反爬挡下 / 后端不可用）。
+            # 这不算通路活着：工具在那头回的是 Error，这里若回 ok:true，
+            # 用户在设置页看到的「后端有响应」就会和他刚刚拿到的失败回执互相打脸。
+            return {"ok": False, "refused": True,
+                    "provider": name or "auto", "backend": label,
+                    "source": source, "query": query, "results": 0,
+                    "latency_ms": latency,
+                    "message": refusal.removeprefix("Error: ")}
         titles = [r.title for r in (rows or [])][:3]
         return {"ok": True, "provider": name or "auto", "backend": label,
                 "source": source, "query": query, "results": len(rows or []),

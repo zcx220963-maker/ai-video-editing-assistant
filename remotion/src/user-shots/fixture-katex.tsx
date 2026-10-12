@@ -13,10 +13,12 @@ import { FilmLayout, F, useBody } from '@dg/film';
 import { TOKENS } from '@dg/tokens';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
+import { E } from '@dg/motion';
 
 const GRID = 20;
 const X_RANGE = 3;
 const Z_RANGE = 3;
+const _ease = E.linear(0);
 
 function waveY(
   x: number,

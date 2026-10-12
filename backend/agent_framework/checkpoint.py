@@ -225,8 +225,9 @@ class CheckpointManager:
         cp.messages = list(messages)
         cp.status = STATUS_FAILED
         await self.save(cp)
-        # 失败仍归还认领：failed 还是崩溃恢复候选，但「谁持有」该让出来，
-        # 否则 owner 非空且租约未过期时两个 claim 都命中不了，这条 run 永远没人接手。
+        # 失败仍归还认领：这条 run 已不在途，owner 留着只会让它看起来「有人在跑」。
+        # 注意它**不再**是启动自动重放的候选（`claim_recoverable` 只认 running）——
+        # 重放由用户的「继续」发起，预算也就由用户重新给。
         if cp.owner_instance_id:
             await self._repo.release_lease(cp.run_id, cp.owner_instance_id)
 
@@ -291,6 +292,9 @@ class CheckpointManager:
         两步都是纯 AND 条件（条件 DSL 不支持 OR）：先领「无主」的（owner IS NULL），
         再领「租约过期」的（owner 非空但 lease < now）。别的实例刚领走且租约未到期的
         run，两步都命中不了——于是「恢复哪个 run」从人工约定变成了服务端判据。
+
+        候选只含 ``running``：被 kill 的 run 来不及改状态，留在 running；写成 failed
+        的已被处理器定性并报过失败，重启不替用户重按「继续」（判据见 repo 层同名方法）。
         """
         lease = _now_dt() + timedelta(seconds=lease_sec)
         rows = await self._repo.claim_recoverable(instance_id, lease, limit=limit)

@@ -13,6 +13,7 @@ import React from 'react';
 import { interpolate, random, useCurrentFrame, useVideoConfig } from 'remotion';
 import { FilmLayout, useBody } from '@dg/film';
 import { TOKENS } from '@dg/tokens';
+import { E } from '@dg/motion';
 
 interface ShotProps {
   text?: string;
@@ -27,6 +28,7 @@ const Shot: React.FC<ShotProps> = ({ text = '', highlight = [], words, subtitleM
   const { durationInFrames } = useVideoConfig();
   const body = useBody(aspect);
   const t = frame / Math.max(1, durationInFrames - 1);
+  const ease = E.inOutCubic(t);
 
   return (
     <FilmLayout
@@ -58,7 +60,7 @@ const Shot: React.FC<ShotProps> = ({ text = '', highlight = [], words, subtitleM
               cy={cy - (1 - rise) * body.h * 0.16}
               r={r}
               fill={i % 5 === 0 ? TOKENS.accent : TOKENS.ink}
-              opacity={0.15 + rise * 0.6}
+              opacity={0.15 + ease * 0.6}
             />
           );
         })}

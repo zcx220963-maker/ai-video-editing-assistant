@@ -52,8 +52,8 @@ PLACEHOLDER_API_KEY = "pending-frontend-settings"
 MY_API_KEY = ""                    # ← 留空；要回落配置请设环境变量 OPENAI_API_KEY
 MY_MODEL = "deepseek-flash"        # ← 例如 "deepseek-chat" 或 "deepseek-v4-flash"；留空用默认
 MY_BASE_URL = ""     # ← 换服务商时才填；留空用 https://api.deepseek.com
-# 12 镜分镜（每镜含 TSX 代码）约需 8K~16K 输出 token；API 默认 4096 会截断末尾镜头。
-DEFAULT_MAX_TOKENS = 16384
+# DeepSeek-V4.1-Flash 输出上限 384K tokens；26 镜分镜（每镜含 TSX 代码）约需 25K~40K。
+DEFAULT_MAX_TOKENS = 131072
 # ==============================================================================
 
 

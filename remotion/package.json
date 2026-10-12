@@ -11,6 +11,8 @@
   "dependencies": {
     "@react-three/fiber": "9.8.1",
     "@remotion/bundler": "4.0.534",
+    "@remotion/layout-utils": "4.0.534",
+    "@remotion/motion-blur": "4.0.534",
     "@remotion/paths": "4.0.534",
     "@remotion/renderer": "4.0.534",
     "@remotion/shapes": "4.0.534",

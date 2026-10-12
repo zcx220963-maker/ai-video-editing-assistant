@@ -47,7 +47,8 @@ COPY . .
 # 白名单多出一个名字时，构建照样成功、lint 照样放行——炸的是打包期那句「解析失败」，
 # 而收到它的是照着白名单写代码的模型，看到的是一行跟它写的 import 长得不一样的错。
 # 烤不成功的镜像才是会报警的那一个。
-RUN node --check server.mjs \
+RUN node -e "const{execSync}=require('child_process');const fs=require('fs');const out=execSync('fc-list : family',{encoding:'utf8'});const fams=[...new Set(out.split('\n').flatMap(l=>l.split(',').map(s=>s.trim())).filter(Boolean))].sort();fs.writeFileSync('font-whitelist.json',JSON.stringify(fams,null,2));const need=['Noto Sans CJK SC','Noto Serif CJK SC','Noto Sans Mono CJK SC'];const miss=need.filter(f=>!fams.includes(f));if(miss.length)throw new Error('镜像缺字体：'+miss.join(', '));console.log('字体白名单',fams.length,'族')" \
+    && node --check server.mjs \
     && node -e "import('./lint.mjs').then(async (m) => { const r = await m.lintShotCode('x'); if (r.ok) throw new Error('空代码竟然过了 lint'); console.log('lint 闸就绪，空代码报', r.errors.length, '条'); })" \
     && node -e "const p=require('./package.json'); if (!p.dependencies.remotion) throw new Error('remotion 没进依赖'); console.log('remotion', p.dependencies.remotion)" \
     && node --input-type=module -e "const m = await import('./lint-rules.mjs'); const {createRequire} = await import('node:module'); const req = createRequire('/srv/x.mjs'); const bad = []; for (const p of m.ALLOWED_IMPORTS) { if (p.startsWith('@dg/')) continue; try { req.resolve(p); } catch { bad.push(p); } } if (bad.length) throw new Error('import 白名单里的包镜像里没装：' + bad.join(', ') + '——要么装进 package.json，要么从白名单删掉'); console.log('import 白名单', m.ALLOWED_IMPORTS.size, '项全部可解析')" \

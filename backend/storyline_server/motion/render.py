@@ -31,9 +31,18 @@ BREATH_LEAD_SEC = 0.10      # 每镜开口前的呼吸
 BREATH_TAIL_SEC = 0.35      # 每镜收尾后的驻留
 DEFAULT_SHOT_SEC = 2.6      # 无旁白且模型没给时长时的兜底驻留
 
-#: 整片帧预算（闸② 用它判）。帧率与文案长度在这里换成「这次要编多少帧」，
+#: 整片帧预算下限（闸② 用它判）。帧率与文案长度在这里换成「这次要编多少帧」，
 #: 超了要用户降 fps / 缩片子，不静默砍——静默砍等于交出一份不是对方要的东西。
 MAX_FRAMES_TOTAL = 4000
+#: 帧预算对目标时长的放余系数——目标 240s 实际可能 260s，留 30% 余量
+_FRAME_BUDGET_HEADROOM = 1.3
+
+
+def max_frames_total(fps: int, target_sec: float | None = None) -> int:
+    """帧预算上限：有目标时长就按目标×帧率×余量算，没有就用固定下限。"""
+    if target_sec and target_sec > 0:
+        return max(MAX_FRAMES_TOTAL, int(target_sec * fps * _FRAME_BUDGET_HEADROOM))
+    return MAX_FRAMES_TOTAL
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 /**
- * 闸① 的自定义规则（四条文件级 + 三条字段对账）。
+ * 闸① 的自定义规则（六条文件级 + 三条字段对账）。
  *
  * 为什么禁项走 ESLint 内置的 `no-restricted-*`，而这些要自研：
  * 它们问的不是「用了哪个危险 API」，而是「这个文件整体上像不像一个合法镜头」——
@@ -10,6 +10,37 @@
  * 塞进规则的配置项），漏传就等于把这三条闸关掉——这是它们与上面四条唯一的差别，
  * 也是为什么这一份清单必须由调用方（Python 侧的 `code_spec`）交过来而不是从代码里猜。
  */
+
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/** 构建期 fc-list :family 生成的字体白名单。Dockerfile 在构建末尾用
+ *  fc-list 现生成、覆写这份文件，同时硬验 Noto Sans/Serif/Mono CJK SC 都在。
+ *  本地没这份文件时白名单为空集，font-family-whitelist 规则让路（不报错）——
+ *  真正的拦截发生在 Docker 构建期，那里白名单一定非空。 */
+let FONT_WHITELIST = new Set();
+try {
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  FONT_WHITELIST = new Set(
+    JSON.parse(readFileSync(join(__dirname, 'font-whitelist.json'), 'utf8')),
+  );
+} catch {}
+
+/** CSS 泛型字族——永远放行，不在白名单里也不报。 */
+const GENERIC_FAMILIES = new Set([
+  'sans-serif', 'serif', 'monospace', 'cursive', 'fantasy',
+  'system-ui', 'ui-monospace', 'ui-sans-serif', 'ui-serif', 'ui-rounded',
+  'math', 'emoji', 'fangsong', 'inherit', 'initial', 'unset', 'revert',
+]);
+
+/** 把 CSS font-family 字符串拆成家族名数组。
+ *  '"Noto Sans CJK SC", sans-serif' → ['Noto Sans CJK SC', 'sans-serif'] */
+function parseFontFamilies(str) {
+  return str.split(',')
+    .map((s) => s.trim().replace(/^["']|["']$/g, '').trim())
+    .filter(Boolean);
+}
 
 /** 预装进 creation-remotion 镜像的那批包 —— 白名单外的 import 一律退回。
  *
@@ -25,17 +56,43 @@ export const ALLOWED_IMPORTS = new Set([
   'react',
   'react-dom',
   'remotion',
+  '@remotion/paths',
+  '@remotion/shapes',
+  '@remotion/motion-blur',
+  '@remotion/layout-utils',
+  // 画法通道：真三维与手绘斜纹。这两个家族在 package.json + lockfile 里躺着，
+  // 且 2026-10-11 那批六支真渲夹具（roughjs / three / KaTeX × 两画幅）就是它们渲出来的
   'three',
   '@react-three/fiber',
   '@remotion/three',
-  '@remotion/paths',
-  '@remotion/shapes',
   'roughjs',
   'katex',
   'katex/dist/katex.min.css',
-  // 母版与 token 走别名，镜头代码不许相对路径摸到服务内部文件
+  // 母版与 token 走别名
   '@dg/film',
   '@dg/tokens',
+  // shot 配方卡的基础动效件（_fixtures 是真实现，不是桩）
+  '@dg/motion',
+  '@dg/polish',
+  '@dg/brand',
+  '@dg/fixtures/Motion',
+  '@dg/fixtures/Polish',
+  '@dg/fixtures/Brand',
+  '@dg/fixtures/Fixtures',
+  '@dg/fixtures/Look',
+  '@dg/fixtures/PageCam2D',
+  '@dg/lib/Caption',
+  '@dg/lib/ClipCard',
+  '@dg/lib/DigitRoll',
+  '@dg/lib/FlashCut',
+  '@dg/lib/PageCam',
+  '@dg/lib/VerticalTicker',
+  '@dg/lib/FlatPanel',
+  '@dg/lib/helpers/motion',
+  '@dg/lib/helpers/rand',
+  '@dg/lib/helpers/shake',
+  '@dg/lib/helpers/camera',
+  '@dg/themes/palettes.json',
 ]);
 
 const isRelative = (src) => typeof src === 'string' && (src.startsWith('.') || src.startsWith('/'));
@@ -406,11 +463,7 @@ export const dgPlugin = {
           if (typeof value !== 'string') return;
           const hit = value.match(RE);
           if (hit) {
-            context.report({
-              node,
-              messageId: 'external',
-              data: { url: hit[0].slice(0, 80) },
-            });
+            context.report({ node, messageId: 'external', data: { url: hit[0].slice(0, 80) } });
           }
         };
         return {
@@ -419,6 +472,107 @@ export const dgPlugin = {
         };
       },
     },
+
+    'must-use-motion': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          noImport:
+            '镜头代码必须 import 至少一个工具 from "@dg/motion" 或 "@dg/polish"。' +
+            '这些是 shot 卡动效的基础工具（E/seg/lerp/DesignStage/EASE/Grain/Vignette）。' +
+            '从 shot 配方卡适配 demo 代码时，demo 已经 import 了这些。',
+          noUse:
+            'import 了 @dg/motion 或 @dg/polish 但代码里没用到任何工具。',
+        },
+      },
+      create(context) {
+        let imported = false;
+        let usedTools = new Set();
+        const MOTION_EXPORTS = new Set([
+          'E', 'seg', 'lerp', 'rand', 'useT', 'DesignStage',
+        ]);
+        const POLISH_EXPORTS = new Set([
+          'EASE', 'Grain', 'Vignette', 'bezier', 'ramp', 'mix', 'FONT', 'fitText',
+        ]);
+        return {
+          ImportDeclaration(node) {
+            if (node.source.value === '@dg/motion' || node.source.value === '@dg/polish') {
+              imported = true;
+            }
+          },
+          Identifier(node) {
+            if (MOTION_EXPORTS.has(node.name) || POLISH_EXPORTS.has(node.name)) {
+              usedTools.add(node.name);
+            }
+          },
+          'Program:exit'() {
+            if (!imported) {
+              context.report({ loc: { line: 1, column: 0 }, messageId: 'noImport' });
+            } else if (usedTools.size === 0) {
+              context.report({ loc: { line: 1, column: 0 }, messageId: 'noUse' });
+            }
+          },
+        };
+      },
+    },
+
+    'no-raw-styled-div': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          rawBg:
+            '禁止用 <div> 带 background/backgroundColor 画纯色块——用 DesignStage 做画布底色，' +
+            '用主题色板（palettes.json）的颜色。渐变（linear-gradient/radial-gradient）可以。',
+          rawBgLiteral:
+            '禁止用 <div> 带 background="{{val}}" 画纯色块——用 DesignStage + 主题色板。',
+        },
+      },
+      create(context) {
+        const isPureColor = (val) => {
+          if (typeof val !== 'string') return false;
+          const s = val.trim();
+          return s.startsWith('#') ||
+            /^(rgb|hsl)a?\(/i.test(s) ||
+            !s.includes('(') && s.length > 0;
+        };
+        return {
+          JSXOpeningElement(node) {
+            if (!node.name || node.name.name !== 'div') return;
+            for (const attr of node.attributes || []) {
+              if (attr.type !== 'JSXAttribute' || attr.name.name !== 'style') continue;
+              const val = attr.value;
+              if (!val || val.type !== 'JSXExpressionContainer') continue;
+              const expr = val.expression;
+              if (!expr || expr.type !== 'ObjectExpression') continue;
+              for (const prop of expr.properties || []) {
+                if (!prop.key) continue;
+                const keyName = prop.key.name || prop.key.value;
+                if (keyName === 'backgroundColor') {
+                  context.report({ node, messageId: 'rawBg' });
+                }
+                if (keyName === 'background') {
+                  const v = prop.value;
+                  if (!v) continue;
+                  if (v.type === 'Literal' && isPureColor(v.value)) {
+                    context.report({ node, messageId: 'rawBgLiteral', data: { val: String(v.value).slice(0, 40) } });
+                  }
+                  if (v.type === 'JSXExpressionContainer' && v.expression.type === 'Literal' && isPureColor(v.expression.value)) {
+                    context.report({ node, messageId: 'rawBgLiteral', data: { val: String(v.expression.value).slice(0, 40) } });
+                  }
+                }
+              }
+            }
+          },
+        };
+      },
+    },
+
+    // （原来这里有一条 `no-svg`，2026-10-12 撤掉。）撤它的理由是数出来的：迁进来的
+    // 226 个 demo 里 **123 个用 `<svg>`/`<path>` 画图**，硬禁等于把刚搬进来的语料判掉一半，
+    // 而这条链上「认得出的画面主体」主要就靠这些几何件。坏画面（空壳、挤成一团）已经有
+    // 闸④ 在像素上判（`EMPTY_MIN_RATIO` / `SPAN_MIN` / `TIGHT_MIN`），不必在语法层再关一种画法。
 
     // ---- 字段参数通道的三条对账（spec §12.5）----
     // 这一族与上面四条的唯一区别是它们要拿分镜声明的字段名比，所以 lint 的调用方
@@ -456,6 +610,101 @@ export const dgPlugin = {
         '<F name="{{name}}"> 的 value 不是 `fields.{{name}}`，也不是绑到它的那个变量。' +
         '这是一个假指针：盒指着这个字段，像素却来自别处，改值时画面上动的不是它。',
     }),
+
+    'staticfile-asset-check': {
+      meta: { type: 'problem', schema: [{ type: 'array', items: { type: 'string' } }],
+              messages: {
+                undeclared: 'staticFile("{{arg}}") 引用了未声明的资产。本镜可用：{{alt}}',
+                nonLiteral: 'staticFile 的实参必须是字符串字面量，变量拼路径让机器无法核对',
+                unused: '声明了资产 "{{name}}" 但代码里没有对应的 staticFile 调用',
+              } },
+      create(context) {
+        const declared = context.options[0] ?? [];
+        const used = new Set();
+        return {
+          CallExpression(node) {
+            if (node.callee.type !== 'Identifier' || node.callee.name !== 'staticFile') return;
+            const arg = node.arguments[0];
+            if (!arg || arg.type !== 'Literal' || typeof arg.value !== 'string') {
+              context.report({ node, messageId: 'nonLiteral' });
+              return;
+            }
+            used.add(arg.value);
+            if (!declared.includes(arg.value)) {
+              context.report({ node, messageId: 'undeclared',
+                data: { arg: arg.value, alt: declared.join(', ') || '（本镜未声明任何资产）' } });
+            }
+          },
+          'Program:exit'() {
+            for (const name of declared) {
+              if (!used.has(name))
+                context.report({ loc: { line: 1, column: 0 }, messageId: 'unused', data: { name } });
+            }
+          },
+        };
+      },
+    },
+
+    'font-family-whitelist': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          notInWhitelist:
+            'fontFamily 里的家族 "{{family}}" 不在镜像字体白名单内（可用：{{allowed}}）。' +
+            '镜像里没装的字体在渲染时会静默回落成默认字族——画面上出现的和代码里写的不是一回事。',
+        },
+      },
+      create(context) {
+        if (FONT_WHITELIST.size === 0) return {};
+        const constStrings = new Map();
+
+        const check = (node, value) => {
+          if (typeof value !== 'string') return;
+          for (const name of parseFontFamilies(value)) {
+            if (GENERIC_FAMILIES.has(name.toLowerCase())) continue;
+            if (FONT_WHITELIST.has(name)) continue;
+            context.report({
+              node,
+              messageId: 'notInWhitelist',
+              data: { family: name, allowed: [...FONT_WHITELIST].join(', ') },
+            });
+          }
+        };
+
+        const resolveVal = (val) => {
+          if (!val) return null;
+          if (val.type === 'Literal' && typeof val.value === 'string') return val.value;
+          if (val.type === 'Identifier' && constStrings.has(val.name)) return constStrings.get(val.name);
+          if (val.type === 'TemplateLiteral' && val.expressions.length === 0)
+            return val.quasis.map((q) => q.value.raw).join('');
+          return null;
+        };
+
+        return {
+          VariableDeclarator(node) {
+            if (node.id.type !== 'Identifier' || !node.init) return;
+            const v = resolveVal(node.init);
+            if (v != null) constStrings.set(node.id.name, v);
+          },
+          Property(node) {
+            if (!node.key) return;
+            if ((node.key.name || node.key.value) !== 'fontFamily') return;
+            const v = resolveVal(node.value);
+            if (v != null) check(node.value, v);
+          },
+          JSXAttribute(node) {
+            if (!node.name || node.name.name !== 'fontFamily') return;
+            const v = resolveVal(node.value);
+            if (v != null) check(node.value, v);
+            if (node.value && node.value.type === 'JSXExpressionContainer') {
+              const v2 = resolveVal(node.value.expression);
+              if (v2 != null) check(node.value.expression, v2);
+            }
+          },
+        };
+      },
+    },
   },
 };
 
@@ -483,3 +732,8 @@ export const RESTRICTED_SYNTAX = [
   { selector: "CallExpression[callee.object.name='process']",
     message: '镜头代码拿不到宿主进程。' },
 ];
+// R2: staticFile 双向对账规则
+// 闸① 新规则：staticFile 引用必须与本镜 assets 声明对账
+export const STATICFILE_RULE = 'dg/staticfile-asset-check';
+// R4: 字体白名单规则
+export const FONT_RULE = 'dg/font-family-whitelist';

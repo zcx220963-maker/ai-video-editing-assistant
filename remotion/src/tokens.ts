@@ -126,4 +126,9 @@ export const LAYOUT_PROBE = {
   max_findings: 8,
 } as const;
 
+/** 闸⑪ 资产动效回读的行首标记。与闸⑧ 同一条 console.log 通道。
+ *  在首帧与探针帧各扫一遍 <img>/<video>，记录盒与 transform；
+ *  server.mjs 比对两帧的快照，判定三态。 */
+export const ASSET_LOG_MARKER = 'DG_ASSETS:';
+
 export type SubtitleMode = (typeof SUBTITLE_MODES)[number];

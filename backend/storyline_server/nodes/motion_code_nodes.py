@@ -131,7 +131,13 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                 bgm_ref=str(inputs.get("bgm") or ""),
                 sess=sess, artifact=artifact, jobs=jobs, attempt=attempt)
         except Exception as exc:
-            await jobs.fail(sess, artifact, str(exc)[:500], attempt or None)
+            lint_errs = getattr(exc, 'lint_errors', None) or []
+            detail = str(exc)[:500]
+            if lint_errs:
+                detail += "：\n" + "\n".join(
+                    f"  · {e.get('rule', '?')} L{e.get('line', '?')}: {e.get('msg', '')}"
+                    for e in lint_errs[:8])
+            await jobs.fail(sess, artifact, detail, attempt or None)
             raise
         return {**out,
                 "media_url": await self.storage.objects.presign_get(out["video"])}
@@ -184,8 +190,12 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                 probe(str(ev.get("stage") or "motion"), pct)
 
         try:
+            spec_for_render = dict(spec)
+            if target is not None:
+                spec_for_render["target_duration_sec"] = target
             out = await code_render.render_code_motion(
-                spec, providers=self.providers, work=work, bgm=bgm_path,
+                spec_for_render,
+                providers=self.providers, work=work, bgm=bgm_path,
                 client=self._client(),
                 progress=on_event, cache=_ObjectShotCache(self.storage.workspace, sess))
             await probe.drain()           # 迟到进度不能盖掉后面的终态
@@ -342,10 +352,14 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                  if r.get("fill_span") is not None}
         tight = sorted(sid for sid, v in spans.items() if v < code_render.FILL_TARGET)
         tokened = [r for r in ledger if r.get("tokens")]
-        # 闸⑦ 判在契约层（validate_code_spec，烧像素之前），到这里的这一份只报账：
-        # 打回的那一路根本走不完这次渲染，所以取 [1]（提醒）而不是 [0]（错误）。
+        # 整片层三道闸（⑦ 配额 / ⑨ 跨镜同构 / ⑩ 文字对比度）都判在契约层
+        # （validate_code_spec，烧像素之前），到这里的这一份只报账：打回的那一路根本
+        # 走不完这次渲染，所以三道都取 [1]（提醒）而不是 [0]（错误）。三道的提醒合成
+        # 一份，和计划卡上看到的是同一串。
         facts = cspec.style_facts(spec["shots"])
-        quota_warns = cspec.check_style_quota(spec["shots"])[1]
+        style_warns = (cspec.check_style_quota(spec["shots"])[1]
+                       + cspec.check_shot_structure(spec["shots"])[1]
+                       + cspec.check_ink_contrast(spec["shots"])[1])
         ch_counts: dict[str, int] = {}
         for ch in facts["channels"].values():
             ch_counts[ch] = ch_counts.get(ch, 0) + 1
@@ -448,15 +462,45 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                       "没人再看。扫过的镜 findings 为空才是「干净」；没扫的镜单独点名，"
                       "不混进 0 告警里"
                 if ledger else "这份分镜没有镜头"),
-            _ev("逐镜提醒（不打回）：" + "；".join(list(quota_warns)
+            _ev(f"闸⑨ 跨镜同构：{len(spec['shots'])} 镜里"
+                + (f"有 {len(facts['same_shape_groups'])} 组代码结构几乎一样（"
+                   + "；".join("、".join(g) for g in facts["same_shape_groups"]) + "）"
+                   if facts["same_shape_groups"] else
+                   "没有一组（≥3 镜）抽掉文字与色相后剩同一副骨架"),
+                "machine",
+                verified=not facts["same_shape_groups"],
+                proof="判据是把 import、注释、字符串字面量与十六进制色号全抹掉之后的"
+                      "token 多重集相似度（≥"
+                      f"{int(cspec.STRUCT_SAME * 100)}% 算同构）。**打回**判在 "
+                      "validate_code_spec（烧像素之前），这里报的是同一份账；"
+                      "换色相、换文案骗不过这条——今天拿仓库里 152 对真实 demo 校准过："
+                      "确实不同的两镜最高 0.736，只换文字与配色的那一对是 1.000"),
+            _ev(f"闸⑩ 文字对比度：{len(facts['contrast'])} 镜量出了文字与底的组合，"
+                + (f"最低 {min(c['ratio'] for c in facts['contrast']):.2f}:1"
+                   if facts["contrast"] else "本片没有可量的字面颜色")
+                + (f"；认不出底色的镜：{facts['contrast_unjudged']} 镜"
+                   if facts["contrast_unjudged"] else ""),
+                "machine",
+                verified=bool(facts["contrast"])
+                and all(c["ratio"] >= cspec.CONTRAST_MIN for c in facts["contrast"]),
+                proof="按 WCAG 2.1 的相对亮度算比值，低于 "
+                      f"{cspec.CONTRAST_MIN:.0f}:1 **打回**、低于 "
+                      f"{cspec.CONTRAST_READABLE:.1f}:1 只提醒。取的是「这镜所有底色里"
+                      "最好读的那一个」，所以深卡白字压在浅页面上不算违规。R3F 的 "
+                      "material/light 颜色不进这一判（那不是文字）；**只从 palette 变量"
+                      "取色而没有字面颜色时判不了**，那一条照实记在 "
+                      "style_contrast_unjudged，不许当成已通过"),
+            _ev("逐镜提醒（不打回）：" + "；".join(list(style_warns)
                 + ([f"这几镜的内容没铺满画面带（短边的 "
                     f"{int(code_render.FILL_TARGET * 100)}% 是目标）："
                     + "、".join(f"{sid} {spans[sid] * 100:.0f}%" for sid in tight)]
                    if tight else []))
-                if (quota_warns or tight) else
+                if (style_warns or tight) else
                 "逐镜提醒（不打回）：没有——文案的具体项与画面带铺满度都在目标线上",
                 "machine", verified=True,
-                proof="这两条**故意不做硬闸**：文案的具体项只看得见数字/引号术语/拉丁缩写，"
+                proof="这一份合流了闸⑦/⑨/⑩ 三道的**提醒**（各自的打回早就在 "
+                      "validate_code_spec 拦住了，走不到这里），加上铺满度清单。其中"
+                      "这两条**故意不做硬闸**：文案的具体项只看得见数字/引号术语/拉丁缩写，"
                       "地名人名器物名词法认不出，误伤的代价是一整轮重规划；铺满度低于 "
                       f"{code_render.FILL_TARGET:.0%} 但高于小气闸 "
                       f"{code_render.TIGHT_MIN:.0%} 的，是「构图小气」这种审美问题，"
@@ -611,12 +655,16 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             "degraded": degraded,
             "empty_ratios": out.get("empty_ratios") or {},
             "fill_spans": out.get("fill_spans") or {},
-            # 闸⑦ 判在契约层，但**账要出在两处**：plan_motion 那份是「改之前就该看得见」，
-            # 这一份是「已经渲出来了，画面用的到底是哪几条通道」。两份读的是同一个
-            # style_facts，所以不会出现计划卡说两种画法、回执说三种。
+            # 整片层三道闸判在契约层，但**账要出在两处**：plan_motion 那份是「改之前就该
+            # 看得见」，这一份是「已经渲出来了，画面用的到底是哪几条通道、有没有同构、
+            # 文字压在什么底色上」。两份读的是同一个 style_facts，所以不会出现计划卡说
+            # 两种画法、回执说三种。
             "style_channels": facts["channels"],
             "style_text_only": facts["text_only"],
-            "style_warnings": list(quota_warns),
+            "style_same_shape": facts["same_shape_groups"],
+            "style_contrast": facts["contrast"],
+            "style_contrast_unjudged": facts["contrast_unjudged"],
+            "style_warnings": list(style_warns),
             "fill_warnings": [f"{sid}：内容只铺开画面带短边的 {spans[sid] * 100:.0f}%"
                               f"（目标 {int(code_render.FILL_TARGET * 100)}%）"
                               for sid in tight],

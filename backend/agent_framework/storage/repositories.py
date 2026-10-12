@@ -749,10 +749,20 @@ class CheckpointsRepo(_Repo):
         两步都是纯 AND 条件（条件 DSL 不支持 OR）：第一步领 owner IS NULL 的，
         第二步领 owner 非空但 lease < now 的。别的实例刚领走且租约未到期的 run，
         两步都命中不了——恢复权因此从人工约定变成了服务端判据。
+
+        候选**只取 running**，不含 failed。判据是「这行有没有被谁定性过」：
+        真被 kill 的 run 来不及写状态，留在 running——那是恢复的正主；而写成
+        failed 的每一行都是收口处理器**主动**落下的定性（配额拦下、LLM 报错、
+        撞迭代上限），已经向用户报过失败。重启就重放它们等于替用户重按了一次
+        「继续」，还给满预算。真机炸过一次：03:43 被配额拦下、零模型调用的一条
+        failed run，在 05:29 服务重建时被自动认领并重放，烧掉 1,953,686 token、
+        一张计划卡都没出。用户显式的「继续」（``/runs/{id}/resume``、
+        同会话发消息触发的 ``interrupted_execution_for_session``）仍看得见
+        failed——那两条路各自按 running/failed 查，都不经过这里。
         """
         set_values = {"owner_instance_id": instance_id,
                       "lease_expires_at": lease_expires_at}
-        base = [Cond("status", "in", ["running", "failed"])]
+        base = [Cond("status", "eq", "running")]
         out = await self.db.claim(
             self.table, set_values,
             where=[*base, Cond("owner_instance_id", "is_null", None)],

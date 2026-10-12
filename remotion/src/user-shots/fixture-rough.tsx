@@ -10,6 +10,7 @@ import React, { useRef, useEffect } from 'react';
 import { useCurrentFrame, useVideoConfig } from 'remotion';
 import { FilmLayout, F, useBody } from '@dg/film';
 import { TOKENS } from '@dg/tokens';
+import { E } from '@dg/motion';
 import rough from 'roughjs';
 
 const Shot: React.FC<{
@@ -19,6 +20,7 @@ const Shot: React.FC<{
 }> = ({ text = '', aspect = 'portrait', fields = {} }) => {
   const frame = useCurrentFrame();
   const { width, durationInFrames } = useVideoConfig();
+  const ease = E.inOutCubic(frame / Math.max(1, durationInFrames - 1));
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const u = width / 1080;
   // 画布 = 母版真正裁出来的那条画面带，不再手写 144/416 这种猜测值
@@ -63,7 +65,7 @@ const Shot: React.FC<{
     } else {
       rc.line(cx - eyeSize / 2, cy, cx + eyeSize / 2, cy, {
         stroke: TOKENS.ink,
-        strokeWidth: 4 * u,
+        strokeWidth: 4 * u * ease,
       });
       for (let i = 1; i <= 3; i++) {
         const inset = i * 12;

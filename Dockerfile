@@ -45,6 +45,9 @@ COPY backend/ ./
 # package.json 的依赖——不在这里 COPY，这一条在 sanctioned 环境（creation-app 内跑套件）
 # 就是读不到文件。拷贝只会因「改了 TSX 没重烤 app 镜像」而变旧，变旧报红不静默过。
 COPY remotion/src/tokens.ts /app/remotion/src/tokens.ts
+# 闸⑪ 要把代码里的 `palettes["deep-ocean"].text` 解析成真实色号才能算对比度：没有这份
+# 色板，凡是从 palette 取色的镜只能记成「未判」，那一条就只剩字面十六进制颜色能判。
+COPY remotion/src/themes/palettes.json /app/remotion/src/themes/palettes.json
 COPY remotion/lint-rules.mjs remotion/package.json /app/remotion/
 # 前端产物放进 REPO_ROOT/frontend/dist(run_server 的静态目录锚点在容器内=/frontend/dist)
 COPY --from=web /web/dist /frontend/dist

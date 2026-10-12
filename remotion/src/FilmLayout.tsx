@@ -7,6 +7,7 @@ import {
 } from 'remotion';
 import {
   ASPECTS,
+  ASSET_LOG_MARKER,
   FIELD_LOG_MARKER,
   FIELD_PROBE_TAIL,
   FILM_GEOMETRY,
@@ -550,6 +551,37 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
     const { findings, scanned } = probeLayout(root, { x: body.x, y: body.y, w: body.w, h: body.h });
     console.log(`${LAYOUT_LOG_MARKER}${JSON.stringify({ frame, findings, scanned, thresholds: LAYOUT_PROBE })}`);
   }, [frame, probeFrame, body.x, body.y, body.w, body.h]);
+
+  // 闸⑪ 资产动效：在两个时点各扫一遍 <img>/<video>，记录盒与 transform。
+  // server.mjs 比对两帧快照：盒/transform 全同 → 静态摆图打回；有变 → 参与动效绿；
+  // 采不到任何资产盒 → 未判（不许记成通过）。
+  // 用两个靠近末尾的帧而非首/末帧：首帧 <img> 可能未加载完（box=y:-999903），
+  // 与探针帧的盒不同会被误判为 animated。两帧都靠近末尾时图片已加载、布局已稳定。
+  // 选 probeFrame-2 与 probeFrame：间隔 2 帧足够检测仍在进行的动效，
+  // 且都在渲染稳定区。对短镜（duration≤4）退化为前半与后半各取一帧。
+  const assetProbeEarly = probeFrame > 4 ? probeFrame - 2 : Math.min(1, Math.floor(durationInFrames / 2));
+  React.useEffect(() => {
+    if (frame !== assetProbeEarly && frame !== probeFrame) return;
+    const root = bodyRef.current;
+    if (!root) return;
+    const assets = Array.from(root.querySelectorAll('img, video'))
+      .filter((el) => paintedWithin(root, el))
+      .map((el) => {
+        const box = measureBox(el);
+        const s = getComputedStyle(el);
+        const src = el.tagName.toLowerCase() === 'img'
+          ? (el as HTMLImageElement).src
+          : (el as HTMLVideoElement).src;
+        return {
+          tag: el.tagName.toLowerCase(),
+          src: src?.slice(-80),
+          box,
+          transform: s.transform,
+          opacity: Number(s.opacity === '' ? 1 : s.opacity),
+        };
+      });
+    console.log(`${ASSET_LOG_MARKER}${JSON.stringify({ frame, assets })}`);
+  }, [frame, assetProbeEarly, probeFrame]);
 
   return (
     <AbsoluteFill style={{ background: TOKENS.bg, fontFamily: TOKENS.fontStack }}>

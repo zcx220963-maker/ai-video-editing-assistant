@@ -25,7 +25,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
+from collections import Counter
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Mapping
 
 # ---------------------------------------------------------------------------
@@ -46,6 +50,34 @@ MAX_SHOTS = 120
 MAX_TEXT_CHARS = 60          # 竖屏字幕带两行的容量
 MAX_TEXT_CHARS_WIDE = 110    # 横屏那条居中横排字幕：一行更宽，两行装得下更多
 MAX_HIGHLIGHTS_PER_SHOT = 4
+
+# R1: card / derived_from 契约栏——模型必须声明选了哪张卡、代码来自哪些 demo
+_SKILL_DIR = Path(__file__).resolve().parents[2] / "examples/skills/motion_explainer"
+
+@lru_cache(maxsize=1)
+def _known_card_ids() -> frozenset[str]:
+    shots_dir = _SKILL_DIR / "shots"
+    if not shots_dir.is_dir():
+        return frozenset()
+    ids = set()
+    for cat in shots_dir.iterdir():
+        if cat.is_dir() and not cat.name.startswith((".", "_")):
+            for card in cat.glob("*.md"):
+                ids.add(f"{cat.name}/{card.stem}")
+    return frozenset(ids)
+
+@lru_cache(maxsize=1)
+def _known_demo_relpaths() -> frozenset[str]:
+    man = _SKILL_DIR / "demos/MANIFEST.json"
+    if not man.is_file():
+        return frozenset()
+    try:
+        return frozenset(m["relpath"] for m in json.loads(man.read_text("utf-8")))
+    except Exception:
+        return frozenset()
+
+#: 相似度阈值（标定 2026-10-12：正样本138对全=1.0，负样本138对范围0.067~0.603中位0.424）
+DERIVED_MIN_SIM = 0.61
 
 #: 旁白音色（edge-tts 中文音色，实测 14 个；值随服务商变，故也放行合规格式）
 VOICES = (
@@ -79,7 +111,7 @@ MAX_CODE_BYTES = 40_000
 
 #: 只有这五种，因为前端只有这五种控件。第六种类型的字段会落成一个没人认识的输入框
 #: ——控件的单一来源是这份 type（旧链 #127「补丁口把字段类型也发出去」那条纪律的延续）。
-FIELD_TYPES = ("number", "color", "text", "bool", "select")
+FIELD_TYPES = ("number", "color", "text", "bool", "select", "image")
 
 #: 每镜最多开几个旋钮。上限不为性能，为**表单可读性**：放开了让模型声明，它会把每个
 #: 字面量都开成字段，一镜四十行表单没人改得动，而那些值本来就在代码里看得见。
@@ -385,6 +417,32 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         _err(errors, f"{sid}：texture={tex!r} 没有对应的滤镜链"
                      f"（可用：{', '.join(TEXTURES)}，留空表示跟整片默认）")
         tex = ""
+
+    # R1: card / derived_from 契约栏
+    card = str(raw.get("card") or "").strip()
+    if not card:
+        _err(errors, f"{sid}：card 为空——每一镜必须声明选了哪张 shot 配方卡（格式：<类别>/<卡名>）")
+    else:
+        known = _known_card_ids()
+        if known and card not in known:
+            _err(errors, f"{sid}：card={card!r} 不在卡库中（共 {len(known)} 张卡），"
+                         f"模型不能自创卡名，必须从 shots/INDEX.md 里选")
+
+    derived_from = raw.get("derived_from") or []
+    if not isinstance(derived_from, list):
+        derived_from = [str(derived_from)]
+    derived_from = [str(d).strip() for d in derived_from if str(d).strip()]
+    if not derived_from:
+        _err(errors, f"{sid}：derived_from 为空——每一镜必须声明代码来自哪些 demo（relpath 列表）")
+    else:
+        known_demos = _known_demo_relpaths()
+        if known_demos:
+            for d in derived_from:
+                if d not in known_demos:
+                    _err(errors, f"{sid}：derived_from={d!r} 不在 demo 语料白名单中"
+                                 f"（共 {len(known_demos)} 个 demo），"
+                                 f"必须从 demos/MANIFEST.json 里选")
+
     return {
         "id": sid,
         "code": code,
@@ -394,6 +452,9 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         "min_duration_sec": min_sec,
         "texture": tex,
         "source": {str(k): str(v) for k, v in src.items()},
+        "card": card,
+        "derived_from": derived_from,
+        "assets": raw.get("assets") or [],
     }
 
 
@@ -401,11 +462,12 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """→ (规范化后的 spec, 错误清单)。错误清单非空即**不可渲染**。
 
     这一层管两类事：① 逐镜「一定会把画面写坏」的几件事（代码在不在、文案超不超
-    字幕容量、高亮词是不是子串、枚举在不在白名单内）；② **整片层**的闸⑦ 硬判据
-    （:func:`check_style_quota`：风格配额与纯文字镜占比）。代码**内容**对不对归闸①
-    （容器里的 lint）与闸④（画面上有没有东西），史实对不对归出处闸与证据账。
-    闸⑦ 只出**提醒**的那一份（文案具体项）不从本函数返回——它不拦，由 ``style_facts``
-    在计划卡与出片回执那两处点名。
+    字幕容量、高亮词是不是子串、枚举在不在白名单内）；② **整片层**的三道硬闸——
+    :func:`check_style_quota`（风格配额与纯文字镜占比）、:func:`check_shot_structure`
+    （闸⑨：跨镜骨架同构）、:func:`check_ink_contrast`（闸⑩：字色在底色上读不读得出）。
+    代码**内容**对不对归闸①（容器里的 lint）与闸④（画面上有没有东西），史实对不对归
+    出处闸与证据账。这几道只出**提醒**的那几份不从本函数返回——它们不拦，由
+    ``style_facts`` 在计划卡与出片回执那两处点名。
     """
     errors: list[str] = []
     if not isinstance(raw, dict):
@@ -463,11 +525,12 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     if len(shots) != len(raw_shots):
         _err(errors, "有镜头不是对象，已丢弃")
 
-    # 闸⑦ 的硬判据（整片风格配额与纯文字镜占比）也挂在这里：三个调用点——plan_motion
-    # 入库前、render_motion_code 烧像素前、patch_motion_code 落盘前——调的都是这一个
-    # 函数，规则因此不可能只在一路上生效。提醒那一份从这里单独取（见 style_facts）。
-    quota_errors, _warns = check_style_quota(shots)
-    errors.extend(quota_errors)
+    # 闸⑦⑨⑩ 的硬判据（整片风格配额与纯文字镜占比 / 跨镜同构 / 前景底色对比度）都挂在
+    # 这里：三个调用点——plan_motion 入库前、render_motion_code 烧像素前、
+    # patch_motion_code 落盘前——调的都是这一个函数，规则因此不可能只在一路上生效。
+    # 提醒那一份从这里单独取（见 style_facts）。
+    for checker in (check_style_quota, check_shot_structure, check_ink_contrast):
+        errors.extend(checker(shots)[0])
 
     bgm = raw.get("bgm") if isinstance(raw.get("bgm"), dict) else {}
     try:
@@ -491,6 +554,7 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         "bgm": {"ref": str(bgm.get("ref") or ""), "volume": bgm_volume,
                 "duck": bool(bgm.get("duck", True))},
         "title": str(raw.get("title") or "")[:80],
+        "target_duration_sec": raw.get("target_duration_sec"),
     }
     return spec, errors
 
@@ -509,12 +573,24 @@ def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
     knobs = {k: shot.get(k) for k in SHOT_KNOBS}
     # 见 SHOT_KNOBS 那条注释：进键的是值扁表，不是整份声明。
     knobs["fields"] = field_values(shot)
+    # R2: 资产字节进缓存键——换图必须重烧，改注释不重烧
+    assets = shot.get("assets") or []
+    assets_hash = ""
+    if assets:
+        asset_pairs = sorted(
+            f"{a.get('sha16','')}/{a.get('name','')}"
+            for a in assets if isinstance(a, dict)
+        )
+        assets_hash = hashlib.sha256(
+            "|".join(asset_pairs).encode("utf-8")
+        ).hexdigest()[:16]
     payload = {
         "code": str(shot.get("code") or ""),
         "knobs": knobs,
         "film": {k: film.get(k) for k in FILM_KNOBS},
         "master": master_hash,
         "deps": lockfile_hash,
+        "assets_hash": assets_hash,
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
@@ -524,36 +600,45 @@ def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
 # 闸⑦ 整片层：风格配额与文案具体项（在烧像素之前判，一次都不花）
 # ---------------------------------------------------------------------------
 
-#: 四条画法通道 → 认的 import 包名。**与技能正文「画面丰富度合同与风格配额」那张表
-#: 逐行同源**（``tests/test_code_spec.py`` 第 ⑦ 节拿正文比对这些名字）。
-#: 为什么判据是 import 而不是模型自报的一栏：自报会漂（写了 `style: rough` 而代码里
-#: 一个 roughjs 都没有），而这条闸要拦的恰恰就是「说用了但其实没有」。
-STYLE_CHANNELS: dict[str, tuple[str, ...]] = {
+#: **画法通道** → 认的 import 包名。只有「这一镜真的画了东西」的四条算通道：
+#: 手绘斜纹（roughjs）、真三维（three / R3F）、公式（katex）、几何图形（裸 SVG 与
+#: `@remotion/shapes`，判据在 markup 上而不是 import 上，见 ``_VECTOR_MARKUP_RE``）。
+#:
+#: ``@dg/motion``/``@dg/polish``/``@dg/lib``/``@dg/themes`` 那一类**不再算通道**：
+#: 它们是动效件与色板，不是画面主体。「左边一张卡片 + 右边一段文字」配齐了
+#: ``@dg/lib/ClipCard`` 与 ``@dg/themes``，画面上仍然什么都没有——旧表把它们计入
+#: variety，正是「配额绿了而画面还是 PPT」的那条缝。它们照样在白名单里可以 import，
+#: 只是撑不起配额。
+#:
+#: **与技能正文「通道表」那张表逐行同源**（``tests/test_code_spec.py`` 第 ⑧ 节拿正文
+#: 比对这些名字）。为什么判据是 import 而不是模型自报的一栏：自报会漂（写了
+#: `style: rough` 而代码里一个 roughjs 都没有），而这条闸要拦的恰恰就是
+#: 「说用了但其实没有」。
+PICTORIAL_CHANNELS: dict[str, tuple[str, ...]] = {
     "rough": ("roughjs",),
     "three": ("three", "@react-three/fiber", "@remotion/three"),
     "katex": ("katex",),
-    "vector": ("@remotion/paths", "@remotion/shapes"),
+    "image": ("staticFile",),  # R2: 图像通道——本镜声明了 assets 且 staticFile 引用
 }
 
-#: 归类顺序：既上 rough 又写裸 SVG 的那一镜算 rough（专门通道优先，配额才不会被
-#: 「一条 three 镜 + 十一条 SVG 镜」蒙成两种通道各半）。
-_CHANNEL_ORDER = ("rough", "three", "katex", "vector")
+#: 归类顺序：专门通道优先，配额才不会被蒙成两种通道各半。
+CHANNEL_ORDER = ("rough", "three", "katex", "image")
 
-#: 没有专门通道、但代码里真在画几何图形 —— 技能正文那句「（或裸 SVG）」的机器形态。
-#: 判据是**写了画形状的东西**，不是 import：`<svg>`/`<path>`/`rough` 之外的
-#: `<div>` 加 `background` 只是色块，色块不算画面主体（「卡片+文字」正是这么写的）。
+#: 第四条通道：代码里真在画几何图形 —— 技能正文那句「（或裸 SVG）」的机器形态。
+#: 判据**是写了画形状的东西**，不是 import：`<svg>`/`<path>` 之外的 `<div>` 加
+#: `background` 只是色块，而色块正是「卡片+文字」的写法，所以它不算这一条。
 _VECTOR_MARKUP_RE = re.compile(
     r"<\s*(svg|path|rect|circle|ellipse|line|polyline|polygon|g)\b"
     r"|\b(toPaths|toCurves|Path2D|linePath|polylinePath|shapeArc|shapeRect|"
-    r"shapeCircle|shapePolygon|E\()")
+    r"shapeCircle|shapePolygon)\(")
 
-#: 四条通道之外的那一类：只有文字与色块。技能正文里的「纯文字/纯色块的那一类镜头」。
+#: 四条通道都不命中的那一类：只有文字与色块。技能正文里的「纯文字/纯色块的那一类镜头」。
 TEXT_CHANNEL = "text"
 
-#: 配额表：镜数 → 至少几种**非文字**通道。与正文「≥6 镜至少两种、≥10 镜至少三种」
-#: 同一份数；6 镜以下不设硬闸（三镜片要求两种通道是逼模型塞一个用不上的立方体，
-#: 正文自己就写了「通道不是装饰」）。
-CHANNEL_QUOTA: tuple[tuple[int, int], ...] = ((6, 2), (10, 3))
+#: 配额表：镜数 → 至少几种**画法通道**。四条通道全用得上才算多风格：
+#: 6 镜以上三种、10 镜以上四种（10 镜是常见片长，此时「三种通道」意味着有一条
+#: 通道被三镜共用，仍可能全片一个母题——那由闸⑨ 在结构上拦，不归这一条）。
+CHANNEL_QUOTA: tuple[tuple[int, int], ...] = ((6, 3), (10, 4))
 
 #: 两条硬闸共同的起步镜数（正文那句「首尾镜不计入分子也不计入分母」也要有分母可算）。
 MIN_SHOTS_FOR_QUOTA = 6
@@ -577,6 +662,15 @@ _CONCRETE_RES = (
 )
 
 
+#: 带绑定名的 import 子句：`import X from "s"` / `import { a, b as c } from "s"` /
+#: `import * as ns from "s"`。只认静态写法（闸① 本就禁动态 import）。
+_IMPORT_CLAUSE_RE = re.compile(
+    r"""import\s+(?:(?P<clause>[^'"]+?)\s+from\s+)?['"](?P<src>[^'"]+)['"]""")
+
+#: 一个绑定名短到什么程度就不认（`as e`、`t` 这种单字母别名在代码体里必然到处撞）。
+_MIN_BINDING_LEN = 2
+
+
 def code_imports(code: str) -> list[str]:
     """一段镜头代码里出现过的包名（按首次出现去重）。"""
     out: list[str] = []
@@ -586,13 +680,82 @@ def code_imports(code: str) -> list[str]:
     return out
 
 
+def imported_bindings(code: str) -> dict[str, list[str]]:
+    """包名 → 这一句 import 在本文件里绑定的局部名（默认名、花括号名、命名空间名）。
+
+    副作用 import（`import "katex/dist/katex.min.css"`）没有局部名，返回空列表。
+    """
+    out: dict[str, list[str]] = {}
+    for m in _IMPORT_CLAUSE_RE.finditer(code or ""):
+        clause, src = m.group("clause"), m.group("src")
+        names: list[str] = []
+        if clause:
+            if "{" in clause:
+                for part in clause[clause.index("{") + 1:clause.rindex("}")].split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    names.append(part.split(" as ")[-1].strip() if " as " in part else part)
+                head = clause[:clause.index("{")].strip().rstrip(",").strip()
+                if head.startswith("*"):
+                    names.append(head.split(" as ")[-1].strip())
+                elif head:
+                    names.append(head.split(" as ")[-1].strip())
+            else:
+                names = [p.strip().split(" as ")[-1].strip()
+                         for p in clause.replace("* as", "as").split(",") if p.strip()]
+        out.setdefault(src, []).extend(n for n in names if n)
+    return out
+
+
+def _uses_binding(code: str, names: list[str]) -> bool:
+    """import 之后的代码体里有没有真的用到这批局部名之一。"""
+    body = _IMPORT_CLAUSE_RE.sub("", code or "")
+    return any(len(n) >= _MIN_BINDING_LEN
+               and re.search(rf"\b{re.escape(n)}\b", body) for n in names)
+
+
+def shot_used_channels(code: str) -> set[str]:
+    """这一镜**真的用了**哪些画法通道（import 了还得在代码体里用得上）。
+
+    「写了 `import { Canvas } from "@react-three/fiber"` 而 JSX 里一个 `<Canvas>`
+    都没有」是凑配额最省事的写法：只 import 一行，画面一片色块。旧判据只看包名，
+    于是这一行就能把 three 记进 variety。
+    """
+    bindings = imported_bindings(code)
+    body = code or ""
+    found: set[str] = set()
+    for name in CHANNEL_ORDER:
+        for pkg in PICTORIAL_CHANNELS[name]:
+            got = bindings.get(pkg)
+            if got is None:
+                if pkg in set(code_imports(body)):
+                    found.add(name)      # 认不出绑定名的写法（`require`/动态）退回旧判据
+                continue
+            if not got or _uses_binding(body, got):
+                found.add(name)
+    if _VECTOR_MARKUP_RE.search(body):
+        found.add("vector")
+    return found
+
+
 def shot_style_channel(code: str) -> str:
-    """一镜归一条画法通道：`rough` / `three` / `katex` / `vector` / `text`。"""
-    imps = set(code_imports(code))
-    for name in _CHANNEL_ORDER:
-        if imps & set(STYLE_CHANNELS[name]):
+    """一镜归一条主画法通道：`rough` / `three` / `katex` / `vector` / `text`。"""
+    all_ch = shot_used_channels(code)
+    for name in CHANNEL_ORDER:
+        if name in all_ch:
             return name
-    return "vector" if _VECTOR_MARKUP_RE.search(code or "") else TEXT_CHANNEL
+    return "vector" if "vector" in all_ch else TEXT_CHANNEL
+
+
+def shot_all_channels(code: str) -> set[str]:
+    """一镜用到的**所有**画法通道（不按优先级截断）。
+
+    与 :func:`shot_style_channel` 的区别：那个按 ``CHANNEL_ORDER`` 只返回第一条
+    匹配（主通道）。配额统计要的是「这一镜真用了哪几种」——一条 three 场景配一圈
+    裸 SVG 引线，两种通道都算，``rough+vector`` 互融的镜正是技能正文要的那种。
+    """
+    return shot_used_channels(code)
 
 
 def has_concrete_item(text: str) -> bool:
@@ -601,18 +764,38 @@ def has_concrete_item(text: str) -> bool:
 
 
 def style_facts(shots: list[dict[str, Any]]) -> dict[str, Any]:
-    """整片的风格与文案账（确认卡、出片回执、闸⑦ 三处读同一份，不各算一遍）。"""
-    channels = {str(s.get("id") or f"s{i + 1:02d}"): shot_style_channel(str(s.get("code") or ""))
-                for i, s in enumerate(shots)}
-    variety = {c for c in channels.values() if c != TEXT_CHANNEL}
+    """整片的风格与文案账（确认卡、出片回执、闸⑦⑨⑩ 三处读同一份，不各算一遍）。"""
+    ids = [str(s.get("id") or f"s{i + 1:02d}") for i, s in enumerate(shots)]
+    codes = [str(s.get("code") or "") for s in shots]
+    channels = {sid: shot_style_channel(code) for sid, code in zip(ids, codes)}
+    all_channels = {sid: shot_all_channels(code) for sid, code in zip(ids, codes)}
+    variety: set[str] = set()
+    for chs in all_channels.values():
+        variety |= chs
     middle = list(channels.items())[1:-1] if len(shots) >= 3 else []
+    same_groups = [[ids[i] for i in g] for g in structure_groups(codes)]
+    contrast = []
+    for sid, code in zip(ids, codes):
+        c = shot_colors(code)
+        if not c["surfaces"] or not c["inks"]:
+            continue
+        worst = min(max(contrast_ratio(ink, bg) for bg in c["surfaces"])
+                    for ink in c["inks"])
+        contrast.append({"id": sid, "ratio": round(worst, 2),
+                         "inks": c["inks"], "surfaces": c["surfaces"]})
     return {
         "channels": channels,
+        "all_channels": all_channels,
         "variety": sorted(variety),
         "text_only": [sid for sid, c in channels.items() if c == TEXT_CHANNEL],
         "text_only_middle": [sid for sid, c in middle if c == TEXT_CHANNEL],
         "hollow": [str(s.get("id") or f"i{i + 1}") for i, s in enumerate(shots)
                    if not has_concrete_item(str(s.get("text") or ""))],
+        # 闸⑨：≥2 镜的同构组（≥3 镜那一档在 validate 里已经打回了）
+        "same_shape_groups": same_groups,
+        # 闸⑩：判得到的那些镜，各自「在所有底色上最好的一档」比值
+        "contrast": contrast,
+        "contrast_unjudged": len(shots) - len(contrast),
     }
 
 
@@ -622,9 +805,10 @@ def check_style_quota(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]
     三条硬判据全部读**代码字节**，都在烧像素之前判（这一层红一次 = 一次分镜重做，
     不是几十分钟白烧）：
 
-    1. 通道种数不够（≥6 镜要 2 种、≥10 镜要 3 种，见 ``CHANNEL_QUOTA``）。这条同时
+    1. 通道种数不够（≥6 镜要 3 种、≥10 镜要 4 种，见 ``CHANNEL_QUOTA``）。这条同时
        拦住正文点名的那种写法——全片只有裸 SVG/图示一种通道，就是「卡片+文字」换了个
-       马甲：variety=1 < 2。
+       马甲：variety=1 < 3。计入的只有四条**画法**通道（rough/three/katex/vector），
+       ``@dg/motion`` 那一类动效件不算——它们不画画面主体。
     2. 全片一条图形通道都没有（≥6 镜时）：这是判据 1 的特例，单独留一条是因为退回理由
        要能指名「一镜图形都没画」，而不是笼统说「种类不够」。
     3. 纯文字/纯色块镜超过中间镜的三分之一（首尾不计入分子也不计入分母，与正文同一口径）。
@@ -647,9 +831,13 @@ def check_style_quota(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]
     if not variety:
         errors.append(
             f"闸⑦ 风格配额：{n} 镜没有一镜画出图形（全是文字与色块）——"
-            f"至少要 {want} 种画法通道。按题材选：器物/手用 roughjs，真三维形体用 "
-            "three + @react-three/fiber，式子用 katex，流程与曲线用 @remotion/shapes "
-            "或裸 SVG。技能正文「画面丰富度合同」那一节逐条写着适合画什么")
+            f"至少要 {want} 种画法通道。四条真通道按题材选：手绘斜纹用 `roughjs`"
+            "（`rough.generator(...)` 画出的形要有 seed），立体形体用 `three` + "
+            "`@react-three/fiber` + `@remotion/three`，式子用 `katex`（记得 "
+            "`import \"katex/dist/katex.min.css\"`，不然渲出来是没上下标的纯文本），"
+            "流程/曲线/几何用 `@remotion/shapes` 或裸 SVG。**只 import 不调用的那一行"
+            "不算通道**（判据读的是代码体里真用得上的那个名字）。技能正文「画面丰富度"
+            "合同」那一节逐条写着适合画什么")
     elif len(variety) < want:
         errors.append(
             f"闸⑦ 风格配额：{n} 镜只用了 {len(variety)} 种画法通道（{'、'.join(variety)}），"
@@ -669,6 +857,354 @@ def check_style_quota(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]
             f"（数字/引号术语/拉丁缩写），低于 {CONCRETE_SHARE_TARGET:.0%} 这条线。"
             f"这些镜没查到：{'、'.join(hollow)}。地名人名机器认不出，所以这一条只提醒不拦——"
             "但「每镜至少落一个具体项」是文案合同写的，逐镜看一眼再出片")
+    return errors, warns
+
+
+# ---------------------------------------------------------------------------
+# 闸⑨ 跨镜结构雷同（同一张卡复制一份只换色相 → 在烧像素之前打回）
+# ---------------------------------------------------------------------------
+
+#: 剥掉的内容：**注释、字符串字面量、import 语句、十六进制颜色**。留下的是
+#: 「结构 + 数字」——时间轴上的秒数、translate 的像素、半径、透明度。
+#: 于是这条判据切得干净：**只换文案与色相的两镜 → 相似度 1.0**（那就是缺陷本身），
+#: 而换了参数与版式的两镜 → 相似度掉下来（那是正当的复用）。
+_SHAPE_STR_RE = re.compile(
+    r"""//[^\n]*|/\*.*?\*/|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`""",
+    re.S)
+_SHAPE_HEX_RE = re.compile(r"#[0-9a-fA-F]{3,8}\b")
+_SHAPE_IMPORT_RE = re.compile(
+    r"""^[ \t]*(?:import|export)[\s\S]{0,400}?from[ \t]+['"][^'"]+['"];?[ \t]*$""",
+    re.M)
+_SHAPE_TOKEN_RE = re.compile(r"[A-Za-z_$][\w$]*|\d+(?:\.\d+)?|[^\sA-Za-z0-9_$]")
+
+#: 骨架短于这个 token 数的镜不参与比对（三五行代码怎么比都是噪声，宁可不判）。
+_SHAPE_MIN_TOKENS = 40
+
+#: 打回线 0.88 与提醒线 0.78 不是拍的：2026-10-12 拿 `remotion/src/demos/` 里
+#: **152 个**剥后仍不少于 40 个 token 的参考实现两两比过，**互不相同的两份代码
+#: 最高只到 0.736**（SlideSpotlightPan ↔ GlowWakeSleepPanel），中位 0.619；
+#: 而把其中任意一份只换字符串与颜色，相似度是 **1.000**。两条线都落在 0.736 之上，
+#: 所以「真换了写法」的片子不会被这一条误伤。
+#:
+#: 为什么这条必须做在契约层：画面语义没有机器判据（闸④ 只判「带子里有没有东西」，
+#: 一个母题重复十二镜在它那里全是绿的），而 2026-10-11 那四条片子的观感恰恰是
+#: 「同一个母题每镜重来一遍，只换色相」——那是**跨镜**的性质，任何单镜判据都看不见它。
+STRUCT_SAME = 0.88
+STRUCT_NEAR = 0.78
+
+#: 几镜同构才算打回：两镜像可以是同一拍的两个镜头（正文允许），三镜起就是全片
+#: 一个母题了——那正是用户驳回「拼贴」时指的那件事。
+STRUCT_MIN_GROUP = 3
+
+
+def canonical_shape(code: str) -> tuple[str, ...]:
+    """一镜代码的**结构骨架**：换文案与换色相都不改变它。"""
+    src = _SHAPE_IMPORT_RE.sub("", str(code or ""))
+    src = _SHAPE_STR_RE.sub("S", src)
+    src = _SHAPE_HEX_RE.sub("C", src)
+    return tuple(_SHAPE_TOKEN_RE.findall(src))
+
+
+def shape_similarity(a: tuple[str, ...], b: tuple[str, ...]) -> float:
+    """两份骨架的 token **多重集** Jaccard（交/并）。"""
+    ca, cb = Counter(a), Counter(b)
+    union = sum((ca | cb).values())
+    return sum((ca & cb).values()) / union if union else 0.0
+
+
+def structure_pairs(codes: list[str]) -> list[tuple[int, int, float]]:
+    """所有可比镜对的骨架相似度（短的镜跳过，见 ``_SHAPE_MIN_TOKENS``）。"""
+    shapes = [canonical_shape(c) for c in codes]
+    out: list[tuple[int, int, float]] = []
+    for i in range(len(codes)):
+        if len(shapes[i]) < _SHAPE_MIN_TOKENS:
+            continue
+        for j in range(i + 1, len(codes)):
+            if len(shapes[j]) >= _SHAPE_MIN_TOKENS:
+                out.append((i, j, shape_similarity(shapes[i], shapes[j])))
+    return out
+
+
+def structure_groups(codes: list[str], *, threshold: float = STRUCT_SAME
+                     ) -> list[list[int]]:
+    """把镜序按「相似度 ≥ threshold」并成组（并查集，只返回 ≥2 镜的组）。"""
+    parent = list(range(len(codes)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, j, s in structure_pairs(codes):
+        if s >= threshold:
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[rj] = ri
+    groups: dict[int, list[int]] = {}
+    for i, s in enumerate(codes):
+        if len(canonical_shape(s)) >= _SHAPE_MIN_TOKENS:
+            groups.setdefault(find(i), []).append(i)
+    return sorted((sorted(v) for v in groups.values() if len(v) >= 2),
+                  key=lambda g: (-len(g), g[0]))
+
+
+def check_shot_structure(shots: list[dict[str, Any]]
+                         ) -> tuple[list[str], list[str]]:
+    """闸⑨：跨镜结构雷同。→ (打回清单, 提醒清单)。"""
+    errors: list[str] = []
+    warns: list[str] = []
+    codes = [str(s.get("code") or "") for s in shots]
+    ids = [str(s.get("id") or f"s{i + 1:02d}") for i, s in enumerate(shots)]
+    if len(codes) < STRUCT_MIN_GROUP:
+        return errors, warns
+    for group in structure_groups(codes):
+        label = "、".join(ids[i] for i in group)
+        if len(group) >= STRUCT_MIN_GROUP:
+            errors.append(
+                f"闸⑨ 跨镜同构：{len(group)} 镜（{label}）的代码骨架一模一样——"
+                "剥掉文案字符串与颜色之后，它们的标识符、数字与符号序列完全重合，"
+                "也就是**只换了字与色相，没换画法**。这不叫多风格，叫拼贴："
+                "让这些镜各用一种自己的母题（手绘 roughjs / 真三维 three / 公式 katex / "
+                "几何图示四种里至少三种），并且每镜的版式、时间轴与图形参数都要不同。"
+                "技能正文「画面丰富度合同与风格配额」那一节写着四类母题怎么选")
+        else:
+            warns.append(
+                f"结构提醒：{label} 两镜的代码骨架相似度 ≥{STRUCT_SAME:.2f}"
+                "（剥掉文案与颜色后几乎逐字相同）。两镜同构可以是同一拍的两个镜头，"
+                "第三镜再照抄就是拼贴——出片前看一眼这两帧是不是一回事")
+    near = [(i, j, s) for i, j, s in structure_pairs(codes)
+            if STRUCT_NEAR <= s < STRUCT_SAME]
+    if near:
+        warns.append(
+            f"结构提醒：{len(near)} 对镜的骨架相似度落在 {STRUCT_NEAR:.2f}~{STRUCT_SAME:.2f}"
+            "（实测互不相同的参考实现最高只到 0.74，所以这一档只是可疑不是定罪）："
+            + "、".join(f"{ids[i]}↔{ids[j]}" for i, j, _ in sorted(
+                near, key=lambda x: -x[2])[:8]))
+    return errors, warns
+
+
+# ---------------------------------------------------------------------------
+# 闸⑩ 前景色与底色的对比度（文字与底色同色 → 画面有了但读不出）
+# ---------------------------------------------------------------------------
+
+_COLOR_VALUE = (r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{4}|[0-9a-fA-F]{3})"
+                r"""|palettes\[\s*['"][^'"]+['"]\s*\]\s*\.\s*[A-Za-z]+"""
+                r"|palette\s*\.\s*[A-Za-z]+|TOKENS\s*\.\s*[A-Za-z]+|[A-Za-z]{3,12}")
+#: 承担「底」的角色：整页底、卡片底、面板底。`fill` 留给图形本体，不当底判。
+_SURFACE_PROP_RE = re.compile(
+    r"\b(?:background|backgroundColor|bgcolor|bg|page|surface|field)\s*[:=]\s*"
+    r"""['"{]*\s*(""" + _COLOR_VALUE + r")")
+#: 承担「字」的角色：`color:` 一类，加上 `<text>`/`<tspan>` 上的 `fill`（SVG 文字
+#: 就靠这一个）。`<path fill=…>` 那种是图形本体的油漆，不参与「读不读得出」的判据。
+_INK_PROP_RE = re.compile(
+    r"\b(?:color|ink|textColor|foreground)\s*[:=]\s*['\"{]*\s*(" + _COLOR_VALUE + r")"
+    r"|\bfill\s*[:=]\s*['\"{]*\s*(" + _COLOR_VALUE + r")")
+
+#: 这些标签上的 `color=` 是材质色与灯光色（立方体、金属度、点光源），不是文字。
+_MATERIAL_TAG_RE = re.compile(
+    r"(?:material|light|mesh|geometry|sprite|shader|object|primitive|attach)\b", re.I)
+_TEXT_TAG_RE = re.compile(r"^(text|tspan)$", re.I)
+_TAG_OPEN_RE = re.compile(r"<\s*([A-Za-z][\w.]*)")
+
+_PALETTE_REF_RE = re.compile(
+    r"""palettes\[\s*['"]([^'"]+)['"]\s*\]\s*\.\s*([A-Za-z]+)""")
+#: `const palette = palettes["deep-ocean"]` 之后，代码里就只剩 `palette.text` 这种写法
+#: ——技能正文给的代码模板正是这一条路，认不出它等于这一档闸对模板渲出来的片子永不生效。
+_PALETTE_BIND_RE = re.compile(
+    r"""\bpalette\s*=\s*palettes\[\s*['"]([^'"]+)['"]\s*\]""")
+
+#: 大字（画面母题的字阶都在 48 px 以上）的 WCAG 下限 3:1，正文 4.5:1。
+#: 3:1 以下打回、3:1~4.5:1 只提醒——母版字幕带的颜色归母版，这里只判镜头代码自己写的字。
+CONTRAST_MIN = 3.0
+CONTRAST_READABLE = 4.5
+
+_NAMED_COLORS = {"white": "#ffffff", "black": "#000000", "red": "#ff0000",
+                 "crimson": "#dc143c", "gold": "#ffd700", "ivory": "#fffff0",
+                 "beige": "#f5f5dc", "gray": "#808080", "grey": "#808080",
+                 "silver": "#c0c0c0", "navy": "#000080", "teal": "#008080",
+                 "orange": "#ffa500", "purple": "#800080", "yellow": "#ffff00",
+                 "transparent": None}   # 显式认不出：透明底不参与对比
+
+
+def _master_file(rel: str) -> Path | None:
+    """母版侧那份事实文件的位置：容器里是 Dockerfile COPY 进来的 `/app/remotion`，
+    本机在仓库根 `remotion/`，也允许 `REMOTION_ROOT` 指过去。
+
+    都没有就返回 None，调用方据此**明说这一档没判**，而不是默默当成通过——
+    「读不到就算过」正是本文件一贯要消灭的那种空挂闸。
+    """
+    env_root = os.environ.get("REMOTION_ROOT")
+    cands = []
+    if env_root:
+        cands.append(Path(env_root) / rel)
+    cands += [Path("/app/remotion") / rel,
+              Path(__file__).resolve().parents[3] / "remotion" / rel]
+    for p in cands:
+        if p.is_file():
+            return p
+    return None
+
+
+@lru_cache(maxsize=1)
+def palettes() -> dict[str, dict[str, str]]:
+    """`remotion/src/themes/palettes.json` 的内容（色板的唯一出处，Python 不重列一份）。
+
+    读不到返回空表：那时 :func:`resolve_color` 认不出 `palettes["x"].text` 这种写法，
+    闸⑩ 就退化成只判字面 hex，并在事实里记一笔「本片未判」——不装成通过。
+    """
+    p = _master_file("src/themes/palettes.json")
+    if not p:
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)}
+
+
+@lru_cache(maxsize=1)
+def token_colors() -> dict[str, str]:
+    """`remotion/src/tokens.ts` 里那几个字面颜色（bg/ink/accent/hl…）。"""
+    p = _master_file("src/tokens.ts")
+    if not p:
+        return {}
+    try:
+        src = p.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    return {k: v for k, v in re.findall(
+        r"\b(\w+)\s*:\s*['\"](#[0-9a-fA-F]{3,8})['\"]", src)}
+
+
+def resolve_color(token: str, default_palette: str | None = None) -> str | None:
+    """把一镜代码里的颜色写法换成 `#rrggbb`。
+
+    认得出的写法：字面 hex（三位/四位/六位/八位都展开）、色名白名单、
+    `palettes["solar-pop"].text`、`palette.text`（`palette` 是谁由调用方把
+    :data:`_PALETTE_BIND_RE` 认出的绑定名传进 ``default_palette``）、`TOKENS.bg`。
+    认不出返回 None——**不猜**。
+    """
+    t = (token or "").strip()
+    if t.startswith("#"):
+        h = t[1:]
+        if len(h) in (3, 4):
+            h = "".join(c * 2 for c in h)
+        if len(h) in (6, 8):
+            return "#" + h[:6].lower()
+        return None
+    low = t.lower()
+    if low in _NAMED_COLORS:
+        return _NAMED_COLORS[low]
+    m = _PALETTE_REF_RE.search(t)
+    if m:
+        got = (palettes().get(m.group(1)) or {}).get(m.group(2))
+        return resolve_color(got, default_palette) if got else None
+    if t.startswith("TOKENS"):
+        got = token_colors().get(t.rsplit(".", 1)[-1])
+        return resolve_color(got, default_palette) if got else None
+    if default_palette and re.match(r"^palette\.[A-Za-z]+$", t):
+        got = (palettes().get(default_palette) or {}).get(t.split(".", 1)[1])
+        return resolve_color(got) if got else None
+    return None
+
+
+def contrast_ratio(fg: str, bg: str) -> float:
+    """WCAG 2.1 相对亮度比（1.0~21.0）。两个参数都得是 `#rrggbb`。"""
+    def lin(c: float) -> float:
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    def lum(hexs: str) -> float:
+        r, g, b = (int(hexs[i:i + 2], 16) / 255 for i in (1, 3, 5))
+        return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+    a, b = lum(fg), lum(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _enclosing_tag(src: str, pos: int) -> str:
+    """位置 `pos` 所在那个 JSX 开标签的标签名（回溯到最近的 `<`）。认不出返回空串。"""
+    lt = src.rfind("<", 0, pos)
+    if lt < 0:
+        return ""
+    m = _TAG_OPEN_RE.match(src[lt:])
+    return m.group(1) if m else ""
+
+
+def shot_colors(code: str) -> dict[str, Any]:
+    """一镜代码里**静态可认**的底色与字色（认不出的计数，不猜值）。"""
+    src = str(code or "")
+    bind = _PALETTE_BIND_RE.search(src)
+    palette_name = bind.group(1) if bind else None
+    surfaces: list[str] = []
+    inks: list[str] = []
+    unresolved = 0
+
+    def add(bucket: list[str], got: str | None) -> None:
+        nonlocal unresolved
+        if got:
+            if got not in bucket:
+                bucket.append(got)
+        else:
+            unresolved += 1
+
+    for m in _SURFACE_PROP_RE.finditer(src):
+        add(surfaces, resolve_color(m.group(1), palette_name))
+    for m in _INK_PROP_RE.finditer(src):
+        token, start = m.group(1) or m.group(2), m.start(1) if m.group(1) else m.start(2)
+        tag = _enclosing_tag(src, start)
+        if _MATERIAL_TAG_RE.search(tag):
+            continue          # `<meshStandardMaterial color=…>` 是立方体的颜色，不是字
+        if token is None:
+            continue
+        if m.group(2) and not _TEXT_TAG_RE.match(tag):
+            continue          # fill 只在 <text>/<tspan> 上算字色
+        add(inks, resolve_color(token, palette_name))
+    return {"surfaces": surfaces, "inks": inks, "unresolved": unresolved,
+            "palette": palette_name}
+
+
+def check_ink_contrast(shots: list[dict[str, Any]]
+                       ) -> tuple[list[str], list[str]]:
+    """闸⑩：镜头代码自己写的字色，在它自己写的每一种底色上是否都读得出来。
+
+    判据是「**最好的一档也低于 3:1 才打回**」：`#ffffff` 的字在深卡片上是对的、
+    在浅页面上是错的，而那种片子里卡片就是它的底，不该拦。真正拦下的是「这一镜
+    写了一种字色，而画面里所有可能的底都把它糊掉了」——2026-10-11 那四条片子上的
+    「米白底 + 奶黄字」「深睡 → 生长激素」正是这一类。
+
+    与闸④ 的分工：闸④ 在像素上判「带子里有没有东西」（糊成一片的浅色字在
+    非底色占比那里是**有**东西的），这一条判「那点东西读不读得出来」。
+    """
+    errors: list[str] = []
+    warns: list[str] = []
+    judged = 0
+    for i, s in enumerate(shots):
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        c = shot_colors(str(s.get("code") or ""))
+        if not c["surfaces"] or not c["inks"]:
+            continue                      # 底或字认不出：不判（末段统一交代未判）
+        judged += 1
+        for ink in c["inks"]:
+            best_bg = max(c["surfaces"], key=lambda bg: contrast_ratio(ink, bg))
+            best = contrast_ratio(ink, best_bg)
+            if best < CONTRAST_MIN:
+                errors.append(
+                    f"闸⑩ 文字对比度：{sid} 的字色 {ink} 在这一镜写出的每一种底色上"
+                    f"最好也只有 {best:.1f}:1（底色：{'、'.join(c['surfaces'])}），"
+                    f"低于大字下限 {CONTRAST_MIN:.0f}:1——画面上有字而观众读不出。"
+                    "换字色或换底色：底色走色板的 `page`/`surface`，字色走 `text`/"
+                    "`muted`，别把 `accent` 当正文色写在浅底上")
+            elif best < CONTRAST_READABLE:
+                warns.append(
+                    f"对比度提醒：{sid} 的字色 {ink} 在最好的底色 {best_bg} 上只有 "
+                    f"{best:.1f}:1（大字勉强可读，正文偏暗，达标线 4.5:1）")
+    if judged == 0 and shots:
+        warns.append(
+            "对比度这一档本片**未判**：镜头代码里的底色或字色没能静态认出来"
+            "（写成变量、渐变、运行时算出来的颜色，或者容器里读不到 palettes.json）。"
+            "未判不是通过。")
     return errors, warns
 
 
@@ -808,9 +1344,29 @@ def knob_props() -> dict[str, Any]:
 #: 渲得出来、闸① 也过、打包也不报错**，只是画面上是一串没有上下标没有斜体的纯文本。
 #: 这种「静默出丑」正是这条名单该拦住的东西，所以它必须出现在模型看得见的那一份里。
 IMPORT_WHITELIST: tuple[str, ...] = (
-    "react", "react-dom", "remotion", "three", "@react-three/fiber",
-    "@remotion/three", "@remotion/paths", "@remotion/shapes",
-    "roughjs", "katex", "katex/dist/katex.min.css", "@dg/film", "@dg/tokens",
+    "react", "react-dom", "remotion",
+    "@remotion/paths", "@remotion/shapes",
+    "@remotion/motion-blur", "@remotion/layout-utils",
+    # 画法通道：手绘斜纹与真三维。这两族在 package.json + lockfile 里躺着，
+    # 2026-10-11 那批六支真渲夹具（roughjs / three / KaTeX × 两画幅）就是它们渲的。
+    "three", "@react-three/fiber", "@remotion/three", "roughjs",
+    "katex", "katex/dist/katex.min.css",
+    # 母版与 token 走别名；镜头代码只能拿到这两个文件级入口
+    "@dg/film", "@dg/tokens",
+    # 参考实现的动效件（_fixtures 是真实现，不是桩）。**只列文件级路径**：
+    # 裸目录名（`@dg/lib`、`@dg/themes`、`@dg/demos`、`@dg/fixtures`）那些目录里
+    # 没有 index 文件，Remotion 打包器的 resolve.extensions 不认目录——名单里写着它，
+    # 闸① 放行、打包期才炸，而炸的是一句「解析失败」而不是一句人话。
+    "@dg/motion", "@dg/polish", "@dg/brand",
+    "@dg/fixtures/Motion", "@dg/fixtures/Polish",
+    "@dg/fixtures/Brand", "@dg/fixtures/Fixtures", "@dg/fixtures/Look",
+    "@dg/fixtures/PageCam2D",
+    "@dg/lib/Caption", "@dg/lib/ClipCard", "@dg/lib/DigitRoll",
+    "@dg/lib/FlashCut", "@dg/lib/PageCam", "@dg/lib/VerticalTicker",
+    "@dg/lib/FlatPanel",
+    "@dg/lib/helpers/motion", "@dg/lib/helpers/rand", "@dg/lib/helpers/shake",
+    "@dg/lib/helpers/camera",
+    "@dg/themes/palettes.json",
 )
 
 #: ``code`` 这一栏的 schema 说明。**这里只留「机器会判什么」**，写法教程整段在技能正文
@@ -826,7 +1382,7 @@ IMPORT_WHITELIST: tuple[str, ...] = (
 _CODE_DOC = (
     "这一镜的**完整 .tsx**（一个文件，顶层一个默认导出的镜头组件），由 creation-remotion "
     "逐帧渲染。闸①（容器里的 ESLint）在渲染前判，违规带镜号与行号退回，不烧像素。"
-    "**写法纪律（画面带坐标系 `useBody()`、母题铺满带子、rough.js 离线形状与 seed、"
+    "**写法纪律（画面带坐标系 `useBody()`、母题铺满带子、四条画法通道与 seed、"
     "按墙钟随机的禁令、字体只用 Noto）见技能正文「镜头代码合同」一节**，这里只列会判红的：\n"
     "· 必须 `import { FilmLayout } from \"@dg/film\"` 并把顶层 JSX 包进 `<FilmLayout>`——"
     "字幕带、安全区、边距、字阶、配色全在母版里，镜头代码只填主体区；不包就没有字幕，"
@@ -848,11 +1404,13 @@ _CODE_DOC = (
     "`<F name=\"…\" value={fields.…}>`（`F` 由 `@dg/film` 导出）。母版按这份标注回读"
     "「值 + 盒」给闸⑥ 对账，字段级命中表拿它定位。三条 lint 在烧像素之前判："
     "声明了却没人读、读了却没声明、`<F>` 标的 value 不是这个字段自己的值\n"
-    "· 画法按题材选，不是装饰：SVG 关键帧用 `interpolate`；手绘质感用 `roughjs` 的"
-    "**离线形状**那一路（`gen.toPaths(...)`，**seed 必须给**——不给时库内部走墙钟随机，"
-    "同一镜两次渲不同像素，而 lint 只看你写的代码、看不到依赖里的 random）；"
-    "立体几何用 `@remotion/three` + `@react-three/fiber`（本容器无 GPU，软件渲染，慢，"
-    "逐镜账上的每帧毫秒会如实变贵）；公式用 `katex`\n"
+    "· 画法按题材选，不是装饰。四条**画法通道**：手绘斜纹 `roughjs`、真三维 `three` + "
+    "`@react-three/fiber` + `@remotion/three`、公式 `katex`（+ 它的样式表）、几何与图示"
+    "（裸 `<svg>` 或 `@remotion/shapes`）。闸⑦ 数的是整片用了几种通道，而**只 import "
+    "一行而代码体里没用那个名字**不算用了这一条\n"
+    "· 整片层还有两道也在烧像素之前判的闸：闸⑨ 不许三镜以上的代码骨架一模一样"
+    "（剥掉文案字符串与颜色之后逐字相同＝只换了色相，那叫拼贴），闸⑩ 不许字色在"
+    "这一镜写出的每一种底色上都低于 3:1（画面有字而观众读不出）\n"
     "· 画面里得有能认出来的东西：闸④ 在**母版画面带内**按像素判空"
     "（三帧带内非底色占比低于 2% 退回）")
 
@@ -888,7 +1446,7 @@ def spec_schema() -> dict[str, Any]:
                                "（min_duration_sec 给 1.5~2.5，代码画封面与落款就行）",
                 "items": {
                     "type": "object",
-                    "required": ["code", "text"],
+                    "required": ["code", "text", "card", "derived_from"],
                     "properties": {
                         "id": {"type": "string",
                                "description": "镜号，省略则按顺序补 s01/s02…"},
@@ -899,6 +1457,27 @@ def spec_schema() -> dict[str, Any]:
                                                 f"容量按画幅：竖屏 ≤{MAX_TEXT_CHARS} 字、"
                                                 f"横屏 ≤{MAX_TEXT_CHARS_WIDE} 字"
                                                 "（超了拆镜，不裁句子）"},
+                        "card": {"type": "string",
+                                 "description": "选了哪张 shot 配方卡，格式 <类别>/<卡名>，"
+                                                "如 opening/fracture。必须命中卡库（见 shots/INDEX.md）"},
+                        "derived_from": {"type": "array", "items": {"type": "string"},
+                                         "description": "代码来自哪些 demo 的 relpath 列表，"
+                                                        "如 [\"demos/opening/fracture/Fracture.tsx\"]。"
+                                                        "每个都必须命中 demos/MANIFEST.json 白名单"},
+                        "assets": {"type": "array",
+                                   "description": "本镜引用的素材资产。每个声明 name/sha16/ext/source/alpha/layer。"
+                                                  "代码里用 staticFile(\"<name>\") 引用，lint 做双向对账",
+                                   "items": {"type": "object",
+                                             "required": ["name", "sha16", "ext"],
+                                             "properties": {
+                                                 "name": {"type": "string"},
+                                                 "sha16": {"type": "string",
+                                                           "description": "sha256 前 16 位"},
+                                                 "ext": {"type": "string"},
+                                                 "source": {"type": "object"},
+                                                 "alpha": {"type": "boolean"},
+                                                 "layer": {"type": "string", "enum": ["fg", "bg", "cutout"]},
+                                             }}},
                         "highlight": {"type": "array", "items": {"type": "string"},
                                       "maxItems": MAX_HIGHLIGHTS_PER_SHOT,
                                       "description": "逐词点亮的词，每个都必须是 text 的子串，"

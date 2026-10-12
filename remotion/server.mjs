@@ -129,7 +129,8 @@ const declaredFrom = (payload) => {
 async function renderShot(payload) {
   const code = String(payload.code ?? '');
   const declaredFields = declaredFrom(payload);
-  const lint = await lintShotCode(code, declaredFields);
+  const assetNames = (payload.assets ?? []).map(a => a.name ?? a).map(String);
+  const lint = await lintShotCode(code, declaredFields, assetNames);
   if (!lint.ok) {
     const err = new Error('闸① lint 未通过');
     err.status = 400;
@@ -168,7 +169,7 @@ async function renderShot(payload) {
   const t0 = now();
   const serveUrl = await bundle({
     entryPoint: path.join(ROOT, 'src', 'index.ts'),
-    publicDir: false,
+    publicDir: path.join(ROOT, 'public'),
     webpackOverride: (cfg) => ({
       ...cfg,
       resolve: {
@@ -177,6 +178,13 @@ async function renderShot(payload) {
           ...(cfg.resolve?.alias ?? {}),
           '@dg/film': path.join(ROOT, 'src', 'FilmLayout.tsx'),
           '@dg/tokens': path.join(ROOT, 'src', 'tokens.ts'),
+          '@dg/motion': path.join(ROOT, 'src', 'demos', '_fixtures', 'Motion.tsx'),
+          '@dg/polish': path.join(ROOT, 'src', 'demos', '_fixtures', 'Polish.tsx'),
+          '@dg/brand': path.join(ROOT, 'src', 'demos', '_fixtures', 'Brand.tsx'),
+          '@dg/fixtures': path.join(ROOT, 'src', 'demos', '_fixtures'),
+          '@dg/lib': path.join(ROOT, 'src', 'lib'),
+          '@dg/themes': path.join(ROOT, 'src', 'themes'),
+
         },
       },
     }),
@@ -199,9 +207,11 @@ async function renderShot(payload) {
   const TOKEN_MARKER = 'DG_TOKENS:';   // 与 src/tokens.ts 的 TOKEN_LOG_MARKER 同名，两处一起改
   const FIELD_MARKER = 'DG_FIELDS:';   //   与 src/tokens.ts 的 FIELD_LOG_MARKER 同名，两处一起改
   const LAYOUT_MARKER = 'DG_LAYOUT:';  //   与 src/tokens.ts 的 LAYOUT_LOG_MARKER 同名，两处一起改
+  const ASSET_MARKER = 'DG_ASSETS:';   //   与 src/tokens.ts 的 ASSET_LOG_MARKER 同名，两处一起改
   let browserLogTruncated = false;
   let fieldsUsed = null;
   let layoutUsed = null;
+  const assetSnapshots = {};  // { [frame]: { frame, assets: [{tag, src, box, transform, opacity}] } }
   const onBrowserLog = (log) => {
     const text = String(log?.text ?? '');
     const at = text.indexOf(TOKEN_MARKER);   // 实测可能带 " Tab N, file:line " 前缀，不按行首判
@@ -239,6 +249,16 @@ async function renderShot(payload) {
         warnings.push(`版面行解析失败：${String(err).slice(0, 120)}`);
       }
       return;   // 版面这一路是记账用的 warning，重试那一遍更稳，直接覆盖，不记不一致
+    }
+    const aat = text.indexOf(ASSET_MARKER);
+    if (aat >= 0) {
+      try {
+        const parsed = JSON.parse(text.slice(aat + ASSET_MARKER.length));
+        assetSnapshots[parsed.frame] = parsed;
+      } catch (err) {
+        warnings.push(`资产行解析失败：${String(err).slice(0, 120)}`);
+      }
+      return;
     }
     // 镜头代码里的 console.log 一律进 warnings（有上限，不让一段狂打的代码撑爆响应）
     if (warnings.length < 20) warnings.push(`[browser] ${log?.type}: ${text.slice(0, 200)}`);
@@ -320,6 +340,56 @@ async function renderShot(payload) {
     }
   }
 
+  // 闸⑪ 资产动效：比对首帧与探针帧的资产快照，判三态。
+  // 静态摆图 → 打回；参与动效 → 绿；采不到盒 → 未判（不许记成通过）。
+
+  let assetMotion = { status: 'undetermined', reason: '没有收到资产探针行' };
+  const snapFrames = Object.keys(assetSnapshots).map(Number).sort((a, b) => a - b);
+  if (snapFrames.length >= 2) {
+    const snap0 = assetSnapshots[snapFrames[0]];
+    const snapN = assetSnapshots[snapFrames[snapFrames.length - 1]];
+    const a0 = snap0.assets ?? [];
+    const aN = snapN.assets ?? [];
+    if (a0.length === 0 && aN.length === 0) {
+      assetMotion = { status: 'undetermined', reason: '两帧都没采到资产盒（可能无 <img>/<video>，或落在 display:contents 里）' };
+    } else {
+      const bySrc = (arr) => {
+        const m = new Map();
+        for (const a of arr) if (a.src) m.set(a.src, a);
+        return m;
+      };
+      const m0 = bySrc(a0);
+      const mN = bySrc(aN);
+      let animated = false;
+      let staticCount = 0;
+      let compared = 0;
+      for (const [src, a] of m0) {
+        const b = mN.get(src);
+        if (!b) continue;
+        compared++;
+        const boxSame = JSON.stringify(a.box) === JSON.stringify(b.box);
+        const transformSame = (a.transform ?? 'none') === (b.transform ?? 'none');
+        const opacitySame = (a.opacity ?? 1) === (b.opacity ?? 1);
+        if (boxSame && transformSame && opacitySame) staticCount++;
+        else animated = true;
+      }
+      if (compared === 0) {
+        assetMotion = { status: 'undetermined', reason: `两帧各有 ${a0.length}/${aN.length} 个资产，但按 src 匹配不到同一资产` };
+      } else if (animated) {
+        assetMotion = { status: 'animated', reason: `${compared} 个资产中至少一个的盒/transform/opacity 在两帧间有变化`, compared, staticCount };
+      } else {
+        assetMotion = { status: 'static', reason: `${compared} 个资产的盒/transform/opacity 在两帧间完全不变——静态摆图`, compared };
+      }
+    }
+  } else if (snapFrames.length === 1) {
+    assetMotion = { status: 'undetermined', reason: `只收到一帧的资产快照（frame ${snapFrames[0]}），无法比对` };
+  }
+  if (assetMotion.status === 'static') {
+    warnings.push(`闸⑪ 资产动效：${assetMotion.reason}——J2 要求主体参与动效，不是静态摆图`);
+  } else if (assetMotion.status === 'undetermined') {
+    warnings.push(`闸⑪ 资产动效：未判——${assetMotion.reason}`);
+  }
+
   let probed = {};
   try {
     const out = execFileSync('ffprobe', [
@@ -366,6 +436,9 @@ async function renderShot(payload) {
     // 与 fields_used 同一条道理——没读到就是 null，这一层的 warnings 里已经如实写了「落空」，
     // 下游不许把 null 读成「扫过且干净」。
     layout_used: layoutUsed,
+    // 闸⑪ 资产动效三态：'static'（打回）/ 'animated'（通过）/ 'undetermined'（未判）。
+    // 未判不许记成通过——下游回执必须如实区分。
+    asset_motion: assetMotion,
     warnings,
   };
 }
@@ -380,14 +453,34 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/lint') {
       const body = await readBody(req);
-      // 与 render-shot 内部那一遍共用 declaredFrom：否则单独调 /lint 的调用方拿到的是
-      // 「三条字段闸根本没开」的绿，而渲染口同一份代码却是红的——两条口必须同判。
-      return send(res, 200, await lintShotCode(body.code ?? '', declaredFrom(body)));
+      const assetNames = (body.assets ?? []).map(a => a.name ?? a).map(String);
+      return send(res, 200, await lintShotCode(body.code ?? '', declaredFrom(body), assetNames));
     }
     if (req.method === 'POST' && url.pathname === '/render-shot') {
       const body = await readBody(req);
       const result = await serialize(() => renderShot(body));
       return send(res, 200, result);
+    }
+    if (req.method === 'POST' && url.pathname === '/stage-assets') {
+      const body = await readBody(req);
+      const relpath = String(body.relpath ?? '');
+      const sha16 = String(body.sha16 ?? '');
+      const bytesB64 = String(body.bytes_b64 ?? '');
+      if (!relpath || !sha16 || !bytesB64)
+        return send(res, 400, { ok: false, error: 'relpath/sha16/bytes_b64 缺一不可' });
+      const safe = path.join(ROOT, 'public', relpath);
+      if (!safe.startsWith(path.join(ROOT, 'public')))
+        return send(res, 400, { ok: false, error: 'relpath 穿越' });
+      const bytes = Buffer.from(bytesB64, 'base64');
+      const hash = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+      if (hash !== sha16)
+        return send(res, 400, { ok: false, error: `sha16 不符：声明 ${sha16}，实算 ${hash}` });
+      await fs.mkdir(path.dirname(safe), { recursive: true });
+      if (await fs.stat(safe).then(() => true).catch(() => false))
+        return send(res, 200, { ok: true, relpath, sha16, idempotent: true });
+      await fs.writeFile(safe, bytes);
+      console.log(`[stage-assets] ${relpath} (${bytes.length} bytes sha16=${sha16})`);
+      return send(res, 200, { ok: true, relpath, sha16, bytes: bytes.length });
     }
     if (req.method === 'GET' && url.pathname.startsWith('/artifact/')) {
       const key = decodeURIComponent(url.pathname.slice('/artifact/'.length));

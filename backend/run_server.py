@@ -114,7 +114,7 @@ BACKEND_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = BACKEND_ROOT.parent
 DEFAULT_MCP_CONFIG = BACKEND_ROOT / "mcp.json"
 DEFAULT_STORYLINE_CONFIG = BACKEND_ROOT / "examples" / "storyline" / "config.toml"
-DEFAULT_MAX_CONTEXT_TOKENS = 8_000
+DEFAULT_MAX_CONTEXT_TOKENS = 65_536
 # 主服务侧会话工作区的过期回收线（与 Storyline 的 [storage].workspace_ttl_sec 对齐）：
 # 崩溃/异常退出遗留的 {会话}/{产物} 目录（含 _files 沙箱）在启动时按 mtime 扫掉。
 WORKSPACE_TTL_SEC = float(os.getenv("WORKSPACE_TTL_SEC", "21600"))
@@ -520,6 +520,9 @@ def build_runtime(
 
         # (a) 崩溃恢复：原子认领本实例可接手的未完成 run 再续跑（跨实例互斥）。
         #     领不到 = 已被别的实例持有且租约未过期，跳过即可，不再「谁都恢复全部」。
+        #     候选只含 running：真被 kill 的来不及写状态，留在 running；写成 failed 的
+        #     已被收口处理器定性并报过失败，重启替它重跑等于用户没按「继续」却烧满预算
+        #     （真机：一条被配额拦下的 failed run 在服务重建后被重放出 1,953,686 token）。
         if checkpoint is not None and auto_resume:
             claimed = await checkpoint.claim_recoverable(instance_id)
             for cp in claimed:

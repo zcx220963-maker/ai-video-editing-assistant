@@ -37,6 +37,8 @@ const Shot = () => <FilmLayout><div>hi</div></FilmLayout>;
 
 const defaultOnly = `import React from 'react';
 import { FilmLayout } from '@dg/film';
+import { E } from '@dg/motion';
+const _t = E.linear(0);
 const Shot = () => <FilmLayout><div>hi</div></FilmLayout>;
 export default Shot;
 `;
@@ -47,6 +49,8 @@ export default Shot;
 const FIELDS_HEAD = `import React from 'react';
 import { useCurrentFrame } from 'remotion';
 import { FilmLayout, F } from '@dg/film';
+import { E } from '@dg/motion';
+const _t = E.linear(0);
 `;
 
 /** 绿样例：两个字段都真读了、都标在该值自己的位置上。 */
@@ -147,6 +151,19 @@ const Shot = ({ fields = {} }) => (
 export default Shot;
 `;
 
+/** 红：fontFamily 用了不在镜像白名单里的字族——渲染时静默回落。 */
+const badFont = `${FIELDS_HEAD}
+const Shot = () => <FilmLayout><div style={{ fontFamily: '"SF Pro Display", sans-serif' }}>hi</div></FilmLayout>;
+export default Shot;
+`;
+
+/** 绿：fontFamily 用了白名单里的字族。 */
+const okFont = `${FIELDS_HEAD}
+const SANS = '"Noto Sans CJK SC", sans-serif';
+const Shot = () => <FilmLayout><div style={{ fontFamily: SANS }}>hi</div></FilmLayout>;
+export default Shot;
+`;
+
 const R = 'dg/fields-declared-unused';
 const U = 'dg/fields-undeclared-read';
 const M = 'dg/field-mark-not-reading';
@@ -172,6 +189,9 @@ const cases = [
   ['字段：<F> 的 name 是表达式（必须红）', markDynamicName, has(M, '表达式'), ['radius', 'accent']],
   ['字段：整块用掉 fields（判不出就必须让路，必须绿）', fieldsDynamic, (e) => e.length === 0, ['radius', 'accent']],
   ['字段：声明名单漏传（不许静默放行，必须红）', noListGiven, has(U, 'radius')],
+  ['字体：非白名单字族（必须红 font-family-whitelist）', badFont,
+    (e) => e.some((x) => x.rule === 'dg/font-family-whitelist')],
+  ['字体：白名单字族（必须绿）', okFont, (e) => e.length === 0],
 ];
 
 let fail = 0;

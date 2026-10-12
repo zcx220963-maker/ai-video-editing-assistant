@@ -189,6 +189,7 @@ class PlanMotionNode(StoryNode):
                 + "\n".join(f"  · {e}" for e in errors[:12])
                 + (f"\n  · …另有 {len(errors) - 12} 条同类错误" if len(errors) > 12 else ""))
         target = _resolve_target_duration(state, inputs, None)
+        spec["target_duration_sec"] = target
         cited, gate = await source_gate(state.session_id, spec["shots"])
         if cited:
             # 校验过的分镜仍可能带着「像查过的一样」的猜测出处入库；一旦出了片，
@@ -251,7 +252,10 @@ def plan_payload(spec: dict[str, Any], *, target: float | None = None,
         }
 
     facts = cspec.style_facts(shots)
-    quota_warns = cspec.check_style_quota(shots)[1]   # 错误那份在 validate 里已经拦过
+    # 错误那三份都在 validate_code_spec 里拦过了；这里取的是**拦完之后给人看的提醒**，
+    # 三道闸各出一份，合流成一栏，用户在同一张卡上看得见「哪几镜其实是同一张卡」。
+    quota_warns = cspec.check_style_quota(shots)[1] \
+        + cspec.check_shot_structure(shots)[1] + cspec.check_ink_contrast(shots)[1]
 
     return {
         "motion_spec": spec,
@@ -261,11 +265,14 @@ def plan_payload(spec: dict[str, Any], *, target: float | None = None,
         "estimated_sec": [low, high],
         "target_duration_sec": target,
         "target_warnings": cspec.check_target(spec, target),
-        # 闸⑦ 的整片账：硬判据（配额、纯文字镜占比）已经在 validate_code_spec 里拦过了，
-        # 这三栏是**拦完之后给人看的那一份**——用了哪几种通道、哪几镜只有文字、
-        # 以及只提醒不拦的那条文案具体项提醒。
+        # 闸⑦⑨⑩ 的整片账：硬判据（配额、纯文字镜占比、跨镜同构、字色对比度）已经在
+        # validate_code_spec 里拦过了，下面几栏是**拦完之后给人看的账**——用了哪几种通道、
+        # 哪几镜只有文字、哪几镜其实是同一张卡、字色在底色上读到几比一。
         "style_channels": facts["variety"],
         "style_text_only": facts["text_only"],
+        "style_same_shape": facts["same_shape_groups"],
+        "style_contrast": facts["contrast"],
+        "style_contrast_unjudged": facts["contrast_unjudged"],
         "style_warnings": quota_warns,
         "aspect": spec["aspect"],
         "resolution": f"{spec['width']}x{spec['height']}",

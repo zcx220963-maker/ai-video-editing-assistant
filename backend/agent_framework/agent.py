@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -51,6 +52,37 @@ from .tool import ToolError, ToolRegistry, is_tool_error, plan_batches
 # 同一个工具连续失败多少次后，本轮不再真执行（成功一次即清零）。
 # 真机规划轮靠「猜键名读产物」连着错六十次烧穿迭代预算，提示词里的「请勿重试」拦不住。
 _MAX_CONSECUTIVE_FAILURES = 4
+
+# ---- 无进展重复调用熔断 ----
+#
+# 上面那道守卫只数**失败**。真机实测的另一族打转它一次都没抓到：一条规划轮里
+# ``web_search`` 用同一句查询打了 20+ 次，每次都**成功**（免 key 链回了一篇毫无关系的
+# 维基页面），40 迭代烧掉 1,953,686 token、``plan_run_id`` 为空＝一张计划卡都没出。
+#
+# 判据取「同一份参数打出逐字相同的结果」而不是「参数相同」——后者会误杀轮询：
+# 外部状态在变时结果字节就在变，streak 归 1，永远攒不到闸（读产物、查进度照跑）。
+# 第二条闸按参数计次，兜的是「每次结果略有不同但同参重复到这个数目」那类抖动型打转。
+_MAX_SAME_RESULT_REPEATS = 2   # 同参同结果最多真跑 2 次，第 3 次不再打后端
+_MAX_SAME_ARGS_ATTEMPTS = 5    # 同参（结果在变，可能有进展）最多真跑 5 次
+_MAX_REFUSALS_BEFORE_FAILURE = 2   # 同样的事实告过两次还照打 → 改记真失败，让老守卫接手
+
+
+def _digest(obj: Any) -> str:
+    """按 JSON 字节算的稳定摘要。
+
+    必须按字节而不是 ``==``：字典相等会放过「缺省 44 与显式 44.0」那类归一化差异，
+    而缓存键、逐镜比较正是按字节判等的（真机踩过一次假合同）。
+    """
+    try:
+        payload = json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        payload = repr(obj)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _repeat_key(name: str, arguments: Any) -> str:
+    return f"{name}\x00{_digest(arguments if arguments is not None else {})}"
+
 
 # 单次工具调用硬超时（秒）：MCP tool_timeout=600s 在此之前先触发并给出更具体的错误；
 # 这里兜底的是本地工具或 MCP 传输层自身卡死的情况——不给这层就会永远挂住。
@@ -1420,6 +1452,9 @@ class AgentOnceRun:
         """
         reg = registry if registry is not None else self.registry
         fail_counts: dict[str, int] = ctx.extras.setdefault("_fail_counts", {})
+        # 本 run 的重复调用账：key → {n, same, last, refused}。
+        # n=同参数真跑次数，same=连续逐字相同结果的次数，last=上次结果的字节摘要。
+        repeats: dict[str, dict[str, Any]] = ctx.extras.setdefault("_repeat_tracker", {})
 
         # 结构性并批：把**同层就绪、互不依赖**的兄弟节点自动补进本批。
         #
@@ -1430,12 +1465,77 @@ class AgentOnceRun:
         # 判据全在图里：前置已完成 + 与本次调用无依赖 + 同层 + 在计划内。
         tool_calls = await self._expand_ready_siblings(ctx, tool_calls, reg)
 
+        # 同一条回复里逐字相同的第二次：并批会真打两次后端，结果必然同一份。
+        # 在分批前先标出来（gather 并发，靠计数器先到先得拦不住）。
+        dup_ids: set[str] = set()
+        _intra: dict[str, int] = {}
+        for tc in tool_calls:
+            k = _repeat_key(tc.name, tc.arguments)
+            _intra[k] = _intra.get(k, 0) + 1
+            if _intra[k] > 1:
+                dup_ids.add(str(tc.id))
+
+        repeat_warnings: list[str] = []
+
         def _refused(tc: ToolCall, times: int) -> ToolError:
             return ToolError(
                 tc.name,
                 f"Error: 「{tc.name}」已连续失败 {times} 次，这次没有再执行——"
                 f"原样重试只会得到同一个错误。换参数或换工具，"
                 f"或者直接告诉用户卡在哪、给个方案（规划轮就调用 submit_plan）。")
+
+        def _blocked_repeat(tc: ToolCall) -> ToolError | None:
+            """这一枪是不是无进展的重复。命中就根本不打后端，只回喂事实。"""
+            if str(tc.id) in dup_ids:
+                return ToolError(
+                    tc.name,
+                    f"Error: 同一次回复里「{tc.name}」这条调用（参数逐字相同）出现了两次，"
+                    f"第二次不执行——一次已经足够，重复只会拿到同一份结果。"
+                    f"要拿别的东西就换参数或换工具。",
+                    counts_as_failure=False)
+            st = repeats.get(_repeat_key(tc.name, tc.arguments))
+            if st is None:
+                return None
+            # 告过两次还照打：改成「记失败」，让 _MAX_CONSECUTIVE_FAILURES 那道老闸接手，
+            # 否则模型可以无限刷这条便宜回执。
+            harsh = st["refused"] >= _MAX_REFUSALS_BEFORE_FAILURE
+            if st["same"] >= _MAX_SAME_RESULT_REPEATS:
+                return ToolError(
+                    tc.name,
+                    f"Error: 「{tc.name}」这一份参数已经真跑过 {st['n']} 次，"
+                    f"每次返回的结果**逐字相同**，这次不再执行。"
+                    f"再打同一份请求不会得到任何新信息：换参数（换关键词、换节点名）、"
+                    f"换工具，或者直接说明卡在哪、给个方案（规划轮就调用 submit_plan）。",
+                    counts_as_failure=harsh)
+            if st["n"] >= _MAX_SAME_ARGS_ATTEMPTS:
+                return ToolError(
+                    tc.name,
+                    f"Error: 「{tc.name}」同一份参数已经真跑过 {st['n']} 次，这次不再执行。"
+                    f"每次返回或许略有不同，但同参重复到这个数目就不是推进而是打转——"
+                    f"换参数或换工具，或告诉用户卡在哪（规划轮就调用 submit_plan）。",
+                    counts_as_failure=harsh)
+            return None
+
+        def _note_repeat(tc: ToolCall, result: Any) -> None:
+            """跑完记账：结果字节和上次一样就把「无进展」连续数加一，不一样就归一。
+
+            真失败（``counts_as_failure=True``）不入这本账：那条路归连续失败守卫管——
+            它按工具名计次（换参数也照数）、有自己的「已连续失败」话术与上限。两本账
+            各数各的，否则同一次失败被两道闸重复定性，回执里的数字就对不上事实。
+            """
+            if is_tool_error(result) and result.counts_as_failure:
+                return
+            key = _repeat_key(tc.name, tc.arguments)
+            digest = _digest(result)
+            st = repeats.setdefault(key, {"n": 0, "same": 0, "last": "", "refused": 0})
+            st["n"] += 1
+            st["same"] = st["same"] + 1 if digest == st["last"] else 1
+            st["last"] = digest
+            st["refused"] = 0
+            if st["same"] == _MAX_SAME_RESULT_REPEATS:
+                repeat_warnings.append(
+                    f"「{tc.name}」最近 {st['same']} 次调用参数与返回结果逐字相同。"
+                    f"下一次同样的参数不会再执行——现在就换参数、换工具，或如实说明卡点。")
 
         async def _exec_one(tc: ToolCall) -> Any:
             await self.hooks.before_tool_call(ctx, tc.name, tc.arguments, call_id=tc.id)
@@ -1447,6 +1547,18 @@ class AgentOnceRun:
                 await self.hooks.after_tool_call(
                     ctx, tc.name, tc.arguments, None, 0.0, error=r, call_id=tc.id)
                 return r
+            blocked = _blocked_repeat(tc)
+            if blocked is not None:
+                # 熔断不是「工具坏了」：默认 counts_as_failure=False，别把「换个思路再来」
+                # 再压一层失败计数（第二次起才升级，见 _blocked_repeat）。
+                repeats_key = _repeat_key(tc.name, tc.arguments)
+                st = repeats.setdefault(
+                    repeats_key, {"n": 0, "same": 0, "last": "", "refused": 0})
+                if str(tc.id) not in dup_ids:
+                    st["refused"] += 1
+                await self.hooks.after_tool_call(
+                    ctx, tc.name, tc.arguments, None, 0.0, error=blocked, call_id=tc.id)
+                return blocked
             try:
                 r = await asyncio.wait_for(
                     reg.execute(tc.name, tc.arguments), timeout=_TOOL_CALL_TIMEOUT)
@@ -1461,6 +1573,7 @@ class AgentOnceRun:
             except Exception as e:  # noqa: BLE001 - Registry 之外再兜一层，循环不该炸
                 r = ToolError(tc.name, f"Error executing {tc.name}: {e}")
             err = r if is_tool_error(r) else None
+            _note_repeat(tc, r)
             if err is None and isinstance(tc.arguments, dict) and "timeline" in tc.arguments:
                 await self._persist_timeline(ctx, tc.arguments["timeline"])
             await self.hooks.after_tool_call(
@@ -1509,6 +1622,10 @@ class AgentOnceRun:
                 f"向用户说明失败原因并询问如何处理（换素材、换参数、跳过这步或换方案），"
                 f"不要继续重试。连续失败到 {_MAX_CONSECUTIVE_FAILURES} 次后该工具不再执行。"
             ))
+        # 无进展重复的预告：闸已经攒到第二次，下一次就不真执行了。
+        # 放在全部回执之后——理由同上面那批守卫提示（tool_calls 未收口时插别的角色直接 400）。
+        for note in dict.fromkeys(repeat_warnings):
+            ctx.messages.append(system(f"⚠️ {note}"))
 
         await self.hooks.after_execute_tools(ctx)
         return results

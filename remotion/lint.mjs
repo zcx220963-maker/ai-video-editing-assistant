@@ -13,18 +13,15 @@ import { dgPlugin, RESTRICTED_GLOBALS, RESTRICTED_SYNTAX } from './lint-rules.mj
  */
 const eslintFor = (() => {
   const cache = new Map();
-  return (declared) => {
-    const key = declared.join('\u0000');
+  return (declared, assets = []) => {
+    const key = declared.join('\u0000') + '@' + assets.join('\u0000');
     let inst = cache.get(key);
     if (inst) return inst;
-    // 三条规则共用同一份 options：它们问的都是「声明名单 vs 代码里的读/标」。
-    // 各造一份而不是共享同一个数组引用——ESLint 会按规则校验/归一 options。
     const fieldOpts = () => ['error', { declared }];
+    const assetOpts = () => ['error', assets];
     inst = new ESLint({
-      overrideConfigFile: true,   // 不读磁盘上的任何配置，闸① 只认这一份
+      overrideConfigFile: true,
       overrideConfig: {
-        // 不写这一行，扁平配置默认只匹配 **/*.js —— 镜头代码是 .tsx，整份配置会
-        // 一条都不套，ESLint 只回一句「File ignored」，闸① 就成了摆设。
         files: ['**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx'],
         languageOptions: {
           parser: tsParser,
@@ -38,16 +35,19 @@ const eslintFor = (() => {
           'dg/must-wrap-film-layout': 'error',
           'dg/needs-shot-export': 'error',
           'dg/no-external-urls': 'error',
+          'dg/must-use-motion': 'error',
+          'dg/no-raw-styled-div': 'error',
           'dg/fields-declared-unused': fieldOpts(),
           'dg/fields-undeclared-read': fieldOpts(),
           'dg/field-mark-not-reading': fieldOpts(),
+          'dg/staticfile-asset-check': assetOpts(),
+          'dg/font-family-whitelist': 'error',
           'no-restricted-globals': ['error', ...RESTRICTED_GLOBALS],
           'no-restricted-syntax': ['error', ...RESTRICTED_SYNTAX],
         },
       },
       cwd: process.cwd(),
     });
-    // 只留最近几十份名单组合：换镜会不断产生新组合，无界缓存是一个静默的内存泄漏口。
     if (cache.size > 64) cache.delete(cache.keys().next().value);
     cache.set(key, inst);
     return inst;
@@ -63,12 +63,14 @@ const eslintFor = (() => {
  * `declaredFields` 缺省成空数组是**有意的严格**：没声明就是没声明，此时代码里出现
  * 任何 `fields.x` 或 `<F>` 都会被打回。想关掉这三条的唯一办法是显式传名单。
  */
-export async function lintShotCode(code, declaredFields = []) {
+export async function lintShotCode(code, declaredFields = [], assetNames = []) {
   const declared = [...new Set((Array.isArray(declaredFields) ? declaredFields : [])
+    .map((s) => String(s)))].filter(Boolean);
+  const assets = [...new Set((Array.isArray(assetNames) ? assetNames : [])
     .map((s) => String(s)))].filter(Boolean);
   let reports;
   try {
-    reports = await eslintFor(declared).lintText(String(code ?? ''), { filePath: 'shot.tsx' });
+    reports = await eslintFor(declared, assets).lintText(String(code ?? ''), { filePath: 'shot.tsx' });
   } catch (err) {
     return { ok: false, errors: [{ rule: 'lint-crash', line: 1, msg: String(err?.message ?? err) }] };
   }

@@ -1,7 +1,7 @@
 ---
 name: motion_explainer_skill
 display: 图文科普片（零素材出片）
-description: 【WORKFLOW SKILL】没有视频素材、用户只给一个选题时的出片流程：自己查资料 → 写每镜文案 → 每镜交一段完整的 React/TSX 画面代码（Remotion 容器逐帧渲）→ 人声旁白配逐词字幕 → 一条成片。适用于科普、历史、概念解释类短片，或用户明确说「我没有素材，你自己找内容做一条」。A zero-material workflow: research, write per-shot copy, author each frame as real React/TSX code, narrate and render.
+description: 【WORKFLOW SKILL】没有视频素材、用户只给一个选题时的出片流程：自己查资料 → 写每镜文案 → 每镜选一张shot配方卡+填参数（不写渲染代码）→ 人声旁白配逐词字幕 → 一条成片。适用于科普、历史、概念解释类短片，或用户明确说「我没有素材，你自己找内容做一条」。A zero-material workflow: research, write per-shot copy, select shot recipe cards and fill params, narrate and render.
 ---
 
 # 何时用这条通道（与常规剪辑的分界）
@@ -16,474 +16,381 @@ description: 【WORKFLOW SKILL】没有视频素材、用户只给一个选题�
 
 # 流程
 
-1. **查资料**：web_search / fetch_url，可以多轮。后端怎么选的、查不到该怎么收口，见下面
-   「查资料：后端链与出处账」那一节。每条要点记下出处（标题 + 链接）。
-2. **写分镜** plan_motion：每镜一句文案 + **一整段真实代码** + 高亮词 + 可选旋钮 + 出处。
-   这一步是**校验闸**，返回的错误清单照抄着改，改完重调本工具——它不烧像素，改十遍也只花几秒。
-   带病的 spec 不会入库，所以永远不会「渲了二十分钟才发现高亮词写错了」。
-3. **对账**：读返回里的 `estimated_sec`（按字数估的秒数区间）、`target_warnings`，
-   以及闸⑦ 那份风格账 `style_channels`（逐镜用的哪条画法通道）与 `style_warnings`
-   （文案里没查到具体项的镜号）。有偏差就先改分镜（删镜 / 缩短每镜文案 / 调语速 /
-   把空的那几镜补上画面主体），别留着让渲染去揭晓。
-   出片之后回执上还有同一份 `style_channels` 加上 `fill_warnings`（内容没铺满画面带的那几镜）
-   和 `layout_warnings` / `layout_unscanned`（闸⑧ 的版面告警，与「压根没扫的那几镜」）——
-   它们是**提醒不是打回**，所以答复里不许说「八道闸全绿」把它们混过去，要照实说哪几镜偏小、
-   哪几镜的标签压在一起，以及哪几镜的版面其实没验过。
+1. **查资料**：web_search / fetch_url，可以多轮。每条要点记下出处（标题 + 链接）。
+2. **写分镜** plan_motion：每镜一句文案 + **一整段适配后的 .tsx 代码** + 高亮词 + 可选旋钮 + 出处。
+   代码不是从零写的——是从 shot 配方卡的 demo 实现适配来的（见下面「镜头代码合同」）。
+3. **对账**：读返回里的 `estimated_sec`、`target_warnings`、`style_channels`、`style_warnings`，
+   有偏差就先改分镜。
 4. **出片** render_motion_code：分钟级到十分钟级。返回 `status=queued/running` 时
-   **继续调 render_status**（同 artifact_id）直到 done/failed，不要在这一轮就宣布成片。
-5. **出片之后还要改** → 看下面那一节「局部改」。**不要**为了改几个字重跑整条流程：
-   重新 plan_motion 会把分镜换成新版，旧成片与新命中表就对不上了；而局部改改的正是
-   那一版片子自己的分镜。
+   **继续调 render_status**（同 artifact_id）直到 done/failed。
+5. **出片之后还要改** → 看下面「局部改」。
 
-# 一镜只有六栏
+# 镜头代码合同：选卡 + 适配（不从零写代码）
 
-`shots[]` 每一项：**code**（必填）、**text**（必填）、**highlight**、**fields**、**source**、
-**texture**（这一镜的质感档，省略=跟整片默认），外加一个只当下限的 **min_duration_sec**。
-没有 `card`、没有 `visual`、没有 `theme`——
-版式与字幕在母版 `<FilmLayout>` 里，画面在代码里。
+## 核心原则
 
-- `text` 容量按画幅：竖屏与方屏 ≤ 60 字、横屏 ≤ 110 字。**它只进母版的字幕带，
-  不进镜头画面**；画两遍是重影。超了裁镜，不要裁句子。
-- `highlight` 里的每个词**必须是该镜文案的子串**，每镜 ≤ 4 个。差一个字就是画面上
-  永远不亮——校验会拦，但拦下来等于白跑一轮。
-- **有旁白时不要写每镜时长**。镜头长度归真实语音时长（话没说完画面不切走），
-  `min_duration_sec` 只当下限参考。想控制节奏请改文案长度与语速。
-- 首尾各留一镜：开场与收尾的呼吸镜（`min_duration_sec` 给 1.5~2.5，代码画封面与落款就行）。
-- `source` 如实填。机器不判史实真伪，它只会如实出现在**分镜卡与逐镜账**上；代码不会自动把
-  出处排进画面，要让观众看到，就得自己在代码里渲染那一栏。没查到的就不要写上去，
-  也不许在答复里替它背书说「已核实」。
+**你不写渲染代码，你选 shot 配方卡 + 适配参数。**
+
+项目内置 **124 张 shot 配方卡**（`shots/` 目录）+ **158 个 demo 实现**（技能目录 `demos/`）+
+**8 套主题色板**（`remotion/src/themes/palettes.json`）。每张卡有调校过的参数、缓动、时间轴，
+demo 实现是参数的真相——你的工作是**选卡 + 把 demo 代码适配到用户的文案和主题**，不是从零写。
+
+## 124 张 shot 卡分 10 类
+
+| 类别 | 卡数 | 用途 | 示例卡 |
+|------|------|------|--------|
+| **opening** | 11 | 开场镜/标题入场 | spotlight-hero-card, brand-ink-open, fracture, letterspace-materialize |
+| **camera** | 10 | 3D空间运镜/2.5D相机 | basic-3d-scene, crash-zoom-punch, depth-layer-moves, space-camera-moves |
+| **effects** | 15 | 视觉特效/光影/转场重音 | aurora-bloom-bg-flip, spotlight-sweep-moves, riso-print-hits, light-play-moves |
+| **typography** | 22 | 文字动效/逐词入场 | flying-words, blur-slide, typewriter-moves, gradient-word-sweep, lead-word-zoom-assemble |
+| **data** | 5 | 数据可视化动效 | chart-live-moves, before-after-slider-scrub, gauge-readout-moves, timeline-travel |
+| **transition** | 15 | 镜间转场 | card-flip-reveal, circle-match-iris, gradient-transition, page-turn-transitions |
+| **rhythm** | 8 | 节奏卡点/变速 | beat-cut-moves, speed-ramp-freeze, quad-split-parallel-scenes, sakuga-timing-shift |
+| **ui-entrance** | 21 | UI元素入场/卡片堆叠 | deck-deal-flyin, card-stack, carousel-3d, wall-reveal-moves, row-embed |
+| **interaction** | 11 | 交互模拟/光标/协作 | collab-cursor-moves, theme-switch-moves, glass-pill-dictation-typing |
+| **outro** | 6 | 收尾/落款 | logo-shrink-wordmark-lockup, grain-dissolve, neon-triple-marquee |
+
+## 选卡方法
+
+**先读 `shots/INDEX.md`（一次加载技能调用）**——它列了全部 124 张卡的卡名、能量、一句话描述，
+扫完就能选卡，不要逐张调「加载技能」读卡全文。
+
+选卡流程：
+1. 读 `shots/INDEX.md`（1 次调用）→ 按选题选 3-5 个类别
+2. 从选中类别里挑 1-3 张卡（看能量搭配：开场高→中段混合→收尾中）
+3. 只读选中卡的全文（每张卡 1 次调用，总共 ≤ 15 次）
+4. 卡全文有：意图、动效核心、参数表（`| 参数 | 典型值 | 调节手感 |`）、已知坑、参考实现路径
+
+**不要读超过 15 张卡。** 124 张卡不需要全看，INDEX.md 的一句话描述足够选卡。
+怎么选、选多少由你根据选题自己决定。
+
+## 适配 demo 代码
+
+每张卡的「参考实现」指向 `demos/<category>/<card-name>/` 下的 TSX 文件。适配步骤：
+
+1. **读 demo 源码**：用 `load_skill` 读技能目录 `demos/<category>/<card-name>/<ComponentName>.tsx`
+   （不是 `read_file` 读 `remotion/src/demos/`——那个路径在容器里不可达）
+2. **替换 import 路径**：demo 用相对路径（`../../_fixtures/Motion`），你必须改成别名：
+   - `../../_fixtures/Motion` → `@dg/motion`
+   - `../../_fixtures/Polish` → `@dg/polish`
+   - `../../_fixtures/Brand` → `@dg/brand`
+   - `../../_fixtures/Look` → `@dg/fixtures/Look`
+   - `../../_fixtures/Fixtures` → `@dg/fixtures/Fixtures`
+   - `../../_fixtures/PageCam2D` → `@dg/fixtures/PageCam2D`
+3. **替换文案**：demo 里的硬编码文字（如 `"Promos took weeks"`）换成用户的文案
+4. **替换颜色**：demo 里的颜色常量换成所选主题的色板值
+5. **调参数**：按参数表和用户需求微调时长、缓动、幅度
+6. **包 FilmLayout**：把适配后的组件包进 `<FilmLayout>` 母版（字幕带、安全区、字阶都在母版里）
+
+## 可用 import
+
+```tsx
+// 基础动效工具（从 video-shotcraft 移植）
+import { E, seg, lerp, rand, useT, DesignStage } from "@dg/motion";
+import { EASE, Grain, Vignette, bezier, ramp, mix, fitText } from "@dg/polish";
+import { BRAND } from "@dg/brand";
+
+// 可复用组件库
+import { Caption } from "@dg/lib/Caption";
+import { FlashCut } from "@dg/lib/FlashCut";
+import { DigitRoll } from "@dg/lib/DigitRoll";
+import { ClipCard } from "@dg/lib/ClipCard";
+import { FlatPanel } from "@dg/lib/FlatPanel";
+import { PageCam } from "@dg/lib/PageCam";
+import { VerticalTicker } from "@dg/lib/VerticalTicker";
+
+// 主题色板
+import palettes from "@dg/themes/palettes.json";
+
+// 母版（字幕带、安全区、字阶、配色）
+import { FilmLayout, useBody, F } from "@dg/film";
+import { TOKENS } from "@dg/tokens";
+
+// Remotion 核心
+import { interpolate, useCurrentFrame, useVideoConfig, random, AbsoluteFill, staticFile } from "remotion";
+
+// 画法通道（在白名单里，按需引入）
+import { fitText as remFitText } from "@remotion/layout-utils";
+```
+
+## 8 套主题色板
+
+每套 7 键：`page`/`surface`/`field`/`text`/`muted`/`accent`/`border`。
+
+| 色板 | page | accent | 风格 |
+|------|------|--------|------|
+| `vintage-kraft` | `#c8aa7d` | `#8b4937` | 复古牛皮纸 |
+| `deep-ocean` | `#0b1620` | `#7cc8b4` | 深海科技 |
+| `obsidian-violet` | `#14121b` | `#bca0e8` | 黑曜紫 |
+| `modern-light` | `#f4f7fb` | `#2563eb` | 现代浅色 |
+| `midnight` | `#090f1a` | `#61d9ef` | 午夜蓝 |
+| `solar-pop` | `#f9faf6` | `#527434` | 阳光活泼 |
+| `coral-burst` | `#fffffe` | `#d94e59` | 珊瑚迸发 |
+| `color-play` | `#f7f5fb` | `#7354b5` | 色彩游乐 |
+
+科普视频推荐主题：`deep-ocean`（科技感）、`midnight`（数据感）、`obsidian-violet`（概念感）。
+
+## 代码模板
+
+```tsx
+import React from "react";
+import { useCurrentFrame, AbsoluteFill, staticFile } from "remotion";
+import { FilmLayout, useBody, F } from "@dg/film";
+import { TOKENS } from "@dg/tokens";
+import { E, seg, lerp, useT, DesignStage } from "@dg/motion";
+import { EASE, Grain, Vignette, fitText } from "@dg/polish";
+import palettes from "@dg/themes/palettes.json";
+
+const palette = palettes["deep-ocean"];
+
+const Shot = (props: any) => {
+  const { text, highlight = [], words, subtitleMode, aspect, fields = {}, assets = [] } = props;
+  const t = useT();
+  const body = useBody(aspect);
+
+  // === 从 shot 卡 demo 适配的动效代码 ===
+  const flip = seg(t, 0.57, 0.64, E.inOutCubic);
+  const rise = seg(t, 0.04, 0.56, E.outCubic);
+
+  // fitText 自动按画幅缩放字号，字族用 TOKENS.fontStack
+  const titleFit = fitText({ text: text, maxLines: 2, maxFontSize: TOKENS.sizeTitle });
+
+  return (
+    <FilmLayout text={text} highlight={highlight} words={words}
+                subtitleMode={subtitleMode} aspect={aspect}>
+      <DesignStage bg={palette.page}>
+        {/* 适配后的画面内容 */}
+        {/* 用 palette.page/palette.surface/palette.accent/palette.text 等主题色 */}
+        {/* 用 E/seg/lerp/EASE 等动效工具 */}
+        {/* 有资产时用 staticFile(assets[0].relpath) 引图，闸⑪ 会判它动没动 */}
+      </DesignStage>
+    </FilmLayout>
+  );
+};
+export default Shot;
+```
+
+## 禁止事项
+
+- **禁止从零写渲染代码**：必须从 shot 卡 demo 适配。先读卡 → 读 demo → 适配。
+- **禁止 Math.random / Date.now / new Date**：用 `rand(seed)` 或 remotion 的 `random(seed)`。seed 必须给固定值。
+- **禁止裸 div 画色块**：用 `DesignStage` + 主题色板。
+- **禁止降档命门参数**：shot 卡「已知坑」里标注的参数不得低于典型值。
+- **禁止外链**：所有资源必须通过 `staticFile` 引本镜 `assets` 声明过的本地资产，不引 http/https URL。
+- **字体必须用白名单字族**：`Noto Sans CJK SC`、`Noto Serif CJK SC`、`Noto Sans Mono CJK SC`、
+  `DejaVu Sans`、`DejaVu Sans Mono`、`DejaVu Serif` 等 18 个镜像内已装字族。
+  lint 规则 `dg/font-family-whitelist` 逐属性检查，非白名单字族逐镜打回。
+  用 `fitText` 时默认走 `TOKENS.fontStack`，不用手写字族名。
+
+## 写法纪律（lint 规则在渲染前判）
+
+- **字段标注**：用 `<F name="字段名" value={fields.字段名}>` 标注可调旋钮的位置，
+  `F` 从 `@dg/film` 导入。lint 规则 `dg/field-drift` 检查：
+  声明了却没人读（fields 里有但代码没引）、读了却没声明（代码引了但 fields 里没有）、
+  不是这个字段自己的值（`<F name="x">` 里读的不是 `fields.x`）。
+- **随机种子**：`rough.generator` 等 API 要传 seed，`seed 必须给`固定值，保证逐帧可复现。
+- **音频时长**：长样本（>5s）要显式给 `durationInFrames`，否则会拖到动作结束后还在响。
+
+# 一镜只有七栏
+
+`shots[]` 每一项：**id**（卡的 `card` 标识，必填）、**code**（必填）、**text**（必填）、
+**highlight**、**fields**、**min_duration_sec**、**texture**（省略=跟整片默认）、**source**。
+
+另有 **card**（选的哪张 shot 卡，必填）、**derived_from**（适配自哪个 demo，必填）、
+**assets**（本镜用到的资产列表，可空）。
+
+- `text` 容量按画幅：竖屏与方屏 ≤ 60 字、横屏 ≤ 110 字。**只进母版字幕带，不进镜头画面**。
+- `highlight` 里每个词**必须是该镜文案的子串**，每镜 ≤ 4 个。
+- **有旁白时不要写每镜时长**。镜头长度归真实语音时长。
+- **无旁白时必须给每镜 `min_duration_sec`**：画面要给观众时间读字幕+看画面，每镜 5~15 秒。
+- 首尾各留一镜：开场与收尾的呼吸镜（`min_duration_sec` 给 1.5~2.5）。
+- `source` 如实填。没查到的不要写上去。
+- `card` 填卡名（如 `aurora-bloom-bg-flip`），`derived_from` 填 demo 的 relpath
+  （如 `demos/effects/aurora-bloom-bg-flip/AuroraBloomBgFlip.tsx`）。闸 `derived_from` 校验
+  白名单读 `demos/MANIFEST.json`，不在清单里的路径逐镜打回。
+- `assets` 每项含 `{relpath, sha256, bytes}`。`staticFile(relpath)` 引图时，lint 规则
+  `dg/staticfile-asset-check` 双向对账：代码里引了但 `assets` 没声明 → 打回；
+  `assets` 声明了但代码没引 → 提醒。
+
+# 时长与镜数
+
+- 「X 分钟以内」是**上限**不是**目标**——90 秒也是「4 分钟以内」。`目标时长（秒）` 传给 plan_motion 的是上限。
+- 没旁白时总时长 = 各镜 `min_duration_sec` 之和。
+- 用户给的时长/画幅/帧率是约束条件。约束之间有冲突或偏差时，你自己判断怎么处理——能自决就自决，需要用户定就问。
 
 # 文案合同（每镜那句话要撑起整条片子）
 
-画面再满，文案是空的就是一条没内容的片子。
-
-这一节里**只有「有没有一个词法可见的具体项」这一条是机器判得出的**，而且它**只出提醒、
-不打回**（闸⑦ 那条硬判据看的是画法通道，不是文案）：判的是**带具体项的镜数占全片镜数**，
-低于 40% 就逐镜点名（首尾镜不除外——文案对每一镜都要求）。数字、年份、引号或书名号里的专名、
-拉丁缩写它认得；「毕昇」「沈括」「胶泥」这种地名人名器物名它认不出，一条讲活字印刷的片子
-完全可以一句数字都不写。所以判错的代价是一整轮重规划，这一条宁可放过。
-**「没打回」不等于「没人看」**：认不出具体项的那些镜会逐镜点名在确认卡与出片回执的
-`style_warnings` 里，用户照着那串镜号要求重写。剩下的几条是写给人的纪律，机器不判。
-
 - **每镜至少落一个具体项**：数字、年份、地名、人名、器物名、专名、比例、因果链上的一环。
-  「很多人认为这件事影响深远」这种句子没有任何具体项，它撑不起一镜，也撑不起一条片子。
-- **不要写引子镜**。开场那一镜也要给东西：「1440 年前后，毕昇把胶泥刻成字」比
-  「今天我们来聊聊活字印刷」信息量高一个数量级，而且后者根本不需要画面。
-- **一句话只说一件事**。字幕条放不下第二件事（竖屏 60 字、横屏 110 字是硬上限），
-  塞进去只会两件事都说不清——拆成两镜，反正多一镜的成本是几秒 TTS 加一次渲染。
-- **文案与画面互为注解，不是互相复述**。文案说「人口从 1 亿涨到 4 亿」，画面就该把这条
-  曲线画出来；文案复述画面上的字，观众听到的是同一句话的两遍。
-- **术语第一次出现要给一句白话**。科普片的失败模式是全程用听众没听过的词解释另一个
-  没听过的词。给不出白话，说明这一镜还没想清楚。
-- 相邻两镜**不要同一主语的两种说法**（「活字印刷术」/「这种印刷方法」/「这项技术」轮着写
-  是凑字，不是行文）。
-
-# 镜头代码合同（闸① 在烧像素之前判，违规带镜号与行号退回）
-
-`code` 是**一个完整的 .tsx**：顶层一个默认导出的镜头组件。
-
-- 必须 `import { FilmLayout } from "@dg/film"` 并把顶层 JSX 包进 `<FilmLayout>`，
-  并且**把 props 透传给它**——字幕带、安全区、边距、字阶、配色全在母版里，
-  镜头代码只填主体区。不包就没有字幕，母版也读不到这一镜的 token。
-
-  ```tsx
-  import React from "react";
-  import { interpolate, random, useCurrentFrame } from "remotion";
-  import { FilmLayout, useBody, F } from "@dg/film";
-  import { TOKENS } from "@dg/tokens";
-
-  const Shot = (props: any) => {
-    const { text, highlight = [], words, subtitleMode, aspect, fields = {} } = props;
-    const frame = useCurrentFrame();
-    const body = useBody(aspect);        // 这一镜能画的那条带子（设备像素）
-    return (
-      <FilmLayout text={text} highlight={highlight} words={words}
-                  subtitleMode={subtitleMode} aspect={aspect}>
-        <svg viewBox={`0 0 ${body.w} ${body.h}`} width={body.w} height={body.h}>
-          {/* 主体区：SVG、rough.js、three、katex、普通 div 都行 */}
-        </svg>
-      </FilmLayout>
-    );
-  };
-  export default Shot;
-  ```
-
-- **能画的地方只有 `useBody()` 报回来的那条带子，坐标已经是设备像素**。母版按画幅裁出
-  画面带后用 `overflow:hidden` 裁掉越界的东西，而带子的尺寸**只有 `useBody()` 知道**：
-  竖屏是 936×1524，横屏是 1800×732，方屏是 952×764（设备像素，不乘任何系数）。
-
-  旧片子在这里栽过跟头：没人告诉镜头代码带子多大，模型就自己猜了一个 `viewBox="0 0 1080 620"`
-  并且 12 镜全照抄。横屏那条带子是 1800×732，于是每个母题都被压成画面约 **9%** 的一小条。
-  **不要猜尺寸，也不要再乘 `u`**：`const body = useBody(aspect)` 之后
-  `viewBox={`0 0 ${body.w} ${body.h}`}`，带内所有 `x`/`y`/`cx`/`cy`/`r`/`width`/`height`/
-  `fontSize`/`strokeWidth` 都按这个坐标系写实数（`aspect` 在缓存键里，横竖屏是两份缓存，
-  同一份代码不会互串）。字号想跟画幅走就乘 `body.w / 1080`，那是**你自己**的比例，不是母版的 `u`。
-- **母题要铺满带子，不是缩在中间一小块**：主体图形占带子短边的 60% 以上（横屏尤其要检查——
-  带子又扁又宽，按竖屏的手感画会两头空）。字号、线宽同理按 `body` 而不是按 1080 想。
-
-- import 只许这些包（镜像里真装了）：`react`、`react-dom`、`remotion`、`three`、
-  `@react-three/fiber`、`@remotion/three`、`@remotion/paths`、`@remotion/shapes`、
-  `roughjs`、`katex`、`katex/dist/katex.min.css`、`@dg/film`、`@dg/tokens`。相对路径自由，
-  名单外的包不存在，写了就是闸上的一次返工。唯一的**子路径**例外就是那条 katex 样式表。
-- **`TOKENS` 是扁平对象，颜色在顶层不在 `.colors` 下**——写 `TOKENS.colors.ink` 会渲染崩。
-  可用的键：
-  | 键 | 值 | 用途 |
-  |---|---|---|
-  | `TOKENS.ink` | `#23211c` | 正文/线条主色 |
-  | `TOKENS.bg` | `#f6f1e4` | 画面底色 |
-  | `TOKENS.paper` | `rgba(255,255,255,0.82)` | 字幕条/纸片底 |
-  | `TOKENS.accent` | `#a8352c` | 强调色（红） |
-  | `TOKENS.hl` | `#f0b7bd` | 高亮色（粉） |
-  | `TOKENS.fontStack` | `"Noto Sans CJK SC",…` | 无衬线字体栈 |
-  | `TOKENS.fontSerif` | `"Noto Serif CJK SC",…` | 衬线字体栈 |
-  | `TOKENS.fontMono` | `"Noto Sans Mono CJK SC",…` | 等宽字体栈 |
-  | `TOKENS.sizeTitle` | `96` | 标题字号（设计像素） |
-  | `TOKENS.sizeBody` | `44` | 正文字号 |
-  | `TOKENS.sizeCaption` | `44` | 字幕字号 |
-  | `TOKENS.sizeNote` | `28` | 注释字号 |
-  | `TOKENS.gutter` | `72` | 页边距（**竖屏基准值**） |
-  | `TOKENS.safeTop` | `96` | 上安全区（**竖屏基准值**） |
-  | `TOKENS.safeBottom` | `320` | 下安全区（**竖屏基准值**） |
-  | `TOKENS.bandHeight` | `132` | 字幕带高度（**竖屏基准值**） |
-  | `TOKENS.bandRadius` | `14` | 字幕带圆角 |
-
-  最后这五行是**竖屏那一档的设备像素**，横屏与方屏各有自己的一套（母版按 `aspect` 取）。
-  所以**不要拿它们算版面**——要版面尺寸就问 `useBody()`，它报回来的就是母版真正裁出来的
-  那个盒；拿 `gutter`/`safeTop` 自己减一遍，横屏上会得到一个和实际画面不符的坐标系，
-  画面上就是「东西都缩在左上角」。字阶（`sizeTitle` 等）与配色可以照用，它们本来就按画幅缩放。
-- **时刻只能来自** `useCurrentFrame()`：禁 `Math.random`（要随机用 remotion 的
-  `random(seed)`）、禁 `Date.now` / `new Date()` / `performance`、禁
-  `setTimeout` / `setInterval` / `requestAnimationFrame` 驱动动画、禁 SVG 的 SMIL
-  （`<animate>` 那一路按墙钟走）。逐帧 seek 下，按墙钟走的东西**两次渲出不同像素**。
-- 禁 `fetch` / `XMLHttpRequest` / `WebSocket` / `localStorage` / `eval` / `new Function` /
-  `process`，禁任何 `http(s)://` 外链资源与 `@import`——容器离线，外链字体与图片会
-  **静默回落**成别的东西。字体只用 `TOKENS` 里那三个 Noto 字族。
-- **不要自己写时长**：`durationInFrames` 由闸② 按真实语音时长注入，也不要在代码里读它
-  来自作主张画满。
-- 一镜代码 ≤ 40000 字节、镜头数 ≤ 120。
-- 表达手段按题材选：图示与关键帧轮播用 `interpolate` + SVG；手绘质感用 rough.js 的
-  **离线形状**那一路——`const gen = rough.generator()`，
-  `gen.toPaths(gen.circle(cx, cy, dia, { fill, stroke, fillStyle: "hachure" 或 "solid", seed: 7 }))`
-  出 `[{d, stroke, strokeWidth, fill}]`，逐条画成自己的 `<path d=…>` 放进 `<svg>`。
-  `rough.svg(el)` 要真 DOM 节点，这条链每帧重新起幅，拿不到也不该拿。
-  **seed 必须给**：不给时库内部用墙钟随机，同一镜两次渲不同像素，而 lint 只看你写的代码。
-  立体几何用 `@remotion/three` + `@react-three/fiber`（容器无 GPU，软件渲染，慢——
-  逐镜账里的每帧毫秒会如实变贵）；公式用 `katex`——**必须同时
-  `import 'katex/dist/katex.min.css'`**：`katex.renderToString` 离线就出得来 HTML，
-  漏了样式表照样渲得出来、闸① 也过，画面上却是一行没有上下标、没有斜体的纯文本，
-  属于「静默出丑」那一类，没有任何一道闸会替你发现。
-- 画面里得有能认出来的东西：闸④ 在**画面带内**按像素判两件事——「有没有画」（三帧带内
-  非底色占比）与「铺开了没有」（这些像素的外接盒占带短边多少）。
-  「字段写了但画面上什么都没有」这类静默空壳，和「画了但挤在中间一小簇」这类贴纸式构图，
-  在这条链都由像素拦，判据见下面「闸④ 判空壳与判小气」那一节。
-
-# 画面丰富度合同与风格配额（闸⑦ 按 import 记账，整片判）
-
-「卡片 + 文字」不是画面。这条链能把图画出来，就没理由交一份只有文字的片子出去。
-
-**每一镜**（首尾那两镜除外）要同时满足：
-
-- **有一个认得出的画面主体**：一座四棱锥、一只斜纹填的手、一条会涨的曲线、一枚刻着字的
-  活字、一个会分叉的请求链路——观众看完这一镜能用手指一下「讲的就是这个」。
-  只有标题、只有色块、只有一行数字在跳，都不算主体。
-- **至少两处先后错开的动效**，不是所有东西同时淡入。例：先画轴 → 再长柱子 → 最后弹读数；
-  或者主体入场后，标注再逐条点亮。用 `interpolate(frame, [起点, 终点], …)` 给每个动效
-  各自的窗口，窗口错开就是先后。
-- **画面上出现的文字是标注，不是正文**。把整句文案再打一遍到画面里，等于字幕画了两遍。
-
-**整片**按画法记账（闸⑦ 读的是每镜代码里**真的 import 了什么**，不是你声称用了什么）：
-
-| 风格通道 | 认的 import | 适合画什么 |
-|---|---|---|
-| 手绘质感 | `roughjs` | 器物、手、地图、有毛边的示意图形 |
-| 立体几何 | `three` / `@remotion/three` | 真三维的形体、剖面、旋转 |
-| 公式 | `katex` | 数学式、化学式、带上下标的记号 |
-| 矢量图示 | `@remotion/paths` / `@remotion/shapes`（或裸 SVG） | 流程、结构、曲线、柱状 |
-
-- 一条 ≥6 镜的片子**至少用两种通道**，≥10 镜至少三种；裸 SVG/paths 单独算一种，
-  但**全部镜头都只用它这一种**不算达标（那正是「卡片+文字」的另一种写法）。
-  **镜数不到 6 不判这一条**——三四镜的短片照样能全是文字，账上会如实写「这一档不判配额」，
-  不许报成「已通过」。
-- 纯文字/纯色块的那一类镜头**不超过中间镜的三分之一**（首尾镜不计入分子也不计入分母）。
-- 这两条是**打回**的（判在契约校验那一层，一帧都不烧）；退回原因里带着
-  `s01=rough、s02=text…` 那份逐镜分布，照着把最该有形体的那几镜换通道就行。
-- 纯文字那一类的判据是**代码字节里的 import**：写了 `<svg>` 或 `@remotion/shapes` 就算画了图，
-  只 import `react` 加几个 `<div>` 色块就算文字镜——所以「用色块拼一个抽象底纹」骗不过这一条。
-- 通道不是装饰：讲几何才上 three，讲器物才上 rough，讲式子才上 katex。为了凑数给历史片
-  塞一个三维立方体，比全片裸 SVG 更难看。
-- 三维这一路在容器里是软件渲染，逐镜账上的每帧毫秒会明显变贵——一两条片子级就够了，
-  别 12 镜全上。
-
-# 把「将来用户可能想改的东西」开成旋钮（fields）
-
-值写在代码里就每次都要改代码、重过闸①、重烧那一镜。开成字段之后：**改一个数字不必动代码**。
-
-每镜 ≤ 12 个，每项 `{name, type, label, value, …}`：
-
-- `type` 只有五种（前端只有这五种控件）：`number`（可给 `min`/`max`/`step`/`unit`）、
-  `color`（`#rgb` 或 `#rrggbb`）、`text`（≤120 字）、`bool`、`select`（`options` ≤12 项，
-  `value` 必须在其中）。
-- `name` 要能当 JS 标识符（代码里写 `fields.<name>`），并且**不许撞母版注入的保留键**：
-  text / highlight / words / fps / durationInFrames / width / height / aspect /
-  subtitleMode / fields / children。撞了就是在 props 里覆盖掉母版自己的那一个，
-  画面上少一样东西而 lint 看不见。
-- `label` 必填（表单的标题；漏了就只能露 `radius` 这种机器名）。
-- 声明里的 `value` 越界**当场打回，不钳值**：钳了就是「账上写 120、画上是 80」。
-- 代码里读它，并在真把它画上那个位置时套一层标注：
-  `<F name="radius" value={fields.radius}>…</F>`（`F` 由 `@dg/film` 导出）。
-  母版按这份标注在探针帧回读「值 + 盒」：闸⑥ 拿它对账，字段级命中表拿它定位。
-  `value` 那一栏**必须写注入的那份值本身**，不许填别的字面量——标注成了假指针，
-  就是账上一个数、画上一个数。
-- 闸① 的三条对账规则在烧像素之前判：声明了却没人读（这个旋钮在画面上根本不生效）、
-  读了却没声明（界面改不到它、闸⑥ 没有期望值可对）、`<F>` 标的 value 不是这个字段自己的值。
-
-# 八道闸（前七道在烧像素之前或当轮判，不会留下一条带病的成片）
-
-① 容器里的 lint（代码内容、import、危险 API、字段对账）② 帧预算（全片 ≤ 4000 帧，
-时长按 TTS 实测算）③ 帧数回读（切片实测与计划差 > 1 帧即退回，不截不补）
-④ 画面像素判两半（带内非底色占比判空壳 **与** 非底色外接盒判小气）
-⑤ 跨镜一致（每一镜回读的母版 token 逐键比对，**容差 0**——字号/边距/安全区两镜不等就退回）
-⑥ 字段对账（注入值 vs 代码自报值，按类型比）
-⑦ 整片风格配额（画法通道种数 + 纯文字镜占比，判在契约校验那一层，一帧都不烧）
-⑧ 版面回读（**探针帧在真 DOM 上量盒**：两处文字压在一起 / 文字被画面带切掉 /
-引线的另一端落在空白处）。
-
-**闸⑧ 是八道里唯一不设红的一道**：它的判据是几何猜的，「宁可漏报，不许误报」，
-出了告警这一镜照样出片。所以它的话必须照实念到用户面前（见下面那一节），
-不许并进「全绿」里——「扫过且干净」与「压根没扫」在回执上是两句不同的话。
-
-外加**出处闸**：本会话真打开过的页面才算查证过，见下面那一节。
-
-## 闸④ 判空壳也判小气——生成代码前必读
-
-闸④ 在每镜的 **15%、50%、85%** 三个时间点取样，**先把帧裁到母版的画面带**（就是
-`useBody()` 那个盒；字幕带在它外面，不参与判空），再对每像素与母版底色 `TOKENS.bg`（`#f6f1e4`）
-做灰度差，**差 ≥ 24** 才算"这里有东西"。同一份二值字节上读出两个数、取方向也不一样：
-
-- **占比**取三帧里**最低**那一帧（动画中途空过一帧就是空过，最满那一帧遮不住）；
-- **铺满度**取三帧里**最满**那一帧的外接盒短边 ÷ 画面带短边（入场动画从中心长出来是这条链
-  的正常写法，判的是它落定之后的构图，不是第一帧）。
-
-两条打回规则：
-
-- **空壳**：最低占比 < **2%** 且 最满铺满度 < **45%**。两半**合起来**判是实测逼出来的——
-  手绘斜纹整镜的像素占比只有 **0.99%**、公式字形 **1.54%**，而它们的构图是铺满带子的
-  （铺满度 52%~74%）。只看占比会把这条链相对旧卡片链的全部价值（线条画、真公式、3D）
-  判成空画面；只看铺满度则放得过一块都画歪的镜。
-- **小气**：最满铺满度 < **30%**，**占比够也拦**。一大块实心色挤在中间 20% 占比能到 4%，
-  但它不是画面，是贴纸——当年那批横屏镜就是这么漏过去的。
-
-**铺满度低于 60% 不打回**（那是目标值不是缺陷，硬拦等于把「留白多的版式」这一种风格判死），
-它会以 `fill_warnings` 的形式逐镜出现在出片回执上。**改法：把母题按 `useBody()` 报回来的
-那条带子排，短边的 60% 以上。**
-
-裁到带子这件事是后加的：以前分母是整帧，而母版自己排的那块纸色字幕条就有 10% 上下——
-**一行代码没画的空镜也能过闸**，这条闸当时判的是「有没有字幕」而不是「有没有画面」。
-
-**这意味着：**
-
-- **动画不要从 opacity 0 起始**——探针帧可能正好取到还没显形的画面。用 `opacity = 0.3 + 0.7 * p`
-  而不是 `opacity = p`，让基础可见度始终在。
-- **底纹/背景色块要够重**——`opacity < 0.3` 或颜色跟 `TOKENS.bg` 每通道差 < 24 的底纹，
-  闸④ 根本看不见（叠完跟底色只差几个值）。要么 opacity ≥ 0.5，要么用 `TOKENS.ink`/`TOKENS.accent`
-  这种跟底色差大的颜色。
-- **细线条要靠铺满带子活下来**——`strokeWidth < 3` 的线条占比本来就只有 1~2%，
-  现在两半合起来判能过，但前提是它**铺得开**（外接盒够到带子的 45% 以上）。
-  一小簇细线在中间照样红。柱状图柱子 ≥ 150px 宽、圆环 ≥ 200px 直径是稳妥写法。
-- **判的是带子不是整帧**：不要照 1080×1920 的手感在横屏上画一小簇——那一簇在带子里
-  也更小，横屏的画面带只有 732 高，同样的坐标铺满度直接掉一档。
-
-# 标签与引线：不许悬空、不许互相盖（闸⑧ 版面回读）
-
-这一道闸看的不是像素，是**探针帧上真的 DOM 盒**：母版在 `durationInFrames - 2` 那一帧
-量每个文字元素、每条引线的两端、每个画得出的图元，然后按三条几何判据出告警。
-它是八道里唯一**只记账不拦截**的那道——告警照样出片，但一条都不许瞒着用户念过去。
-
-三条判据（阈值**随读数一起回传**，单源在 `remotion/src/tokens.ts` 的 `LAYOUT_PROBE`，
-本节抄的是当前取值，改了以回执上那份为准）：
-
-- **叠字**：两个文字盒的交叠面积 ≥ **较小那个的 40%** 报。夹具实测：横向压掉 150px
-  （比例 0.5）报，压掉 50px（比例 0.167）**不报**——标签挨着但不糊，是正常排版。
-- **被画面带切**：文字盒越出画面带任一边 ≥ **3px** 报，并说清哪一边、越了多少。
-  母版会把带子外面裁掉，观众读到的是半个字；124px 那种越界在回执上会写成「右边缘切掉约
-  124px」。
-- **引线悬空**：`<line>` / `<polyline>` / `<path>` 的某一端，在 **max(带短边×2%, 20px)**
-  之内既没挨着文字也没挨着画得出的图元 → 报，并给出那个空端的**带内坐标**。
-  藏在 `<g transform>` 里的引线一样算得准（端点跟着 `getScreenCTM` 映射走）。
-
-**落笔前该做的三件事**，做完基本就不会有告警：
-
-1. **先拿带子再排位置**。`useBody()` 报回来的 `body.w/body.h` 就是你唯一的画布，
-   告警里的 `box` / `at` **也是同一个坐标系**（画面带左上角是 (0,0)），直接照它减位移。
-   别按 1080×1920 的手感排横屏——横屏的带子只有 732 高，同样的坐标撞边概率高一档。
-2. **引线两头都要有落点**。一端贴标签、另一端贴那个图元（圆心、柱顶、多边形边上），
-   两端都要在带子里。指到画面外「留个悬念」是合法写法，但要在回执里说明那是有意的，
-   不许让读者以为是个 bug。
-3. **标签挤不下就换位置或收文案**，别缩小字号：字号由母版的 token 给，你自己缩一档
-   闸⑤ 就红（跨镜字号不一致），而且观众看到的是两种排版。
-
-**读回执的三种状态，是三种不同的病**（`layout_warnings` 里前两种必有一条）：
-
-- **落空（missing）**：这一镜压根没回传版面行——多半是镜像里的母版比这条 Python 链旧。
-  意思是「这一镜的版面**等于没验过**」，回给用户时不许写成「版面没问题」。
-- **没扫（unscanned）**：收到了行但 `scanned=null`，画面带的 ref 没挂上。同样不许当干净。
-- **扫过且干净**：`findings` 是空表且报了扫描条数（几处字、几条线、几个图元）。
-  只有这一种可以说「验过」。
-
-单帧告警超过 **8** 条时母版会截断并在回执写「丢了 N 条」——那不是「问题变少了」，
-是那一片排版整体塌了，改法是按上面三条重排这一镜，而不是一条条挪。
-
-# 数值画上画面：跨量级必须换对数刻度
-
-**判据**：同一张图里最大/最小读数**跨过 100 倍**，就别按最大值等比画条长——
-线性轴会把小值压成轴线上一个看不见的点，那不是「悬殊」，那是「少了一根柱子」。
-
-真机翻过的车：一镜比「一茶匙水 5 克 / 一茶匙中子星物质 10 亿吨」，线性轴下水那根柱子
-高 2 像素，观众读到的是「图里只有一根柱子」。跨 16 个量级的东西用线性轴画，等于把
-这一镜的论点删掉。
-
-**做法**（柱长、折线纵坐标、气泡半径都同一套）：
-
-```tsx
-const vals = [5, 1e9];                       // 原值，读数用它
-const lo = Math.log10(Math.min(...vals) / 3); // 轴底退一格，最小的那条才留得下长度
-const hi = Math.log10(Math.max(...vals));
-const frac = (v: number) => (Math.log10(Math.max(v, 1e-12)) - lo) / (hi - lo);
-// 柱高 = frac(v) * 带子可用高度；0 与负值先在外面退到某个正的下界，别把 0 塞进 log
-```
-
-- **读数仍然按原值报**（`5 克` / `10 亿吨`），轴旁标一句「每格 10 倍」。对数轴留住的是
-  「谁比谁大几个量级」，不是把数字改小——标了原值就不骗人。
-- **不到 100 倍别换**：差 2~3 倍的量用线性轴更直观，套对数反而抹平了差异。
-- 折线/散点同一判据；`@remotion/chart` 那一路如果自己不带对数轴，就照上面的 `frac`
-  自己算完再喂进去。
+- **不要写引子镜**。开场那一镜也要给东西。
+- **一句话只说一件事**。字幕条放不下第二件事——拆成两镜。
+- **文案与画面互为注解，不是互相复述**。文案说「人口从 1 亿涨到 4 亿」，画面就该把曲线画出来。
+- **术语第一次出现要给一句白话**。
+- 相邻两镜**不要同一主语的两种说法**。
 
 # 查资料：后端链与出处账
 
-**后端按这三层选，每次调用现读**：① 用户在「设置」页配的搜索 API（brave / tavily /
-serpapi / 自建 SearXNG，配了只走那一路）→ ② 环境变量 `SEARCH_PROVIDER` 那三个同名项 →
-③ 免 key 回落链。回执首行 `[检索后端：…]` 会老实告诉你是哪一路出的。
+- web_search 的结果带 `source_url`、`source_title`，调 plan_motion 时原样填进 `source`。
+- 查不到就说查不到，不要编。`source` 留空比编一个强。
+- 出处不进画面（除非用户要求），但进分镜卡和逐镜账。
 
-免 key 链按查询文字路由，是**真机探出来的**，不是随手排的：中文走维基百科 API，拉丁文字走
-Bing RSS（英文维基随后），DuckDuckGo 垫底。这台机器上 DDG 两个端点都回人机验证壳，换 UA、
-改 POST 都一样——那是**出口 IP 的信誉问题**，不是「网上没有这条内容」。
+# 画面质感档 texture
 
-由此有两条硬规矩：
+每镜可选 `texture`（省略=跟整片默认），5 档：
 
-- **查不到 ≠ 不存在**。免 key 链的覆盖面只有百科与通用网页，新近数字、长尾中文网页本来就不在
-  里面。换关键词再试、用 `fetch_url` 直接打开你已知的页面，或让用户去设置页配一把搜索 key；
-  都不许把「0 条」写成「没有相关记载」这类结论。
-- **出处只对账，不判真伪**。`web_search` 命中的链接和 `fetch_url` 真打开过的页面会记进本会话的
-  检索账。分镜 `source` 里的链接只有能对上一笔账才算查证过，对不上会被出处闸退回。
-  自己编一个看着像真的 URL 是最坏的写法——它骗得过画面，骗不过账本；查不到就老老实实写
-  「未核实：<依据一句话>」，或在文案里说明这是通行说法。自标未核实的**放行**，冒充查过的**打回**。
-- 分镜卡上每一镜的凭据状态写在 `source_gate` 里（`verified` / `declared_unverified` /
-  `no_source` / `ledger_absent` 四种）。给用户复述时照这四种说，别把它们混成「已核实」。
+| 档 | 画面特征 | 适用 |
+|----|---------|------|
+| `none` | 无滤镜 | 默认 |
+| `film` | 暗底+辉光+景深+颗粒+暗角 | 概念讲述、主线叙事 |
+| `tv` | 电视质感+扫描线 | 复古、新闻感 |
+| `glow` | 辉光增强 | 科幻、数据高亮 |
+| `bleach` | 漂白+高对比 | 历史、纪实 |
 
-# 用户在计划卡上能改的那几件事
+# 字幕模式
 
-`aspect`（画幅）/ `fps`（帧率）/ `narration`（要不要人声）/ `voice`（音色）/
-`rate`（语速）/ `subtitle_mode`（字幕形态）是**整部片子的属性**，不是每步各设一个；
-`texture`（质感）也在计划卡上，但那一格给的是**整片默认档**，每一镜还能自己覆盖。
-这七个同时也是 plan_motion 与 render_motion_code 的**顶层入参**。
-**param_options 只在 plan_motion 那一步出现一次**；render_motion_code 自动继承
-plan_motion 的值，**不要在 render_motion_code 上再列这些 param_options**——
-否则计划卡上同一组选项弹两遍，用户选两次同样的值。
+3 档：`full`（全字幕）、`torn_highlight`（撕纸高亮，推荐）、`none`（无字幕）。
+字幕带在母版 `<FilmLayout>` 里，镜头代码不用管字幕。
 
-把它们写进 plan_motion 该步的 param_options，用户就会在计划卡上看到并自己勾选。
-勾选的值**覆盖**你写在 spec 里的同名字段——那是用户的决定，不要在 spec 里再写一份旧值去"提醒"。
+# 局部改
 
-建议的默认档：portrait + 15fps + narration=true + zh-CN-YunjianNeural + rate=+0% +
-torn_highlight + texture=none。用户没表态就按这套，但**开关要照常给**，让他有机会改。
+出片后要改几个字或几镜，**不要重跑整条流程**：
 
-字幕只有母版那三种画法：torn_highlight 撕纸条 + 逐词点亮 / full 整句显示 / none 不上字幕。
-镜头代码碰不到字幕带，别在代码里自己画一行字幕。
+1. **改文案/高亮词** → patch_motion_code（只改指定镜的 text/highlight，不重渲结构）
+2. **改一镜的画面** → 重新选卡/适配那一段代码 → patch_motion_code
+3. **改整体风格** → 换主题色板 → patch_motion_code（改 palette 引用）
 
-`texture` 的**顶层那档是整片默认**，每一镜还能用自己的 `shots[].texture` 覆盖它：
-film 老胶片（颗粒+暗角+暖偏）/ tv 老电视（扫描线+色偏）/ glow 柔光（高光泛开，最贵一档）/
-bleach 漂白（硬对比低饱和）/ none 不加。
-**两种写法是两件事**：这一镜**省略** texture＝跟随整片默认；显式写 `"none"`＝这一镜就是不加，
-即使整片加了。要「第 3 镜老电视、其余柔光」这种混合观感，就逐镜交档，不必重做分镜。
-它是**每一镜切片上多走一趟编码**（滤镜在拼接之前、切片缓存之后），代价只有加了档的那几镜
-画质过二代编码、出片多花几十秒，**不会让任何一镜重烧 Remotion 帧**：这一档故意不进按镜缓存键。
-模型选了非 none 时，出片回执的 `evidence` 会按镜带上档位与实际消费的滤镜串；
-串为空而档位非 none，就说明这趟根本没跑（而不是「跑了但看不出来」）。
+# 十一道闸
 
-**只有卡面那排按钮受枚举约束**：param_options 的每个候选值都要能从节点枚举表里反查得到，
-用户手打的「+8%」这类非档位值会被第四重校验整张卡退回。而 spec 本体收任意 ±50% 的百分比
-（校验器只过正则）。所以用户点了个精确百分比时：**写进 spec 顶层的 rate**，
-该开关的 param_options 照常给（他会看到 +10% 那一档，勾了就以他的为准）。
+| 闸 | 判什么 | 违规怎么办 |
+|----|--------|-----------|
+| ① | 镜头代码能编译、有默认导出、import 在白名单内、字族在白名单内 | 改到过 |
+| ② | 时长/画幅/fps 合法 | 改参数 |
+| ③ | 高亮词是文案子串 | 改 highlight 或 text |
+| ④ | 画面非空+带内填充（`FILL_TARGET=0.60`→60%、`SPAN_MIN=0.45`→45%、`TIGHT_MIN=0.30`→30%、`EMPTY_MIN_RATIO=0.02`→2%） | 换卡/加内容 |
+| ⑤ | 母版 token 完整、跨镜一致 | 补 props |
+| ⑥ | 字段对账（fields 声明 vs 代码使用） | 补/删字段 |
+| ⑦ | 画法通道达标（配额 `((6,3),(10,4))`） | 换卡/加通道 |
+| ⑧ | 版面铺满、无叠字裁字 | 调参数/换卡 |
+| ⑨ | 跨镜同构（`STRUCT_SAME=0.88`） | 换卡/调参数 |
+| ⑩ | 字色对比度（`3:1` 正文 / `4.5:1` 强调） | 换色 |
+| ⑪ | 资产动效（三态：static 打回 / animated 通过 / undetermined 未判） | 给资产加动效 |
 
-配乐（BGM）给 `bgm` 参数两种写法都收：随消息附上的曲库歌曲的 **material_id**（用户从「音乐库」
-点「导入并做配乐」挂上来的那条，直接原样传，别自己拼对象键），或一个 ``obj:`` 对象引用。
-传了就取不到字节会直接失败，不会静默出成无声片；不传就是纯人声。
-音量与闪避在 spec 的 `bgm` 对象里（`volume` 0~0.6、缺省 0.18，`duck` 缺省开）。
-**这条路上不要调 select_BGM**：它绑在 ``generate_script`` 上，零素材片子里调它，
-计划门会连 ASR、片段理解一串上游一起补齐——那串步骤对一条没有素材的片子毫无意义。
-归属由后端判，别人曲库里的 id 一律算不存在。
-**也别把歌曲塞进 load_media**——它不是画面素材，会被当成"纯音频"丢掉。
+闸 ⑦⑨⑩ 在 `plan_motion` 时就**硬拦**（不烧像素），改十遍只花几秒。
+闸 ① 在容器 lint（渲染前）。闸 ②③④⑤⑥⑧ 在渲染时判。闸 ⑪ 在出片后判。
 
-# 出片之后要改哪里：局部改（patch_motion_code）
+**未判不是通过**：闸 ⑪ 返回 `undetermined`（探针采不到资产盒）时，不是"通过了"——
+是这一镜没有可判的资产，闸 ⑪ 对它没有发言权。只有 `animated` 才是通过。
+镜数不到 6 不判配额——这一档不判配额，模型才知道未判不是通过。
 
-片已经出来了，用户说的是「第 3 镜那个数字错了」「这句字幕换个说法」「把最后那镜删掉」
-「BGM 换一首」「加一层老胶片味」——这些都不该重做整片。**只有**要换画幅/帧率/音色/语速/
-字幕形态，或者要加镜、换叙事结构时，才重走 plan_motion → render_motion_code（那几件是整部
-片子的属性，而且**进按镜缓存键**，改它们等于每一镜都要重烧，那不叫局部改）。
+# 通道表（闸⑦）
 
-四种改法一次调用可以同时给：
+5 条画法通道 + 1 条文字通道：
 
-- `edits`：逐格改值。每条 `{pointer, value, shot}`。指针白名单只有五条：
-  `/shots/<i>/code`、`/shots/<i>/text`、`/shots/<i>/source`、`/shots/<i>/texture`、
-  `/shots/<i>/fields/<name>/value`。**pointer 必须原样取自那一版成片命中表条目的
-  `pointer` 键**——不要自己拼字段名，也不要拿另一版的表来读。命中表按
-  `GET /motion/hitmap?artifact_id=<那一版>` 取，内容也在出片回执指向的那份对象里。
-  带上 `shot`（该条目的镜号）后，指针与镜号对不上就直接退你；不报错地改到别的格上，
-  是这条链路最贵的失败。
-  哪些指针要重过闸① 说清免得白等：改 `code` **必须重过闸①**才允许落盘
-  （绕开 lint 改代码等于闸① 不存在）；改字段值与改质感档**都不重过闸①**（代码字节没动，
-  lint 的结论不可能变）。但它们各自的取值范围照查：字段看该镜声明的 `min`/`max`，
-  质感看 film/tv/glow/bleach/none 这五档，**外加一个空串 `""`**——`"none"` 是"这一镜明确不加，
-  即使整片加了"，`""` 是"这一镜收回表态、重新跟随整片默认那一档"，两件事、界面上两个格子；
-  要把一镜先前点名的档退回跟整片走，写 `""`（指针做不了"删掉这一栏"这件事）。
-  越界一律打回，不钳值。
-- `shot_sets`：整镜改写 `{shot, set}`。`set` 里给要改的那几栏，可改的是归一后的镜头键
-  （code / text / highlight / fields / min_duration_sec / source / texture）。与 `edits` 的区别：
-  这里**允许新增**——给一镜补上原本没声明的旋钮（`fields` 整份重写）得走这条。
-  镜号 `id` 在哪一种里都不许改（它是命中表、按镜缓存与对比帧共同的锚点）。
-- `remove_shots`：按镜号删镜，不许删光。
-- `reorder`：重排后的**完整**镜号清单，必须与现有镜号成套（漏一个就当错误——要删请写
-  `remove_shots`）。重排只动顺序，一镜都不重烧。
+| 通道 | import 标志 | 用途 |
+|------|------------|------|
+| `rough` | `roughjs` | 手绘斜纹、草图质感 |
+| `three` | `three`/`@react-three/fiber`/`@remotion/three` | 真 3D 场景、WebGL 渲染 |
+| `katex` | `katex` | 数学公式 |
+| `vector` | `<svg>`/`<path>`/`<rect>` 等 | 矢量图形 |
+| `image` | `staticFile` | 图像/视频资产（本镜 `assets` 声明过的） |
+| `text` | （fallback） | 纯文字+色块 |
 
-另有 `bgm`（换配乐：素材 id 或 `obj:` 引用；配乐不进按镜缓存键，所以只重走混音）、
-`texture`（换**整片默认**质感档：个别镜要换用 `/shots/<i>/texture` 指针。它不进按镜缓存键、
-滤镜跑在切片之后，所以一镜都不重烧，命中切片的镜照样被加上新档）和
-`target_duration_sec`（缺省沿用那一版当初的承诺值，显式传了才算改口）。
+配额：`CHANNEL_QUOTA = ((6, 3), (10, 4))`——`MIN_SHOTS_FOR_QUOTA=6`，
+≥6 镜需三种画法通道，≥10 镜需四种。镜数不到 6 不判配额。
+每镜用了哪些通道由代码字节里的 import 与标记自动识别。
 
-要知道的三件事：
+另有两条文字镜约束（首尾镜不计入分子也不计入分母）：
+- `MAX_TEXT_ONLY_SHARE = 1/3`：纯文字/纯色块镜不超过中间镜的三分之一。这两条是**打回**的。
+- `CONCRETE_SHARE_TARGET = 0.40`（40%）：中间镜里含具体项（数字/引号术语/拉丁缩写）的占比目标 40%。这条只出提醒，不打回——地名人名机器认不出，所以不拦。
 
-1. **它改的是「那一版自己的分镜」**，不是会话里最新的 `plan_motion`。所以 base_artifact_id
-   要传那一版返回体顶层的 `artifact_id`；指纹对不上会被拒收（那是「拿着旧表改新片」），
-   此时唯一出路是重新出片、重新量表。旧声明式链的产物（链身份不是 remotion）同样拒收。
-2. **它产出一条新版本**：新的 `artifact_id`、新的成片，旧版一个字节都不动，可以直接播回去、
-   也可以逐镜比对（返回里的 `patch.before_frames` 是改前的代表帧）。改动会同步进会话当前
-   分镜，所以你下一次重渲不会把用户的这几处编辑丢掉。
-3. 与出片一样是分钟级任务：返回 `status=queued/running` 就继续调 `render_status`，
-   别在提交那一轮就宣布改完了。返回里的 `evidence` 会写明这次真烧了哪几镜
-   （`changed_shots`）、哪几镜复用了切片——那句话是给用户看的账，照它说，
-   别替它加「已全面复核」。
+# 镜头代码的 import 名单
 
-# 成本口径（为什么省着写）
+lint 白名单 36 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 
-这条链**一镜一次**容器内的整段渲染，成本按「这一镜编了多少帧 × 每帧多少毫秒」记在逐镜账上：
-15fps 是推荐档，30fps 的每帧毫秒与母带编码时间都翻倍，而画面并不会更"满"。
-用户嫌长请删镜或缩文案，不要靠抬帧率。全片帧预算上限 4000 帧，超了直接报错
-（要求降 fps 或缩短片子），不会静默截断成半条片子。
+`react`、`react-dom`、`remotion`、`@remotion/paths`、`@remotion/shapes`、
+`@remotion/motion-blur`、`@remotion/layout-utils`、
+`three`、`@react-three/fiber`、`@remotion/three`、`roughjs`、
+`katex`、`katex/dist/katex.min.css`、
+`@dg/film`、`@dg/tokens`、`@dg/motion`、`@dg/polish`、`@dg/brand`、
+`@dg/fixtures/Motion`、`@dg/fixtures/Polish`、`@dg/fixtures/Brand`、
+`@dg/fixtures/Fixtures`、`@dg/fixtures/Look`、`@dg/fixtures/PageCam2D`、
+`@dg/lib/Caption`、`@dg/lib/ClipCard`、`@dg/lib/DigitRoll`、`@dg/lib/FlashCut`、
+`@dg/lib/PageCam`、`@dg/lib/VerticalTicker`、`@dg/lib/FlatPanel`、
+`@dg/lib/helpers/motion`、`@dg/lib/helpers/rand`、`@dg/lib/helpers/shake`、
+`@dg/lib/helpers/camera`、`@dg/themes/palettes.json`。
 
-省的那一半在**按镜切片缓存**：缓存键 =「代码字节 + 这一镜的文案/点亮词/下限秒 +
-字段的 name→value 扁表 + 整片开关（fps/画幅/旁白/音色/语速/字幕形态）+
-母版哈希 + 依赖锁哈希」。改一个字、改一个字段值就未命中，但**只重烧那一镜**，
-其余镜头直接复用已有切片；字段的 label/min/max/step 不进键（改控件边界不动像素），
-**换 BGM 与换质感都不动切片**——缓存存的是**加质感之前**的像素，滤镜在缓存之后按镜各跑
-一趟，所以整片默认与单镜覆盖都烧不到任何 Remotion 帧。
+# TOKENS
 
-出处也不在这本账上：`source` 不进缓存键——改一条引用不改像素，不该为它重烧一镜。
+`TOKENS` 是扁平对象，颜色在顶层不在 `.colors` 下。可用键：
+`TOKENS.fontStack`/`fontSerif`/`fontMono`（字体栈）、
+`TOKENS.sizeTitle`/`sizeBody`/`sizeCaption`/`sizeNote`（字阶）、
+`TOKENS.bg`（底色）、`TOKENS.paper`（字幕条与纸片底色）、
+`TOKENS.ink`（正文主色）、`TOKENS.accent`（强调色）、`TOKENS.hl`（高亮色）、
+`TOKENS.gutter`/`safeTop`/`safeBottom`/`bandHeight`/`bandRadius`（版面尺寸）。
+
+要版面尺寸就问 `useBody()`——它报回来的就是母版真正裁出来的那个盒。
+
+母版画面带尺寸（去掉安全区与 gutter 后的画面区）：
+- 竖屏 portrait：936×1524
+- 横屏 landscape：1800×732
+- 方屏 square：952×764
+
+# 资产与图像通道
+
+本链支持图像资产——用 `staticFile` 引本镜 `assets` 声明过的本地文件。
+
+## assets 栏
+
+每镜可声明 `assets` 数组，每项含：
+- `relpath`：相对于 `public/` 的路径（如 `stage/<cache_key>/<filename>`）
+- `sha256`：字节身份校验
+- `bytes`：文件大小
+
+## staticFile 对账
+
+lint 规则 `dg/staticfile-asset-check` 双向对账：
+- 代码里 `staticFile("foo.png")` 但 `assets` 没声明 `foo.png` → **打回**
+- `assets` 声明了但代码没引 → **提醒**（可能是死声明）
+
+## image 字段类型
+
+`fields` 里可声明 `type: "image"` 的字段（`FIELD_TYPES` 6 档：
+`number`/`color`/`text`/`bool`/`select`/`image`），让用户从素材库选图，值落 `fields.<name>`。
+
+## 资产入库
+
+资产通过 `POST /stage-assets` 端点入库（sha256 校验 + 幂等），存到 `public/` 下。
+`materials.origin` 支持 `'art'`（代码生成的素材）。全局素材库 `asset_library` 表不属任何用户。
+
+# 字体白名单
+
+镜像内已装字族 18 个（构建期 `fc-list : family` 生成 `font-whitelist.json`）：
+
+`Noto Sans CJK SC`、`Noto Serif CJK SC`、`Noto Sans Mono CJK SC`、
+`Noto Sans SC`、`Noto Serif SC`、`Noto Sans Mono CJK SC`（别名）、
+`DejaVu Sans`、`DejaVu Sans Mono`、`DejaVu Serif`、
+`DejaVu Math Text`、`DejaVu Sans Condensed`、`DejaVu Sans Narrow`、
+`DejaVu Serif Condensed`、`DejaVu Serif Display`、`DejaVu Sans Extralight`、
+`DejaVu Serif Condensed`、`Liberation Sans`、`Liberation Mono`、`Liberation Serif`。
+
+lint 规则 `dg/font-family-whitelist` 逐 `fontFamily` 属性检查（含 JSX 属性和常量解析），
+非白名单字族逐镜打回。用 `fitText` 时默认走 `TOKENS.fontStack`（Noto Sans CJK SC），不用手写字族名。
+
+# 闸⑪：资产动效
+
+闸 ⑪ 判**资产是否参与了动效**——静态摆图不算"用了资产"。
+
+## 三态
+
+| 态 | 含义 | 处置 |
+|----|------|------|
+| `static` | 资产在首帧与探针帧的盒/transform/opacity 完全相同 | **打回**：给资产加动效（位移/缩放/淡入/旋转） |
+| `animated` | 资产在两帧之间有可观测的变化 | **通过** |
+| `undetermined` | 探针采不到资产盒（没有 `<img>`/`<video>` 或盒为空） | **未判**：闸 ⑪ 对这镜没有发言权 |
+
+**未判不是通过**。只有 `animated` 才是通过。
+
+## 探针机制
+
+母版 `FilmLayout` 在 `probeFrame - 2`（首帧附近）和 `probeFrame`（末帧附近）两个时点
+扫一遍 `<img>`/`<video>`，记录 tag/src/box/transform/opacity。
+`server.mjs` 比对两帧快照，按 src 匹配，比较盒/transform/opacity 是否变化。

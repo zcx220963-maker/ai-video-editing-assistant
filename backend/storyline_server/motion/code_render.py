@@ -98,7 +98,8 @@ FILL_TARGET = 0.60
 #: 一改所有旧缓存自然失效，所以这一栏加进去不会多烧一镜。
 META_FIELDS = ("sec", "speech_sec", "planned_frames", "frames", "words", "degraded",
                "measured_sec", "width", "height", "fps", "empty_ratio", "fill_span",
-               "tokens", "field_checks", "render_timings", "cache_key", "layout")
+               "tokens", "field_checks", "render_timings", "cache_key", "layout",
+               "asset_motion")
 
 #: 母版回读字段盒的探针帧尾偏移（`durationInFrames - 本值`）。**必须与
 #: `remotion/src/tokens.ts` 的 `FIELD_PROBE_TAIL` 同值，两处一起改**：闸⑥ 比的是那一刻
@@ -683,10 +684,12 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
 
     narr = await narration_for(shot, spec, providers, shot_work)
     sec, frames = float(narr["sec"]), int(narr["frames"])
-    if frames_used + frames > rpipe.MAX_FRAMES_TOTAL:
+    frame_budget = rpipe.max_frames_total(
+        fps, spec.get("target_duration_sec"))
+    if frames_used + frames > frame_budget:
         raise MediaError(
             f"闸② 帧预算用尽：到 {sid} 需要 {frames_used + frames} 帧，上限 "
-            f"{rpipe.MAX_FRAMES_TOTAL}。降 fps（{fps}→10）或缩短片子再来——"
+            f"{frame_budget}。降 fps（{fps}→10）或缩短片子再来——"
             "不静默砍镜，也不静默截帧")
 
     props = shot_input_props(shot, spec, frames=frames,
@@ -745,6 +748,9 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
         # 闸⑧ 的版面读数：与 field_checks 同一次浏览器回读、同一探针帧，也一同进缓存
         # （缺了这一栏，复用切片的那几镜在整片账上会被读成「版面扫过且干净」）。
         "layout": summarize_layout(sid, resp.get("layout_used")),
+        # 闸⑪ 资产动效三态：'static'（打回）/ 'animated'（通过）/ 'undetermined'（未判）。
+        # 未判不许记成通过——回执必须如实区分。
+        "asset_motion": resp.get("asset_motion") or {"status": "undetermined", "reason": "容器没回传资产行"},
         "render_timings": resp.get("timings") or {}, "cache_key": key,
         "chain": "remotion",
         "lint_warnings": [str(w)[:200] for w in (resp.get("warnings") or [])][:8],

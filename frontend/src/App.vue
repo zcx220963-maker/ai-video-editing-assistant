@@ -4377,13 +4377,20 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <div>
             <b :class="testSearchResult.ok ? 'ok' : 'bad'">{{ testSearchResult.backend
                        || testSearchResult.provider || "免 key 回落链" }}</b>
-            {{ testSearchResult.ok
-               ? `连通 · ${testSearchResult.results} 条 · ${testSearchResult.latency_ms}ms`
-               : "不通 · " + (testSearchResult.message || "未知错误") }}
+            <template v-if="testSearchResult.ok">
+              {{ `连通 · ${testSearchResult.results} 条 · ${testSearchResult.latency_ms}ms` }}
+            </template>
+            <!-- 「后端答了话」与「这条查询有可用结果」是两件事：免 key 链把与查询词
+                 零重合的条目全丢掉时，说「不通」会让人去查网络，真要查的是关键词。 -->
+            <template v-else>
+              {{ (testSearchResult.refused ? "后端有回应，但这条查询没留下可用结果 · "
+                                          : "不通 · ")
+                 + (testSearchResult.message || "未知错误") }}
+            </template>
           </div>
           <div v-if="testSearchResult.sample && testSearchResult.sample.length"
                class="set-note">{{ testSearchResult.sample.join(" ／ ") }}</div>
-          <div class="set-note">{{ testSearchResult.message }}</div>
+          <div v-if="testSearchResult.ok" class="set-note">{{ testSearchResult.message }}</div>
         </div>
         <div v-if="keyError" class="set-v bad">{{ keyError }}</div>
       </div>
