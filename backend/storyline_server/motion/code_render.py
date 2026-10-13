@@ -555,9 +555,11 @@ def summarize_layout(shot_id: str, layout_used: Any) -> dict[str, Any]:
                 "reason": str(layout_used.get("reason") or "母版没扫这一帧")}
     return {"shot": shot_id, "status": "scanned", "findings": findings,
             "scanned": {k: scanned.get(k) for k in ("texts", "leaders", "drawn", "dropped",
-                                                    # 闸⑲-a / ⑳(a) 的两个读数（T30）：母版量、
-                                                    # 这一层只搬，判在 code_spec。
-                                                    "subjects", "subject_share", "text_share")},
+                                                    # 闸⑲-a / ⑳(a) 的两个读数（T30）与 ⑳(c) 的
+                                                    # 画面指纹（T32）：母版量、这一层只搬，
+                                                    # 判在 code_spec。
+                                                    "subjects", "subject_share", "text_share",
+                                                    "grid_text", "grid_drawn", "colors")},
             "band": scanned.get("band") if isinstance(scanned.get("band"), Mapping) else None,
             "thresholds": _thresh(layout_used.get("thresholds")),
             "frame": layout_used.get("frame"), "reason": None}
@@ -1308,6 +1310,27 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
             "status": row.get("status"),
         }
 
+    # ---- 闸⑳(c) 画面同构（R8-T32）：同样判在拼接之前 ----
+    # 判的是**画面**：两镜代码可以写得不一样（闸⑨ 跨镜骨架同构因此放过它，而且那条还要
+    # ≥3 镜），屏幕上却仍是同一张卡。读数就挂在上面那份版面回读里，所以这一道的调用点
+    # 紧挨着 ⑲-a——两条闸读同一趟回读、判的却是两件事（铺开多大一片 / 是不是同一张）。
+    deg_errors, deg_warns, deg_undet = cspec.check_degenerate_forms(
+        spec["shots"], scanned=subject_scanned)
+    if deg_errors:
+        raise MediaError("闸⑳(c) 画面同构未通过，母带还没开始（一帧都没拼）：\n"
+                         + "\n".join(f"  · {e}" for e in deg_errors))
+    degenerate_readings: dict[str, dict[str, Any]] = {}
+    for i, s in enumerate(spec["shots"]):
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        row = subject_scanned.get(sid) or {}
+        sc = row.get("scanned") if isinstance(row.get("scanned"), Mapping) else {}
+        degenerate_readings[sid] = {
+            "grid_text": (sc or {}).get("grid_text"),
+            "grid_drawn": (sc or {}).get("grid_drawn"),
+            "colors": (sc or {}).get("colors"),
+            "status": row.get("status"),
+        }
+
     await asyncio.to_thread(mediaops.concat, clips, master, fps=fps, transition=plan)
     total = float(mediaops.probe(master)["duration"])
     not_taken = cspec.check_transition_effect([sec for _, sec in shot_secs], total,
@@ -1384,6 +1407,13 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
                 "shots": subject_readings,
                 "warnings": list(sub_warns),
                 "undetermined": list(sub_undet),
+            },
+            # 闸⑳(c) 的读数（T32）：逐镜的画面指纹原文。取证要的是**指纹**本身——
+            # 「这两镜的格子一样」要能被人拿着两个数自己核，而不是只看到一句「不重复」。
+            "degenerate_forms": {
+                "shots": degenerate_readings,
+                "warnings": list(deg_warns),
+                "undetermined": list(deg_undet),
             },
             "degraded": [f"{r['id']}：{r['degraded']}" for r in ledger if r["degraded"]],
             # 闸④ 两半的读数留在返回里：定 EMPTY_MIN_RATIO / SPAN_MIN 终值要的是

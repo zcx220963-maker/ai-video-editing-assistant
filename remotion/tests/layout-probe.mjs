@@ -321,5 +321,98 @@ console.log('------------------------------');
   console.log('');
 }
 
+// ---------------------------------------------------------------------------
+// R8-T32 画面指纹（闸⑳(c) 的真机取证）
+//
+// 闸⑳(c) 判的是「两镜**代码不同、画面上却是同一张卡**」。判据在 Python（阈值、配对、
+// 措辞都在 `code_spec.check_degenerate_forms`），这里只钉**母版量出来的那三个读数**：
+//
+//   ① 「同一张卡换个写法」必须量出**同一个**指纹。这是这一整道闸的立足点——指纹要是
+//      跟着写法走，它判的就成了「代码像不像」，而闸⑨ 已经在判那个了（⑨ 比骨架、还要
+//      ≥3 镜才定罪；⑳(c) 比画面、两镜即算，两个问题的答案不一样）。
+//   ② 「不同的画面」必须量出**不同的**指纹。少了这一句，一个恒定的指纹也能让 ① 全绿。
+//   ③ 三支都要量得到（`Number.isFinite` / 非空），否则「没量到」会被读成「没重复」——
+//      而颜色那一栏尤其要注意：这张丑卡除了文字色之外一个声明的颜色都没有，母版要是
+//      只收 background/fill/stroke，这一栏就是空的，而空栏在 Python 侧落**未判**，
+//      这条闸就恰好在它该响的地方闭嘴。
+// 代码必须真的不一样（下面有一条断言钉住这件事）——「代码不同、画面同一张」这句话，
+// 两半都得是真的。
+console.log('R8-T32 画面指纹（⑳(c)：代码不同、画面同一张）');
+console.log('------------------------------------------');
+{
+  const shoot = async (code, tag) => {
+    const r = await post('/render-shot', {
+      code,
+      cache_key: `layoutprobe-t32-${tag}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+      declared_fields: [],
+      input_props: { fps: 30, durationInFrames: 30, aspect: 'portrait', text: 'T32' },
+    });
+    if (!r.json?.ok || !r.json?.layout_used?.scanned) {
+      say(false, `${tag}：渲染/回读没成功 HTTP ${r.status} `
+        + `${String(r.json?.error || r.json?.layout_used?.reason).slice(0, 160)}`);
+      return null;
+    }
+    return r.json.layout_used.scanned;
+  };
+
+  // 甲：那张丑卡（一块渐变底板 + 四行字，**一个 SVG 形状都没有**）。
+  const CARD_A = shot(`        <div style={{ position: 'absolute', left: 60, top: 60, width: 816,
+                      height: 1404,
+                      background: 'linear-gradient(180deg, rgba(20,20,24,0.9), rgba(20,20,24,0.9))' }} />
+        <Box x={140} y={140} w={640} h={140}>第一步：先说清结论</Box>
+        <Box x={140} y={520} w={640} h={140}>第二步：再给一个数</Box>
+        <Box x={140} y={900} w={640} h={140}>第三步：最后收一句</Box>
+        <Box x={140} y={1280} w={640} h={150}>这几行字就是全部画面</Box>`);
+  // 甲′：**同一张卡、另一份代码**——多一层包壳、坐标各偏 4px、元素换了顺序、字号写法也不同。
+  // 偏 4px 仍然落在同一格里（格 156×254），这正是「用粗网格而不是精确坐标」那句话的取证。
+  const CARD_A2 = shot(`        <div style={{ position: 'absolute', left: 0, top: 0, width: '100%',
+                      height: '100%' }}>
+          <div style={{ position: 'absolute', left: 64, top: 64, width: 808, height: 1396,
+                        background: 'linear-gradient(180deg, rgba(20,20,24,0.9), rgba(20,20,24,0.9))' }} />
+          <Box x={144} y={1284} w={640} h={150}>这几行字就是全部画面</Box>
+          <Box x={144} y={904} w={640} h={140}>第三步：最后收一句</Box>
+          <Box x={144} y={524} w={640} h={140}>第二步：再给一个数</Box>
+          <Box x={144} y={144} w={640} h={140}>第一步：先说清结论</Box>
+        </div>`);
+  // 乙：**另一个画面**——两块底板横着摆、字在左边。差得足够远，指纹必须分得开。
+  const CARD_B = shot(`        <svg width={body.w} height={body.h}
+                             style={{ position: 'absolute', left: 0, top: 0 }}>
+          <circle cx={468} cy={762} r={300} fill="none" stroke={TOKENS.ink} strokeWidth={6} />
+        </svg>
+        <Box x={100} y={180} w={420} h={110}>上半句结论</Box>
+        <Box x={100} y={1600} w={420} h={110}>下半句收尾</Box>`);
+
+  const a = await shoot(CARD_A, 'a');
+  const a2 = await shoot(CARD_A2, 'a2');
+  const b = await shoot(CARD_B, 'b');
+  if (a && a2 && b) {
+    say(CARD_A !== CARD_A2,
+        '甲与甲′的**代码文本确实不同**（否则「代码不同、画面同一张」这半句是空话）');
+    const ok3 = (s) => Number.isFinite(s.grid_text) && Number.isFinite(s.grid_drawn)
+      && Array.isArray(s.colors);
+    say(ok3(a) && ok3(a2) && ok3(b),
+        `三支都量到了画面指纹（甲 0x${(a.grid_text >>> 0).toString(16)}/`
+        + `0x${(a.grid_drawn >>> 0).toString(16)}、甲′ 0x${(a2.grid_text >>> 0).toString(16)}/`
+        + `0x${(a2.grid_drawn >>> 0).toString(16)}、乙 0x${(b.grid_text >>> 0).toString(16)}/`
+        + `0x${(b.grid_drawn >>> 0).toString(16)}）`);
+    const setEq = (x, y) => JSON.stringify([...x].sort()) === JSON.stringify([...y].sort());
+    say(a.grid_text !== 0 && a.grid_drawn === 0,
+        `甲这一支的文字有格子、图元一个都没有（文字 0x${(a.grid_text >>> 0).toString(16)}、`
+        + `图元 0x${(a.grid_drawn >>> 0).toString(16)}）——那块底板是 div，**不算图元**，`
+        + `这正是「卡片+文字」的样子`);
+    say(a.colors.length > 0,
+        `甲的主色量得出来（${JSON.stringify(a.colors)}）——那张卡除了文字色没有别的声明颜色，`
+        + `母版要是不收 color，这一栏就是空的，而空栏在 Python 侧落**未判**`);
+    say(a.grid_text === a2.grid_text && a.grid_drawn === a2.grid_drawn
+      && setEq(a.colors, a2.colors),
+        '甲与甲′（同一张卡、另一份代码、坐标各偏 4px、元素次序不同）指纹**完全相同**——'
+        + '所以这条判的是画面而不是写法');
+    say(a.grid_text !== b.grid_text || a.grid_drawn !== b.grid_drawn
+      || !setEq(a.colors, b.colors),
+        '甲与乙（另一个画面）指纹**分得开**——否则一个恒定的指纹也能让上面那条全绿');
+  }
+  console.log('');
+}
+
 console.log(fail === 0 ? '\nALL PASSED' : `\n${fail} FAILED`);
 process.exitCode = fail === 0 ? 0 : 1;

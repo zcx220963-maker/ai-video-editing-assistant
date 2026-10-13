@@ -1373,6 +1373,118 @@ def _as_float(value: Any) -> float | None:
     return float(value)
 
 
+def _as_int(value: Any) -> int | None:
+    """位掩码那条读数只认真整数（``bool`` 不算：``True`` 掩码毫无意义，写成
+    「量到了 1」正是 D-未判不绿要防的那种）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def check_degenerate_forms(shots: list[dict[str, Any]], *,
+                           scanned: Mapping[str, Any] | None = None
+                           ) -> tuple[list[str], list[str], list[str]]:
+    """闸⑳ 退化形态：⑳(c) **画面同构**这一条。→ (打回, 提醒, 未判)。
+
+    **这一道只实现 ⑳(c)，另两条已经各有唯一一处实现，这里不重写**（同一判据抄成
+    第二份就是本仓踩过三次的清单漂移）：
+
+    * ⑳(a)「卡片+文字」——`check_subject_present` 里那条**联合**判（主体 <18% 且
+      文字 >45%）。⑳ 的账读它的结果，因为那一条判的就是 ⑳(a) 原本要判的形态。
+    * ⑳(b)「一镜一模板的空转」——归闸④ 的 `fill_span` 与 R7-T18b 那条
+      「模板套上去等于没画」，判在**代码**上，不在画面上。
+
+    ⑳(c) 判的是**画面**：模型完全可以给两镜写不同的代码（于是闸⑨ 跨镜骨架同构那一条
+    放过它——它还要求 ≥3 镜才定罪），而屏幕上出现的仍是同一张卡：同样的字压在同几个
+    格子里、同样的图元铺在同一片。两个问题的答案不一样，所以两条闸并存。
+
+    **两镜即算**（闸⑨ 那条要 ≥3 镜，是因为骨架同构得看整片才看得出是不是风格；这条要
+    的只是「这里出现了一次重复」，所以整片两镜一样算），因此这里没有「至少 N 镜才
+    定罪」那一档，也就不需要那个常量。
+
+    读数（母版在探针帧上量的，闸⑧ 那条回读通道顺路带回）：
+    ``grid_text`` / ``grid_drawn``（把 6×6 粗网格上被文字/图元压到的格子记成位掩码）与
+    ``colors``（母版**从 DOM 里声明的**颜色字段收来的前四主色——不是对像素做直方图）。
+    用粗网格而不是精确坐标：同一张卡换个写法坐标会差几像素，格子还是那几格。
+
+    判一对：文字网格与图元网格**都相同且都非空**（0 是「这一镜没有这一类东西」，
+    两个 0 相等毫无意义）→ 候选；再看配色：两边都认得出颜色且**颜色集合相同** → 定罪
+    「两镜画面上是同一张卡」；两边都认得出而集合不同 → 配色不同，不是同一张卡，放行
+    （按集合比而不是按频次序比：频次相近的两个色在两条片子上会互换名次）。
+    颜色有一边认不出（母版读不到、或那一镜的颜色都不是字面值）→ 这一对**没判完**，
+    落未判——只凭几何撞上就定罪会误伤「同版式不同配色」的合法系列镜头，而
+    「没认出来」写成「不同」又会让这条闸恰好在它该响的时候闭嘴（D-未判不绿）。
+
+    读数整栏取不到（母版旧、或这一镜压根没扫）→ 未判，逐镜记一条，说清是哪一栏缺。
+    """
+    errors: list[str] = []
+    warns: list[str] = []
+    undetermined: list[str] = []
+    head = "闸⑳(c) 画面同构："
+    readings = scanned if isinstance(scanned, Mapping) else {}
+
+    # 逐镜取出三栏读数。`None` 一律是「没量到」，与「量到 0」分开记。
+    prints: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for i, s in enumerate(shots):
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        order.append(sid)
+        got = readings.get(sid)
+        got = got if isinstance(got, Mapping) else None
+        scanned_row = got.get("scanned") if isinstance(got, Mapping) else None
+        sc = scanned_row if isinstance(scanned_row, Mapping) else {}
+        colors = sc.get("colors") if sc else None
+        prints[sid] = {
+            # 位掩码是整数；`bool` 会被判成「没量到」（`True` 掩码毫无意义）。
+            "grid_text": _as_int(sc.get("grid_text")),
+            "grid_drawn": _as_int(sc.get("grid_drawn")),
+            # 认不出颜色时是空表，与「没读到这一栏」（None）不是一件事。
+            "colors": ([str(c) for c in colors if str(c).strip()]
+                       if isinstance(colors, (list, tuple)) else None),
+        }
+        # 整栏取不到就逐镜记未判：**不能靠「这一对跳过」悄悄放过**——那正是
+        # 「没量到」被读成「量到了、没问题」的老路，而这一栏恰好在母版旧时最缺。
+        if not sc or prints[sid]["grid_text"] is None or prints[sid]["grid_drawn"] is None:
+            why = ("这一镜的版面压根没扫成（闸⑧ 那一趟落空）" if not sc else
+                   "镜像里的母版比这条链旧，这一趟没带画面的粗网格指纹")
+            prints[sid] = {"grid_text": None, "grid_drawn": None, "colors": None}
+            undetermined.append(
+                f"{head}{sid} 的**画面指纹**没读到（{why}），这一镜跟谁像**没判过**——"
+                f"未判不是通过")
+
+    for a in range(len(order)):
+        for b in range(a + 1, len(order)):
+            pa, pb = prints[order[a]], prints[order[b]]
+            gta, gda = pa["grid_text"], pa["grid_drawn"]
+            gtb, gdb = pb["grid_text"], pb["grid_drawn"]
+            if gta is None or gtb is None:
+                continue                              # 这一对里有镜没读到，上面已记未判
+            if not gta or not gda:                    # 0 = 这镜没文字/没图元，不构成候选
+                continue
+            if gta != gtb or gda != gdb:
+                continue
+            ca, cb = pa["colors"], pb["colors"]
+            if ca and cb:
+                # 比的是**集合**而不是「谁排第一」：频次相近的两个色在两条片子上会互换
+                # 名次，按位比就会把同一张卡判成不同。集合不同 = 配色不同，放行。
+                if set(ca) != set(cb):
+                    continue                          # 几何撞上、配色不同：不是同一张卡
+                _err(errors,
+                     f"{head}{order[a]} 与 {order[b]} 的**画面**是同一张卡：文字压在同样的"
+                     f"格子里、图元铺在同一片（粗网格指纹 0x{gta:x}/0x{gda:x} 两镜相同）、"
+                     f"配色也一样（{'、'.join(ca)}）——代码写得不同，屏幕上没区别。两镜的"
+                     f"分工、构图、主色至少换一样（换主色只算换张皮，优先换构图：把主体"
+                     f"挪到别的位置、换一个不同的版式族）")
+                continue
+            # 有一边认不出颜色：几何撞上但这一对没判完。
+            who = order[a] if not ca else order[b]
+            undetermined.append(
+                f"{head}{order[a]} 与 {order[b]} 的几何指纹撞上了（0x{gta:x}/0x{gda:x}），"
+                f"但 {who} 的主色**没认出来**（那一镜的颜色都不是字面值），这一对没判完——"
+                f"未判不是「不同」，也不是「相同」")
+    return errors, warns, undetermined
+
+
 #: 抽象词那条打回理由里给的改写示范——**刻意给一个器物**，因为真机上模型被拦之后
 #: 最常见的反应是把抽象词换个近义词（「理念」→「观念」），而不是去画一个东西。
 _SUBJECT_HINT = "活字盘"

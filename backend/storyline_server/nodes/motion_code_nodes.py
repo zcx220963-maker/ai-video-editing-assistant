@@ -429,6 +429,17 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         subj_tight_txt = "、".join(
             "{0} {1:.0f}%".format(sid, float(row["subject_share"]) * 100)
             for sid, row in subj_tight.items())
+        # 闸⑳(c) 的账（T32）：同样是渲染层带回来的读数，报告层只摊开不重算——这一道
+        # 红了根本出不了片，所以走到这里时「打回」那一栏必然是空的，回执要说清的是
+        # **拿什么判的、哪几对没判完**。
+        deg = dict(out.get("degenerate_forms") or {})
+        deg_shots = dict(deg.get("shots") or {})
+        deg_warns = list(deg.get("warnings") or [])
+        deg_undet = list(deg.get("undetermined") or [])
+        deg_measured = [sid for sid, r in deg_shots.items()
+                        if r.get("grid_text") is not None and r.get("grid_drawn") is not None]
+        deg_nocolor = [sid for sid, r in deg_shots.items()
+                       if r.get("grid_text") is not None and not r.get("colors")]
         per_shot_ms = [float((r.get("render_timings") or {}).get("per_frame_ms") or 0.0)
                        for r in burned]
 
@@ -570,6 +581,22 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                       "单踩一条只提醒——满屏大字配小图标的封面镜不该被这条拦住。"
                       "读数取不到的那一档记未判（不是通过）"
                 if subj else "这一趟渲染没有回传主体读数（旧版本地缓存？）"),
+            _ev(f"闸⑳(c) 画面同构（判的是**画面**，不是代码）："
+                f"{len(deg_measured)}/{len(spec['shots'])} 镜量到了画面指纹（粗网格上文字"
+                f"压到哪些格、图元铺在哪几片 + 主色），"
+                f"{len(spec['shots']) * (len(spec['shots']) - 1) // 2} 对两两比过，"
+                + ("没有一对是同一张卡" if deg_measured else "一镜都没量到——见下面的未判栏")
+                + (f"；主色认不出的镜：{'、'.join(deg_nocolor)}（这几镜只按几何判）"
+                   if deg_nocolor else ""),
+                "machine",
+                verified=(len(deg_measured) == len(spec["shots"]) and not deg_undet),
+                proof="闸⑨ 比的是**代码骨架**且要 ≥3 镜才定罪；这一条比的是**画面**、"
+                      "两镜即算——模型给两镜写不同的代码、屏幕上却是同一张卡（同样的字"
+                      "压在同样几格、同样的图元铺在同一片、主色也一样）就是它要抓的。"
+                      "两条都在，因为两个问题的答案不一样。读数取不到的那一档记未判；"
+                      "几何撞上而有一边认不出主色时这一对**没判完**，只按几何撞上就定罪"
+                      "会误伤「同版式不同配色」的合法系列镜头"
+                if deg else "这一趟渲染没有回传画面指纹（旧版本地缓存？）"),
             _ev(f"闸⑨ 跨镜同构：{len(spec['shots'])} 镜里"
                 + (f"有 {len(facts['same_shape_groups'])} 组代码结构几乎一样（"
                    + "；".join("、".join(g) for g in facts["same_shape_groups"]) + "）"
@@ -797,6 +824,13 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                 "shots": subj_shots,
                 "warnings": subj_warns,
                 "undetermined": subj_undet,
+            },
+            # 闸⑳(c) 的账（T32）：逐镜画面指纹原文 + 未判那一栏。留指纹而不是只留一句
+            # 「不重复」，是为了出片回执能被人**拿着两个数自己核**这两镜到底像在哪。
+            "degenerate_forms": {
+                "shots": deg_shots,
+                "warnings": deg_warns,
+                "undetermined": deg_undet,
             },
             "fill_warnings": [f"{sid}：内容只铺开画面带短边的 {spans[sid] * 100:.0f}%"
                               f"（目标 {int(code_render.FILL_TARGET * 100)}%）"

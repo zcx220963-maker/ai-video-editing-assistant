@@ -540,6 +540,81 @@ function subjectBoxes(root: Element, convert: Convert): PxBox[] {
   return out;
 }
 
+/** 闸⑳(c) 的**画面指纹**：把画面带切成 6×6 的粗网格，记下文字盒与图元盒各压到哪些格。
+
+ *  为什么是「哪几格」而不是精确坐标：⑳(c) 要判的是「**画面上**是不是同一张卡，只是代码
+ *  写法不同」——同一张卡换个写法，坐标会差几个像素、格子在不在还是会一样。反过来精确坐标
+ *  会让一条 3px 的位移把两组判成不同，判据就成了「代码像不像」的另一个马甲。
+ *  闸⑨ 比代码骨架且要 ≥3 镜才定罪；⑳(c) 比**画面**且两镜即算——两个问题的答案不一样，
+ *  所以两条闸并存（这也是「不许合并、不许重复实现」那句话的落点）。
+ */
+const DEGEN_GRID = 6;
+
+function gridSignature(boxes: PxBox[], band: PxBox): number {
+  if (band.w <= 0 || band.h <= 0) return 0;
+  let bits = 0;
+  const cw = band.w / DEGEN_GRID;
+  const ch = band.h / DEGEN_GRID;
+  for (const b of boxes) {
+    const x0 = Math.floor((b.x - band.x) / cw);
+    const x1 = Math.floor((b.x + b.w - band.x) / cw);
+    const y0 = Math.floor((b.y - band.y) / ch);
+    const y1 = Math.floor((b.y + b.h - band.y) / ch);
+    for (let gy = Math.max(0, y0); gy <= Math.min(DEGEN_GRID - 1, y1); gy++) {
+      for (let gx = Math.max(0, x0); gx <= Math.min(DEGEN_GRID - 1, x1); gx++) {
+        bits |= 1 << (gy * DEGEN_GRID + gx);
+      }
+    }
+  }
+  return bits;
+}
+
+/** 闸⑳(c) 的**主色直方图**：这一镜画面上真声明了哪些颜色，按出现次数从多到少取前几个。
+
+ *  说清楚它量的是什么：**不是**对像素做直方图，而是把 DOM 里画得出来的元素身上声明的
+ *  颜色（`background-color`/`fill`/`stroke`/`color`，以及 SVG 属性写法）收起来数频次。
+ *  两者在「同一张卡换个写法」这件事上等价（卡的颜色是写出来的），而它不需要读像素——
+ *  省一整趟解码，也就能在探针那一帧顺手算完。渐变与位图在这条判据里认不出颜色：那种镜
+ *  的这一栏是空的，而空栏**不参与**判定（见 Python 侧 `check_degenerate_forms`：颜色
+ *  认不出时只按网格判，并把「颜色没量到」如实记在账上）。
+ *
+ *  `color`（文字色）也在里面，而且**必须**在：⑳(c) 要抓的那张丑卡恰恰是「一块底板 + 几
+ *  行字、一个 SVG 形状都没有」，那种镜除了文字色之外一个声明的颜色都没有——不收它，
+ *  这一栏就是空的，而空栏落「未判」，这条闸就恰好在它该响的地方闭嘴。
+ *  收的是**声明值**，所以 `color` 会沿继承链在每个元素上各记一次——那正好是「这镜的墨色
+ *  是什么」的频次，判据那边按**集合**比，不看谁排第一。
+ */
+function colorHistogram(root: Element): string[] {
+  const count = new Map<string, number>();
+  const bump = (raw: string) => {
+    if (!raw) return;
+    const v = raw.trim().toLowerCase();
+    if (!v || v === 'transparent' || v === 'none' || v.startsWith('url(')) return;
+    if (v.startsWith('rgba(0, 0, 0, 0)')) return;
+    count.set(v, (count.get(v) || 0) + 1);
+  };
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  for (const el of Array.from(root.querySelectorAll('*'))) {
+    const s = getComputedStyle(el);
+    // `fill`/`stroke` **只对 SVG 元素收**：CSS 里这两个属性的初值就是黑色，于是每一个
+    // 普通 div 都会贡献一次 `rgb(0, 0, 0)`——真机实测那一栏会变成「所有颜色都被黑色挤掉
+    // 前四名里的一半」，而这条读数要回答的是「这镜画了什么颜色」。
+    if (el.namespaceURI === SVG_NS) {
+      bump(s.fill);
+      bump(s.stroke);
+      bump(el.getAttribute('fill') || '');
+      bump(el.getAttribute('stroke') || '');
+    }
+    bump(s.backgroundColor);
+    bump(s.color);
+    bump(el.getAttribute('color') || '');
+  }
+  return Array.from(count.entries())
+    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+    .slice(0, 4)
+    .map(([c]) => c);
+}
+
 /** 一组盒的**并集外接盒**与画面带相交之后，占带面积的比例（0~1）。
  *
  *  为什么取并集外接盒而不是并集面积：判据问的是「主体件铺开了多大一片画面」，
@@ -676,6 +751,11 @@ function probeLayout(root: Element, band: PxBox, convert: Convert) {
       subjects: subject.length,
       subject_share: Math.round(shareOfBoxes(subject, band) * 10000) / 10000,
       text_share: Math.round(shareOfBoxes(texts.map((t) => t.box), band) * 10000) / 10000,
+      // 闸⑳(c)：这一镜的**画面指纹**（粗网格上文字/图元各压到哪些格 + 主色前四）。
+      // 判据在 Python：两条指纹撞上就是「代码不同、画面上是同一张卡」。
+      grid_text: gridSignature(texts.map((t) => t.box), band),
+      grid_drawn: gridSignature(drawn.map((d) => d.box), band),
+      colors: colorHistogram(root),
     },
   };
 }
