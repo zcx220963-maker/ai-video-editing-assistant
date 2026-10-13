@@ -705,7 +705,7 @@ context.py:226 ContextBuilder.build  →  返回前产出：
 | ID | 任务 | 说明 |
 |---|---|---|
 | T19 | 把 §1.5 四条红全转成常驻断言 | 逐文件 rc==0 口径固化进 `scripts/run_tests.py`，并在 README 记录「pytest 收集会 INTERNALERROR，勿单独依赖」；同时**决定**：`tests/test_segment_ids.py:152` 的模块级 `sys.exit` 改为 `if __name__=="__main__"` 守卫（一处小改，让未来 pytest 可用，但不作为本轮阻塞项） |
-| T28 | 「未判」不许算过 | `test_code_gates.py` 今天唯一红就是这一条（`未判档：提醒清单为空但通道账照样逐镜摊着`）——以测试驱动把 `undetermined` 从提醒升级成**阻断档** |
+| T28 | 「未判」不许算过 | **已落地**。病根不是措辞而是**出口数**：闸⑩ 那句「本片这一档未判」原先走的是 `warns`（第二个出口），而提醒在回执与卡面上的读法是「不打回、只是顺口一提」——于是「压根没量过」与「量过、只是不达标」在**每一处读它的人眼里**长得一模一样（D-未判不绿 说的正是这件事）。修法是把三态**分家**：① `check_ink_contrast` 增第三个出口 `undetermined`（返回三元组；`[0]`/`[1]` 的取法不变，三处调用点里只有报账那两处要改）；② `code_spec` 新增**唯一的**整片闸清单 `WHOLE_FILM_GATES`（六道）+ 三态合成 `whole_film_gate_results()`——六道闸原先在**三处各抄一遍**（validate 一份、计划卡一份、出片回执一份，回执那份还漏了 ⑫），这类清单漂移在本仓踩过三次（§9-Q90/Q91）；③ 计划卡与出片回执各出两栏：`style_warnings`（提醒）与 `style_unjudged`（未判），互不混装；④ 回执新增一条**阻断档**证据行 `未判档（阻断：不许折算成通过）`，`status` 恒为 `UNVERIFIED`。红法（`test_code_gates.py` 那条**故意红**改成新语义 + 两支两侧夹：字面颜色的一镜 → 未判栏空；认不出颜色的一镜 → 恰好一条——这一栏不是常量） | `test_code_gates.py` **120/120**、`test_layout_subject.py` **110/110**（那条源码钉改成钉**唯一清单**），**全套件 113 支 0 红**（首次全绿）、**4917 条断言** | P5 的第一条销账：未判与通过不再同格；「清单只有一个」那条纪律顺带落到这一族判据上 |
 | T29 | 离线套件基线更新 | 基线 96 文件 → **R0–R9 后 99+**（新增 `test_delivery_hygiene.py`、`test_semantic_gates.py`、`test_context_hygiene.py`〔㉓/账面/T40-T41 双向红样〕）→ **R10 后 100+**（另加 `test_requirements_hygiene.py`〔Q69〕、`test_handrolled_goldens.py`〔四份金样，Q66〕）；断言总数须**只增不减**（历史基线 1176）；跑法固定：容器内 `PYTHONPATH=/app`、逐文件 rc==0 口径 |
 
 ---

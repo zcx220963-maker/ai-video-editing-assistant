@@ -361,11 +361,10 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         # 走不完这次渲染，所以三道都取 [1]（提醒）而不是 [0]（错误）。三道的提醒合成
         # 一份，和计划卡上看到的是同一串。
         facts = cspec.style_facts(spec["shots"])
-        style_warns = (cspec.check_style_quota(spec["shots"])[1]
-                       + cspec.check_shot_structure(spec["shots"])[1]
-                       + cspec.check_ink_contrast(spec["shots"])[1]
-                       + cspec.check_layout_family(spec["shots"])[1]
-                       + cspec.check_subject_named(spec["shots"])[1])
+        # 打回那一份走不到这里（validate_code_spec 已经拦了），取的是拦完之后给人看的
+        # 两栏：**提醒**与**未判**。两栏必须分家——T28 的全部意思就是这个（§0.5-P5）：
+        # 「这一档没人量过」一旦混进提醒，回执上的读法就成了「量过、没问题，顺口提一句」。
+        _, style_warns, style_unjudged = cspec.whole_film_gate_results(spec["shots"])
         ch_counts: dict[str, int] = {}
         for ch in facts["channels"].values():
             ch_counts[ch] = ch_counts.get(ch, 0) + 1
@@ -585,6 +584,19 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                       f"{code_render.TIGHT_MIN:.0%} 的，是「构图小气」这种审美问题，"
                       "机器拦不得（闸④ 拦的是空壳与挤成一坨）。所以它们落成清单，"
                       "由人看完再决定改不改"),
+            # ★ T28 的**阻断档**：未判的事单独立一档，status 恒为 UNVERIFIED。
+            #   它不是提醒——提醒读作「不改也能出」，未判读作「这一档没人量过」；
+            #   两者合成一行，后者就被降级成了前者（这一条曾经就是这么写的，
+            #   见 §0.5-P5 与 §6-T28：片上少一次「其实没量」的记录，人就不改）。
+            _ev("未判档（阻断：**不许折算成通过**）："
+                + ("；".join(style_unjudged) if style_unjudged else
+                   "没有——整片六道闸每一档都真量过（量不出的会在这一栏点名，"
+                   "不会混进上面的提醒清单）"),
+                "machine", verified=not style_unjudged,
+                proof="这一栏与上面那一栏的分工是**三态**：打回（validate_code_spec 拦下，"
+                      "根本走不到出片）／提醒（量过且不达标但机器拦不得，出清单给人看）／"
+                      "未判（压根没量）。三态合成两态就会出现「未判被读成通过」——"
+                      "D-未判不绿 说的就是这件事"),
             _ev(f"时钟归声音：{len(held)}/{len(voiced)} 个带声镜头的长度 ≥ 自己语音时长 + "
                 f"{BREATH_FLOOR_SEC}s，没有一镜在话说到一半时切走",
                 "machine", verified=bool(voiced) and len(held) == len(voiced),
@@ -744,6 +756,9 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             "style_contrast": facts["contrast"],
             "style_contrast_unjudged": facts["contrast_unjudged"],
             "style_warnings": list(style_warns),
+            # 未判档单列（T28）：与 style_warnings 分开是这一条的**全部意思**——
+            # 看一眼这两个键的读者必须能立刻分出「不达标但出得来」与「没人量过」。
+            "style_unjudged": list(style_unjudged),
             "fill_warnings": [f"{sid}：内容只铺开画面带短边的 {spans[sid] * 100:.0f}%"
                               f"（目标 {int(code_render.FILL_TARGET * 100)}%）"
                               for sid in tight],

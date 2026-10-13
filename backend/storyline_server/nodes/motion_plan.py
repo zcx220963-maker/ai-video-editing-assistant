@@ -322,11 +322,10 @@ def plan_payload(spec: dict[str, Any], *, target: float | None = None,
         }
 
     facts = cspec.style_facts(shots)
-    # 错误那三份都在 validate_code_spec 里拦过了；这里取的是**拦完之后给人看的提醒**，
-    # 三道闸各出一份，合流成一栏，用户在同一张卡上看得见「哪几镜其实是同一张卡」。
-    quota_warns = cspec.check_style_quota(shots)[1] \
-        + cspec.check_shot_structure(shots)[1] + cspec.check_ink_contrast(shots)[1] \
-        + cspec.check_layout_family(shots)[1] + cspec.check_subject_named(shots)[1]
+    # 打回那一份在 validate_code_spec 里拦过了；这里取**拦完之后给人看的**两栏——提醒一栏、
+    # 未判一栏（T28）。两栏分家不是措辞讲究：计划卡上「提醒」读作「不改也能出」，
+    # 「未判」读作「这一档没人量过」，合成一栏就等于把后者降级成了前者。
+    _, quota_warns, quota_undet = cspec.whole_film_gate_results(shots)
 
     return {
         "motion_spec": spec,
@@ -345,6 +344,10 @@ def plan_payload(spec: dict[str, Any], *, target: float | None = None,
         "style_contrast": facts["contrast"],
         "style_contrast_unjudged": facts["contrast_unjudged"],
         "style_warnings": quota_warns,
+        # 未判档单列（T28）：这一栏非空即「本片有闸没量过」，卡面按阻断档显示，
+        # 不许与上一栏（提醒）用同一种措辞与同一种颜色。卡上看得见 = 用户能在
+        # 烧像素之前就叫人补底色/重写代码，而不是等出片回执再发现。
+        "style_unjudged": quota_undet,
         "aspect": spec["aspect"],
         "resolution": f"{spec['width']}x{spec['height']}",
         "fps": spec["fps"],

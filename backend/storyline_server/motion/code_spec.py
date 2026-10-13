@@ -750,9 +750,7 @@ def validate_code_spec(raw: dict[str, Any], *,
     # render_motion_code 烧像素前、patch_motion_code 落盘前——调的都是这一个函数，
     # 规则因此不可能只在一路上生效。
     # 提醒那一份从这里单独取（见 style_facts）。
-    for checker in (check_style_quota, check_derived_similarity,
-                    check_shot_structure, check_ink_contrast,
-                    check_layout_family, check_subject_named):
+    for checker in WHOLE_FILM_GATES:
         errors.extend(checker(shots)[0])
     # 闸⑱：投递腿存在性。只有调用方**知道**客户端能力时才判（None = 不判）——
     # plan_motion 那一侧还没有客户端，硬塞一个 None 当 False 会把「没接腿」误判成「缺腿」。
@@ -2048,7 +2046,7 @@ def shot_colors(code: str) -> dict[str, Any]:
 
 
 def check_ink_contrast(shots: list[dict[str, Any]]
-                       ) -> tuple[list[str], list[str]]:
+                       ) -> tuple[list[str], list[str], list[str]]:
     """闸⑩：镜头代码自己写的字色，在它自己写的每一种底色上是否都读得出来。
 
     判据是「**最好的一档也低于 3:1 才打回**」：`#ffffff` 的字在深卡片上是对的、
@@ -2061,6 +2059,7 @@ def check_ink_contrast(shots: list[dict[str, Any]]
     """
     errors: list[str] = []
     warns: list[str] = []
+    undetermined: list[str] = []
     judged = 0
     for i, s in enumerate(shots):
         sid = str(s.get("id") or f"s{i + 1:02d}")
@@ -2083,11 +2082,46 @@ def check_ink_contrast(shots: list[dict[str, Any]]
                     f"对比度提醒：{sid} 的字色 {ink} 在最好的底色 {best_bg} 上只有 "
                     f"{best:.1f}:1（大字勉强可读，正文偏暗，达标线 4.5:1）")
     if judged == 0 and shots:
-        warns.append(
+        # ★ 这一条走的是**第三个出口**（`undetermined`），不是 `warns`——T28 判过的：
+        #   它在提醒清单里待过一阵子，而提醒在回执上的读法是「不打回、只是顺口一提」，
+        #   于是「本片这一档压根没量过」被读成了「量过、没问题，只提醒一下」。
+        #   未判与通过在同一格 = D-未判不绿 说的那件事（§0.5-P5）。
+        undetermined.append(
             "对比度这一档本片**未判**：镜头代码里的底色或字色没能静态认出来"
             "（写成变量、渐变、运行时算出来的颜色，或者容器里读不到 palettes.json）。"
             "未判不是通过。")
-    return errors, warns
+    return errors, warns, undetermined
+
+
+#: 整片层的六道判据（闸⑦ 风格配额 / 闸⑫ 与 demo 骨架同构 / 闸⑨ 跨镜同构 /
+#: 闸⑩ 文字对比度 / 闸⑮ 版式族配额 / 闸⑯ 主体具名）。**三处调用点**（plan_motion
+#: 入库前、render 烧像素前、patch 落盘前）与**两处报账**（计划卡、出片回执）都从
+#: 这一个元组取，规则因此不可能只在某一路上生效；这也是「清单只有一个」那条纪律
+#: 落在这一族判据上的样子（同一形状的清单漂移踩过三次，见 §9-Q90/Q91）。
+WHOLE_FILM_GATES = (check_style_quota, check_derived_similarity,
+                    check_shot_structure, check_ink_contrast,
+                    check_layout_family, check_subject_named)
+
+
+def whole_film_gate_results(shots: list[dict[str, Any]]
+                            ) -> tuple[list[str], list[str], list[str]]:
+    """把整片六道闸的三个出口合成一份：``(打回, 提醒, 未判)``。
+
+    **三个出口是这一条的全部意思**（T28）：一道闸说不清的时候，它的答案既不是
+    「过」也不是「不过」，而是「没判」——三者必须落在三个不同的格子里，因为回执、
+    计划卡与模型读的都是格子名。判据自己带第三个出口时就用它；还没带第三态的那些
+    闸按两态处理（``len(got) > 2`` 那一下），不逼它们假装有未判档。
+    """
+    errors: list[str] = []
+    warns: list[str] = []
+    undetermined: list[str] = []
+    for gate in WHOLE_FILM_GATES:
+        got = gate(shots)
+        errors.extend(got[0])
+        warns.extend(got[1])
+        if len(got) > 2:
+            undetermined.extend(got[2])
+    return errors, warns, undetermined
 
 
 # ---------------------------------------------------------------------------
