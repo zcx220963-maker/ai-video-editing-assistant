@@ -499,6 +499,51 @@ def extract_text(tool_result: Any) -> str:
 # Tool 适配：把一个 MCP 工具变成 Registry 可注册的 Tool
 # --------------------------------------------------------------------------
 
+# MCP 侧每份工具描述的字节上限（§5.7 第⑥条；T41 落地）。
+# 为什么是「字节」而不是字数：与 §5.4.1 的整张预算表同一把尺（``section_bytes``），
+# 账面要能被逐字复核。600 这个数本身是条款里定的**内容长度约束**，不是标定出来的
+# 阈值——改它必须同批改对应断言（同 §11 那句「改一个数必须同批改断言」）。
+DESC_MAX_BYTES = 600
+
+# 被截掉的正文去哪了，要**写在截断处**：模型看不见「少了一句」，只会照着剩下的做。
+# 指向技能正文而不是指向某个 HTTP 端点：那是模型这一轮真拿得到的东西（计划里用到本节点时
+# 服务端预注入它的技能；单轮内也能 load_skill 取）。
+_DESC_POINTER = "……（本节点说明过长，此处截断；完整约束与指针形状在本节点随身的技能正文里，load_skill 可取）"
+
+
+def _bytes(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _cut(text: str, limit: int) -> str:
+    """按 UTF-8 字节切到 ``limit`` 以内，且**不切碎字符**。
+
+    ``decode(errors="ignore")`` 会丢掉最后那个被切一半的多字节字符——这是刻意的：
+    JSON 里带半个汉字能编码成功，但读出来是乱码，而且它会让「描述 ≤600 B」这条判据
+    变成随机数（同一句话在两台机器上可能不同长）。
+    """
+    if limit <= 0:
+        return ""
+    return text.encode("utf-8")[:limit].decode("utf-8", "ignore")
+
+
+def compose_description(body: str, tail: str = "") -> tuple[str, bool]:
+    """排一份描述并截到 ``DESC_MAX_BYTES``，返回 ``(文本, 是否截过)``。
+
+    优先丢正文的**尾部**，两样东西必须留下：
+    1. ``tail``（「必须先显式调用谁」）——少一句就是一次白跑的调用；
+    2. ``_DESC_POINTER``——被截掉的那半句去哪了，只有这里说得出来。
+    指针一行自己都放不下时（正文长到 600 B 装不下任何东西）先丢指针、只保 ``tail``：
+    宁可少一句「去哪找」，也不能少一句「必须先调谁」。
+    """
+    if _bytes(body) + _bytes(tail) <= DESC_MAX_BYTES:
+        return body + tail, False
+    room = DESC_MAX_BYTES - _bytes(tail) - _bytes(_DESC_POINTER)
+    if room > 0:
+        return _cut(body, room) + _DESC_POINTER + tail, True
+    return _cut(tail, DESC_MAX_BYTES), True
+
+
 class MCPTool(Tool):
     """包装某个 MCP Server 暴露的工具：schema 来自 tools/list，execute 走 tools/call。
 
@@ -508,6 +553,13 @@ class MCPTool(Tool):
 
     中文名走 MCP 标准的 ``title`` 字段：Storyline 注册节点时把 ``BaseNode.display_name``
     填进去，这里读回来——服务端仍是节点元信息的唯一作者，主服务不再抄第二份词表。
+
+    描述在这一层截到 ``DESC_MAX_BYTES``（T41，§5.7 第⑥条）：剪辑节点的描述由 Storyline
+    侧写，最长的几份近 2 KB，而它们的约束在技能正文里**本来就有第二份**（真机对过账：
+    ``plan_motion``/``patch_motion_code``/``render_motion_code`` → ``motion_explainer_skill``，
+    ``patch_video`` → ``default_editing_workflow_skill``）。截断而不是删：被截的那份说明
+    末尾留一行指向技能正文，且 ``plan.round.unbacked_truncations`` 会问「这段溢出真有载体吗」
+    ——**移出即须有闸读到**（同一句判据的另一半）。
     """
 
     def __init__(self, client: MCPClient, tool_def: dict[str, Any], *, timeout: float,
@@ -541,23 +593,38 @@ class MCPTool(Tool):
         return self._raw_name
 
     @property
-    def description(self) -> str:
-        """工具说明；剪辑节点额外附一行「必须先显式调用谁」。
+    def _desc_body(self) -> str:
+        """会被截的那一段（服务端写的那份说明）。"""
+        return self._desc or f"MCP tool {self._raw_name} on {self._client.server}"
 
-        为什么要把这件事写进说明：`script_template_rec`／`group_clips`／`filter_clips`／
-        `transition_rec`／`text_rec` 这几个节点的前置**不允许被自动补齐**（它们要的是
-        创意决策参数，服务端替不了）。原先模型只有撞上去才知道——真机实测：
-        模型直接调 `select_BGM`，服务端返回「脚本模板推荐 需要你直接调用…」，
-        它才回头补，白烧一轮；重试一次还可能再撞另一个。
-        把「哪些前置得你自己点名」提前写在说明里，模型第一次调用就能按对顺序来。
+    @property
+    def _desc_tail(self) -> str:
+        """截不动的那一段——「必须先显式调用谁」。
+
+        为什么它比正文末尾那句话更该留下：这几个前置**不会被服务端自动补齐**，
+        模型不知道就会先撞一次错、再回头补（真机实测白烧一轮）。正文末尾多半是
+        渲染耗时这类提醒，少一句不致命；这条少一句就是一次白跑的调用。
         """
-        base = self._desc or f"MCP tool {self._raw_name} on {self._client.server}"
         blocking = self._explicit_deps.get(self._raw_name) or ()
         if not blocking:
-            return base
-        return (f"{base}\n"
-                f"[必须显式调用] 这些前置节点不会被自动补齐，请在你真正调用本节点之前"
+            return ""
+        return (f"[必须显式调用] 这些前置节点不会被自动补齐，请在你真正调用本节点之前"
                 f"先逐个调用它们（并传入创意决策参数）：{'、'.join(blocking)}。")
+
+    @property
+    def description(self) -> str:
+        """工具说明（**已按 ``DESC_MAX_BYTES`` 截过**）；剪辑节点额外附一行「必须先显式调用谁」。
+
+        为什么非截不可：执行轮整批 schema 真机实测 54,140 B，其中最长四份描述合计
+        6.1 KB，而它们说的每一句在各自技能正文里都有更完整的一份——描述是**另一次**
+        抄写（第二份真相），瘦它就等于删掉一次抄写。截断点与指向都写在 ``compose_description``。
+        """
+        return compose_description(self._desc_body, self._desc_tail)[0]
+
+    @property
+    def desc_truncated(self) -> bool:
+        """这份说明是不是被截过——承载闸（``plan.round.unbacked_truncations``）读它。"""
+        return compose_description(self._desc_body, self._desc_tail)[1]
 
     @property
     def parameters(self) -> dict[str, Any]:

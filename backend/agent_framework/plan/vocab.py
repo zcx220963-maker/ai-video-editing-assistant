@@ -31,10 +31,16 @@ _IMPLICIT_SKILLS: dict[str, tuple[str, ...]] = {
     "render_motion_code": ("motion_explainer_skill",),
     # 局部改改的就是同一份归一后的分镜（字段名与必填项一字不差），
     # 少了这份技能，模型会按别的入参形状提交 edits，闸在入库前退它。
-    # 口播链的 patch_video **不挂**技能：它的 edits 是「命中表指针 + 值」，指针形状与可改字段
-    # 白名单全写在节点的 input_schema 里（执行轮模型本来就看得到），没有第二份需要随身带着的
-    # 字段字典。motion 那一路要带技能，是因为改的就是同一份归一后的分镜字段名。
     "patch_motion_code": ("motion_explainer_skill",),
+    # 口播链的 patch_video **原先不挂**技能，理由是「指针形状与可改字段白名单写在
+    # input_schema 里，没有第二份要随身带的字段字典」——那个理由只覆盖**入参形状**。
+    # T41 把它挂上，是因为**约束散文**另有出处：节点描述里那四条（必须带 base_artifact_id、
+    # 指纹不一致就重出片、本工具不改总长也不改顺序、分钟级任务要轮询 render_status）
+    # 在 `default_editing_workflow/SKILL.md` 的「# 出片之后要改哪里：局部改（patch_video）」
+    # 一节里逐条都有，而且写得更细（连 hitmap 那个对象键与 GET 端点都写了）。
+    # 描述要截到 ≤600 B（§5.7 第⑥条），截掉的那几句必须有载体——这份技能就是载体，
+    # 挂上它同时满足「预注入」与「移出即须有闸读到」（判据见 `round.unbacked_truncations`）。
+    "patch_video": ("default_editing_workflow_skill",),
 }
 
 

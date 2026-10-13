@@ -221,6 +221,15 @@ SECTION_BUDGET_BYTES: dict[str, int] = {
     # 不截长）仍在这条线之内。**这不是「为跑通而抬预算」**：取证与 Q55 第②种出路的
     # 论证见 §9-Q104；§8.1 拿到真 P95 后再按 P95 × 1.15 收紧（同批改本节与指南）。
     "planning_round": 14976,
+    # 工具面（T41 随裁剪一起上线，§5.4.1 那一行）。断值取 §5.4 的目标 40,960 B——
+    # 这一栏的目标与断值**同数**是有意的，理由与别块相反：别块的目标是「R9 该瘦到哪」
+    # （今天做不到，所以断值另算），而这一栏的目标就是「执行轮工具面 ≤40 KB」这条
+    # 验收口径本身，它今天必须过（真机实测：按计划裁后 14,561 B，裁剪前 54,140 B）。
+    #
+    # **只在按计划裁过的那一轮上判**（见 ``tools_box`` 的注释）：未裁的轮次发的是全量
+    # 能力面，53 KB 上下是它的正常尺寸——拿这条线去判它们等于让闲聊轮全死，
+    # 那正是 §9-Q100 ③ 当初不敢设这个数的原因。未裁那一档的账与取舍登记在 §9-Q105。
+    "tools": 40960,
 }
 
 # §5.4 的「目标」列：R9 要把这几块瘦到哪。**与上面那张断值表是两件事**——
@@ -347,19 +356,55 @@ def tools_box(definitions: Sequence[Mapping[str, Any]], *,
     ``sent`` 是**这一轮实际下发**的份数，``total_registered`` 是注册表里全部可见份数：
     两者的差就是「按轮裁剪」省下的量（T41 的判据读它）。``largest`` 取字节最大的三份，
     够定位「谁在顶预算」——列全了反而没人看。
+
+    T41 补两栏（都是为了判据能被**逐字复核**，不是为了让账面好看）：
+    ``bytes`` 是这一轮工具面的总字节（``tools`` 断值判的就是它），
+    每份最大的工具另带 ``desc_bytes``——§5.7 第⑥条的「描述 ≤600 B」是**描述**的线，
+    而整份 schema 的字节由入参形状决定（分镜那种节点天然近 2 KB，砍它就等于砍掉参数）。
+    两个数分开记，判据才不会含混成「工具该多小」。
     """
     rows = []
     for d in definitions:
         fn = d.get("function") or {}
         rows.append({"name": str(fn.get("name") or "?"),
-                     "bytes": section_bytes(json.dumps(d, ensure_ascii=False))})
+                     "bytes": section_bytes(json.dumps(d, ensure_ascii=False)),
+                     "desc_bytes": section_bytes(str(fn.get("description") or ""))})
     rows.sort(key=lambda r: (-r["bytes"], r["name"]))
+    total = sum(r["bytes"] for r in rows)
+    # 断值只在**按计划裁过的那一轮**上判（T41）。理由：未裁的那些轮次（闲聊 / 定时任务）
+    # 发的是全量能力面，53 KB 上下是它的正常尺寸，拿 40 KB 去判它们等于让闲聊轮全死
+    # （§9-Q100 ③ 那条顾虑的原样）。裁剪过的一轮则相反——它的字节数完全由我们控制，
+    # 超线就说明裁剪逻辑坏了（或者有人把白名单放大了一个量级），那时必须响。
+    budget = section_budget("tools") if filter_name else None
     return {
         "sent": len(rows),
         "total_registered": total_registered,
         "filter": filter_name,
+        "bytes": total,
+        "budget": budget,
+        "over_budget": bool(budget is not None and total > budget),
         "largest": rows[:3],
     }
+
+
+def check_tools_budget(box: Mapping[str, Any]) -> None:
+    """``tools`` 的断值（§5.4.1 那一行；T41 起真生效）：超线即抛，**请求不发出**。
+
+    与逐块那条（``ContextBuilder._over_budget_message``）同一个形状与同一个出路：
+    压回去，或按 Q55 走流程抬预算（两处同批改）。不在这里就地截工具：
+    静默少给一个节点，模型只会撞上去才知道，那是「看着还在、其实没了」的另一种写法。
+    """
+    if not box.get("over_budget"):
+        return
+    top = "、".join(f"{r.get('name')}({r.get('bytes')} B)"
+                    for r in box.get("largest") or [])
+    raise ContextBudgetError(
+        "上下文预算闸㉓：本轮工具面超出 §5.4 的断值，本次请求不发出（不许截工具顶过去）：\n"
+        f"- tools（filter={box.get('filter')}）：{box.get('bytes')} B > 预算 "
+        f"{box.get('budget')} B，下发 {box.get('sent')}/"
+        f"{box.get('total_registered')} 份 schema；最大的三份：{top}。\n"
+        "出路只有两条：把工具面压回预算内（T41 的按计划裁剪就是这件事），"
+        "或按 Q55 走流程调预算（两处同批改：context.py 的 SECTION_BUDGET_BYTES 与 §5.4 表）。")
 
 
 class ContextBuilder:

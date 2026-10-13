@@ -29,6 +29,8 @@ from .prompt import planning_section, planning_section_blocks, render_injections
 from .reconcile import (NON_STEP_TOOLS, PlanCardHook, PlanReconcileHook,
                         reconcile)
 from .resume import pending_continuation
+from .round import (ROUND_FILTER, SCOPE_CONDITION_KEY, SCOPE_SECTION, plan_nodes,
+                    registry_for_round, scope_lines, trimmed_nodes)
 from .skills import preload_skills
 from .support import (CUSTOM_MAX_CHARS, CUSTOM_MAX_ITEMS, PLAN_MAX_CANDIDATES,
                       PlanIssues, neutralize)
@@ -44,6 +46,9 @@ __all__ = [
     "render_injections", "reconcile", "preload_skills", "planning_section",
     "planning_section_blocks",
     "pending_continuation", "claims_plan_card", "claims_step_executed",
+    # T41：执行轮工具面的按链装配（表 + 「如何请求扩面」那段说明，成对出现）
+    "registry_for_round", "trimmed_nodes", "scope_lines", "plan_nodes",
+    "ROUND_FILTER", "SCOPE_SECTION", "SCOPE_CONDITION_KEY",
     "PlanCardHook", "PlanReconcileHook", "NON_STEP_TOOLS",
     "record_plan_card", "drain_plan_cards", "drain_plan_round", "reset_plan_cards",
 ]

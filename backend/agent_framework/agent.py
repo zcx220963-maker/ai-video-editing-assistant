@@ -27,7 +27,8 @@ from .ask_gate import (NO_POPUP_NOTE, PLAN_CARD_NUDGE, looks_like_asking_user,
 from .checkpoint import Checkpoint, CheckpointManager
 from .catalog import get_catalog
 from .compress import _repair_orphans
-from .context import ContextBuilder, LEDGER_ENTRY_TYPE, Section, tools_box
+from .context import (ContextBuilder, LEDGER_ENTRY_TYPE, Section,
+                      check_tools_budget, tools_box)
 from .hooks import AgentHook, AgentHookContext, CompositeHook, _current_hook_ctx, _current_hooks
 from .identity import (current_identity, rebind_artifact_scope,
                        storyline_session_id, use_identity, use_identity_or_inherit)
@@ -35,7 +36,9 @@ from .llm import LLMClient, LLMResponse
 from .messages import ToolCall, assistant, system, tool_result, user
 from .plan import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_step_executed,
                         pending_continuation, planning_section_blocks,
-                        preload_skills, reconcile, render_injections)
+                        preload_skills, reconcile, render_injections,
+                        ROUND_FILTER, SCOPE_CONDITION_KEY, SCOPE_SECTION,
+                        plan_nodes, registry_for_round, scope_lines, trimmed_nodes)
 from .plan_retro import (PlanRetrospective, plan_card_lines, rework_line,
                          revise_line)
 from .render_gate import (ADJUST_OPTION, CONFIRM_OPTION,
@@ -784,8 +787,13 @@ class AgentOnceRun:
                  "fingerprint": self.context_builder.fingerprint()})
         # 上下文面账面（R9-T37，§5.7 第①条）：与指纹同一条留档通道、同样只记一次
         # （续跑那半截沿用快照里那份，别在历史里留两本同一轮的账）。
-        self._record_context_ledger(state, reg, user_id=session.user_id,
-                                    planning=planning, ledger=context_ledger)
+        self._record_context_ledger(
+            state, reg, user_id=session.user_id, ledger=context_ledger,
+            # 「这一轮的工具面是按什么裁的」：规划轮是规划门那张表，执行轮是 T41 按计划
+            # 裁的那张（``registry is not None`` 就是「带了一张自己的表进来」），
+            # 普通轮是全量（None）。账面 filter 那一栏因此与真发出去的东西一一对应。
+            tools_filter=("planning_registry" if planning
+                          else (ROUND_FILTER if registry is not None else None)))
         r = _Round(
             ctx=ctx, state=state, reg=reg, messages=messages, iteration=start_iteration,
             cp=cp, run_id=run_id, planning=planning, interactive=interactive,
@@ -831,7 +839,7 @@ class AgentOnceRun:
         return " ".join(words)
 
     def _record_context_ledger(self, state: RunState, reg: ToolRegistry, *,
-                               user_id: str | None, planning: bool,
+                               user_id: str | None, tools_filter: str | None,
                                ledger: dict[str, Any] | None) -> None:
         """把本轮的上下文面账面写进 qa_parts（R9-T37，§5.7 第①条）。
 
@@ -840,6 +848,10 @@ class AgentOnceRun:
           只有**刚装配过上下文**的那条入口拿得到；
         - ``tools`` 只有这里算得对——装配出口不认识工具注册表，而
           ``sent``/``total_registered`` 这两个数正是「按轮裁剪省了多少」的判据（T41）。
+
+        ``tools_filter`` 说明这一轮的工具面是按什么裁的（``planning_registry`` /
+        ``registry_for_round`` / None=全量）。它同时决定 ``tools`` 断值判不判：
+        只有**裁过**的那两档判（普通轮发的是全量能力面，见 ``tools_box`` 的注释）。
 
         ``ledger`` 为 None（断点续跑那三条入口）时**什么都不写**：那半截没有重新装配，
         现算一个「这轮的工具面」只会与快照里那份 sections 不同批。
@@ -850,7 +862,10 @@ class AgentOnceRun:
         entry["tools"] = tools_box(
             reg.get_definitions(user_id=user_id),
             total_registered=len(self.registry.get_definitions(user_id=user_id)),
-            filter_name="planning_registry" if planning else None)
+            filter_name=tools_filter)
+        # 断值在这里判，而且是**请求发出之前**：工具面是本轮要发给模型的 schema，
+        # 顶穿了就没有「先跑跑看」这一说（同逐块那条闸的口径）。
+        check_tools_budget(entry["tools"])
         state.qa_parts.append(entry)
 
     async def _tool_round(self, r: "_Round", resp: LLMResponse) -> str | None:
@@ -1958,6 +1973,9 @@ class Agent:
                       if memory_store is not None else None)
         self._planning: ToolRegistry | None = None
         self._planning_sig: tuple[str, ...] | None = None
+        # 执行轮按计划裁过的工具面（T41）与它的签名缓存，见 _round_registry。
+        self._round: ToolRegistry | None = None
+        self._round_sig: tuple[Any, ...] | None = None
         self._queue: asyncio.Queue[_Request] = asyncio.Queue()
         self._locks: dict[str, asyncio.Lock] = {}
         self._running = False
@@ -1981,18 +1999,69 @@ class Agent:
         return self._planning
 
     def _resume_registry(self, cp: Any) -> ToolRegistry | None:
-        """续跑这条快照时该用哪张注册表：规划轮续跑还是规划轮那张。
+        """续跑这条快照时该用哪张注册表：规划轮那张 / 执行轮按计划裁过的那张 / 全量。
 
-        ``None`` = 用全量注册表（执行轮、普通轮、以及没接计划门时的所有轮次）。
+        ``None`` = 用全量注册表（普通轮、以及没接计划门时的所有轮次）。
         为什么要在**这里**，而不是让 ``Runner`` 自己判：注册表是从计划门现建的，
         Runner 手里没有门；轮次身份在快照里，Agent 两边都够得着。
+
+        T41 之后执行轮也有一张自己的表（按计划裁的），所以续跑要按**同一条口径**取回来：
+        在渲染确认门/弹窗上停过一次之后再接着跑，如果回退成全量注册表，那个 run 前后
+        两半的工具面就不是同一张——账面记的 ``sent`` 与模型手里真有的东西会对不上，
+        而且「被裁的节点第二半又能调了」这件事没有任何地方说得清。计划本体从
+        ``RunState`` 里取（与 ``approved_plan`` 同一份，不另存一份步骤清单）。
         """
         gate = self.plan_gate
-        if not _planning_run(cp) or gate is None or not gate.whitelist():
-            # 没有可规划的节点 = ``plan()`` 当初直接退回 ``handle`` 的那种进程状态：
-            # 这轮本来就不是规划轮，别硬塞一张没有剪辑节点的表。
+        if _planning_run(cp):
+            if gate is None or not gate.whitelist():
+                # 没有可规划的节点 = ``plan()`` 当初直接退回 ``handle`` 的那种进程状态：
+                # 这轮本来就不是规划轮，别硬塞一张没有剪辑节点的表。
+                return None
+            return self._planning_registry(gate)
+        plan = RunState.restore(cp).approved_plan or {}
+        steps = plan.get("steps") or []
+        if not steps:
             return None
-        return self._planning_registry(gate)
+        return self._round_registry(steps)
+
+    def _round_registry(self, plan_steps: Iterable[Any]) -> ToolRegistry:
+        """执行轮的工具面：这张计划的节点 + 通用件（T41，§5.7 第⑥条）。
+
+        **签名必须含工具子集身份**：主注册表的名字清单只说明「有哪些工具可用」，
+        说明不了「这一轮裁出了哪几张」——两张不同的计划卡前后脚执行时，只按主注册表
+        当签名会命中同一份缓存，第二条计划就会拿到第一条的工具面（它需要的那几个节点
+        不在里面，模型只能撞上去才知道）。缓存键因此是「主注册表清单 + 计划节点集合」
+        两样一起，缺一样都是假命中（判据见 tests/test_context_hygiene 的 T41-②）。
+
+        工具实例与主注册表共享（不复制、不重建工具本身）：裁剪只影响**发给模型的
+        schema**，不影响执行、不影响并发分批、不影响出口的中文名。
+        """
+        signature = (tuple(self.runner.registry.tool_names),
+                     tuple(sorted(plan_nodes(plan_steps))))
+        if self._round is None or self._round_sig != signature:
+            self._round = registry_for_round(self.runner.registry, plan_steps)
+            self._round_sig = signature
+        return self._round
+
+    def _scope_section(self, plan_steps: Iterable[Any]) -> list[Section]:
+        """「如何请求扩面」那一小节（T41-②）：被裁的节点名与怎么要回它们。
+
+        它是**执行轮专属**的一段（计划卡不同、被裁的节点就不同），所以走
+        ``extra_sections`` 而不是常驻 ContextSource——常驻的话每一轮都要重算一遍，
+        而且「本轮裁了谁」这个事实只有装配这一侧知道。
+
+        空表（没裁任何节点）就整节不发：写一段「你可以请求扩面」会让模型以为工具被裁了。
+        """
+        lines = scope_lines(trimmed_nodes(self.runner.registry, plan_steps))
+        if not lines:
+            return []
+        return [Section(name=SCOPE_SECTION,
+                        text=f"<{SCOPE_SECTION}>\n" + "\n".join(lines)
+                             + f"\n</{SCOPE_SECTION}>",
+                        kind="conditional", condition_key=SCOPE_CONDITION_KEY,
+                        # 这一段的读者是「发现自己缺工具」的那一步：要回来只有两条路
+                        # ——问用户（ask_user）或者取技能（load_skill）看还有没有别的走法。
+                        referenced_by=("ask_user", "load_skill"))]
 
     def _lock_for(self, session_id: str) -> asyncio.Lock:
         return self._locks.setdefault(session_id, asyncio.Lock())
@@ -2221,6 +2290,10 @@ class Agent:
             user_id=user_id, conversation_id=conversation_id)
         sections = list(render_injections(compiled))
         sections += await preload_skills(self.skill_loader, compiled.get("skills_hint") or ())
+        # 工具面按这张计划裁（T41）：只发计划用得到的剪辑节点 + 通用件，被裁的节点名
+        # 进「如何请求扩面」那一小节（裁的是 schema 字节，不是可发现性，Q56）。
+        steps = compiled.get("steps") or []
+        sections += self._scope_section(steps)
         session = await self.session_manager.get_or_create(user_id, conversation_id)
         # 从规划轮的用户消息中提取附件 ID，传递到执行轮——
         # 否则 Agent 会忘记用户已上传的素材（如配乐），跑去网上重新下载。
@@ -2238,6 +2311,7 @@ class Agent:
             return await self.runner.run(
                 session, message or f"按已确认的计划执行：{compiled.get('label') or wanted}",
                 run_id=run_id, stream=stream, attachments=attachments,
+                registry=self._round_registry(steps),
                 extra_sections=sections,
                 approved_plan=compiled, plan_run_id=plan_run_id,
             )
