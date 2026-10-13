@@ -21,6 +21,7 @@ import {
   FILM_GEOMETRY,
   LAYOUT_LOG_MARKER,
   LAYOUT_PROBE,
+  REVEAL_LOG_MARKER,
   TOKENS,
   TOKEN_LOG_MARKER,
 } from './tokens';
@@ -280,6 +281,195 @@ export const F: React.FC<FieldMarkProps> = ({ name, value, children }) => {
     </span>
   );
 };
+
+// ---------------------------------------------------------------------------
+// R12-T60 分区揭示：**逐区域 mask**（闸㉘ 的申报 → 闸㉗ 判它）
+//
+// 这一族的画法是「把画面当纸，一块一块按顺序画出来」。母版负责的是最后一步：
+// 按 `reveal.regions[]` 逐帧算出**每一块此刻允许被看见的那部分**，把它当作剪切路径
+// 套到这一镜的插画（`<img>`）上。
+//
+// 三条设计决定，逐条都有理由：
+//
+// 1. **坐标只在母版里换算一次**。区域的四栏是「插画原图像素」（`canvas`），母版按
+//    这张图**这一帧的实况盒**折算成成片像素——它是唯一拿得到那个盒的一侧。Python 侧
+//    （㉗）不自己算这套换算：算第二遍就是两把尺，而母版算的是实况、Python 算的是估算，
+//    两把尺迟早对不上。所以母版把算出来的结果**逐帧报出去**（`DG_REVEAL:` 行），
+//    ㉗ 采样的就是这份账。
+// 2. **允许掩码 = 块 − 后续块 − 受保护的块**（闸㉘ 的原话）。「后续块」扣掉是因为
+//    后面那一块到点才该画：不扣的话，一块的推进会先把后面那块的位置刷出来，
+//    画面上提前露出——正是 ㉗ 要抓的那件事。
+// 3. **读同一帧时钟**：进度按下式算，`frame` 就是 `useCurrentFrame()`。
+//    `code_render.py` 那条「命中的盒与代表帧说同一时刻」是同一句话。
+// ---------------------------------------------------------------------------
+
+/** 分区揭示的最小输入（与 Python `code_spec.check_reveal_regions` 的栏位同名）。 */
+export interface RevealRegion {
+  id: string;
+  sequence: number;
+  region: { x: number; y: number; w: number; h: number };
+  direction: 'ltr' | 'rtl' | 'ttb' | 'btt' | 'whole';
+  start_ms: number;
+  duration_ms: number;
+  protected?: string[];
+  label?: string;
+}
+
+export interface RevealSpec {
+  canvas: { w: number; h: number };
+  scene_duration_ms?: number;
+  regions?: RevealRegion[];
+}
+
+/** 一带内的一个矩形（成片像素，左上角）。与 `region` 同形，单独起名只为读起来清楚。 */
+export interface RevealRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+const REVEAL_DIRECTIONS = new Set(['ltr', 'rtl', 'ttb', 'btt', 'whole']);
+
+/** 注入的 props → 分区揭示的输入（把认不出的写法挡在外面，与母版别的回退同规）。
+ *
+ *  `revealProbeFrames` 是 Python 点名要账的那几帧（㉗ 的采样时刻）。**它不是画法的
+ *  一部分**：不进缓存键（键在 Python 侧按 `reveal` 算），也不改变任何像素——它只决定
+ *  母版在哪几帧多发一行 console.log。所以故意做成与 `reveal` 并列的第二个注入项，
+ *  不塞进 `reveal` 里：塞进去的话「同一份申报、不同的采样时刻」会变成两份不同的申报。 */
+export function resolveReveal(injected: unknown):
+{ spec: RevealSpec | null; probeFrames: number[] } {
+  const src = (injected && typeof injected === 'object' ? injected : {}) as Record<string, unknown>;
+  const rawReveal = src.reveal;
+  let spec: RevealSpec | null = null;
+  if (rawReveal && typeof rawReveal === 'object') {
+    const r = rawReveal as RevealSpec;
+    const canvas = r.canvas;
+    const okCanvas = !!canvas && Number(canvas.w) > 0 && Number(canvas.h) > 0;
+    const regions = Array.isArray(r.regions) ? r.regions : [];
+    if (okCanvas && regions.length) {
+      spec = {
+        canvas: { w: Number(canvas.w), h: Number(canvas.h) },
+        scene_duration_ms: Number(r.scene_duration_ms ?? 0),
+        regions: regions.filter((g) => !!g && !!g.region && REVEAL_DIRECTIONS.has(g.direction)),
+      };
+      if (!spec.regions!.length) spec = null;
+    }
+  }
+  const rawFrames = Array.isArray(src.revealProbeFrames) ? src.revealProbeFrames : [];
+  const probeFrames = rawFrames
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v) && v >= 0)
+    .map((v) => Math.round(v));
+  return { spec, probeFrames };
+}
+
+/** 这一块在 `progress`（0~1）时**已经被画到**的那部分；`whole` 只有全有全无。
+ *
+ *  推进方向是**这一块的 mask 前沿往哪走**，不是画面往哪移。四种都按同一份 region 盒
+ *  切一刀：左→右就是「已画宽度 = w×进度」。 */
+export function sweepRect(region: RevealRect, direction: string, progress: number): RevealRect {
+  const p = Math.min(1, Math.max(0, progress));
+  if (direction === 'whole') return { ...region };
+  if (direction === 'rtl') return { x: region.x + region.w * (1 - p), y: region.y, w: region.w * p, h: region.h };
+  if (direction === 'ttb') return { x: region.x, y: region.y, w: region.w, h: region.h * p };
+  if (direction === 'btt') return { x: region.x, y: region.y + region.h * (1 - p), w: region.w, h: region.h * p };
+  return { x: region.x, y: region.y, w: region.w * p, h: region.h };
+}
+
+/** `a` 减去若干矩形 → 剩下的矩形清单（可能 0 片）。
+ *
+ *  一进一出的扣法（每次切最多成 4 片：上/下/左/右），所以 n 次扣除最多 4n 片。
+ *  为什么不用「多边形布尔运算」：这一族只需要矩形，而一个多边形裁剪库引进来是给整个
+ *  渲染容器加一条依赖——这四行算术自己就是它的全部用处。小数坐标一路留着，
+ *  取整只发生在最后写进 `clip-path` 那一刻（中途取整会在扣出的小片上积累缝隙）。 */
+export function subtractRects(a: RevealRect, others: RevealRect[]): RevealRect[] {
+  let pieces: RevealRect[] = [a];
+  for (const o of others) {
+    const next: RevealRect[] = [];
+    for (const p of pieces) {
+      const ix = Math.max(p.x, o.x);
+      const iy = Math.max(p.y, o.y);
+      const ir = Math.min(p.x + p.w, o.x + o.w);
+      const ib = Math.min(p.y + p.h, o.y + o.h);
+      if (ir <= ix || ib <= iy) { next.push(p); continue; }   // 不相交：原样留下
+      const pr = p.x + p.w;
+      const pb = p.y + p.h;
+      if (iy > p.y) next.push({ x: p.x, y: p.y, w: p.w, h: iy - p.y });            // 上
+      if (ib < pb) next.push({ x: p.x, y: ib, w: p.w, h: pb - ib });              // 下
+      if (ix > p.x) next.push({ x: p.x, y: iy, w: ix - p.x, h: ib - iy });        // 左
+      if (ir < pr) next.push({ x: ir, y: iy, w: pr - ir, h: ib - iy });           // 右
+    }
+    pieces = next;
+  }
+  return pieces.filter((p) => p.w > 0.5 && p.h > 0.5);
+}
+
+/** 一块在时刻 `tMs` 的进度（线性，无缓动）。
+ *
+ *  为什么**不加缓动**：㉗ 判的是「到点的那一刻画满了没有」，缓动只会让「到点」这个
+ *  时刻在画面上变得更模糊（末端仍在慢慢逼近）。这一族的观感来自区域划分，不来自
+ *  这一条的缓动曲线——要缓动是母版 `entrance` 那一档的事。
+ *  `duration_ms=0` 定义为「瞬时」（t ≥ start 就整块可见），不做除零。 */
+export function revealProgress(region: RevealRegion, tMs: number): number {
+  if (region.direction === 'whole' || !region.duration_ms) return tMs >= region.start_ms ? 1 : 0;
+  if (tMs <= region.start_ms) return 0;
+  return Math.min(1, (tMs - region.start_ms) / region.duration_ms);
+}
+
+/** 某一帧、每一块**允许被看见**的那部分，单位是**画布像素**（＝申报的坐标系）。
+ *
+ *  刻意留在画布像素里：换算是**两个不同的去处**（`clip-path` 要元素本地像素、
+ *  `DG_REVEAL:` 那一行要成片像素），在这里乘上任何一个比例都会让另一个去处拿错尺。
+ *  于是这一层只算「哪一块、到点没有、被扣成哪几片」，换算是调用方两行乘法的事。
+ *
+ *  返 `{id, sequence, rects}`——按 sequence 升序，**没到点的块也在**（`rects: []`）：
+ *  「这一块此刻什么都不该显示」与「这一块不在这次申报里」在 ㉗ 的账上是两件事。 */
+export function revealMasks(spec: RevealSpec, frame: number, fps: number):
+Array<{ id: string; sequence: number; rects: RevealRect[] }> {
+  const regions = (spec.regions ?? []).slice().sort((a, b) => a.sequence - b.sequence);
+  const tMs = fps > 0 ? (frame / fps) * 1000 : 0;
+  const byId = new Map(regions.map((r) => [r.id, r]));
+  return regions.map((r) => {
+    if (tMs < r.start_ms) return { id: r.id, sequence: r.sequence, rects: [] };
+    const drawn = sweepRect(r.region, r.direction, revealProgress(r, tMs));
+    const cut: RevealRect[] = [];
+    for (const later of regions) {
+      if (later.sequence > r.sequence) cut.push(later.region);
+    }
+    for (const pid of r.protected ?? []) {
+      const g = byId.get(String(pid));
+      if (g && g.id !== r.id) cut.push(g.region);
+    }
+    const rects = subtractRects(drawn, cut).filter((p) => p.w > 0 && p.h > 0);
+    // 一片都没被扣掉时**原样返回推进到哪**，不走减法：减法里的浮点误差会让「画满了」
+    // 少掉最后一根发丝（w 从 808 变成 807.99999），而 ㉗ 的采样网格是贴着这条边排的。
+    if (!cut.length) return { id: r.id, sequence: r.sequence, rects: [drawn] };
+    return { id: r.id, sequence: r.sequence, rects };
+  });
+}
+
+/** 画布像素 → 另一套坐标（`sx`/`sy` 是「一个画布像素跨几个目标像素」，`ox`/`oy` 是原点）。
+ *  两个去处共用这一行乘法，两处各写一遍就会在某一处漏掉原点。 */
+export function mapRects(rects: RevealRect[], sx: number, sy: number,
+                         ox = 0, oy = 0): RevealRect[] {
+  const q = (n: number) => Math.round(n * 100) / 100;
+  return rects.map((r) => ({ x: q(ox + r.x * sx), y: q(oy + r.y * sy),
+                             w: q(r.w * sx), h: q(r.h * sy) }));
+}
+
+/** 一帧的允许掩码（元素本地像素）→ `clip-path` 的路径串（多子路径＝并集）。
+ *
+ *  为什么用 `path()` 而不是几个 `inset()`：并集没法用一条 `inset()` 表达（它只切一个
+ *  矩形），而 `mask-image` + `mask-composite` 在 headless Chrome 里各版本行为不一。
+ *  `clip-path: path()` 是同一份几何的最简表达，且它在 SVG/HTML 上是同一套规则。
+ *  **空清单返回 `'none'`（不裁）而不是空串**：空串是非法值，浏览器整条忽略——
+ *  于是「本该全是纸底」的一帧反而全显示，而这一族唯一的验收靠的就是那一帧。 */
+export function clipPathOf(rects: RevealRect[]): string {
+  if (!rects.length) return 'none';
+  const seg = rects.map((r) => (`M${r.x},${r.y} H${r.x + r.w} V${r.y + r.h} H${r.x} Z`));
+  return `path("${seg.join(' ')}")`;
+}
 
 /** 成片像素坐标系里的一个盒，左上角 (x,y)。 */
 interface PxBox {
@@ -756,6 +946,16 @@ function probeLayout(root: Element, band: PxBox, convert: Convert) {
       grid_text: gridSignature(texts.map((t) => t.box), band),
       grid_drawn: gridSignature(drawn.map((d) => d.box), band),
       colors: colorHistogram(root),
+      // 闸㉕ 徽章构图（R11）：**逐件**主体包围盒的原始读数，带内坐标、整数像素。
+      // 为什么要逐件而不是复用上面那两个数：`subjects` 只有**个数**、`subject_share` 只有
+      // **并集外接盒**的占比——「一枚圆形徽章铺满画面」与「两个部件左上一个右下」这两件
+      // 事，在「个数 1 / 占比 0.28」这栏里长得很像，只有拿到件本身的盒（宽高比、离带中心
+      // 多远）才分得开。判据（`BADGE_MIN_SHARE` / 居中容差 / 近方形容差）**全在 Python**
+      // ——母版只报量到了什么，两处各写一个 0.25 就会出现两把尺（同 ⑲-a 那条规矩）。
+      subject_boxes: subject.map((b) => {
+        const t = toBand(b);
+        return { x: Math.round(t.x), y: Math.round(t.y), w: Math.round(t.w), h: Math.round(t.h) };
+      }),
     },
   };
 }
@@ -804,6 +1004,9 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   // 四条取值走 `resolveShotMotion`：镜头代码转交了就用它给的，没转交就取注入的那份。
   const motionIn = resolveShotMotion({ entrance, exit, entranceFrames, exitFrames },
                                      getInputProps());
+  // R12-T60：分区揭示的申报（母版按它逐帧算 mask）。与上面那条同一条回退逻辑：
+  // 镜头代码转交不了它（它本来就不是代码的数据），一律读注入的那一份。
+  const revealIn = resolveReveal(getInputProps());
   const motion = composeMotion(
     shotMotion(motionIn.entrance, motionIn.entranceFrames, frame, durationInFrames, height, true),
     shotMotion(motionIn.exit, motionIn.exitFrames, frame, durationInFrames, height, false),
@@ -945,6 +1148,54 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
       });
     console.log(`${ASSET_LOG_MARKER}${JSON.stringify({ frame, assets })}`);
   }, [frame, assetProbeEarly, probeFrame]);
+
+  // 闸㉗ 的原料：分区揭示的**允许掩码**（R12-T60）。三个决定写在这里：
+  //
+  //   1. `useLayoutEffect` 而不是 `useEffect`：这一条改的是**这一帧的像素**，
+  //      必须在浏览器画这一帧之前落下去。`useEffect` 在 paint 之后跑，逐帧截图时
+  //      会慢一帧（截图拿到的是上一帧的 mask）——而 ㉗ 判的正是「这一帧该不该露」，
+  //      慢一帧就等于把判据整体挪了一格。
+  //   2. 只改 `<img>`（这一族的插画就是它）。母版不知道镜头代码把图画在哪儿，
+  //      所以位置的换算按**元素自己的盒**做（canvas → 元素本地像素），
+  //      与镜头代码怎么摆无关——「区域画在哪儿」于是只有一处实现。
+  //   3. Python 点名的帧各发一行 `DG_REVEAL:`（它自己去抽那一帧来比色），
+  //      别的帧只改像素不出声：毎帧一行会把逐镜账撑成噪声，而 ㉗ 只需要几个时刻。
+  React.useLayoutEffect(() => {
+    const root = bodyRef.current;
+    if (!root) return;
+    const { spec, probeFrames } = revealIn;
+    const imgs = Array.from(root.querySelectorAll('img'))
+      .filter((el) => paintedWithin(root, el)) as HTMLImageElement[];
+    if (!spec) return;
+    const masks = revealMasks(spec, frame, fps);
+    const all = masks.flatMap((m) => m.rects);
+    for (const el of imgs) {
+      const sx = el.offsetWidth / Number(spec.canvas.w);
+      const sy = el.offsetHeight / Number(spec.canvas.h);
+      // 元素自己还没量到尺寸（图未加载）时**不裁**：裁一个 0 宽的盒等于把整张图抹掉，
+      // 而 ㉗ 会把那一帧读成「未开始的区域是纸底」——一条假绿，正好是本闸要拦的那件事。
+      el.style.clipPath = (sx > 0 && sy > 0) ? clipPathOf(mapRects(all, sx, sy)) : 'none';
+    }
+    if (!probeFrames.includes(frame)) return;
+    const convert = frameConvert();
+    const boxes = imgs.map((el) => {
+      const b = measureBox(el);
+      return { src: (el.src ?? '').slice(-80), box: b ? convert(b) : null,
+               local: { w: el.offsetWidth, h: el.offsetHeight } };
+    });
+    console.log(`${REVEAL_LOG_MARKER}${JSON.stringify({
+      frame, canvas: spec.canvas, boxes,
+      // 成片像素（带内坐标）：㉗ 拿它加画面带原点就是能在帧上取样的矩形。
+      // 用**成片像素**而不是元素本地像素：本地的原点在元素自己的角上，
+      // 而元素的位置是镜头代码摆的——那一侧的读数会随排版漂，这一侧不会。
+      regions: masks.map((m) => ({
+        id: m.id, sequence: m.sequence,
+        rects: mapRects(m.rects, (boxes[0]?.box?.w ?? 0) / Number(spec.canvas.w),
+                        (boxes[0]?.box?.h ?? 0) / Number(spec.canvas.h),
+                        boxes[0]?.box?.x ?? 0, boxes[0]?.box?.y ?? 0),
+      })),
+    })}`);
+  }, [frame, fps, revealIn]);
 
   return (
     <AbsoluteFill style={{ background: TOKENS.bg, fontFamily: TOKENS.fontStack }}>

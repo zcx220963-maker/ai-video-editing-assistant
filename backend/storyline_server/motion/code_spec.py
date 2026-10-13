@@ -668,6 +668,13 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         # 改了就该重烧一次是浪费——代价是命中缓存的镜必须按**当前**申报重判，见
         # `code_render` 缓存路径上那一段。
         "motion": raw.get("motion"),
+        # 闸㉘ 的申报（R12-T59）。与 `motion` 同一套分工：形状的唯一主人是
+        # `check_reveal_regions`，所以这里**原样带着走**，连大小写与空白都不动
+        # （在归一里把认不出的写法清成空表，就是把「写了但写错了」修成「没写」）。
+        # **但它与 `motion` 有一处决定性的不同：它进缓存键**（见 `SHOT_KNOBS` 那条注释）
+        # ——`motion` 只是「这条动效为谁动」的申报，改它一个像素都不变；而 `reveal`
+        # 是母版**照着它逐帧算 mask** 的输入，改一次就是改像素。
+        "reveal": raw.get("reveal"),
     }
 
 
@@ -789,6 +796,12 @@ def validate_code_spec(raw: dict[str, Any], *,
     # 所以它跟上面那批整片闸并排放在这里，三个调用点（plan 入库前 / 烧像素前 / 落盘前）
     # 一起生效。「事件触发帧在不在窗口里」那一半要像素，在 code_render 逐镜那一段。
     errors.extend(check_motion_anchors(shots))
+    # 闸㉘（R12-T59）：镜级 `reveal` 栏的几何与时序合法性。**也放在这里**，理由与 ㉑ 的
+    # 闸前那一半一字不差：它是纯 schema 校验，判一次一次请求都不用发；而它必须与
+    # ㉑ 共享同一个调用点，否则「计划轮过了、烧像素那一轮没过」这种半合法状态会出现。
+    # ㉘ 的**另一半**（像素与时序对不对得上）是 ㉗，那一条要真帧，在 code_render 里。
+    for s in shots:
+        errors.extend(check_reveal_regions(s))
     # 闸⑱：投递腿存在性。只有调用方**知道**客户端能力时才判（None = 不判）——
     # plan_motion 那一侧还没有客户端，硬塞一个 None 当 False 会把「没接腿」误判成「缺腿」。
     if has_stage_leg is not None:
@@ -858,6 +871,15 @@ def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
         "deps": lockfile_hash,
         "assets_hash": assets_hash,
     }
+    # R12-T59：`reveal` 是**母版逐帧算 mask 的输入**，所以它必须进键——与 `motion`
+    # 恰好相反（那一条刻意不进，理由写在 `_norm_shot` 里）。不进键的后果是这条链最贵的
+    # 那一种：改一个揭示时刻，命中缓存的镜原样返回旧切片，而账上写着「重烧过」。
+    # **只在真有这一栏时才加这一项**：无条件加会改掉所有既有镜的键（`None` 也是一个
+    # 值），整片换一次缓存＝每一镜白烧一次 Remotion 帧——而它们一个字节都没变。
+    # 加了之后「有 → 改了 → 删了」三种状态两两算出的键都不同（在、值不同、不在），
+    # 所以这一处省下的只是无谓的坏键，不是判据。
+    if shot.get("reveal") is not None:
+        payload["reveal"] = shot.get("reveal")
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -1402,6 +1424,152 @@ def check_subject_present(shots: list[dict[str, Any]], *,
     return errors, warns, undetermined
 
 
+# ---------------------------------------------------------------------------
+# 闸㉕ 徽章构图（R11-T53/㉕）：一枚徽章撑满画面 ≠ 一个场景
+# ---------------------------------------------------------------------------
+
+#: 徽章那一档的**大小**线：单件主体铺到带的这一比例以上，才谈得上「它就是这个画面」。
+#: 与 ⑲-a 的 ``SUBJECT_MIN_BBOX``（0.18）**不是同一个数，也不同一处判**：0.18 是「主体
+#: 太小」的下限（四条判据联合里的一条），这一条判的是**反面**——单个件大到铺满足以冒充
+#: 场景。取 0.22 而不是 0.18：0.18~0.22 那一小段里的是「一镜就画一个居中图形」的正常
+#: 封面镜（技能正文允许），把线压到 0.18 会把它一起打回。
+BADGE_MIN_SHARE = 0.22
+
+#: 「居中」的容差：主体中心离带中心超过带（宽/高）的这一比例 → 不算居中。
+#: 该值由 2026-10-13 的两支读数定：真 · 居中徽章的中心偏差 <3%，手摆歪的构图 >10%；
+#: 取 0.08 让「手工摆的偏心」落在这一档之外。
+BADGE_CENTER_TOL = 0.08
+
+#: 「近方形」的容差：盒的长边 ÷ 短边超过这一比例就不算近方形。
+#: 1.35 ≈ 4:3 略宽——4:3 已是「一张图」的形状，正圆徽章与正方徽章的实测比值都 <1.1。
+BADGE_ASPECT_TOL = 1.35
+
+#: 徽章那条打回理由里给的改写方向（技能正文「先取 `asset_role=part` 拼场景」那条）。
+_BADGE_HINT = "先把 `asset_role='part'` 的部件取几件拼成一个场景"
+
+
+def check_badge_composition(shots: list[dict[str, Any]], *,
+                            scanned: Mapping[str, Any] | None = None
+                            ) -> tuple[list[str], list[str], list[str]]:
+    """闸㉕ 徽章构图：这一镜画面上是不是**一枚居中、近方形的单件撑满了画面**。
+    → (打回, 提醒, 未判)。
+
+    **它要拦的形状。** 把一个 24 px 的线图标放大到铺满画面，屏幕上出现的是一枚徽章
+    （或一块色斑），不是「一个场景」——这件事 ⑲-a 拦不住：⑲-a 判的是「主体**太小**」，
+    而徽章恰恰是**太大**（``subject_share`` 一路到 0.9 也不触发它）。⑳(c) 也拦不住：
+    它判的是「两镜画面上是同一张卡」，一镜的徽章跟谁都不像。所以这是两条既有闸之间的
+    一格真空，本闸只补这一格。
+
+    **为什么判据要四条联合（单件 + 够大 + 居中 + 近方形）。** 每一条单独都会误伤合法
+    构图：单件（一个居中的人像插画）、够大（一条横贯画面的时间轴）、居中（三件里居中
+    的那一件）、近方形（一张占半屏的方框流程图）——四条同时成立，才是「一枚徽章」：
+    画面上只有**一个**东西、它**铺得开**、它**摆在正当中**、它的形状**不指向任何内容**
+    （正圆/正方/近似方形，没有细长结构、没有拼装感）。少任何一条，画面里就有别的信息，
+    归技能正文的构图目标管，不由这里打回。
+
+    **不判「小徽章」那一档。** 一枚小图标摆在角上做装饰是正常写法（⑲-a 那条「主体小、
+    文字也不多 → 提醒」已经覆盖了）。这条闸只管「大」。
+
+    读数（母版在探针帧上量的，㉕ 与 ⑲-a/⑳(c) **同一趟**回读）：``subject_boxes``
+    （逐件主体盒，带内整数像素）＋ ``band``（带的宽高）＋ ``subjects``/``subject_share``。
+    母版只报**原始读数**，四条判据与三个阈值全部在**这一处**——同一趟回读在两处各写一个
+    0.25，就是两把尺（⑲-a 那条规矩的同一句话）。
+
+    三个出口：过 / 打回 / **未判**。读数整栏取不到（母版旧、没带 ``subject_boxes``）、
+    带尺寸读到 0、``subjects``/``subject_share`` 缺一栏 → 未判，逐镜说清缺的是哪一栏。
+    「没量到」不许写成「量到了、没问题」（D-未判不绿）。
+    """
+    errors: list[str] = []
+    warns: list[str] = []
+    undetermined: list[str] = []
+    head = "闸㉕ 徽章构图："
+    readings = scanned if isinstance(scanned, Mapping) else {}
+    for i, s in enumerate(shots):
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        got = readings.get(sid)
+        got = got if isinstance(got, Mapping) else None
+        if got is None or got.get("status") != "scanned":
+            undetermined.append(
+                f"{head}{sid} 的版面没回读到（闸⑧ 那一趟没扫成），这一镜的构图"
+                f"**没量过**——未判不是通过")
+            continue
+        sc = got.get("scanned") if isinstance(got.get("scanned"), Mapping) else {}
+        count = sc.get("subjects") if isinstance(sc, Mapping) else None
+        share = _as_float(sc.get("subject_share")) if isinstance(sc, Mapping) else None
+        band = sc.get("band") if isinstance(sc, Mapping) else None
+        boxes = sc.get("subject_boxes") if isinstance(sc, Mapping) else None
+        if count is None or share is None or not isinstance(band, Mapping):
+            undetermined.append(
+                f"{head}{sid} 母版这一趟没带 ㉕ 要的读数（镜像里的母版比这条链旧："
+                f"缺 subjects/subject_share/band 之一），这一格**没量过**——未判不是通过")
+            continue
+        if not isinstance(boxes, (list, tuple)):
+            undetermined.append(
+                f"{head}{sid} 母版没带**逐件**主体盒（`subject_boxes` 是这一闸新加的"
+                f"回读栏，镜像里的母版比这条链旧），这一镜的构图**没量过**"
+                f"——未判不是通过")
+            continue
+        bw, bh = _as_float(band.get("w")), _as_float(band.get("h"))
+        if not bw or not bh or bw <= 0 or bh <= 0:
+            undetermined.append(
+                f"{head}{sid} 画面带的宽高读到 {band.get('w')}×{band.get('h')}"
+                f"（算不出「居不居中」），这一格**没量过**——未判不是通过")
+            continue
+        if not isinstance(count, int) or count != 1:
+            # 多件（或 0 件）不是徽章的形状：0 件归 ⑲-a 的空壳那条，多件本身就是「拼起来
+            # 的场景」。这里**不记未判**——这是量到了、且量清楚了，只是不是这一格的问题。
+            continue
+        if len(boxes) != 1:
+            undetermined.append(
+                f"{head}{sid} 个数读数是 1，逐件盒却带了 {len(boxes)} 件"
+                f"（母版两栏对不上），这一镜的构图**没判完**——未判不是通过")
+            continue
+        b = boxes[0] if isinstance(boxes[0], Mapping) else None
+        x, y = (_as_float(b.get("x")), _as_float(b.get("y"))) if b else (None, None)
+        w, h = (_as_float(b.get("w")), _as_float(b.get("h"))) if b else (None, None)
+        if None in (x, y, w, h) or not w or not h or w <= 0 or h <= 0:
+            undetermined.append(
+                f"{head}{sid} 那一件主体的盒读不齐（{boxes[0]!r}），这一镜的构图"
+                f"**没判完**——未判不是通过")
+            continue
+        if share < BADGE_MIN_SHARE:
+            # 单件但没铺开：这是「一镜一个居中小图形」的正常构图（⑲-a 的提醒那一档管它）。
+            continue
+        centred = (abs((x + w / 2) - bw / 2) <= BADGE_CENTER_TOL * bw
+                   and abs((y + h / 2) - bh / 2) <= BADGE_CENTER_TOL * bh)
+        aspect = max(w, h) / min(w, h)
+        square = aspect <= BADGE_ASPECT_TOL
+        if centred and square:
+            _err(errors,
+                 f"{head}{sid} 画面上是**一枚徽章**，不是一个场景：整镜只有 1 件主体，"
+                 f"它铺了带的 {share * 100:.0f}%（线 {BADGE_MIN_SHARE * 100:.0f}%）、"
+                 f"中心就在带正中（偏差 "
+                 f"{abs((x + w / 2) - bw / 2) / bw * 100:.1f}% ≤ {BADGE_CENTER_TOL * 100:.0f}%）、"
+                 f"形状近似方形（长边/短边 {aspect:.2f} ≤ {BADGE_ASPECT_TOL:g}，"
+                 f"盒 {int(round(w))}×{int(round(h))} px）——"
+                 f"把一件件素材放大铺满，屏幕上就是一枚徽章或一块色斑，"
+                 f"观众看到的是「图标」而不是「这一镜在讲什么」。"
+                 f"这一镜要真的像场景：{_BADGE_HINT}（按技能正文那句，"
+                 f"取 4~6 件摆到不同位置、大小错开、彼此有前后或相邻关系），"
+                 f"或者换一个版式族（主体 + 标注、主体 + 局部放大、时间轴）；"
+                 f"真就只需要一个图形时，把它缩到带的三成以内、挪离正中，"
+                 f"让画面里还有别的东西可看")
+            continue
+        # 单件、够大，只是没居中或不够方：不到徽章那一档，但记一句——这类镜离徽章很近。
+        why = []
+        if not centred:
+            why.append(f"中心偏带正中 "
+                       f"{abs((x + w / 2) - bw / 2) / bw * 100:.1f}%"
+                       f"（容差 {BADGE_CENTER_TOL * 100:.0f}%）")
+        if not square:
+            why.append(f"长边/短边 {aspect:.2f}（容差 {BADGE_ASPECT_TOL:g}）")
+        warns.append(
+            f"{head}{sid} 整镜只有 1 件主体、铺了带的 {share * 100:.0f}%"
+            f"（{'；'.join(why)}）——还没到「居中近方形徽章」那一档，但离它很近，"
+            f"看一眼构图：给它配几件部件或一条标注，画面才有信息")
+    return errors, warns, undetermined
+
+
 def _as_float(value: Any) -> float | None:
     """读数只认真数：``None``/字符串/``bool`` 一律算「没量到」（``bool`` 是 ``int`` 子类，
     真值会悄悄变成 1.0——那正是「没量到被写成量到了」的一种）。"""
@@ -1515,6 +1683,281 @@ def check_motion_anchors(shots: list[dict[str, Any]]) -> list[str]:
                                  + (f"（声明的是：{'、'.join(sorted(names))}）" if names
                                     else "（这一镜一个字段都没声明）")
                                  + "——锚到一个不存在的字段，与没锚是同一件事")
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# 闸㉘ 标注层几何与时序合法（R12-T59）：分区揭示的申报栏，一次请求都不发出就判完
+# ---------------------------------------------------------------------------
+
+#: 分区揭示的推进方向（`reveal.regions[].direction`）。
+#: 四档都带一个「整块一次显示」的 `whole`：它落在两种正常写法上——① 一块没有推进感的
+#: 元素（画面上直接出现的一面标注）；② 作者还没想好推进方向。**不给 `whole` 会逼人瞎填
+#: 一个方向**，而瞎填的方向会直接决定 mask 的插值（母版按它逐帧扫），也就是决定像素。
+REVEAL_DIRECTIONS = ("ltr", "rtl", "ttb", "btt", "whole")
+
+#: 幕时长允许的超额（ms）：`scene_duration_ms` 与「末段结束」之间可以留的停留。
+#: 判据不是「有停留」，而是**这个停留必须写在账上**（㉘ 的等式），0 也合法——
+#: 一镜的最后一笔落定就是这一镜的结尾，那是最常见的写法。
+REVEAL_HOLD_MAX_MS = 4000
+
+#: `direction=whole` 时母版不做推进插值，所以它的 `duration_ms` 只用来占位。
+#: 今天 **不额外校验**（写 0 也收）：一个「整块显示」的元素，谁也说不出它的时长该是多少，
+#: 凭空定一个下限只是给模型加一条背不出理由的规矩。这一条如实写在这里，别当成漏。
+_REVEAL_FIELDS = ("id", "label", "sequence", "narrative_role", "subtitle_ref",
+                  "region", "direction", "start_ms", "duration_ms", "protected")
+
+
+def _reveal_ints(rect: Any) -> tuple[dict[str, int] | None, str]:
+    """`region{整数像素}` → 四个整数；不是整数就退回（连同理由）。"""
+    if not isinstance(rect, Mapping):
+        return None, f"region 不是对象（{type(rect).__name__}）"
+    out: dict[str, int] = {}
+    for k in ("x", "y", "w", "h"):
+        v = rect.get(k)
+        # `True` 是 int 的子类：`isinstance(True, int)` 为真，所以先排掉 bool，
+        # 再要求值本身是 int 或「整数值的字符串/浮点」。坐标不许是 12.5——
+        # 半像素坐标在不同画幅下取整方向不同，两处一取整就成了两把尺。
+        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+            return None, f"region.{k}={v!r} 不是数字"
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None, f"region.{k}={v!r} 不是数字"
+        if f != int(f):
+            return None, f"region.{k}={v!r} 不是整数像素"
+        out[k] = int(f)
+    if out["w"] <= 0 or out["h"] <= 0:
+        return None, f"region 的宽高读到 {out['w']}×{out['h']}（必须为正）"
+    return out, ""
+
+
+def _reveal_size(raw: Any) -> tuple[tuple[int, int] | None, str]:
+    """`canvas` → `(w, h)`（正整数两栏）；缺栏或非整数退回。"""
+    if not isinstance(raw, Mapping):
+        return None, f"不是对象（{type(raw).__name__}）"
+    pair: list[int] = []
+    for k in ("w", "h"):
+        v = raw.get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+            return None, f"{k}={v!r} 不是数字"
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None, f"{k}={v!r} 不是数字"
+        if f != int(f) or int(f) <= 0:
+            return None, f"{k}={v!r} 不是正整数像素"
+        pair.append(int(f))
+    return (pair[0], pair[1]), ""
+
+
+def _reveal_ms(value: Any) -> int | None:
+    """毫秒栏 → 非负整数；不是就 None（连同 NaN/负值一起退回）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != int(f) or f < 0:
+        return None
+    return int(f)
+
+
+def reveal_canvas(raw: Mapping[str, Any]) -> tuple[int, int] | None:
+    """`reveal.canvas` → `(w, h)`；缺这一栏或不是正整数像素时退回 `None`。
+
+    单独开一个口子（而不是让调用方去碰 `_reveal_size` 那两个返回值），是为了让
+    「canvas 怎么读」只有**一处**实现：尺寸对账（`code_render._check_reveal_canvas`）
+    与 ㉘ 的形状校验必须用同一套读法，否则会出现一处认 `"1024"`、另一处不认这种
+    「两边都说自己判了」的局面。非法那一档 ㉘ 会报（它才是形状的主人），这里不重复报。
+    """
+    size, _why = _reveal_size(raw.get("canvas"))
+    return size
+
+
+def reveal_probe_frames(shot: Mapping[str, Any], *, frames: int, fps: int) -> list[int]:
+    """这一镜 ㉗ 要取证的**帧号**（升序去重；没申报 `reveal` 时是空表）。
+
+    取法：每一块「**应该刚画满**」的那一帧 = `ceil((start_ms + duration_ms) / 1000 × fps)`。
+
+    为什么只要这几个时刻（而不是每帧都取）：「到点必须已显示」与「未到点必须是纸底」
+    这两句话在**同一帧**上同时判得动——在这一帧上，这一块必须已经画满，而它后面那些块
+    必须还是纸底。于是 `n` 块只要 `n` 个时刻，㉗ 就同时把两个方向都看住了：
+    某块提前露出来，会在**前一块**的那个时刻被抓到；某块到点没显示，在它自己的时刻被抓到。
+    逐帧取是 `n × fps` 个采样，而多出来的那些帧说的还是同一件事。
+
+    越界钳到 `[0, frames-1]`：申报写到这一幕之外（㉘ 不判这个——它是「这一幕多长」的
+    问题，不是这一块的几何错）时，取这一镜**最后一帧**；那一帧仍然能证「到点没显示」。
+    """
+    raw = shot.get("reveal")
+    if not isinstance(raw, Mapping):
+        return []
+    regions = raw.get("regions")
+    if not isinstance(regions, (list, tuple)):
+        return []
+    last = max(0, int(frames) - 1)
+    out: set[int] = set()
+    for r in regions:
+        if not isinstance(r, Mapping):
+            continue
+        start = _reveal_ms(r.get("start_ms"))
+        dur = _reveal_ms(r.get("duration_ms"))
+        if start is None or dur is None:
+            continue
+        at = int(-(-(start + dur) * int(fps) // 1000))       # 向上取整的整数写法
+        out.add(max(0, min(last, at)))
+    return sorted(out)
+
+
+def check_reveal_regions(shot: Mapping[str, Any]) -> list[str]:
+    """闸㉘ 镜级 `reveal` 栏的**形状合法性**（R12-T59），→ 错误清单（空＝过或没申报）。
+
+    判六件事，全部是纯 schema 校验（不读像素、不读库，与 闸⑯ 的写法那一半同族）：
+
+    1. `canvas` 两栏是**正整数**；每个 `region` 四栏是**整数像素**（浮点坐标打回：
+       半像素在不同画幅下取整方向不同，两处一取整就成了两把尺）；
+    2. `region ⊂ canvas`（越界的区域在画面上永远揭不开——母版按 canvas→盒 的比例换算，
+       越界部分一乘就是画外，而账上它看着是合法的）；
+    3. `sequence` **从 1 起、连续、不重复**（它是母版排揭示顺序、㉗ 找「后续区域」的唯一
+       依据：有洞或有重号，两处就会各排出一个顺序）；
+    4. **幕内 `start_ms` 两两不重叠**——按 sequence 排好的相邻两段，
+       `前段 start_ms + duration_ms ≤ 后段 start_ms`；重叠的两段会同时推进两个 mask，
+       画面上是两块一起揭开，而账上读作「依次」；
+    5. `scene_duration_ms == 末段结束 + 停留`，停留 ∈ [0, :data:`REVEAL_HOLD_MAX_MS`]，
+       **且等式必须写对**：账上的幕时长是拼接与验收读的那个数，差一毫秒就是两笔账；
+    6. `protected[]` 里的每个 id 都在本镜区域里（保护一个不存在的区域＝这句话没有对象）。
+
+    **拿不准的不许记成过**（D-未判不绿的反面用法）：这一条判的是**形状**，形状缺栏一律
+    打回而不是「未判」——闸前这一层没有「未判」这个出口，未判属于需要真机读数的那几条
+    （㉗）。所以这里宁可退回让模型补全，也不放一份读不懂的申报进渲染。
+    """
+    errors: list[str] = []
+    raw = shot.get("reveal")
+    if raw is None:
+        return errors                       # 没申报＝这一镜不走这一族风格，㉘ 不适用
+    sid = str(shot.get("id") or "")
+    head = f"闸㉘ 标注层：{sid}："
+    if not isinstance(raw, Mapping):
+        return [f"{head}reveal 不是对象（{type(raw).__name__}）——"
+                f"这一栏要么不写，要么写成 {{canvas, scene_duration_ms, regions[]}}"]
+
+    cw = ch = None
+    got_canvas, why = _reveal_size(raw.get("canvas"))
+    if got_canvas is None:
+        _err(errors, f"{head}reveal.canvas 读不出来：{why}——区域坐标以插画原图的像素"
+                     f"为单位，没有 canvas 就说不清这四个数是画在哪张图上的")
+    else:
+        cw, ch = got_canvas
+
+    regions = raw.get("regions")
+    if not isinstance(regions, (list, tuple)) or not regions:
+        return errors + [f"{head}reveal.regions 为空——申报了这一族风格就得说清有几块、"
+                         f"按什么顺序揭"]
+
+    seen_ids: set[str] = set()
+    seqs: list[int] = []
+    spans: list[tuple[int, int, int, str]] = []      # (sequence, start_ms, end_ms, id)
+    prot: list[tuple[str, list[str]]] = []
+    for i, r in enumerate(regions, 1):
+        rid = str(r.get("id") or "").strip() if isinstance(r, Mapping) else ""
+        if not rid:
+            _err(errors, f"{head}第 {i} 块没有 id——它是顺序、保护栏与回执三处的指针")
+            rid = f"#{i}"
+        if rid in seen_ids:
+            _err(errors, f"{head}id 重复：{rid!r}（回执与 protected 都按 id 指，重号就指不准）")
+        seen_ids.add(rid)
+        if not isinstance(r, Mapping):
+            _err(errors, f"{head}第 {i} 块不是对象（{type(r).__name__}）")
+            continue
+        # 多出来的键**当场退回**，不静默忽略：这一栏的名字有两种写法的诱惑
+        # （`startMs` 与 `start_ms` 只差一个下划线），静默忽略＝模型以为它申报了时序，
+        # 而母版读到的是「没有开始时刻」——两边的账就这么分开了。
+        extra = sorted(set(r) - set(_REVEAL_FIELDS))
+        if extra:
+            _err(errors, f"{head}{rid}：不认的栏位 {extra}——这一族只认 "
+                         f"{', '.join(_REVEAL_FIELDS)}（毫秒与逐块栏位一律下划线写法，"
+                         f"`startMs` 这种驼峰不认，别两处各写一个名字）")
+        seq = r.get("sequence")
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            _err(errors, f"{head}{rid}：sequence={seq!r} 不是整数")
+            seq = None
+        else:
+            seqs.append(seq)
+        start = _reveal_ms(r.get("start_ms"))
+        dur = _reveal_ms(r.get("duration_ms"))
+        if start is None:
+            _err(errors, f"{head}{rid}：start_ms={r.get('start_ms')!r} 不是非负整数毫秒")
+        if dur is None:
+            _err(errors, f"{head}{rid}：duration_ms={r.get('duration_ms')!r} 不是非负整数毫秒")
+        if start is not None and dur is not None and seq is not None:
+            spans.append((seq, start, start + dur, rid))
+        direction = str(r.get("direction") or "").strip().lower()
+        if direction not in REVEAL_DIRECTIONS:
+            _err(errors, f"{head}{rid}：direction={r.get('direction')!r} 不是一条推进方向"
+                         f"（可用：{', '.join(REVEAL_DIRECTIONS)}）")
+        canon, why = _reveal_ints(r.get("region"))
+        if canon is None:
+            _err(errors, f"{head}{rid}：{why}")
+        elif cw is not None and ch is not None:
+            x, y, w, h = canon["x"], canon["y"], canon["w"], canon["h"]
+            if x < 0 or y < 0 or x + w > cw or y + h > ch:
+                _err(errors, f"{head}{rid}：区域 {x},{y} {w}×{h} 超出了 canvas "
+                             f"{cw}×{ch}——越界的那部分按比例换算到画面上是画外，"
+                             f"永远揭不开，而账上它看着合法")
+        sub = r.get("subtitle_ref")
+        if sub is not None:
+            idx = _reveal_ms(sub)
+            if idx is None or idx < 1:
+                _err(errors, f"{head}{rid}：subtitle_ref={sub!r} 不是「第几个词」"
+                             f"（从 1 起的整数，与 `subtitle:<i>` 锚同一套序号）")
+        got_prot = r.get("protected")
+        if got_prot is not None:
+            if not isinstance(got_prot, (list, tuple)):
+                _err(errors, f"{head}{rid}：protected 不是数组")
+            else:
+                prot.append((rid, [str(p) for p in got_prot]))
+
+    # ③ sequence 从 1 连续不重复：只在每一块都给出了整数 sequence 时才判——
+    # 已有别的红在上面点了名，这里再报一次同一件事只是噪声。
+    if seqs and len(spans) == len(seqs) and sorted(seqs) == list(range(1, len(seqs) + 1)):
+        pass
+    elif seqs:
+        _err(errors, f"{head}sequence 必须从 1 起、连续、不重复，实得 {sorted(seqs)}"
+                     f"（{len(regions)} 块）——母版排揭示顺序与 ㉗ 找「后续区域」都按它，"
+                     f"有洞或有重号，两处会各排出一个顺序")
+
+    # ④ 幕内 start_ms 两两不重叠（按 sequence 排序后判相邻）
+    ordered = sorted(spans)
+    for (s1, a1, e1, id1), (s2, a2, _e2, id2) in zip(ordered, ordered[1:]):
+        if a2 < e1:
+            _err(errors, f"{head}{id1}（第 {s1} 块，{a1}–{e1} ms）与 {id2}"
+                         f"（第 {s2} 块，{a2} ms 起）**在时间上重叠**——两块会同时推进"
+                         f"各自的 mask，画面上是一起揭开，而账上读作「依次」")
+
+    # ⑤ 幕时长等式：末段结束 + 停留
+    if ordered:
+        last_end = ordered[-1][2]
+        scene = _reveal_ms(raw.get("scene_duration_ms"))
+        if scene is None:
+            _err(errors, f"{head}scene_duration_ms={raw.get('scene_duration_ms')!r} "
+                         f"不是非负整数毫秒——它是这一幕的总长，拼接按它对齐")
+        else:
+            hold = scene - last_end
+            if hold < 0:
+                _err(errors, f"{head}scene_duration_ms={scene} ms **短于**末段结束 "
+                             f"{last_end} ms——最后一笔还没画完这一幕就结束了")
+            elif hold > REVEAL_HOLD_MAX_MS:
+                _err(errors, f"{head}scene_duration_ms={scene} ms 比末段结束 {last_end} ms "
+                             f"多出 {hold} ms 的停留，超过 {REVEAL_HOLD_MAX_MS} ms 上限"
+                             f"——这么长的空等要么是时长算错了，要么该拆成两幕")
+
+    # ⑥ protected 指向本镜真有的区域
+    for rid, ids in prot:
+        ghost = [p for p in ids if p and p not in seen_ids]
+        if ghost:
+            _err(errors, f"{head}{rid}：protected 里的 {ghost} 不在本镜区域里"
+                         f"——保护一个不存在的区域＝这句话没有对象")
     return errors
 
 
@@ -2983,6 +3426,110 @@ def spec_schema() -> dict[str, Any]:
                                                        "所以别把整句话的词都挂上来"},
                                 }}},
 
+                        # 闸㉘（R12-T59）。**挂在这一族里**（与 `motion` 并排，不另起
+                        # 一个「元素申报」的顶层口）：两者回答的是同一个问题的两侧——
+                        # `motion` 说「这条动效为哪条数据动」，`reveal` 说「这一块画面
+                        # 什么时候揭」。分成两个口，模型迟早会只写一个。
+                        #
+                        # **不进 required**：这一族风格（分区揭示）是可选画法，绝大多数
+                        # 片子不写它。真写了的那一镜，㉘ 逐条判它的几何与时序（判据在
+                        # `check_reveal_regions`，一次请求都不发就判完）。
+                        "reveal": {
+                            "type": "object",
+                            "description": "**分区揭示**：把画面当纸，一块一块按顺序画出来"
+                                           "（白板讲解风）。只在你要这一镜真的分块揭示时写，"
+                                           "不写＝这一镜不走这一族。写了就要写全三样："
+                                           "`canvas`（插画原图的像素尺寸，区域坐标以它为"
+                                           "单位）、`scene_duration_ms`（这一幕总长＝末段"
+                                           "结束＋停留，停留 ≤ "
+                                           f"{REVEAL_HOLD_MAX_MS} ms）、`regions[]`。"
+                                           "闸㉘ 判：整数像素坐标、区域不出 canvas、"
+                                           "sequence 从 1 连续不重复、幕内 start_ms 两两"
+                                           "不重叠、幕时长等式成立、protected 指得着；"
+                                           "闸㉗ 再拿真帧比色判「未开始的区域是不是还是"
+                                           "纸底」",
+                            "required": ["canvas", "scene_duration_ms", "regions"],
+                            "properties": {
+                                "canvas": {
+                                    "type": "object", "required": ["w", "h"],
+                                    "description": "插画**原图**的像素尺寸——区域坐标的"
+                                                   "坐标系。必须与你 `assets` 里那张图的真"
+                                                   "尺寸一致（渲染前按库里那一行核对，"
+                                                   "对不上直接退回）",
+                                    "properties": {"w": {"type": "integer"},
+                                                   "h": {"type": "integer"}}},
+                                "scene_duration_ms": {
+                                    "type": "integer",
+                                    "description": "这一幕的总长（毫秒）＝最后一段结束 + "
+                                                   "停留。这个等式是 ㉘ 的一条判据："
+                                                   "账上的时长要能一眼算出来"},
+                                "regions": {
+                                    "type": "array", "minItems": 1,
+                                    "description": "按揭示顺序的一块块元素。"
+                                                   "一块＝画面上一个矩形区域，"
+                                                   "按 direction 推进地把纸画满",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["id", "sequence", "region",
+                                                     "direction", "start_ms",
+                                                     "duration_ms"],
+                                        "properties": {
+                                            "id": {"type": "string",
+                                                   "description": "本镜内唯一的名字"
+                                                                  "（顺序、protected、回执"
+                                                                  "三处都按它指）"},
+                                            "label": {"type": "string",
+                                                      "description": "这一块画的是什么"
+                                                                     "（给人看的一句话）"},
+                                            "sequence": {"type": "integer",
+                                                         "description": "第几块，从 1 起、"
+                                                                        "连续、不重复"},
+                                            "narrative_role": {
+                                                "type": "string",
+                                                "description": "它在叙事里干什么"
+                                                               "（建立 / 对比 / 结论…）"},
+                                            "subtitle_ref": {
+                                                "type": "integer",
+                                                "description": "这一块与旁白第几个词对齐"
+                                                               "（从 1 起，与 "
+                                                               "`subtitle:<i>` 锚同一套"
+                                                               "序号）"},
+                                            "region": {
+                                                "type": "object",
+                                                "required": ["x", "y", "w", "h"],
+                                                "description": "画在哪：**整数像素**，"
+                                                               "坐标系是 `canvas`"
+                                                               "（半像素不收——不同画幅下"
+                                                               "取整方向不同，两处一取整"
+                                                               "就成了两把尺）",
+                                                "properties": {
+                                                    "x": {"type": "integer"},
+                                                    "y": {"type": "integer"},
+                                                    "w": {"type": "integer"},
+                                                    "h": {"type": "integer"}}},
+                                            "direction": {
+                                                "type": "string",
+                                                "enum": list(REVEAL_DIRECTIONS),
+                                                "description": "这一块往哪个方向推进："
+                                                               "ltr 左→右 / rtl 右→左 / "
+                                                               "ttb 上→下 / btt 下→上 / "
+                                                               "whole 整块一次显示"},
+                                            "start_ms": {"type": "integer",
+                                                         "description": "这一块从这一幕的"
+                                                                        "第几毫秒开始画"},
+                                            "duration_ms": {
+                                                "type": "integer",
+                                                "description": "画这一块用多少毫秒"},
+                                            "protected": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                                "description": "这一块**不许覆盖**的"
+                                                               "其它块 id——画到它们头上"
+                                                               "就说明顺序或坐标错了"
+                                                               "（㉗ 的允许掩码会把它们"
+                                                               "扣掉）"},
+                                        }}},
+                            }},
                         "fields": {
                             "type": "array", "maxItems": MAX_FIELDS_PER_SHOT,
                             "description": "这一镜**交出去给用户改的旋钮**（≤12 个）：把将来"

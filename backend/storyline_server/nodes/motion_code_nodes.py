@@ -40,6 +40,7 @@ from ..motion import code_patch as mcode
 from ..motion import code_render
 from ..motion import code_spec as cspec
 from ..motion import hitmap as mhit
+from ..motion import reveal_gate
 from ..motion import remotion_client as rc
 from .core_nodes import (SYNC_TOLERANCE_SEC, _JobProgress, _ev, _obj,
                          _resolve_target_duration)
@@ -432,6 +433,26 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             str(r.get("id")) for r in ledger
             if (r.get("motion_anchors") or {}).get("undetermined"))
         anchor_tol = max(1, int(out["fps"]) // cspec.MOTION_ANCHOR_TOLERANCE_DIV)
+        # 闸㉗ 的整片账（T61）：与 ㉑ 同规——这一道红了根本出不了片（渲染口就 raise 了），
+        # 报告层只**摊开**渲染层带回来的那串理由，不重算。
+        #
+        # 「申报了揭示」同样读 **spec 里那一栏**（`s.get("reveal")`），不读账里的
+        # `r["reveal"]`：后者每一镜都有（`META_FIELDS` 里那一栏），拿它当「申报」
+        # 会把「每一镜都申报了揭示」写进回执——而这条链上**绝大多数镜根本没有揭示**，
+        # ㉗ 对它们连不适用都算不上，只是没事。
+        reveal_declared = [str(s.get("id")) for s in spec["shots"] if s.get("reveal")]
+        reveal_undet = [u for r in ledger
+                        for u in ((r.get("reveal") or {}).get("undetermined") or [])]
+        reveal_undet_shots = sorted(str(r.get("id")) for r in ledger
+                                    if (r.get("reveal") or {}).get("undetermined"))
+        # 「判完了」只在**申报过**、且账上**确有这一栏**的镜里数：没申报的镜没有「判完了」
+        # 这回事（它们那一栏是空的，不是绿的）；账上根本没这一栏的（旧缓存、或这一镜没走到
+        # 那一步）也不许算进「判完了」——数多了就是把「没判过」报成「判过」。
+        reveal_rows = {str(r.get("id")): r.get("reveal") for r in ledger
+                       if isinstance(r.get("reveal"), Mapping)}
+        reveal_clear = [sid for sid in reveal_declared
+                        if sid in reveal_rows
+                        and not (reveal_rows[sid].get("undetermined") or [])]
         # 闸⑰ 的整片账（T23）：这一道判在拼接之前（红了根本出不了片），所以它的读数由
         # 渲染层带回来（`code_render` 的 `av_accounting`），报告层只**摊开**不重算——
         # 重算就会出现「判的时候 0.97、报的时候 0.99」这种两把尺。
@@ -584,6 +605,31 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                       f"就注进去了）、`beat:<n>` 这条链没有节拍表；申报条数与像素段数不等也"
                       f"落未判（对不齐就说不清哪条对哪段）。**所以「锚到必然存在字段上」这条"
                       f"绕法今天只被闸前那一半挡着**，见 §9-Q98，不许被说成「㉑ 已完全挡住」"
+                if ledger else "这份分镜没有镜头"),
+            _ev(f"闸㉗ 揭示时序（画面上什么时候该露出哪一块，按像素判）："
+                + (f"{len(reveal_declared)}/{len(ledger)} 镜申报了分区揭示，其中 "
+                   f"{len(reveal_clear)} 镜在各自的开演时刻上逐点比过色"
+                   if reveal_declared else "这份分镜一镜都没申报分区揭示（这一档不存在）")
+                + (f"；**未判**的镜：{'、'.join(reveal_undet_shots)}"
+                   f"（未判 ≠ 通过——底色取样失败、母版没回读分区、画面带原点读不到的"
+                   f"都落这一档；具体理由见下）"
+                   if reveal_undet_shots else "")
+                + ("；" + "；".join(reveal_undet) if reveal_undet else ""),
+                "machine",
+                verified=(bool(reveal_declared)
+                          and len(reveal_clear) == len(reveal_declared)
+                          and not reveal_undet),
+                proof="三样东西都不经过模型：① 母版在它自己算出的允许掩码上回读矩形"
+                      "（`DG_REVEAL:` 行，**只有母版一处实现**——画布像素换算成元素内坐标"
+                      "这件事不能有第二把尺）；② ffmpeg 抽那一帧的 RGB24，在掩码内按 3×3 "
+                      f"网格取点（全程 ffmpeg + 纯 Python，**不引图像库**）；③ 与「插画原图"
+                      "四角内缩取样量出来的纸底色」比 CIE76 的 ΔE。判据两句话："
+                      f"`start_ms` 还没到的块，掩码里必须**全是纸底**（ΔE ≤ "
+                      f"{reveal_gate.PAPER_DELTA_E_MAX:g}）；已经画完的块，掩码里必须"
+                      "**不全是纸底**。这一条是这族风格唯一吃像素的判据——满幅插画下"
+                      "⑲-a 的主体占比天然 ≈1、㉕ 的徽章四条也不触发。"
+                      "**基准从不写死常量**（只能从原图量，量不到就未判），"
+                      "所以「把基准换成纯白就全绿」这条绕法没有入口"
                 if ledger else "这份分镜没有镜头"),
             _ev(f"闸⑰ 音画数据对账："
                 + (f"BGM {av['bgm_sec']}s / 成片 {av['film_sec_planned']}s"
@@ -898,6 +944,13 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             # 把「动效密度过了」当成「动效锚定过了」，那正是未判不许绿的那条口径要防的。
             "motion_anchor_warnings": anchor_warns,
             "motion_anchor_unjudged": anchor_undet,
+            # 闸㉗（T61）同规：**指标栏与未判栏都要另起**，不许并进上面那两栏。
+            # ㉑ 判的是「动效为哪条数据服务」、㉗ 判的是「画面上什么时候该露出哪一块」，
+            # 一镜完全可能 ㉑ 过、㉗ 未判（母版没回读分区）或反过来。
+            # 没有任何镜申报揭示时 `reveal_declared` 是空的——那一档在回执上写「不存在」，
+            # 不是写「通过了」。
+            "reveal_declared_shots": reveal_declared,
+            "reveal_unjudged": reveal_undet,
             "master_hash": out["master_hash"],
             "lockfile_hash": out["lockfile_hash"],
             "gl": out["gl"],

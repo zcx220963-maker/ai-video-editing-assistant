@@ -12,6 +12,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
+from ..asset_scale import verdict_of as scale_verdict_from
 from ..media_replay import drain_rendered_media, reset_rendered_media
 from ..plan_replay import drain_plan_round, reset_plan_cards
 from .db import Cond, Datastore, IntegrityConflict, in_, is_null, le, not_null
@@ -1365,7 +1366,9 @@ class AssetLibraryRepo(_Repo):
                   tags: str = "[]", caption: str = "", era: str = "",
                   width: int | None = None, height: int | None = None,
                   enabled: bool = True,
-                  asset_id: str | None = None) -> dict[str, Any]:
+                  asset_id: str | None = None,
+                  asset_role: str = "",
+                  scale_facts: dict[str, Any] | None = None) -> dict[str, Any]:
         """入库一行素材。每行必须带 license（§5.2 硬约束）。
 
         ``enabled`` 默认 True（入库即启用，策展库的常规路径）。出图产物走
@@ -1382,6 +1385,15 @@ class AssetLibraryRepo(_Repo):
             "license_url": license_url, "subject": subject,
             "style_family": style_family, "tags": tags, "caption": caption,
             "era": era, "enabled": enabled, "fetched_at": _now(),
+            # R11-T53/T54：角色与「最细笔画够不够细」两格。默认值就是「机器还没标」
+            # （role 空串、scale None）——入库脚本算得出来才传，算不出来留空，
+            # 不留「猜一个」的入口（Q114）。
+            "asset_role": asset_role,
+            # `scale_safe` **没有入参**，只能从实测回执里取（T54 的验收：「任何写入
+            # 路径都不接受人工传入的 scale_safe」）。做成参数就有一个调用点可以传
+            # `True` 而 `scale_facts` 里什么都没有——那正是「人填」的原形。
+            "scale_safe": scale_verdict_from(scale_facts),
+            "scale_facts": json.dumps(scale_facts or {}, ensure_ascii=False),
         })
 
     async def get(self, asset_id: str) -> dict[str, Any] | None:
@@ -1412,10 +1424,15 @@ class AssetLibraryRepo(_Repo):
     async def search(self, query: str, *, subject: str | None = None,
                      style_family: str | None = None,
                      source: str | None = None,
+                     asset_role: str | None = None,
                      limit: int = 20) -> list[dict[str, Any]]:
         """检索内置素材库：2-gram 文件名/caption/subject 匹配 + 可选过滤。
 
         只返回 ``attribution_required=false`` 的资产（§5.2：需署名的不进检索结果）。
+        ``asset_role``（R11-T53）按「素材在片子里的角色」过滤，取值见
+        ``agent_framework.asset_sources.ASSET_ROLES``；**不传＝不过滤**（未判的那些件
+        只在不传时才进结果——按角色找件的人本来就不该拿到未判件，但「随便搜搜」
+        不该因为这一栏空着就搜不到东西）。
         """
         where: dict[str, Any] = {"attribution_required": False, "enabled": True}
         if subject:
@@ -1424,6 +1441,8 @@ class AssetLibraryRepo(_Repo):
             where["style_family"] = style_family
         if source:
             where["source"] = source
+        if asset_role:
+            where["asset_role"] = asset_role
         rows = await self.db.select(self.table, where=where,
                                     order_by=["-created_at"], limit=limit * 3)
         if query:
@@ -1443,3 +1462,20 @@ class AssetLibraryRepo(_Repo):
             where["source"] = source
         rows = await self.db.select(self.table, where=where, limit=100000)
         return len(rows)
+
+    async def set_facts(self, asset_id: str, *, asset_role: str = "",
+                        scale_facts: dict[str, Any] | None = None) -> None:
+        """把机器算出来的两格（角色 / 最细笔画）写回已有行（R11-T53/T54 的补标路径）。
+
+        与 ``add`` 分开是为了让「补标」不必重走一次入库：入库那一路要 MinIO 里真有字节，
+        而补标只需要**读**已有的对象。方法名带 `facts` 也是刻意的——库里除了这条路径，
+        没有别的地方会改这两列，谁改的、改的是哪两格一眼看得见。
+
+        `scale_safe` 同样**没有入参**（T54）：它是 `scale_facts['verdict']` 的投影，
+        人填不进一个与实测无关的布尔值。
+        """
+        await self.db.update(self.table, {
+            "asset_role": asset_role,
+            "scale_safe": scale_verdict_from(scale_facts),
+            "scale_facts": json.dumps(scale_facts or {}, ensure_ascii=False),
+        }, where={"id": asset_id})

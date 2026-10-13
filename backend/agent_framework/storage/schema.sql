@@ -76,6 +76,16 @@ CREATE TABLE IF NOT EXISTS asset_library (
   license_url          text NOT NULL DEFAULT '',
   subject              text NOT NULL DEFAULT '',
   style_family         text NOT NULL DEFAULT '',
+  -- R11-T53：素材在片子里的角色（icon/part/scene/texture/bg）。初值由机器推
+  -- （`agent_framework/asset_sources.py::asset_role_of`），人只做抽检——空串是
+  -- 「机器没标出来」（未判），不是「没有角色」，所以它不参与检索过滤的分母。
+  asset_role           text NOT NULL DEFAULT ''
+                       CHECK (asset_role IN ('','icon','part','scene','texture','bg')),
+  -- R11-T54：最细笔画实测是否 ≥2 px（`agent_framework/asset_scale.py`）。
+  -- **可空**是刻意的：NULL = 未判（量不出来，如栅格图或纯填充路径），
+  -- 与 false（量出来不够细）是两件事——并成一格会把「没量」说成「不合格」。
+  scale_safe           boolean,
+  scale_facts          jsonb NOT NULL DEFAULT '{}',
   tags                 text NOT NULL DEFAULT '[]',
   caption              text NOT NULL DEFAULT '',
   era                  text NOT NULL DEFAULT '',
@@ -86,6 +96,8 @@ CREATE TABLE IF NOT EXISTS asset_library (
 CREATE INDEX IF NOT EXISTS asset_subject_idx ON asset_library(subject, enabled);
 CREATE INDEX IF NOT EXISTS asset_style_idx   ON asset_library(style_family, enabled);
 CREATE INDEX IF NOT EXISTS asset_source_idx  ON asset_library(source, enabled);
+-- 角色过滤是检索侧真在用的路径（`search_illustration` 的 asset_role 过滤）。
+CREATE INDEX IF NOT EXISTS asset_role_idx    ON asset_library(asset_role, enabled);
 
 -- 分片续传账本：一行 = 一次「谁、往哪个会话、传多大文件、切成几块」。
 -- 只记计划不记进度：分片本身就放在对象存储的 uploads/ 前缀下，一块一个对象，

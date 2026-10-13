@@ -16,7 +16,7 @@ from .knobs import bare_node
 from .support import clean
 
 __all__ = ["preload_skills", "sections_for_plan", "changed_film_knobs",
-           "wants_sound_design"]
+           "wants_sound_design", "WHITEBOARD_SECTIONS", "SUPPLY_SECTIONS"]
 
 #: 写代码的节点（本轮的正文块几乎全由它们决定）。与 ``vocab._IMPLICIT_SKILLS`` 同一份
 #: 名单口径：那三个节点各挂一份 ``motion_explainer_skill``，所以这里就是「谁在写代码」。
@@ -39,6 +39,27 @@ MOTION_SECTIONS = ("motion-anchors", "subject-naming", "text-only-quota")
 
 #: 图像/部件通道的两块。成对发：讲「从哪取」与「取到之后动效闸怎么判」是同一件事的两半。
 IMAGE_SECTIONS = ("image-channel", "asset-motion")
+
+#: R11-T57 的两块：**部件怎么拼成一个场景**（闸㉕ 的活法）与**`scale_safe` 怎么用**。
+#: 通道条件是 ``motion`` **且** ``image`` 两条腿同时在计划里，缺一不发——
+#: 少了 ``image`` 这一腿，正文里那些 `search_illustration`/`asset_role` 今天根本调不到
+#: （那是「教一条今天走不通的路」）；少了 ``motion`` 这一腿，本轮没有人写镜头代码，
+#: 「一件放大铺满画面 = 一枚徽章」这句话没有读者。两块一起发，是因为第①条把「取不到件」
+#: 之后的下一步指给了第②条（换一件 / 改当 scene 用），拆开发出去只会各说一半。
+SUPPLY_SECTIONS = ("asset-parts", "scale-safe")
+
+#: R12-T62 的那一块：**出图腿的视觉规范**（手绘纸底那一族：纸底 `#F5EBD7`、深灰线、
+#: 点缀色 ≤3、画面内零文字）。通道条件是「**这一轮真会产出一张 raster 插画**」，
+#: 而它的机器可见形态就是计划里有 `imagegen`（出图节点）——那条规矩要写进的就是
+#: 这个节点唯一的入参 `prompt`。
+#:
+#: **为什么条件不是「有供给腿」**（`IMAGE_NODES` 那三条）：`search_illustration` /
+#: `select_illustration` 取的是库里现成的件，它们的观感不由我们定，把「统一出图视觉
+#: 规范」发给那一轮等于教模型一条它执行不了的路（§5.7 第②条那条「通道条件」的反面）。
+#: 也**必须**同时有写代码的节点：没有镜头代码就没有 `reveal` 申报与 `staticFile` 引用，
+#: 这一节的读者是「正在给某个镜头配图并把标注写出来的那个模型」，缺了它这一节没有读者。
+WHITEBOARD_SECTIONS = ("whiteboard-imagegen",)
+
 
 def _flag(value: Any) -> bool:
     """开关值 → 真假（``True`` / ``"true"`` / ``"1"`` / ``"yes"`` 都算真）。"""
@@ -124,12 +145,16 @@ def sections_for_plan(compiled: Any, card: Any = None) -> tuple[str, ...]:
     """本片计划 → 这次点名要的正文块（升序；空表＝只要默认集）。
 
     ``compiled`` 是执行轮的编译结果（``{"steps": [{node, params, …}]}``），``card`` 是那张
-    计划卡（可选，只为读 ``param_options[].default``）。判据四条，逐条都能反证：
+    计划卡（可选，只为读 ``param_options[].default``）。判据五条，逐条都能反证：
 
     1. 计划里有写代码的节点（``MOTION_NODES``）→ 发 ``MOTION_SECTIONS`` 三块；
     2. 计划**动过**整片开关 → 追加 ``film-knobs``（见 ``changed_film_knobs``）；
     3. 计划里有供给腿节点（``IMAGE_NODES``）→ 发 ``IMAGE_SECTIONS`` 两块；
-    4. 本片有旁白或配乐 → 追加 ``sound-design``（见 ``wants_sound_design``）。
+    4. 本片有旁白或配乐 → 追加 ``sound-design``（见 ``wants_sound_design``）；
+    5. 写代码**且**有供给腿 → 追加 ``SUPPLY_SECTIONS`` 两块（T57；条件是两条腿**同时**
+       在计划里，理由见 ``SUPPLY_SECTIONS`` 上面那段）；
+    6. 写代码**且**计划里有 `imagegen` → 追加 ``WHITEBOARD_SECTIONS`` 一块（T62；
+       条件比第 5 条窄一档，理由见 ``WHITEBOARD_SECTIONS`` 上面那段）。
 
     计划里**一个 motion 节点都没有**时返回空表：那一轮要么是常规剪辑（另一份技能），
     要么只是问一句——此时 ``preload_skills`` 的 ``names`` 本来也不含这份技能，
@@ -137,8 +162,10 @@ def sections_for_plan(compiled: Any, card: Any = None) -> tuple[str, ...]:
     """
     steps = _steps(compiled)
     nodes = _nodes(steps)
+    writes_code = bool(nodes.intersection(MOTION_NODES))
+    has_supply = bool(nodes.intersection(IMAGE_NODES))
     out: list[str] = []
-    if nodes.intersection(MOTION_NODES):
+    if writes_code:
         out.extend(MOTION_SECTIONS)
         if changed_film_knobs(compiled, card):
             out.append("film-knobs")
@@ -146,8 +173,12 @@ def sections_for_plan(compiled: Any, card: Any = None) -> tuple[str, ...]:
             out.append("sound-design")
     if "patch_motion_code" in nodes:
         out.append("patch-motion")
-    if nodes.intersection(IMAGE_NODES):
+    if has_supply:
         out.extend(IMAGE_SECTIONS)
+    if writes_code and has_supply:
+        out.extend(SUPPLY_SECTIONS)
+    if writes_code and "imagegen" in nodes:
+        out.extend(WHITEBOARD_SECTIONS)
     return tuple(sorted(set(out)))
 
 

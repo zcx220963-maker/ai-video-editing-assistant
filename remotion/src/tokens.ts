@@ -131,4 +131,14 @@ export const LAYOUT_PROBE = {
  *  server.mjs 比对两帧的快照，判定三态。 */
 export const ASSET_LOG_MARKER = 'DG_ASSETS:';
 
+/** 闸㉗ 分区揭示回读的行首标记（R12-T60/T61，与闸⑧⑪ 同一条 console.log 通道）。
+ *
+ *  与其它几条回读最大的不同：它**不在探针帧上扫地**，而是只在 Python 点名的
+ *  那几个帧（`revealProbeFrames`）各报一行——㉗ 要的是「区域到点/未到点的那一刻
+ *  画面上是什么」，那一刻是**算出来的**（区域自己的 start/duration + fps），
+ *  不是末帧那一格。母版报的是**它自己算出来的允许掩码**（成片像素、带内坐标），
+ *  Python 拿它去采样比色——「区域落在哪儿」只有一处实现，就是这里（两处各算一遍
+ *  就是两把尺：母版按 img 的实时盒换算，Python 没有那个盒）。 */
+export const REVEAL_LOG_MARKER = 'DG_REVEAL:';
+
 export type SubtitleMode = (typeof SUBTITLE_MODES)[number];

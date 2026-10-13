@@ -2,7 +2,7 @@
 name: motion_explainer_skill
 display: 图文科普片（零素材出片）
 description: 【WORKFLOW SKILL】没有视频素材、用户只给一个选题时的出片流程：自己查资料 → 写每镜文案 → 每镜选一张shot配方卡+填参数（不写渲染代码）→ 人声旁白配逐词字幕 → 一条成片。适用于科普、历史、概念解释类短片，或用户明确说「我没有素材，你自己找内容做一条」。A zero-material workflow: research, write per-shot copy, select shot recipe cards and fill params, narrate and render.
-sections: film-knobs, patch-motion, sound-design, image-channel, asset-motion, subject-naming, motion-anchors, text-only-quota
+sections: film-knobs, patch-motion, sound-design, image-channel, asset-motion, asset-parts, scale-safe, whiteboard-imagegen, subject-naming, motion-anchors, text-only-quota
 ---
 
 # 何时用这条通道（与常规剪辑的分界）
@@ -538,6 +538,77 @@ sha256，渲染前一帧都不烧就会红。素材来源分类 `materials.origi
 母版 `FilmLayout` 在 `probeFrame - 2`（首帧附近）和 `probeFrame`（末帧附近）两个时点
 扫一遍 `<img>`/`<video>`，记录 tag/src/box/transform/opacity。
 `server.mjs` 比对两帧快照，按 src 匹配，比较盒/transform/opacity 是否变化。
+<!-- /section -->
+
+<!-- section: asset-parts -->
+# 部件拼场景（闸㉕）：先取件，拼不出就明说
+
+一镜要有「一个场景」的样子，**先取件再画**——这是默认写法，不是备选：
+
+1. **取件**：`search_illustration(query="<本镜的具体物件名>", asset_role="part")`。
+   `asset_role` 五档：`icon` 一枚符号 / `part` 拼图部件 / `scene` 一整幅画面 /
+   `texture` 质感底 / `bg` 铺满屏的底图；空串＝未标。**按角色找件就点上这一栏**
+   ——不传时未标的件也会进结果（「随便搜搜」不该因为这一栏空着就搜不到东西）。
+   回执 `found[]` 每件带 `asset_role`、`scale_safe`、`width`/`height`、`sha256`。
+2. **拼场景**：`select_illustration(asset_id=…)` 取 **4~6 件**，摆到不同位置、大小错开、
+   彼此有前后或相邻关系。**一件放大铺满画面不是场景，是一枚徽章**——闸㉕ 判的就是这个
+   形状：整镜只有 1 件主体 + 它铺了带的 ≥22% + 中心离带正中 ≤8% + 长边/短边 ≤1.35，
+   四条同时成立 → 打回，回执把四个读数一起摆出来（`subject_boxes` 逐件盒 + `band`）。
+3. **拼不出来就明说无图**：回执的 `reason` 是三态——`hit` 命中 / `no_match` 库内确无此
+   类目（`note` 里带「这个源一共多少行」的证据）/ `source_not_available` 这条腿今天没通。
+   后两态**都不是**「那你画一个吧」：改走四条画法通道（`rough`/`three`/`katex`/`vector`）
+   把主体画出来，或如实降级——闸⑦ 的纯文字配额管占比，纯文字镜的 `subject` 照样要填
+   （闸⑯）。
+4. **不许自己写 `<path>` 拼一件「看起来像素材」的东西顶上**。这一条**今天没有闸在读**：
+   闸㉕ 看的是形状（多大、多正、多居中），不是「这件是谁画的」。所以它靠你守——理由不是
+   规矩，是效果：手画一件的真实物件画不出该有的细节，代价还比取件高；取不到件的那一镜，
+   正确的动作是第 3 条里那两条。
+
+拼出来的场景照样要填 `subject`（闸⑯ 每镜必填）。`subject_terms`（⑲-b 盲描述用的词族）
+**今天 schema 里没有这一栏**，别写——同「主体具名」那一节。
+<!-- /section -->
+
+<!-- section: scale-safe -->
+# 部件档的缩放实测（`scale_safe`）：不过线的件不得用作主体
+
+`scale_safe` 是**量出来的**，不是谁填的：把这件素材缩到它在片子里的最小尺寸（部件档＝
+画布短边 1080 的 0.18，即 194 px 那一档），量**最细笔画还剩几像素**，判据 ≥2 px
+（片子可能被平台二次压缩，1 px 的线压一刀就成灰雾）。库里**没有任何一条写入路径接受人工
+传值**——「我觉得这个够粗」不是一个输入。
+
+三态，只有一态能用：
+
+| `scale_safe` | 含义 | 用法 |
+|----|------|------|
+| `true` | 实测过、过线 | 可作主体（部件档最小的那一档也用得住） |
+| `false` | 实测过、不过线 | **不得用作主体**。缩到 0.18 会糊成一道灰雾——`select_illustration` 对 `asset_role` 是 `icon`/`part` 的件**当场拒收**。换一件，或改当 `scene`/`bg` 用（那一档按整幅画面放，不走 0.18 的缩放） |
+| `null` | **未判**：栅格件、纯填充路径量不出最细笔画 | 未判**不拦**，但回执 `scale_note` 会写明它没量过——别把「没量」当「合格」（D-未判不绿） |
+
+⚠️ 那条拒收**只住在 `select_illustration` 这一个节点里**：不经它、直接把 `asset_id`
+填进 `shots[].assets` 的话，今天没有任何一处会替你把这一栏看一眼。
+
+**别把两件事混成一件**：`scale_safe` 今天量的只是「最细笔画 ≥2 px」；墨色与所在底色的
+对比是**另一条**判据（`code_spec.contrast_ratio` / `CONTRAST_MIN`，在片子那侧按实际配色
+算，不在这一栏里）。
+<!-- /section -->
+
+<!-- section: whiteboard-imagegen -->
+# 出图腿的视觉规范（手绘纸底那一族）
+
+走「一整幅手绘插画 + 按叙事顺序把它露出来」这条路时，规范写进 `imagegen` 的 `prompt`。
+
+**四条硬规矩**：① 纸底 `#F5EBD7`，**禁纯白**（纯白底压一刀就不是纸了）；② 深灰线描
+（`#3A3A3A` 一带），线条是主角；③ 点缀色**上限三色**（红/橙/蓝一档），颜色是注解；
+④ **画面内零文字**——字母、数字、标签、刻度都不许有，文字全交给字幕层。
+外加两禁：禁写实/摄影/三维，禁复杂纹理。
+
+**三句话要一起写**：画面描述写「能被认出的东西」（闸⑯ 对 `subject` 用同一把尺）；
+一张图 = **一整幕**，配 `staticFile` 引用 + 一份 `reveal` 申报（没有 `reveal`，它只是静图）；
+`reveal.canvas` **必须等于这张图的真实像素尺寸**（闸㉘ 后半段拿库行 `width`/`height` 对账，
+对不上直接退回；库行没尺寸记**未判**，不是通过）。
+
+**这一格今天只有提醒**：「画面内零文字」没有判据。⑲-a 的 `text_share` **把母版字幕层
+也算进去了**，分不清画面内文字与字幕层，拿它打回必然误伤——别拿它自证清白或认罪（Q119）。
 <!-- /section -->
 
 <!-- section: subject-naming -->

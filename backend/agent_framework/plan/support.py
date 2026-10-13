@@ -82,6 +82,18 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 同一形状：`vocab.props_for` 只扫顶层，嵌套键扫不出来，不收就是假告警）。
     "motion_anchor_warnings", "motion_anchor_unjudged",
     "motion", "anchors", "kind",
+    # 闸㉗（分区揭示的时序一致，R12-T61）的产物键 + 它那一族**分镜 schema 的嵌套键**。
+    # `reveal_declared_shots` / `reveal_unjudged` 是整片账里那两栏（「申报了几镜」与
+    # 「哪几镜没判过」），技能正文要教模型照它们如实复述——这一栏比上面几栏更刺眼：
+    # 模型嘴上说「揭示时序已核」，而账上写着未判，正是 D-未判不绿 要防的那件事。
+    # 后面那一串（`reveal`/`canvas`/`scene_duration_ms`/`regions`/`region`/`direction`/
+    # `start_ms`/`duration_ms`/`protected`/`sequence`/`label`/`narrative_role`/`subtitle_ref`）
+    # 与 `motion`/`anchors`/`kind` 同一形状：它们在**分镜 schema 里**（不是臆造名），
+    # 但计划文案的词表只扫工具 schema 的顶层键，分镜里那层扫不到，不收就是假告警。
+    "reveal_declared_shots", "reveal_unjudged",
+    "reveal", "canvas", "scene_duration_ms", "regions", "region", "direction",
+    "start_ms", "duration_ms", "protected", "sequence", "label",
+    "narrative_role", "subtitle_ref",
     # 闸⑮（版式族配额）与闸⑯（主体具名）的产物键：技能正文要教模型「每镜写清 subject
     # 与 subject_channel」，卡面的逐镜账里这两栏与 style（代码里认得的通道）并排摆着。
     # `subject`/`subject_channel` **在 plan_motion 的 schema 里**（不是臆造名），但

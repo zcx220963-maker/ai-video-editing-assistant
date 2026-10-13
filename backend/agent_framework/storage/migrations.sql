@@ -90,3 +90,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_username_uidx ON users (username);
 -- (系统预置为 NULL 对所有人可见,用户添加的仅本人可见,删账号级联清理)。
 ALTER TABLE skills ADD COLUMN IF NOT EXISTS owner_user_id text REFERENCES users(id) ON DELETE CASCADE;
 ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS owner_user_id text REFERENCES users(id) ON DELETE CASCADE;
+
+-- R11-T53：asset_library 增 asset_role（素材在片子里的角色）。
+-- 老库的行一律先是空串（= 未判），补值只走机器那条路（`asset_ingest.py --backfill`），
+-- 不给人工 UPDATE 留入口——Q114 否决的就是「先人工标一遍再上线」那种作业。
+-- 约束在这里 DROP+ADD 的写法与 schema.sql 的建表期 CHECK **逐项相等**（与 materials.origin
+-- 那条同规）：本文件是唯一执行口，新建库走 schema.sql、老库走这里，两边必须落成同一形状。
+ALTER TABLE asset_library ADD COLUMN IF NOT EXISTS asset_role text NOT NULL DEFAULT '';
+ALTER TABLE asset_library DROP CONSTRAINT IF EXISTS asset_library_asset_role_check;
+ALTER TABLE asset_library ADD CONSTRAINT asset_library_asset_role_check
+  CHECK (asset_role IN ('','icon','part','scene','texture','bg'));
+CREATE INDEX IF NOT EXISTS asset_role_idx ON asset_library(asset_role, enabled);
+
+-- R11-T54：scale_safe（最细笔画实测 ≥2 px）与它的量法回执 scale_facts。
+-- **不加 NOT NULL、不设默认值**：NULL = 未判（栅格件、纯填充路径量不出最细笔画），
+-- false = 量出来不够细。两者并成一格，「今天没量」就会被读成「不合格」，
+-- 而 T54 的清单（哪些件要补）正是从这一格里数出来的。
+ALTER TABLE asset_library ADD COLUMN IF NOT EXISTS scale_safe boolean;
+ALTER TABLE asset_library ADD COLUMN IF NOT EXISTS scale_facts jsonb NOT NULL DEFAULT '{}';

@@ -16,34 +16,34 @@ import os
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 让 asset_common 可导入
+
+
+def _add_backend_to_path() -> None:
+    """把 `agent_framework` 放上 import 路径（同 `asset_ingest.py` 里那一份：
+    宿主是 `<仓库根>/backend`，容器是 `/app`）。"""
+    here = Path(__file__).resolve()
+    for cand in (here.parents[1] / "backend", Path("/app")):
+        if (cand / "agent_framework").is_dir():
+            sys.path.insert(0, str(cand))
+            return
+
+
+_add_backend_to_path()
+
+from agent_framework.asset_sources import probe_entries  # noqa: E402
 
 from asset_common import classify_failure  # noqa: E402
 
 UA = "CodeArts-AssetProbe/1.0 (https://codearts.huaweicloud.com)"
 
-PROBES = [
-    ("wikimedia-commons", "api",
-     "https://commons.wikimedia.org/w/api.php?action=query&list=categorymembers"
-     "&cmtitle=Category:Photographs&cmtype=file&format=json&cmlimit=1"),
-    ("wikimedia-commons", "file",
-     "https://commons.wikimedia.org/wiki/Special:FilePath/Example.jpg?width=800"),
-    ("iconify", "npm",
-     "https://registry.npmjs.org/@iconify/json/latest"),
-    ("polyhaven", "api",
-     "https://api.polyhaven.com/assets"),
-    ("ambientcg", "index",
-     "https://ambientcg.com/get?category=2-Pass&format=jpg&size=2048"),
-    ("open-peeps", "site",
-     "https://openpeeps.com"),
-    ("humaaans", "site",
-     "https://humaaans.com"),
-    ("kenney", "site",
-     "https://kenney.nl"),
-    ("quaternius", "site",
-     "https://quaternius.com"),
-]
+#: 探测清单**由注册表生成**（R11-T50）。它曾经是这里手写的 9 条，与入库脚本的 5 条腿、
+#: schema 里的 8 个源名互不相等——三份清单各说各的，正是「供给面撒谎」的入口。
+#: 量的是「这个源今天通不通」，与「模型能不能点它」是两件事：**没跑过的腿照样探**
+#: （那正是 T52 的输入），**射程外的源不探**（Q110：量它没有用途）。
+PROBES = probe_entries()
 
 
 def probe_one(source: str, endpoint: str, url: str, location: str) -> dict:

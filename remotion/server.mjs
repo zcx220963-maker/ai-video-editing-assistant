@@ -232,10 +232,12 @@ async function renderShot(payload) {
   const FIELD_MARKER = 'DG_FIELDS:';   //   与 src/tokens.ts 的 FIELD_LOG_MARKER 同名，两处一起改
   const LAYOUT_MARKER = 'DG_LAYOUT:';  //   与 src/tokens.ts 的 LAYOUT_LOG_MARKER 同名，两处一起改
   const ASSET_MARKER = 'DG_ASSETS:';   //   与 src/tokens.ts 的 ASSET_LOG_MARKER 同名，两处一起改
+  const REVEAL_MARKER = 'DG_REVEAL:';  //   与 src/tokens.ts 的 REVEAL_LOG_MARKER 同名，两处一起改
   let browserLogTruncated = false;
   let fieldsUsed = null;
   let layoutUsed = null;
   const assetSnapshots = {};  // { [frame]: { frame, assets: [{tag, src, box, transform, opacity}] } }
+  const revealSnapshots = {}; // { [frame]: { frame, canvas, boxes, regions: [{id, sequence, rects}] } }
   const onBrowserLog = (log) => {
     const text = String(log?.text ?? '');
     const at = text.indexOf(TOKEN_MARKER);   // 实测可能带 " Tab N, file:line " 前缀，不按行首判
@@ -282,6 +284,27 @@ async function renderShot(payload) {
       } catch (err) {
         warnings.push(`资产行解析失败：${String(err).slice(0, 120)}`);
       }
+      return;
+    }
+    const vat = text.indexOf(REVEAL_MARKER);
+    if (vat >= 0) {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text.slice(vat + REVEAL_MARKER.length));
+      } catch (err) {
+        warnings.push(`分区揭示行解析失败：${String(err).slice(0, 120)}`);
+        return;
+      }
+      // 同一帧被 seek 到两遍时取后一遍，但**两遍不一样必须记账**——与字段行同一规矩：
+      // ㉗ 拿这一行的矩形去抽帧采样，「同一帧两次算出不同的掩码」意味着这份账在这一镜上
+      // 不牢（多半是插画的盒在两遍之间变了：图首帧未加载完，盒是 0）。
+      // 不在这里判红：判红要读像素，那是 Python 侧（㉗）的事，这一层只如实搬。
+      const prev = revealSnapshots[parsed.frame];
+      if (prev && JSON.stringify(prev) !== JSON.stringify(parsed)) {
+        warnings.push(`分区揭示回读在第 ${parsed.frame} 帧出现两遍且内容不一致` +
+                      '（同一帧两次算出不同的允许掩码），取最后一遍——这一镜的 ㉗ 证据不牢');
+      }
+      revealSnapshots[parsed.frame] = parsed;
       return;
     }
     // 镜头代码里的 console.log 一律进 warnings（有上限，不让一段狂打的代码撑爆响应）
@@ -491,6 +514,12 @@ async function renderShot(payload) {
     // `undetermined` 与闸⑪ 同规：如实回传，下游不许读成通过。rejected 在这一步
     // 根本走不到这里（熔合前就 400 了），能到这个字段的只有 ok / undetermined。
     assets_gate: assetsGate,
+    // 闸㉗ 的原料（R12）：母版在 Python 点名的那几帧各回读一行「这一帧哪些区域允许被看见」
+    // （成片像素、带内坐标）。与 fields_used/layout_used 同规：没读到就是 null/空表，
+    // 这一层的 warnings 已经如实写了「解析失败/两遍不一致」，下游**不许**把空表读成
+    // 「每一块都没问题」——空表的正确读法是「这一镜没有分区揭示的申报，或通道没跑起来」，
+    // 两者要 ㉗ 自己去分辨（它手上有申报）。
+    reveal_used: Object.keys(revealSnapshots).length ? revealSnapshots : null,
     warnings,
   };
 }

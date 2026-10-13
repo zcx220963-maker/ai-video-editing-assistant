@@ -54,6 +54,8 @@ from ..providers import Providers
 from . import code_spec as cspec
 from . import remotion_client as rc
 from . import render as rpipe
+from . import reveal_gate
+from . import review_loop
 
 Progress = Callable[[dict[str, Any]], "Awaitable[None] | None"]
 
@@ -112,7 +114,15 @@ META_FIELDS = ("sec", "speech_sec", "planned_frames", "frames", "words", "degrad
                # `motion_anchor_frames` 是它算不出来的那个输入：旁白逐词的帧刻度。
                # 后者必须进缓存还原——命中缓存的那一镜不会重跑 TTS，没有它就只能把
                # 字幕锚全记成「未判」，而那是拿一个假未判冒充真判过。
-               "motion_anchors", "motion_anchor_frames")
+               "motion_anchors", "motion_anchor_frames",
+               # 闸㉗（T61）只有**一个**出口要进缓存：未判那一栏。打回那一档在渲染口
+               # 就抛了、走不到这里；通过不需要记账。之所以它**可以**照搬缓存里的裁决
+               # （而 ㉑ 必须重判），是因为它的申报 `shot["reveal"]` 在缓存键里——
+               # 理由写在 `render_code_shot` 里那道闸的注释上。
+               # 加这一栏会让这之前的缓存 meta 一律被读成「不完整 → 重烧一遍」，
+               # 与当初加 `motion_anchors` 同一条代价，可接受（宁可多烧一次，
+               # 也不许一份旧 meta 在整片账上被读成「揭示时序没人判过」或反过来）。
+               "reveal")
 
 #: 母版回读字段盒的探针帧尾偏移（`durationInFrames - 本值`）。**必须与
 #: `remotion/src/tokens.ts` 的 `FIELD_PROBE_TAIL` 同值，两处一起改**：闸⑥ 比的是那一刻
@@ -805,7 +815,7 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
     空壳，而没有人会想到去看母版那行代码。
     """
     window = cspec.shot_motion_window(frames)
-    return {
+    props: dict[str, Any] = {
         # 镜号进 props 只为一件事：渲染侧据此把 `publicDir` 指到
         # `public/assets/<sid>/`（§4-5）。它**不进缓存键**——键是按代码字节 + 旋钮 +
         # 整片开关 + assets 的 sha/name 对算的（`shot_cache_key`），与镜号无关；
@@ -829,6 +839,19 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
         "entranceFrames": window,
         "exitFrames": window,
     }
+    # 闸㉗ 的两项注入（R12-T60/T61）。**只在真申报了这一族时才发**：给没申报的镜塞一个
+    # `reveal: null` 会让母版那一段每帧多跑一次（`resolveReveal` 立刻返回空，代价接近 0，
+    # 但母版里「有没有这一栏」从此不再能从 props 上分辨），也让 input_props 的字节
+    # 白涨——而这一份 props 是逐镜要过 HTTP 的。
+    reveal = shot.get("reveal")
+    if reveal is not None:
+        props["reveal"] = reveal
+        # 母版在这几帧各回读一行「这一帧哪些区域允许被看见」（`DG_REVEAL:`）。
+        # 帧号由**这一侧**算（`reveal_probe_frames`）：它要读 `durationInFrames` 与 fps，
+        # 而那两个数是这一侧排的班——母版自己算就成了第二个出处。
+        props["revealProbeFrames"] = cspec.reveal_probe_frames(
+            shot, frames=frames, fps=int(spec["fps"]))
+    return props
 
 
 async def _tail_frame(clip: Path, dst: Path, *, fps: int) -> None:
@@ -887,6 +910,46 @@ async def _shot_texture(clip: Path, dst_dir: Path, *, shot: Mapping[str, Any],
     return out_clip, kind, chain, out_frame
 
 
+def _check_reveal_canvas(sid: str, shot: Mapping[str, Any], row: Mapping[str, Any], *,
+                         first: bool, name: str) -> str:
+    """申报的 `reveal.canvas` vs 这张素材的**真实像素尺寸** → `ok` / `undetermined: …`。
+
+    这是 R12-T59 的第二半。㉘（`code_spec.check_reveal_regions`）只在 schema 内部自洽：
+    它判得了 `region ⊂ canvas`、`sequence` 连号、`scene_duration_ms == 末块 end + hold`，
+    却**判不了这个 `canvas` 说的是哪张图**——那是它拿不到的东西。而揭示的全部几何都
+    建立在这个坐标空间上：canvas 报错一个数，画面上每一块露出的位置就整体错位，
+    而且**没有任何别的闸会响**（掩码在母版里按同一份申报算，它自洽地错）。
+    拿库行的 `width/height` 对账是这里唯一有出处的一把尺。
+
+    **只对第一件素材判**，与闸㉗ 取纸底基准的那一件同一件（`reveal_gate._paper_of` 读的
+    也是 `assets[0]`）：两处挑的必须是同一件，否则会出现「底色按 A 件量、尺寸按 B 件判」，
+    而那种错在任何一份回执上都看不出来。
+
+    三态：
+      * 库行有尺寸且与申报一致 → `ok`；
+      * 库行有尺寸而对不上 → **抛**（这不是「没判过」，是判过了、不合格：基准换算错了）；
+      * 库行没尺寸（`width/height` 是 NULL，老行或没探过尺寸的源）→ `undetermined: …`，
+        如实写进 manifest，**不当成通过**。
+    """
+    raw = shot.get("reveal")
+    if not isinstance(raw, Mapping) or not first:
+        return ""
+    want = cspec.reveal_canvas(raw)
+    if want is None:
+        return ""            # ㉘ 已经报过「canvas 缺/不是两个整数」，这里不重复报
+    w, h = row.get("width"), row.get("height")
+    if not w or not h:
+        return (f"undetermined: 素材 {name} 的库行没有 width/height（NULL），"
+                f"揭示画布 {want[0]}×{want[1]} 没判过——未判不是通过")
+    if (int(w), int(h)) != want:
+        raise MediaError(
+            f"闸㉘ 揭示画布与素材真实尺寸对不上：{sid} 申报 canvas={want[0]}×{want[1]}，"
+            f"而素材 {name} 的库行是 {int(w)}×{int(h)}——揭示的每一块矩形都是在这个坐标"
+            "空间里量的，基准错了，画面上露出的位置就整体错位，且没有第二道闸会响。"
+            "请按素材的真实像素尺寸重写 reveal.canvas（或换一张素材）")
+    return "ok"
+
+
 async def _stage_shot_assets(shot: Mapping[str, Any], *, sid: str,
                              storage: Any, client: dict[str, Any]) -> list[dict[str, Any]]:
     """渲染前把本镜 assets 的字节投到渲染容器 `public/assets/<sid>/` 下，并留一份 manifest。
@@ -916,7 +979,7 @@ async def _stage_shot_assets(shot: Mapping[str, Any], *, sid: str,
     if stage is None:
         raise MediaError(f"{sid}：声明了 {len(assets)} 个素材但渲染客户端没有 stage_asset 口")
     items: list[dict[str, Any]] = []
-    for a in assets:
+    for i, a in enumerate(assets):
         sha256 = str(a.get("sha256") or "").strip().lower()
         name = str(a.get("name") or "").strip()
         if not sha256 or not name:
@@ -948,7 +1011,11 @@ async def _stage_shot_assets(shot: Mapping[str, Any], *, sid: str,
                       # 这张素材自己是动图还是静图。三档（animated/static/undetermined）
                       # 由闸⑪ 那一路回读填写，这里拿不到就如实写 undetermined——
                       # 编一个 static 会让闸⑪ 的「动图当静图用」判据永远绿。
-                      "motion": "undetermined"})
+                      "motion": "undetermined",
+                      # R12-T59 的后半段：申报的揭示画布 vs 这张图的真实像素尺寸。
+                      # 对不上在这里就抛（见 `_check_reveal_canvas`）；量不到记未判。
+                      "canvas_check": _check_reveal_canvas(
+                          sid, shot, row, first=(i == 0), name=name)})
     # manifest 也走同一个口投，不复用别的写入通道：它是「这一镜**真投成功了什么**」的
     # 记录，而 lint 期要拿它判「声明了但没投递」。跟素材一起走同一条腿，两边的失败方式
     # 才一致（投递腿断了，manifest 也不会凭空出现在容器里）。
@@ -1088,6 +1155,25 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
                               size=size, duration=float(info["duration"]),
                               shot_work=shot_work, band=_band_of(tokens, size))
 
+    # 闸㉗ 揭示-时序像素一致（R12-T61，见 `reveal_gate` 的模块 docstring）：
+    # 这一族唯一**只吃像素、不吃申报**的判据——满幅插画下 ⑲-a 的 `subject_share`
+    # 天然 ≈1、㉕ 的徽章那四条（16:9 的插画长边/短边 1.78 > 1.35）都不触发，
+    # 「一张静图配字幕」在这条链上没有别的闸会响。
+    #
+    # 排位：在闸④ **之后**（④ 一次 ffmpeg 就出结论，㉗ 要按探针帧逐帧抽，让「整片是空的」
+    # 这一档在最便宜的那道闸上先退回去），在**切片进缓存之前**（与 ⑥/⑭/㉑ 同一条理由：
+    # 退回去的一镜不许在缓存里留一份不合格的切片）。
+    #
+    # **命中缓存为什么不用重判**（与紧邻的闸㉑ 恰好相反）：㉑ 读的是申报 `shot["motion"]`，
+    # 而它**不进缓存键**（不改变任何像素，改它不该重烧），所以缓存那一镜必须拿当前申报
+    # 重判一次。㉗ 读的申报是 `shot["reveal"]`，它**在缓存键里**（母版要按它逐帧算掩码，
+    # 改它就换像素），于是命中缓存 ⇒ 申报逐字节相同 ⇒ 这份裁决仍然成立，照搬即可。
+    reveal_errors, reveal_undet = await reveal_gate.check_reveal(
+        sid, shot, gate=resp, band=_band_of(tokens, size), clip=raw, size=size,
+        fps=fps, frames=frames, storage=storage, work=shot_work)
+    if reveal_errors:
+        raise MediaError("\n".join(reveal_errors))
+
     clip = shot_work / "clip.mp4"
     # 哑片 + 旁白 → 带声切片（视频流直接 copy：切片已经编过一次，再编一遍只掉画质）
     await asyncio.to_thread(
@@ -1131,6 +1217,10 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
         # 少了它字幕锚只能记成未判（见 META_FIELDS 那条注释）。
         "motion_anchors": {"warnings": anchor_warns, "undetermined": anchor_undet},
         "motion_anchor_frames": [int(w["startFrame"]) for w in frame_words],
+        # 闸㉗ 的读数（T61）：**只有未判**这一档要写下来——打回那一档在上面就抛了。
+        # 与 ㉑ 那栏不同，这里**没有** warnings：㉗ 是三出口（通过/打回/未判），
+        # 卷里没给它「提醒」这一档，凭空造一个会让「未判」有一天被折进提醒里。
+        "reveal": {"undetermined": reveal_undet},
         "render_timings": resp.get("timings") or {}, "cache_key": key,
         "chain": "remotion",
         "lint_warnings": [str(w)[:200] for w in (resp.get("warnings") or [])][:8],
@@ -1215,39 +1305,26 @@ def _shot_table(sid: str, index: int, size: tuple[int, int], *,
             "entries": entries}
 
 
-async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work: Path,
-                             client: dict[str, Any] | None = None,
-                             storage: Any = None,
-                             bgm: Path | None = None,
-                             progress: Progress | None = None,
-                             cache: "rpipe.ShotCache | None" = None) -> dict[str, Any]:
-    """整条链：代码分镜 spec → 成片。质感在**每一镜的切片**上过一趟滤镜
-    （`_shot_texture`，拼接之前），母带那一趟只剩拼接与 BGM 闪避——都调 `render.py`
-    的同一批函数，不在这里复制第二份。"""
-    client = client or rc.endpoints()
-    work.mkdir(parents=True, exist_ok=True)
-    shots = list(spec.get("shots") or [])
-    if not shots:
-        raise MediaError("spec.shots 为空，没有可渲染的镜头")
+async def _render_shots(shots: list[dict[str, Any]], *, spec: Mapping[str, Any],
+                        providers: Providers, work: Path, client: dict[str, Any],
+                        identities: Mapping[str, str], storage: Any = None,
+                        cache: "rpipe.ShotCache | None" = None,
+                        progress: Progress | None = None,
+                        frames_used: int = 0
+                        ) -> tuple[list[Path], list[dict[str, Any]],
+                                   dict[str, dict[str, Path]], dict[str, Any], int]:
+    """**逐镜那一趟**：烧每一镜 → (clips, ledger, files, hitmaps, 帧预算计数)。
 
-    # 身份哈希一次取齐（缓存在 /healthz 里是每次现读，这里整条片子用同一份，
-    # 于是「母版中途换了」不会让同一批镜头拿两种键）
-    health = await asyncio.to_thread(client["health"])
-    if not health.get("ok"):
-        raise MediaError(f"creation-remotion 健康检查未通过：{health}")
-    identities = {"master_hash": str(health.get("master_hash") or ""),
-                  "lockfile_hash": str(health.get("lockfile_hash") or "")}
-    missing = [k for k, v in identities.items() if len(v) < 8]
-    if missing:
-        raise MediaError(
-            f"creation-remotion 没报出 {'、'.join(missing)}——缓存键缺这一段就会让"
-            "「改了母版却命中旧切片」，整条片子拒绝开工比静默命中便宜")
-
+    单独抽出来，是因为它现在有**两个**调用方：整片那一趟（`render_code_motion`）与
+    ㉖ 回看环的**只重烧改到的镜**那一趟。两处各写一遍循环，迟早一处带上 `rec["hits"]`、
+    另一处忘了，于是命中表在回看之后整片消失——而命中表正是前端「选着改」的入口。
+    「只重烧」这件事不需要额外机制：同一个 `cache` 传进来，没改代码的镜自然命中缓存，
+    改过的那镜键变了、自然重烧（见 `shot_cache_key`：键的输入含这一镜的 `code`）。
+    """
     clips: list[Path] = []
     ledger: list[dict[str, Any]] = []
     files: dict[str, dict[str, Path]] = {}
     hitmaps: dict[str, Any] = {}
-    frames_used = 0
     for i, shot in enumerate(shots):
         rec = await render_code_shot(shot, spec=spec, providers=providers, work=work,
                                      index=i, frames_used=frames_used,
@@ -1262,11 +1339,95 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
         ledger.append({k: v for k, v in rec.items() if k not in ("clip", "frame")})
         await _emit(progress, {"stage": "shot", "shot": rec["id"], "done": i + 1,
                          "total": len(shots), "frames_total": frames_used})
+    return clips, ledger, files, hitmaps, frames_used
+
+
+async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work: Path,
+                             client: dict[str, Any] | None = None,
+                             storage: Any = None,
+                             bgm: Path | None = None,
+                             progress: Progress | None = None,
+                             cache: "rpipe.ShotCache | None" = None,
+                             review: bool | None = None) -> dict[str, Any]:
+    """整条链：代码分镜 spec → 成片。质感在**每一镜的切片**上过一趟滤镜
+    （`_shot_texture`，拼接之前），母带那一趟只剩拼接与 BGM 闪避——都调 `render.py`
+    的同一批函数，不在这里复制第二份。
+
+    ``review`` 是 ㉖ 回看环那个整片开关（R11）：``None`` = 看 ``spec["review"]``，
+    显式 True/False 压过它。**默认关**：这一档每镜一次带帧的多模态调用，是最贵的调用，
+    而它救的是「已经红了」的镜——开关关着只是少一条自动修复的路，不会让问题片子溜出去；
+    关着的时候回执里那一栏对红镜是 `not_run`，**不许折算成通过**（Q112/Q113）。
+    """
+    client = client or rc.endpoints()
+    work.mkdir(parents=True, exist_ok=True)
+    shots = list(spec.get("shots") or [])
+    if not shots:
+        raise MediaError("spec.shots 为空，没有可渲染的镜头")
+    # ㉖ 的开关：参数压过 spec 里那一栏；两处都没写就是**关**（默认关的理由见 docstring）。
+    review_enabled = bool(spec.get(review_loop.REVIEW_KNOB)) if review is None else bool(review)
+
+    # 身份哈希一次取齐（缓存在 /healthz 里是每次现读，这里整条片子用同一份，
+    # 于是「母版中途换了」不会让同一批镜头拿两种键）
+    health = await asyncio.to_thread(client["health"])
+    if not health.get("ok"):
+        raise MediaError(f"creation-remotion 健康检查未通过：{health}")
+    identities = {"master_hash": str(health.get("master_hash") or ""),
+                  "lockfile_hash": str(health.get("lockfile_hash") or "")}
+    missing = [k for k, v in identities.items() if len(v) < 8]
+    if missing:
+        raise MediaError(
+            f"creation-remotion 没报出 {'、'.join(missing)}——缓存键缺这一段就会让"
+            "「改了母版却命中旧切片」，整条片子拒绝开工比静默命中便宜")
+
+    clips, ledger, files, hitmaps, frames_used = await _render_shots(
+        shots, spec=spec, providers=providers, work=work, client=client,
+        identities=identities, storage=storage, cache=cache, progress=progress)
 
     drift = check_token_drift(ledger)
     if drift:
         raise MediaError("闸⑤ 跨镜一致性未通过，母带还没开始（一帧不拼接）：\n"
                          + "\n".join(f"  · {e}" for e in drift[:10]))
+
+    # ---- 闸㉖ 回看环（R11-T56）：红/未判的镜先走一趟回看，改完**只重烧那一镜** ----
+    # 位置是这里，不是更后面：回看改的是某一镜的**代码**，改完那一镜的切片、
+    # `planned_frames`、版面读数全都是新的——下游（⑦ 转场配不配得上、⑰ 声画对账、
+    # ⑲-a/⑳(c)/㉕ 的判点、⑬ 的拼接）读的都是**这一份**账。放在拼接之前、放在
+    # 这些判据之前，它们判的就一定是回看之后的那一版；放在后面就变成「判旧的、
+    # 拼新的」，那是最坏的一种账（两个版本各占一半）。
+    review_receipt: dict[str, Any] | None = None
+    if review_enabled is not False:
+        async def _reburn(new_spec: dict[str, Any]) -> dict[str, Any]:
+            """再烧一次**逐镜**那一趟（不走拼接/混音）：只有代码变了的镜是缓存未命中。"""
+            c2, l2, f2, h2, n2 = await _render_shots(
+                list(new_spec.get("shots") or []), spec=new_spec, providers=providers,
+                work=work, client=client, identities=identities, storage=storage,
+                cache=cache, progress=progress)
+            return {"shots": l2, "shot_files": f2, "clips": c2, "hitmaps": h2,
+                    "frames_used": n2}
+
+        try:
+            rev = await review_loop.run(
+                spec=spec, first={"shots": ledger, "shot_files": files},
+                render_fn=_reburn, cache=cache, work=work,
+                enabled=bool(review_enabled), fps=fps)
+        except review_loop.ReviewBlocked as exc:
+            # Q113：判据不可用要**阻断出片 + 出可读回执**，不是放行。
+            raise MediaError(str(exc)) from exc
+        review_receipt = rev["receipt"]
+        if rev["render"] is not ledger:
+            # 回看真的重烧了：**整份采纳**新的逐镜账（clips/ledger/files/hitmaps/
+            # 帧预算计数五样一起换）。只换一部分会出现「画面用新的、账用旧的」——
+            # 而那正是回执最会骗人的形状。
+            got = rev["render"]
+            clips = list(got.get("clips") or [])
+            ledger = list(got.get("shots") or [])
+            files = dict(got.get("shot_files") or {})
+            hitmaps = dict(got.get("hitmaps") or {})
+            frames_used = int(got.get("frames_used") or frames_used)
+            drift = check_token_drift(ledger)
+            if drift:
+                raise MediaError("闸⑤ 跨镜一致性未通过（回看改过代码之后重判）：\n"
+                                 + "\n".join(f"  · {e}" for e in drift[:10]))
 
     # ---- 母带：拼接与 BGM 闪避走 `render.py` 的函数；质感**不在这一层**了 ----
     # 质感那一趟挪到了每一镜的切片上（`_shot_texture`，拼接之前），母带这里没有滤镜：
@@ -1370,6 +1531,30 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
             "status": row.get("status"),
         }
 
+    # ---- 闸㉕ 徽章构图（R11）：判的还是同一趟 DOM 回读，还是拼接之前 ----
+    # 与 ⑲-a/⑳(c) 并排：三条闸读的是**同一份**逐镜版面回读（⑲-a 读「主体太小」、
+    # ⑳(c) 读「两镜像同一张卡」、㉕ 读「主体太大且居中近方形」），所以调用点紧挨着，
+    # 且都在 `mediaops.concat` **之前**——徽章是逐镜的事，拼完再判等于让整片白拼一次。
+    # 读数里那栏逐件盒（`subject_boxes`）是 ㉕ 新加的，共用 `subjectBoxes()`，
+    # 阈值全留在 Python 这一侧（母版只报原始读数）。
+    badge_errors, badge_warns, badge_undet = cspec.check_badge_composition(
+        spec["shots"], scanned=subject_scanned)
+    if badge_errors:
+        raise MediaError("闸㉕ 徽章构图未通过，母带还没开始（一帧都没拼）：\n"
+                         + "\n".join(f"  · {e}" for e in badge_errors))
+    badge_readings: dict[str, dict[str, Any]] = {}
+    for i, s in enumerate(spec["shots"]):
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        row = subject_scanned.get(sid) or {}
+        sc = row.get("scanned") if isinstance(row.get("scanned"), Mapping) else {}
+        badge_readings[sid] = {
+            "subjects": (sc or {}).get("subjects"),
+            "subject_share": (sc or {}).get("subject_share"),
+            "band": (sc or {}).get("band"),
+            "subject_boxes": (sc or {}).get("subject_boxes"),
+            "status": row.get("status"),
+        }
+
     await asyncio.to_thread(mediaops.concat, clips, master, fps=fps, transition=plan)
     total = float(mediaops.probe(master)["duration"])
     not_taken = cspec.check_transition_effect([sec for _, sec in shot_secs], total,
@@ -1454,6 +1639,20 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
                 "warnings": list(deg_warns),
                 "undetermined": list(deg_undet),
             },
+            # 闸㉕ 的读数（R11）：逐镜的件数 / 占比 / 带尺寸 / **逐件盒**。取证要的是盒
+            # 本身——「居中近方形」要能被人拿着 4 个数自己核，而不是只看到一句「是徽章」。
+            "badge_composition": {
+                "min_share": cspec.BADGE_MIN_SHARE,
+                "center_tol": cspec.BADGE_CENTER_TOL,
+                "aspect_tol": cspec.BADGE_ASPECT_TOL,
+                "shots": badge_readings,
+                "warnings": list(badge_warns),
+                "undetermined": list(badge_undet),
+            },
+            # 闸㉖ 的回执（R11-T56）：**三出口 + 缺席**。这一栏不打回画面，它保证的是
+            # 「回看」这件事不在交付语里被说成做过——数据全部来自账（缓存键 + 切片字节），
+            # 不来自模型的话。没开回看时红镜记 `not_run`（不是缺席、更不是通过）。
+            "review_loop": review_receipt,
             "degraded": [f"{r['id']}：{r['degraded']}" for r in ledger if r["degraded"]],
             # 闸④ 两半的读数留在返回里：定 EMPTY_MIN_RATIO / SPAN_MIN 终值要的是
             # 这些数字的分布，只留布尔就再不知道那条线离实际有多远

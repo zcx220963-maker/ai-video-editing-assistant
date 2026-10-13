@@ -414,5 +414,248 @@ console.log('------------------------------------------');
   console.log('');
 }
 
+// ---------------------------------------------------------------------------
+// R11 ㉕ 徽章构图（T50 那一卷）——母版必须报出**逐件**主体盒
+//
+// ㉕ 要判的形状是「一枚居中、近方形的单件撑满画面」：把一件素材放大铺满，屏幕上出现的
+// 是一枚徽章或一块色斑，不是「一个场景」。**判据（四条联合、三个阈值）在 Python**
+// （`code_spec.check_badge_composition`），这一份夹具只钉母版那侧的读数——理由与 ⑲-a
+// 那两支同规：读数为 `undefined` 是「母版没带这一栏」（Python 侧落**未判**），与
+// 「量出来是 0」是两件事，夹具混了这两件事，闸就会在它该响的地方静默。
+//
+// 为什么要**逐件**盒而不是上面已经有的 `subjects`/`subject_share`：后者只有个数与并集
+// 外接盒的占比，「一枚圆形徽章铺满画面」与「两件部件左上/右下」在这两栏里长得很像
+// （个数不同而已，占比都能很大），只有拿到件本身的盒（宽高比、离带中心多远）才分得开。
+//
+// 下面 `expect` 里的 0.22 / 0.08 / 1.35 是**夹具期望值**（同 `subjectMin: 0.18` 那条的
+// 写法），判据仍在 Python 一处；这里出现它们是为了让「改阈值的人能看见自己放宽了什么」。
+console.log('R11 ㉕ 徽章构图（母版必须报出逐件盒）');
+console.log('----------------------------------');
+{
+  const shoot = async (code, tag) => {
+    const r = await post('/render-shot', {
+      code,
+      cache_key: `layoutprobe-r11-${tag}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+      declared_fields: [],
+      input_props: { fps: 30, durationInFrames: 30, aspect: 'portrait', text: 'R11 ㉕' },
+    });
+    if (!r.json?.ok || !r.json?.layout_used?.scanned) {
+      say(false, `${tag}：渲染/回读没成功 HTTP ${r.status} `
+        + `${String(r.json?.error || r.json?.layout_used?.reason).slice(0, 160)}`);
+      return null;
+    }
+    return r.json.layout_used.scanned;
+  };
+
+  // ① 一枚徽章：**单件**、摆带正中、近方形、铺到带的四分之一（圆 r=300 → 600×600，
+  //    600×600/(936×1524) ≈ 0.2524，过 0.22 那条线）。这四个读数**同时**成立时，
+  //    Python 侧必须打回；少任何一个，就是合法构图。
+  const BADGE = shot(`        <svg width={body.w} height={body.h}
+                             style={{ position: 'absolute', left: 0, top: 0 }}>
+          <circle cx={468} cy={762} r={300} fill="none" stroke={TOKENS.ink} strokeWidth={6} />
+        </svg>`);
+  // ② 两件部件、左上/右下错开、各自都不方：这是「拼出来的场景」那一档，㉕ 必须放行。
+  //    它的存在意义是钉住 ①「不是只要画面上有图形就报」——错的形状得量成错的读数。
+  const PARTS = shot(`        <svg width={body.w} height={body.h}
+                             style={{ position: 'absolute', left: 0, top: 0 }}>
+          <rect x={120} y={180} width={260} height={200} fill="none"
+                stroke={TOKENS.ink} strokeWidth={6} />
+          <circle cx={640} cy={1120} r={130} fill="none" stroke={TOKENS.accent}
+                  strokeWidth={6} />
+        </svg>`);
+
+  const badge = await shoot(BADGE, 'badge');
+  const parts = await shoot(PARTS, 'parts');
+  if (badge && parts) {
+    const isBox = (b) => b && ['x', 'y', 'w', 'h'].every(
+      (k) => Number.isInteger(b[k]));
+    // 「逐件盒」这一栏：缺它（`undefined`）＝母版旧，Python 侧落未判；有它但空数组
+    // 才是「这一镜画面上没有主体件」——两者不是一件事，所以分开报。
+    say(Array.isArray(badge.subject_boxes) && Array.isArray(parts.subject_boxes),
+        `两支都带回了 \`subject_boxes\` 这一栏（徽章 ${JSON.stringify(badge.subject_boxes)}、`
+        + `两件 ${JSON.stringify(parts.subject_boxes)}）——缺这栏即「母版旧」，`
+        + `Python 侧落**未判**而不是「没问题」`);
+    if (Array.isArray(badge.subject_boxes) && Array.isArray(parts.subject_boxes)) {
+      say(badge.subject_boxes.every(isBox) && parts.subject_boxes.every(isBox),
+          '逐件盒报的是**带内整数像素**（与 findings 的 box/at 同一个系、同一个取整口径）');
+      const bw = badge.band?.w, bh = badge.band?.h;
+      const bx = badge.subject_boxes[0] || {};
+      say(Number.isFinite(bw) && bw > 0 && Number.isFinite(bh) && bh > 0
+        && badge.subject_boxes.every((b) => b.x >= 0 && b.y >= 0 && b.x + b.w <= bw + 1
+          && b.y + b.h <= bh + 1),
+          `盒落在带子里（带 ${JSON.stringify(badge.band)}，徽章盒 ${JSON.stringify(badge.subject_boxes[0])}）`);
+      // ① 的四个读数必须**同时**落在徽章那一格——这是 Python 打回它的输入。
+      const cdx = Math.abs(bx.x + bx.w / 2 - bw / 2) / bw;
+      const cdy = Math.abs(bx.y + bx.h / 2 - bh / 2) / bh;
+      const aspect = Math.max(bx.w, bx.h) / Math.min(bx.w, bx.h);
+      say(badge.subjects === 1 && badge.subject_boxes.length === 1,
+          `徽章这一支量出**单件**（subjects=${badge.subjects}，`
+          + `逐件盒 ${badge.subject_boxes.length} 件）`);
+      say(Number.isFinite(badge.subject_share) && badge.subject_share >= 0.22,
+          `徽章这一支铺开 ≥0.22（实得 ${badge.subject_share}）`);
+      say(cdx <= 0.08 && cdy <= 0.08,
+          `徽章这一支摆在带正中（横偏 ${(cdx * 100).toFixed(1)}%、纵偏 `
+          + `${(cdy * 100).toFixed(1)}%，容差 8%）`);
+      say(aspect <= 1.35,
+          `徽章这一支近似方形（长边/短边 ${aspect.toFixed(2)}，容差 1.35，`
+          + `盒 ${bx.w}×${bx.h}）——这四条同时成立，Python 侧才打回`);
+      // ② 的「单件」那条**不成立**：㉕ 的判据是四条联合，这一条挂了就整条放行。
+      say(parts.subjects === 2 && parts.subject_boxes.length === 2,
+          `两件那一支量出 2 件（subjects=${parts.subjects}，`
+          + `盒 ${JSON.stringify(parts.subject_boxes)}）——「单件」不成立，㉕ 因此放行`);
+      say(!(parts.subject_boxes.length === 1),
+          '两件那一支**没有**被量成一件（逐件盒是逐元素量的，不是并集外接盒——'
+          + '并集那一栏是 `subject_share`，判徽章用不上它）');
+    }
+  }
+  console.log('');
+}
+
+// ---------------------------------------------------------------------------
+// R12-T60 分区揭示（母版侧）：逐帧算出「这一块此刻允许被看见的那部分」
+//
+// 判据在 Python 侧（㉗ 拿这几帧的账去抽帧比色），这一支钉的是**母版的读数**与
+// **选型本身**。它必须存在，理由是 T60 原文里那句前置条件：
+//
+//   「先用一支真渲夹具证明 `clip-path`/`mask-image` 在 headless Chrome 里逐帧稳定，
+//     证不出就不许写进合同当保证」
+//
+// 我们选了 `clip-path: path()`（`mask-image` + `mask-composite` 在各版本 headless
+// Chrome 上行为不一，见 `FilmLayout.clipPathOf` 上面那段），而且**没有**按原文写
+// 「两层 mask 相减」：相减是在 JS 几何里做的（`subtractRects`），落到浏览器只有一条
+// 路径。这条选型是整族风格的地基——它不稳，㉗ 那二十多 KB 的比色器判的就是一份不存在
+// 的几何。所以这一支真渲一镜，量五件事：没申报时一行都不发 · 只报点名帧 · 未到点的块
+// 一个像素都不许有 · 扣掉后续块之后不越界 · 同一份申报渲两遍掩码逐字相等。
+//
+// 坐标系：夹具刻意让**插画原图尺寸 = 画面带尺寸**（canvas 936×1524），于是母版那次
+// 「画布像素 → 成片像素」的换算是 sx=sy=1——断言里写的矩形就是申报里的区域矩形本身。
+// 那次映射对不对不归这一支判（同一行代码在 ㉗ 的真帧比色里另有一支夹）。
+console.log('R12-T60 分区揭示（母版逐帧允许掩码）');
+console.log('----------------------------------');
+{
+  // 一张**平铺满带**的插画：母版只对 `<img>` 套掩码（这一族的插画就是它），所以夹具
+  // 不能拿 svg 形状代替——用 `data:` 而不是 `staticFile`：这一趟判的是几何，
+  // 投递腿另有整套判据，绑在一起会让红指向错的地方（与 `effects-probe` 同规）。
+  const PIC = 'data:image/svg+xml,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="936" height="1524">'
+    + '<rect width="936" height="1524" fill="#F5EBD7"/>'
+    + '<circle cx="320" cy="360" r="150" fill="none" stroke="#3A3A3A" stroke-width="10"/>'
+    + '<rect x="520" y="1080" width="300" height="260" fill="none" stroke="#3A3A3A"'
+    + ' stroke-width="10"/></svg>');
+
+  // 两块、上下不重叠、各 1 s：这一份申报的合法性由 ㉘ 判（Python 侧），这里只借它当输入。
+  const REVEAL = {
+    canvas: { w: 936, h: 1524 },
+    scene_duration_ms: 2000,
+    regions: [
+      { id: 'block-a', sequence: 1, region: { x: 0, y: 0, w: 936, h: 762 },
+        direction: 'ltr', start_ms: 0, duration_ms: 1000 },
+      { id: 'block-b', sequence: 2, region: { x: 0, y: 762, w: 936, h: 762 },
+        direction: 'ltr', start_ms: 1000, duration_ms: 1000 },
+    ],
+  };
+  // 三个点名帧（30 fps、60 帧 = 2000 ms，与 scene_duration_ms 对齐）：
+  // 第 6 帧 = 200 ms（块 b **开始之前**，T60 红法那一支）· 第 30 帧 = 1000 ms（块 a 到点）·
+  // 第 45 帧 = 1500 ms（块 b 画到一半）。
+  const PROBE = [6, 30, 45];
+
+  const REVEAL_SHOT = shot(`        <img src={${JSON.stringify(PIC)}}
+          style={{ position: 'absolute', left: 0, top: 0, width: body.w, height: body.h }} />`);
+
+  const render = async (tag, extra) => post('/render-shot', {
+    code: REVEAL_SHOT,
+    cache_key: `layoutprobe-r12-${tag}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    declared_fields: [],
+    input_props: { fps: 30, durationInFrames: 60, aspect: 'portrait',
+                   text: `R12 ${tag}`, ...extra },
+  });
+
+  const first = await render('reveal', { reveal: REVEAL, revealProbeFrames: PROBE });
+  const j = first.json;
+  if (!j?.ok) {
+    say(false, `分区揭示那一支没渲成：HTTP ${first.status} `
+      + `${String(j?.error || JSON.stringify(j?.errors)).slice(0, 200)}`);
+  } else {
+    const rev = j.reveal_used;
+    say(rev !== null && typeof rev === 'object',
+        '申报了这一族的镜，母版回了 `reveal_used` 账——没读到（null）的正确读法是'
+        + '「通道没跑起来」，Python 侧落**未判**而不是「每一块都没问题」');
+    if (rev) {
+      const row = (f) => rev[String(f)];
+      const at = (f, id) => (row(f)?.regions || []).find((r) => r.id === id);
+      const area = (rs) => (rs || []).reduce(
+        (s, r) => s + Math.max(0, r.w) * Math.max(0, r.h), 0);
+      const frames = Object.keys(rev).map(Number).sort((a, b) => a - b);
+      say(JSON.stringify(frames) === JSON.stringify(PROBE),
+          `只在**点名的帧**出声（点名 ${JSON.stringify(PROBE)}，实得 ${JSON.stringify(frames)}）`
+          + '——毎帧一行会把逐镜账撑成噪声，而 ㉗ 只需要那几个时刻');
+
+      const bx = row(6)?.boxes?.[0];
+      say(!!bx && !!bx.box && bx.box.w > 0 && bx.box.h > 0,
+          `点名帧那一行带回了插画元素的**实况盒**（${JSON.stringify(bx?.box)}）——`
+          + '元素还没量到尺寸时母版**不裁**（裁一个 0 宽的盒等于把整张图抹掉，'
+          + '而 ㉗ 会把那一帧读成「未开始的区域是纸底」，一条假绿）');
+
+      // ① T60 红法原样：块 b 开始之前，它一个像素都不许有。「空表」与「零面积」都算
+      //    ——`revealMasks` 对没到点的块返空表，卡在 start_ms 那一帧返的是推进 0 的
+      //    零宽矩形，两者都不是「看得见」。
+      say(area(at(6, 'block-b')?.rects) === 0,
+          `第 6 帧（块 b 开始之前）块 b 的允许掩码**零面积**`
+          + `（实得 ${JSON.stringify(at(6, 'block-b')?.rects)}）——这一条不成立，`
+          + '就是「整图第 0 帧就全显」，也就是这一族风格根本不存在');
+
+      // ② 进度按**同一帧时钟**线性插值：第 6 帧 = 200 ms / 1000 ms = 0.2 → 已画宽 187.2。
+      const a6 = at(6, 'block-a')?.rects || [];
+      say(a6.length === 1 && a6[0].x === 0 && a6[0].y === 0 && a6[0].h === 762
+        && Math.abs(a6[0].w - 187.2) < 0.5,
+          `第 6 帧块 a 画到 0.2（\`ltr\` → 已画宽 187.2，实得 ${JSON.stringify(a6)}）`);
+
+      // ③ 到点那一刻铺满自己的区域，而后一块仍是零面积——「画满了」与「还没开始」
+      //    必须分得开，㉗ 的两句话就是按这两个时刻写的。
+      const a30 = at(30, 'block-a')?.rects || [];
+      say(a30.length === 1 && Math.abs(area(a30) - 936 * 762) < 1,
+          `第 30 帧（1 s，块 a 的 duration 到点）块 a 铺满自己的区域`
+          + `（实得 ${JSON.stringify(a30)}）`);
+      say(area(at(30, 'block-b')?.rects) === 0,
+          `同一帧块 b 仍是零面积（实得 ${JSON.stringify(at(30, 'block-b')?.rects)}）`);
+
+      // ④ 扣掉后续块之后**不越界**（T60 验收口径里那句的机器形状）：每一片都落在它
+      //    自己的区域里、且落在 canvas 内。区域横竖各跨半屏，扣完必须还是矩形并集。
+      const within = (r, g) => r.x >= g.x - 0.01 && r.y >= g.y - 0.01
+        && r.x + r.w <= g.x + g.w + 0.01 && r.y + r.h <= g.y + g.h + 0.01;
+      const all = Object.values(rev).flatMap((v) => v.regions || []);
+      const bad = all.filter((r) => {
+        const g = REVEAL.regions.find((x) => x.id === r.id);
+        return !g || (r.rects || []).some((p) => !within(p, g.region)
+          || p.x < -0.01 || p.y < -0.01 || p.x + p.w > 936.01 || p.y + p.h > 1524.01);
+      });
+      say(all.length === PROBE.length * REVEAL.regions.length && bad.length === 0,
+          `${PROBE.length} 帧 × ${REVEAL.regions.length} 块 = ${all.length} 条读数都在账上，`
+          + `且每一片都落在自己的区域里、不越 canvas 边界（越界的 ${bad.length} 条）`);
+
+      // ⑤ 「逐帧稳定」的可判形状：同一份申报渲两遍，掩码逐字相等。
+      const again = await render('reveal-again', { reveal: REVEAL, revealProbeFrames: PROBE });
+      const rev2 = again.json?.reveal_used;
+      say(!!rev2 && JSON.stringify(rev2) === JSON.stringify(rev),
+          '同一份申报渲两遍，逐帧掩码**逐字相等**（`clip-path: path()` 这条选型的稳定性）'
+          + '——不等即「同一帧画不出同一份几何」，㉗ 的比色器就没有地基'
+          + `（第二遍 ${JSON.stringify(rev2).slice(0, 140)}）`);
+
+      const dup = (j.warnings || []).filter((w) => String(w).includes('分区揭示回读'));
+      say(dup.length === 0,
+          `没有「同一帧两次算出不同的允许掩码」的记账（${JSON.stringify(dup)}）`);
+    }
+
+    // ⑥ 没申报这一族的镜：**一行都不发**（`code_render` 那侧也只在真写了 `reveal`
+    //    时才注入这两项，理由是不给母版一个「有没有这一栏」都分不出来的输入）。
+    const plain = await render('no-reveal', {});
+    say(plain.json?.reveal_used === null,
+        `没申报的镜母版回的是 null（实得 ${JSON.stringify(plain.json?.reveal_used)}）`
+        + '——null 与「掩码全是空表」是两件事，混了就等于把「这一镜没有分区揭示」'
+        + '读成「每一块都没露出来」');
+  }
+  console.log('');
+}
+
 console.log(fail === 0 ? '\nALL PASSED' : `\n${fail} FAILED`);
 process.exitCode = fail === 0 ? 0 : 1;

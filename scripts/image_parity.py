@@ -510,6 +510,12 @@ def container_dir_entries(container: str, path: str) -> tuple[int, str]:
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
+    # 判词里带「✓」「✗」这类字符：Windows 宿主控制台默认 GBK，直接 print 会
+    # UnicodeEncodeError——对账脚本自己炸掉会把「没比过」伪装成「全对上了」。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:       # noqa: BLE001 —— 老解释器没有 reconfigure 就算了
+        pass
     ap = argparse.ArgumentParser(description="镜像 COPY 完整性：Dockerfile 声明的每一件逐件比 md5")
     ap.add_argument("--dockerfile", default="Dockerfile")
     ap.add_argument("--context", default=".", help="构建上下文（compose 的 build 目录）")

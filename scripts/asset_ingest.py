@@ -28,6 +28,28 @@ from typing import Any, AsyncIterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # 让 asset_common 可导入
 
+
+def _add_backend_to_path() -> None:
+    """把 `agent_framework` 放上 import 路径（R11-T50：源名与实测口径都在那边）。
+
+    为什么要试两个候选：宿主布局是 `<仓库根>/scripts` + `<仓库根>/backend`，容器里
+    这两个目录落在**两个根**上（`/scripts` 与 `/app`，见 Dockerfile 那一段注释）。
+    写死一个，另一个布局就变成 `ModuleNotFoundError`——而那正是「容器里跑不了，
+    跳过吧」的来源。
+    """
+    here = Path(__file__).resolve()
+    for cand in (here.parents[1] / "backend", Path("/app")):
+        if (cand / "agent_framework").is_dir():
+            sys.path.insert(0, str(cand))
+            return
+
+
+_add_backend_to_path()
+
+from agent_framework.asset_scale import measure_asset          # noqa: E402
+from agent_framework.asset_sources import (                    # noqa: E402
+    ASSET_SOURCES, asset_role_of, ingest_names, role_facts)
+
 UA = "CodeArts-AssetIngest/1.0 (https://codearts.huaweicloud.com)"
 ALLOWED_SPDX = {"MIT", "Apache-2.0", "CC0", "CC0-1.0", "BSD", "ISC", "BSD-2-Clause", "BSD-3-Clause"}
 PD_LICENSES = {"PD", "PD-old", "PD-old-100", "PD-US", "PD-US-expired", "CC0", "cczero", "CC0-1.0"}
@@ -416,9 +438,38 @@ def ingest_offline(*, storage: Any, offline_dir: str, dry_run: bool = False) -> 
 
 # ── 存储 ────────────────────────────────────────────────────────────
 
+def _fill_facts(row: dict, data: bytes | None) -> dict:
+    """入库前把 R11-T53/T54 那两格算出来（角色、最细笔画实测）。
+
+    **算不出来就留空**（role 空串 / scale None）：Q114 否决的正是「先人工标一遍」，
+    而这里的替代品不是「猜一个最像的档」，是**如实留未判**。留空的代价是这一件不进
+    按角色/按缩放安全的过滤，看得见、数得出来；猜错的代价是「明明有素材却搜不到」，
+    查起来贵得多。
+
+    就地改 `row` 并返回它——这个函数只被 `_store_asset` 调，形态上就是「写库前那一趟」。
+    """
+    if not row.get("asset_role"):
+        role, why = asset_role_of(
+            subject=str(row.get("subject") or ""), style_family=str(row.get("style_family") or ""),
+            mime=str(row.get("mime") or ""), ext=str(row.get("ext") or ""),
+            width=row.get("width"), height=row.get("height"))
+        row["asset_role"] = role
+        # 判据原话进 scale_facts 的同一份回执里（这一栏叫 facts 就是「机器读出来的事实」）：
+        # 出问题时能看见「这件的角色是凭什么标出来的」，不必回去读代码。
+        row.setdefault("_role_why", why)
+    facts = measure_asset(data, mime=str(row.get("mime") or ""), ext=str(row.get("ext") or ""))
+    if row.get("_role_why"):
+        facts["role_why"] = row.pop("_role_why")
+    row["scale_facts"] = facts
+    # **不往 row 里写 `scale_safe`**：库仓储不收这个入参（T54：任何写入路径都不接受
+    # 人工传入的值），它由 `scale_facts['verdict']` 那条唯一投影算出来。
+    return row
+
+
 async def _store_asset(storage: Any, row: dict, data: bytes) -> None:
     """写 MinIO + asset_library 表。"""
     object_key = row["object_key"]
+    _fill_facts(row, data)          # R11-T53/T54：角色与最细笔画两格，写库前算
 
     async def _chunks() -> AsyncIterator[bytes]:
         yield data
@@ -466,13 +517,96 @@ def _write_failures(rows: list[dict], path: str) -> None:
 
 # ── 主入口 ──────────────────────────────────────────────────────────
 
-SOURCES = {
-    "wikimedia-commons": ingest_wikimedia,
-    "iconify": ingest_iconify,
-    "polyhaven": ingest_polyhaven,
-    "ambientcg": ingest_ambientcg,
-    "open-peeps": ingest_openpeeps,
+#: 函数名 → 实现。注册表里每行写的是**函数名字符串**（`agent_framework.asset_sources`
+#: 不能 import 本脚本——那是倒过来的依赖），所以这里把名字翻译成实现，翻译表**必须齐**：
+#: 少一个名字，`--source` 就少一条腿，而「注册表说有、命令行没有」正是 T50 要灭的形状。
+_INGEST_FUNCS = {
+    "ingest_wikimedia": ingest_wikimedia,
+    "ingest_iconify": ingest_iconify,
+    "ingest_polyhaven": ingest_polyhaven,
+    "ingest_ambientcg": ingest_ambientcg,
+    "ingest_openpeeps": ingest_openpeeps,
 }
+
+#: `--source` 的取值域，**由注册表生成**（R11-T50）。顺序跟注册表走：注册表把
+#: 「活库真有行」的两条排在最前面。
+SOURCES = {l.name: _INGEST_FUNCS[l.ingest] for l in ASSET_SOURCES if l.ingest}
+_missing_legs = [l.name for l in ASSET_SOURCES if l.ingest and l.ingest not in _INGEST_FUNCS]
+if _missing_legs:       # 注册表与实现脱钩时**当场炸**，不静默少一条腿
+    raise RuntimeError(f"注册表里的源 {_missing_legs} 指向本脚本里不存在的入库函数")
+
+
+async def backfill_facts(storage: Any, *, limit: int = 100000) -> dict:
+    """给**已在库**的行补 R11-T53/T54 那两格（角色 / 最细笔画实测）。
+
+    为什么要单独一条路：入库脚本只在**新入**素材时算这两格，而这两格是后加的——
+    库里已有的行（iconify 那批 SVG 就是最典型的一批）不补，`asset_role` 与
+    `scale_safe` 在真机上就永远是空的，「按角色找件」与「部件档最小尺寸」两条
+    会一起落空。补标只**读**对象（不重传、不重算 sha），所以可以在任意时刻重跑。
+
+    幂等：已经有 `scale_facts` 的行跳过（`--force` 才重算）。重算会覆盖，
+    因为这只是一个函数的输出，不是人工数据——但改判据之前要看清楚它会覆盖什么。
+    """
+    rows = await storage.assets.list_assets(enabled=True, limit=limit)
+    stats = {"total": len(rows), "roles_filled": 0, "scale_measured": 0,
+             "scale_undetermined": 0, "skipped": 0, "bytes_missing": 0}
+    # T53 的验收里点名要的那一份「icon→part 的候选清单」：即便**空**也是证据——
+    # 它证明缺的是采购（库里没有拼图部件），而不是标签口径没定。
+    part_candidates: list[str] = []
+    final_roles: list[dict] = []
+    for row in rows:
+        has_facts = bool((row.get("scale_facts") or {}) if isinstance(row.get("scale_facts"), dict)
+                         else row.get("scale_facts"))
+        if row.get("asset_role") and has_facts:
+            stats["skipped"] += 1
+            continue
+        data = await _object_bytes(storage, str(row.get("object_key") or ""))
+        if data is None:
+            stats["bytes_missing"] += 1
+        fresh: dict = {"subject": row.get("subject") or "",
+                       "style_family": row.get("style_family") or "",
+                       "mime": row.get("mime") or "", "ext": row.get("ext") or "",
+                       "bytes_": row.get("bytes") or 0,
+                       "width": row.get("width"), "height": row.get("height")}
+        _fill_facts(fresh, data)
+        role = str(fresh.get("asset_role") or "")
+        facts = fresh.get("scale_facts") or {}
+        if role and not row.get("asset_role"):
+            stats["roles_filled"] += 1
+        if facts.get("verdict") is None:
+            stats["scale_undetermined"] += 1
+        else:
+            stats["scale_measured"] += 1
+        await storage.assets.set_facts(
+            str(row["id"]),
+            asset_role=role or str(row.get("asset_role") or ""),
+            scale_facts=facts)
+        final_roles.append({"asset_role": role or str(row.get("asset_role") or "")})
+        if (role or row.get("asset_role")) == "part":
+            part_candidates.append(str(row.get("src_id") or row.get("id") or ""))
+    tally = role_facts(final_roles)
+    print(f"[backfill] {stats}", file=sys.stderr)
+    print(f"[backfill] 角色分布 {tally['counts']}（未判 {tally['undetermined']} / 共 {tally['total']}）",
+          file=sys.stderr)
+    print(f"[backfill] part 档候选 {len(part_candidates)} 件"
+          + (f"：{', '.join(part_candidates[:20])}" if part_candidates
+             else "（**一件都没有**——缺的是采购，不是标签口径）"), file=sys.stderr)
+    stats["roles"] = tally
+    stats["part_candidates"] = part_candidates
+    return stats
+
+
+async def _object_bytes(storage: Any, key: str) -> bytes | None:
+    """从对象存储读回一件素材的字节（补标用）。读不到**记失败并返回 None**——
+    「对象不在桶里」与「这件量不出来」是两件事，回执上要分得开。"""
+    if not key:
+        return None
+    try:
+        chunks = [c async for c in storage.objects.get_stream(key)]
+    except Exception as e:      # noqa: BLE001
+        record_failure("backfill", "object_get", e, detail=key)
+        return None
+    return b"".join(chunks)
 
 
 async def main_async(args: argparse.Namespace) -> int:
@@ -483,6 +617,16 @@ async def main_async(args: argparse.Namespace) -> int:
 
     all_results: list[dict] = []
     manifest_path = args.manifest or "assets/manifest.jsonl"
+
+    if getattr(args, "backfill", False):
+        # 补标这一路**不取件、不写 manifest**（它改的是库里已有的行，没有「新入 N 条」
+        # 这个数）。跑完就把两格的账打出来，然后照常走失败回执那一段。
+        stats = await backfill_facts(storage, limit=args.limit)
+        if stats["total"] and not stats["roles_filled"] and not stats["scale_measured"]:
+            print("[backfill] 没有任何一格被改动——库里的行都已经标过了（或是读不到字节）",
+                  file=sys.stderr)
+        await storage.close()
+        return 1 if get_failures() and not stats["total"] else 0
 
     if args.offline_dir:
         results = ingest_offline(storage=storage, offline_dir=args.offline_dir,
@@ -526,6 +670,12 @@ async def main_async(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    # 回执里带「⚠」这类字符：Windows 宿主控制台默认 GBK，直接 print 会 UnicodeEncodeError
+    # ——入库脚本自己炸在最后一行，会让「取件失败 N 件」的账看不出到底跑没跑到收尾。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:       # noqa: BLE001 —— 老解释器没有 reconfigure 就算了
+        pass
     parser = argparse.ArgumentParser(description="R3 素材入库")
     parser.add_argument("--source", default="all",
                         help=f"素材源: {', '.join(SOURCES)}, all, manual")
@@ -537,6 +687,8 @@ def main() -> int:
                         help="manifest.jsonl 输出路径（默认 assets/manifest.jsonl）")
     parser.add_argument("--dry-run", action="store_true",
                         help="只探测不写库")
+    parser.add_argument("--backfill", action="store_true",
+                        help="不取件：给库里已有的行补算 asset_role 与 scale_safe（R11-T53/T54）")
     args = parser.parse_args()
     return asyncio.run(main_async(args))
 
