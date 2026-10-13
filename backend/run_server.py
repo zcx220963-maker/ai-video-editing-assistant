@@ -8,7 +8,7 @@
     Tool Registry  ← Spawn / Search(web) / fetch_media / File / Cron / Memory / Skill /
                      Agent Team(send_message·任务板·常驻子 Agent) / rerun_from /
                      剪辑节点（只来自 Storyline MCP；未连通即无剪辑能力）/
-                     MCP 外部工具(mcp.json)
+                     MCP 外部工具(mcp.json 当种子 + 设置页那一路热连，同一张表同一份账)
     Scheduling     ← Cron(工具) + Heartbeat(周期唤醒)
     Storage        ← build_storage(--storage)：pg_minio=PG 元数据 + MinIO 媒体字节（生产），
                      memory=内存替身（离线测试）；启动即校验连通性与建表，连不上直接退出
@@ -76,6 +76,7 @@ from agent_framework.mq import MessageQueue, build_message_queue
 from agent_framework.server import create_app
 from agent_framework.session import SessionManager
 from agent_framework.storage import Storage, build_storage
+from agent_framework.summary_store import SummaryStore
 from agent_framework.skill import (
     SkillLoader,
     SkillManifestContextSource,
@@ -285,7 +286,7 @@ def build_runtime(
     gate_render: bool = True,
     observability: bool = True,
     static_dir: str | Path | None = None,
-    mcp_config: str | Path | bool | None = None,     # None=存在即用；False=关闭
+    mcp_config: str | Path | bool | None = None,     # None=存在即当种子入库；False=关闭这条路
     storyline_config: str | Path | bool | None = None,
     team: str | Path | bool | None = None,           # False = 禁用 Agent Team（状态在 PG 协作三表）
     max_context_tokens: int | None = None,           # None/<=0 = 不压缩
@@ -396,7 +397,11 @@ def build_runtime(
     compressor = None
     budget = max_context_tokens if max_context_tokens is not None else DEFAULT_MAX_CONTEXT_TOKENS
     if budget > 0:
-        compressor = ContextCompressor(budget, summarizer=make_llm_summarizer(llm))
+        # summaries=（R10-T47）：摘要按「被淘汰那一段的指纹」落进 checkpoint_entries，
+        # 同一段前缀的第二轮**一次模型调用都不发**。不传就等于每轮重算一次——
+        # 那正是这条要治的病，所以这里必须接上，不能只留个可选参数。
+        compressor = ContextCompressor(budget, summarizer=make_llm_summarizer(llm),
+                                       summaries=SummaryStore(storage))
 
     context_builder = ContextBuilder(
         None,                       # None = 按提示词库解析；显式字符串仍可覆盖
@@ -544,7 +549,18 @@ def build_runtime(
             if n:
                 _info(f"--no-resume：已把 {n} 条残留 running checkpoint 标记为 failed（消除幽灵任务）")
 
-        # (b) 通用 MCP：mcp.json / config.yaml 里的 stdio 与 StreamableHttp server 列表
+        # (b) 通用 MCP：mcp.json 是**部署期的种子**——写进 mcp_servers（owner_user_id=NULL
+        #     → 全用户共享的系统 server，enabled=True），**连接交给下面的动态通道 (b2)**。
+        #
+        #     为什么从「启动期直接连」改成「入库当种子」：原先 json 与 /mcp/servers 接口
+        #     是两条各连一遍的通道，同一台 server 两边都有就会注册两次（撞名即整体回绝），
+        #     而且「库里写着什么」与「实际连上了什么」分成两份账，对不上时没有一处说得清。
+        #     种子只做幂等 upsert，连不连得上看 (b2) 那一份账。
+        #
+        #     **部署清单是权威**：upsert 会把 enabled 写回 True，所以「在界面上临时关掉一台
+        #     系统 server」不跨重启——这是有意的（否则发版改 json 关不掉一台已经在库里被
+        #     关过的 server）。用户自己加的 server（owner_user_id 非空）不在这条路上，
+        #     (b2) 也不在启动时连它们，它们的启停完全归界面管。
         if mcp_path is not None and mcp_path.is_file():
             try:
                 cfg = load_mcp_config(mcp_path)
@@ -552,14 +568,23 @@ def build_runtime(
                 _warn(f"MCP 配置 {mcp_path} 解析失败：{exc}")
                 cfg = None
             if cfg is not None:
+                seeded: list[str] = []
                 for sc in cfg.list_servers():
+                    if not sc.name:
+                        _warn(f"MCP 配置 {mcp_path} 里有一台没写名字的 server，已跳过")
+                        continue
                     try:
-                        client = await connect_server(sc)
-                        names = await register_mcp_tools(registry, client, sc)
-                        mcp_clients.append(client)
-                        _info(f"MCP server「{sc.name}」已接入 {len(names)} 个工具：{names}")
+                        await storage.mcp_servers.upsert(
+                            sc.name, sc.to_dict(), enabled=True, owner_user_id=None)
+                        seeded.append(sc.name)
                     except Exception as exc:  # noqa: BLE001
-                        _warn(f"MCP server「{sc.name}」连接失败，已跳过：{exc}")
+                        _warn(f"MCP server「{sc.name}」写入配置失败，已跳过：{exc}")
+                if seeded:
+                    _info(f"MCP 静态配置已入库 {len(seeded)} 台：{seeded}（连接交给动态通道）")
+        elif mcp_path is not None:
+            # 文件不存在是**常态**（默认部署不带 mcp.json），所以这里只要一行，不要刷屏；
+            # 但必须有这一行：「我明明配了却没生效」与「服务端确实没这条路」在日志上要分得开。
+            _info(f"MCP 静态配置不存在（{mcp_path}），本次仅 Storyline 一路")
 
         # (b2) 动态 MCP：库里 enabled 的 server 热连（配置由 /mcp/servers 接口管理）
         live = await mcp_manager.connect_enabled()
@@ -819,7 +844,8 @@ def parse_args() -> argparse.Namespace:
                    default=int(os.getenv("QUOTA_WINDOW", "86400")),
                    help="配额统计窗口（秒），默认 86400=24 小时")
     p.add_argument("--mcp-config", default=None,
-                   help="通用 MCP 配置文件（默认 mcp.json，存在即接入）")
+                   help="通用 MCP 配置文件（默认 mcp.json）：存在则作为**启动种子**写进 "
+                        "mcp_servers，再由动态通道连接；不存在会出一行回执")
     p.add_argument("--no-mcp", action="store_true", help="禁用通用 MCP 接入")
     p.add_argument("--storyline-config", default=None,
                    help="Storyline config.toml（默认 examples/storyline/config.toml；剪辑节点唯一来源，未连通即无剪辑能力）")

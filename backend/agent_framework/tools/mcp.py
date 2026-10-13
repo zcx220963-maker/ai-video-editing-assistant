@@ -79,6 +79,35 @@ class MCPServerConfig:
             enabled_tools=list(enabled),
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        """回到 ``from_dict`` 读得懂的形状（入库用）。
+
+        为什么需要它（T46 之前不需要）：``mcp.json`` 从「启动期直接连」改成「写进
+        ``mcp_servers`` 当种子」之后，这份配置第一次有了**落地**形态，而落地形态必须
+        能被同一张表读回来——``McpManager.connect`` 走的就是
+        ``MCPServerConfig.from_dict(row["config"])``。两个方向写在同一个类里，
+        改一个忘一个的机会小一半（只有 ``from_dict`` 时，加字段的人看不见还有个往回写的口）。
+
+        空值不写进去：``env``/``headers`` 为空时留空，免得库里躺着 ``{"env": {}}``
+        这种「看着像配了、其实没配」的形状。
+        """
+        out: dict[str, Any] = {
+            "type": self.type,
+            "tool_timeout": self.tool_timeout,
+            "enabled_tools": list(self.enabled_tools),
+        }
+        if self.command:
+            out["command"] = self.command
+        if self.args:
+            out["args"] = list(self.args)
+        if self.env:
+            out["env"] = dict(self.env)
+        if self.url:
+            out["url"] = self.url
+        if self.headers:
+            out["headers"] = dict(self.headers)
+        return out
+
 
 @dataclass
 class MCPToolsConfig:

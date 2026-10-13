@@ -307,6 +307,11 @@ const toolLib = ref(null);
 const loadingTools = ref(false);
 // —— 工具库管理态：MCP 服务（动态注册）与技能库的增删改查 ——
 const mcpServers = ref([]);
+// 设置页里那个 MCP 区块用的草稿与回话。刻意**不复用** mcpForm/mcpMsg：那两个是工具库
+// 弹窗的东西（弹窗开着/收起是另一套状态），共用会让「我在设置页填了一半，切去工具库
+// 弹窗，回来字没了」。写库那一支仍然共用（见 mcpUpsert）——状态各管各的，口径只有一份。
+const mcpDraft = ref({ name: "", type: "streamableHttp", url: "", command: "", args: "" });
+const mcpSetMsg = ref("");
 const loadingMcp = ref(false);
 const mcpForm = ref(null);        // null=表单收起;{name,type,url,command,args,tool_timeout}
 const mcpBusy = ref(false);
@@ -1018,6 +1023,19 @@ function editMcp(s) {
   mcpMsg.value = "";
 }
 
+// 登记/更新一台 MCP Server（**只写配置，不连线**——connect 走 enable）。
+// 工具库弹窗与设置页区块共用这一支：两个入口写的是同一张表、同一份字段口径。
+async function mcpUpsert(name, config) {
+  const r = await fetch("/mcp/servers", {
+    method: "POST",
+    headers: { ...authHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ name, config }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+  return j;
+}
+
 async function saveMcp() {
   const f = mcpForm.value;
   if (!f || !f.name.trim()) { mcpMsg.value = "名称必填"; return; }
@@ -1039,13 +1057,7 @@ async function saveMcp() {
   }
   mcpBusy.value = true;
   try {
-    const r = await fetch("/mcp/servers", {
-      method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ name: f.name.trim(), config }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    const j = await mcpUpsert(f.name.trim(), config);
     mcpForm.value = null;
     itemModal.value = null;
     mcpMsg.value = "已保存：" + j.saved + "（点「启用」才会连接）";
@@ -1057,7 +1069,7 @@ async function saveMcp() {
   }
 }
 
-async function toggleMcp(s) {
+async function toggleMcp(s, sink = mcpMsg) {
   mcpBusy.value = true;
   try {
     const op = s.live ? "disable" : "enable";
@@ -1065,26 +1077,58 @@ async function toggleMcp(s) {
                           { method: "POST", headers: authHeaders() });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
-    mcpMsg.value = op === "enable"
+    sink.value = op === "enable"
       ? `已连接，注册 ${(j.tools || []).length} 个工具`
       : "已断开";
     await loadMcpAdmin();
   } catch (e) {
     // detail 本身已是人话(如「连接失败:<urlopen error ...>」),不再叠加前缀
-    mcpMsg.value = e.message;
+    sink.value = e.message;
   } finally {
     mcpBusy.value = false;
   }
 }
 
-async function delMcp(s) {
+async function delMcp(s, sink = mcpMsg) {
   if (!confirm(`删除 MCP 服务 ${s.name}？（在线会先断开）`)) return;
   const r = await fetch(`/mcp/servers/${encodeURIComponent(s.name)}`,
                         { method: "DELETE", headers: authHeaders() });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) { mcpMsg.value = "删除失败：" + (j.detail || r.status); return; }
-  mcpMsg.value = "已删除：" + j.deleted;
+  if (!r.ok) { sink.value = "删除失败：" + (j.detail || r.status); return; }
+  sink.value = "已删除：" + j.deleted;
   await loadMcpAdmin();
+}
+
+// ---- 设置页的 MCP 区块：与工具库那边共用读写，只换个草稿与回话出口 ----
+
+//: 已连线的 MCP server 数（设置页抬头那一行读它）
+const liveMcpCount = computed(() => mcpServers.value.filter((s) => s.live).length);
+//: 已连线 server 贡献的工具总数——这个数就是本轮 `context_ledger.tools` 里来自 MCP 的那部分
+const mcpToolCount = computed(
+  () => mcpServers.value.reduce((n, s) => n + ((s.tools || []).length), 0));
+
+async function addMcpFromSettings() {
+  const d = mcpDraft.value;
+  if (!d.name.trim()) { mcpSetMsg.value = "名称必填"; return; }
+  const config = { type: d.type, tool_timeout: 60, enabled_tools: ["*"] };
+  if (d.type === "stdio") {
+    config.command = d.command.trim();
+    config.args = d.args.split(",").map((x) => x.trim()).filter(Boolean);
+  } else {
+    config.url = d.url.trim();
+  }
+  mcpBusy.value = true;
+  try {
+    const j = await mcpUpsert(d.name.trim(), config);
+    mcpSetMsg.value = `已登记 ${j.saved}（点「启用」才连线）`;
+    // 只清地址不清 name/type：连着登记两三台同一类 server 时少敲两下
+    mcpDraft.value = { ...d, name: "", url: "", command: "", args: "" };
+    await loadMcpAdmin();
+  } catch (e) {
+    mcpSetMsg.value = "登记失败：" + e.message;
+  } finally {
+    mcpBusy.value = false;
+  }
 }
 
 // ---- 技能库管理：上传 zip / 重扫导入目录 / 删除 ----
@@ -2947,6 +2991,10 @@ async function toggleSettings() {
   } catch (e) {
     keyError.value = "读不到当前设置：" + e.message;
   }
+  // MCP 清单走的是另一个端点（/mcp/servers 而不是 /settings/*），单独拉一次。
+  // 失败只写进这一区块自己的回话，不占 keyError——MCP 挂了不该让整页设置看起来是坏的。
+  mcpSetMsg.value = "";
+  await loadMcpAdmin();
 }
 
 async function saveLLM() {
@@ -4554,6 +4602,63 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           </div>
           <div v-for="n in testImageResult.notes || []" :key="n" class="set-note bad">{{ n }}</div>
         </div>
+        <!-- MCP 外部工具：发版种子（backend/mcp.json，启动时入库）与这里登记的运行期
+             那一路写的是**同一张表**，连接一律由 McpManager 发起——所以「哪台在线、
+             贡献了几个工具」在这一个地方就能看全，不用去翻启动日志。 -->
+        <div class="set-line set-head">
+          MCP 外部工具
+          <span :class="liveMcpCount ? 'set-v' : 'set-note'">
+            {{ liveMcpCount
+               ? `已连 ${liveMcpCount} 台 · 共 ${mcpToolCount} 个工具`
+               : "未连任何外部 MCP —— 工具面只有本机自带的那些" }}
+          </span>
+        </div>
+        <p v-if="!mcpServers.length" class="set-note">
+          还没有登记任何 MCP Server。部署期可以放一份 <code>backend/mcp.json</code> 当种子
+          （启动时写进库，不带这份文件就是现在这样）；也可以在下面现登记一台。
+        </p>
+        <div v-for="s in mcpServers" :key="'set-' + s.name" class="set-line">
+          <span :class="s.live ? 'set-v' : 'set-note'" style="min-width: 11rem">
+            {{ s.name }}
+            <!-- 「这台是发版种子带进来的，删了重启还会回来」要在这一行说清，
+                 否则有人删完发现它又冒出来，会当成 bug 查 -->
+            <template v-if="s.owner_user_id === null">（种子·系统）</template>
+          </span>
+          <span class="set-note">
+            {{ s.live
+               ? `${s.tools.length} 个工具：${s.tools.slice(0, 4).join("、")}`
+                  + (s.tools.length > 4 ? "…" : "")
+               : (s.enabled ? "已启用但未连上（看上一条回话）" : "未启用") }}
+          </span>
+          <button class="clip" :disabled="mcpBusy" @click="toggleMcp(s, mcpSetMsg)">
+            {{ s.live ? "关断" : "启用" }}
+          </button>
+          <button class="clip ghost" :disabled="mcpBusy" @click="delMcp(s, mcpSetMsg)">删除</button>
+        </div>
+        <div class="set-line">
+          <input v-model.trim="mcpDraft.name" spellcheck="false"
+                 placeholder="名称（字母数字与 _ -）" :disabled="mcpBusy" />
+          <select v-model="mcpDraft.type" :disabled="mcpBusy">
+            <option value="streamableHttp">streamableHttp</option>
+            <option value="sse">sse</option>
+            <option value="stdio">stdio</option>
+          </select>
+          <template v-if="mcpDraft.type === 'stdio'">
+            <input v-model.trim="mcpDraft.command" spellcheck="false"
+                   placeholder="命令，如 npx" :disabled="mcpBusy" />
+            <input v-model.trim="mcpDraft.args" spellcheck="false"
+                   placeholder="参数（逗号分隔）" :disabled="mcpBusy" />
+          </template>
+          <input v-else v-model.trim="mcpDraft.url" spellcheck="false"
+                 placeholder="http://host:port/mcp" :disabled="mcpBusy" />
+          <button class="clip" :disabled="mcpBusy || !mcpDraft.name.trim()"
+                  @click="addMcpFromSettings">{{ mcpBusy ? "登记中…" : "登记" }}</button>
+        </div>
+        <p class="set-note">
+          「登记」只写配置不连线；点「启用」才连，连上后它的工具**当轮**就进模型工具面，
+          不用重启。与既有工具撞名会整体回绝（宁可不上线也不静默覆盖）。
+        </p>
+        <div v-if="mcpSetMsg" class="set-note">{{ mcpSetMsg }}</div>
         <div v-if="keyError" class="set-v bad">{{ keyError }}</div>
       </div>
 

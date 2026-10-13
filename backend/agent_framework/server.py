@@ -1096,6 +1096,10 @@ def create_app(
             servers.append({
                 "name": r["name"], "config": cfg, "enabled": bool(r.get("enabled")),
                 "live": r["name"] in live, "tools": live.get(r["name"], []),
+                # owner_user_id 给出来是为了让界面说得出「这台是发版种子带进来的系统 server
+                # （NULL）还是我自己加的」——T46 把 mcp.json 降级成种子之后，两类 server
+                # 在同一张列表里，分不出就会有人去删一台重启后又冒出来的。
+                "owner_user_id": r.get("owner_user_id"),
                 "updated_at": updated.isoformat() if hasattr(updated, "isoformat") else "",
             })
         return {"servers": servers}
