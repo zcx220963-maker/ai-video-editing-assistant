@@ -541,6 +541,7 @@ class AgentOnceRun:
             messages = await self.context_builder.build(
                 session, message, attachments=rows, rejected_attachments=rejected,
                 extra_sections=extra_sections,
+                recall_terms=self._recall_terms(approved_plan),
             )
             # 账面**就地取走**，不留到后面从 builder 上读：ContextBuilder 是跨 run 共享的，
             # `last_ledger` 是最后写者赢——两条 run 交错时读到的是别人的账。
@@ -798,6 +799,36 @@ class AgentOnceRun:
             plan_nudges=max(0, self.config.plan_card_nudges))
         state.persist(cp)
         return r
+
+    @staticmethod
+    def _recall_terms(approved_plan: Mapping[str, Any] | None) -> str:
+        """批准计划 → 本轮额外的召回词（R9-T39，§5.7 第④条）。
+
+        给的是**步骤的机器名与中文名两样**：机器名（``plan_motion``）跟记忆里的工具
+        教训同词，中文名（「编排分镜」）跟用户偏好同词——只给一样，另一半记忆就召不回来。
+        计划里没有的字段一律跳过，不猜、不补。
+
+        为什么由 agent 侧算而不是让 ``memory`` 自己去看计划：``ContextSource`` 只拿得到
+        用户消息，计划在 ``extra_sections`` 里、渲染顺序在 source 之后——让每个 source
+        自己去翻计划就是第二份「谁在装配」的真相。
+        """
+        if not approved_plan:
+            return ""
+        words: list[str] = []
+        for step in approved_plan.get("steps") or []:
+            if not isinstance(step, Mapping):
+                continue
+            node = str(step.get("node") or "").strip()
+            if not node:
+                continue
+            words.append(node)
+            label = str(get_catalog().label(node) or "").strip()
+            if label and label != node:
+                words.append(label)
+            for name in step.get("skills_hint") or []:
+                if str(name).strip():
+                    words.append(str(name).strip())
+        return " ".join(words)
 
     def _record_context_ledger(self, state: RunState, reg: ToolRegistry, *,
                                user_id: str | None, planning: bool,

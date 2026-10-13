@@ -1127,6 +1127,21 @@ class MemoriesRepo(_Repo):
                                     order_by=["category"])
         return {r["category"]: r["content"] for r in rows}
 
+    async def stamps(self, user_id: str) -> dict[str, Any]:
+        """分类 → 该分类正文最后一次写入的时间（``memories.updated_at``）。
+
+        读侧回执要用（R9-T39：注入不全时必须说清「最早的那条起于哪里」）。表是
+        (user_id, category) 一行一块文本，**没有逐条时间戳**——所以这里给的只能到
+        分类粒度：这是现存为止最细的真值，不是「最早一条」的近似替代品（见 §9-Q102）。
+        """
+        rows = await self.db.select(self.table, where={"user_id": user_id},
+                                    order_by=["category"])
+        out: dict[str, Any] = {}
+        for row in rows:
+            got = row.get("updated_at")
+            out[row["category"]] = got.isoformat() if hasattr(got, "isoformat") else got
+        return out
+
     async def drop_category(self, user_id: str, category: str) -> int:
         return await self.db.delete(self.table, where={"user_id": user_id,
                                                        "category": category})

@@ -203,10 +203,12 @@ SECTION_BUDGET_BYTES: dict[str, int] = {
     "skills": 3630,               # 实测 3,156（6 份清单连内层 <skills> 标签）
     "skill_instructions": 35864,  # 实测 31,186（motion_explainer 正文，今天整段注入）
     # 内容由上限决定的块：断值 = 结构上限的字节折算，拦的是「有人把上限删了/放开了」。
-    # 上限口径按最坏情况全 CJK（3 字节/字）折：4000 字正文（total_chars，memory.py:92）
-    # + 344 字 USAGE_NOTE + 两段「更早的记忆已省略 N 字」提示 + 两个分类标题 ≈ 4,466 字
-    # ≈ 13.4 KB，再留 ~400 B 余量。**这不是现值**——记忆的现值由用户内容决定，没有单一现值。
-    "memory": 13824,
+    # T39 之后记忆改「按条召回 + 不截字」，注入量由自己的上限卡死（memory.py：
+    # total_bytes=1400 + per_category_bytes=700），最坏情况（全 CJK、两段标题、
+    # 未注入回执带 ISO 时间戳、USAGE_NOTE ≤120 B）≈ 1,800 B。
+    # 断值取 §5.4 的目标 2048：结构上界（1,800）与目标之间那点余量留给标题/回执措辞，
+    # **严于目标就等于把目标当闸**（§9-Q100 ①），而这里要拦的是「上限被放开」。
+    "memory": 2048,
     # 全开金样实测 4,834 B。给 2× 而不是 ×1.15：这一段里有**用户可控文本**
     # （feedback_quote / pending_asked 是用户原话，neutralize 只防注入不截长），
     # 紧值会让「用户写了段长反馈」直接变成「出不了计划」。2× 是失控检测线，
@@ -235,9 +237,6 @@ SECTION_TARGET_BYTES: dict[str, int] = {
 SECTION_BUDGET_DEBT: dict[str, tuple[int, int, str]] = {
     "skills": (1536, 3156,
                "描述瘦身（**没有任务号**）：T43 只去重内层 <skills> 标签，省不到 40 B"),
-    "memory": (2048, 13417,
-               "T39：读侧召回 + USAGE_NOTE 344→≤120 字（现值按**结构上限的最坏情况**算，"
-               "不是实时值——记忆大小由用户内容决定）"),
     "knobs": (1228, 1829,
                "T40：改条件注入（现值未标定，所以今天**不设断值**，标定要等真机首轮的账）"),
     "skill_instructions": (16384, 31186, "T42：技能正文分段键"),
@@ -425,6 +424,7 @@ class ContextBuilder:
         attachments: Sequence[Mapping[str, Any]] = (),
         rejected_attachments: Sequence[str] = (),
         extra_sections: Sequence[str | Section] = (),
+        recall_terms: str = "",
     ) -> list[Message]:
         """装配本轮上下文。
 
@@ -433,9 +433,15 @@ class ContextBuilder:
         不该做成常驻 ContextSource 让每轮都重跑一遍检索。
         元素可以是裸串（自动命名）或 :class:`Section`（带条件键与引用方的好账）。
 
+        ``recall_terms``（R9-T39）是本次**装配方才知道**的额外召回词——执行轮的计划
+        步骤名就属于这一类：它们在 ``extra_sections`` 里，而 ``ContextSource.render``
+        拿到的只有用户消息。把它拼进 query 交给产出方（现只有 ``memory`` 用它做关键词
+        召回），比让每个 source 自己去翻计划诚实：装配方知道自己这轮在干嘛。
+
         返回前产出一本账（``self.last_ledger``，格式见 §5.7 第①条）；
         ``over_budget`` 非空即抛 :class:`ContextBudgetError`——**请求不发出**。
         """
+        query = f"{current_input}\n{recall_terms}".strip() if recall_terms else current_input
         sections: list[Section] = []
 
         def _add(sec: Section) -> None:
@@ -458,7 +464,7 @@ class ContextBuilder:
                              referenced_by=ASSEMBLY_REF))
 
         for source in self.context_sources:
-            body = await source.render(current_input, user_id=session.user_id)
+            body = await source.render(query, user_id=session.user_id)
             if body:
                 # 三个可选属性由 ContextSource 自己声明（协议仍是 `name` + `render`）：
                 # 装配侧不认识「记忆」或「技能」是什么，只认它自报的身份与消费者。

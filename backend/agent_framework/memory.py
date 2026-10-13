@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .identity import current_identity_or
@@ -68,81 +69,199 @@ class MemoryStore:
         got = await self._mem.entries(self.user_id)
         return {cat: got[cat].strip() for cat in cats if got.get(cat, "").strip()}
 
+    async def stamps(self, categories: list[str] | None = None) -> dict[str, str]:
+        """分类 → 该分类最后写入时间（ISO 串）。注入回执用它说清「最早一条起于哪里」。"""
+        cats = categories or list(CATEGORIES)
+        got = await self._mem.stamps(self.user_id)
+        return {cat: str(got[cat]) for cat in cats if got.get(cat)}
+
 
 class MemoryContextSource:
-    """实现 ContextSource 协议：把记忆内容注入 System Prompt。
+    """实现 ContextSource 协议：**按相关度召回**记忆条目注入 System Prompt。
 
-    当前策略是全量携带，但**带上限**：render(query) 的 query 参数为未来 RAG 相关性召回预留。
+    召回（R9-T39，取代此前的「全量携带 + 超限保尾部」）：
+
+    - ``query``（本轮用户消息 + 计划步骤名，由 ``ContextBuilder.build(recall_terms=)``
+      拼好递进来）按词打分，取命中的前 ``top_k`` 条；**命中 0 条的条目不注入**——
+      「每轮全量 dump」正是要被换掉的东西。
+    - 一条都没命中时**仍然发一段**：只留回执行说明「有记忆但本轮没命中，可 read_memory 读」。
+      为什么不干脆整段不发：模型会以为这个用户没有记忆，从此不再写、不再读。
+    - 取舍**按条，不截字**：装不下的整条不注入，并在末尾留一行「未注入 N 条」。
+      旧行为是「保尾部」——头部被悄悄丢掉，模型看到的是一份**看起来完整**的记忆，
+      这是 §5.7 第④条点名要改掉的静默截断。
 
     为什么必须有上限：记忆是 Agent 自己 append 的，schema 上没有任何长度约束，
-    而它每一轮都整段注进 system，压缩器又不看 system 段。实测 append 200 次就有
-    30489 字符，且只增不减——每轮 prompt 稳定膨胀，最后必然打爆上下文。
-    超限时按分类截断并明确写出「已省略多少字」，让模型知道自己看到的不是全部
-    （而不是静默丢内容、让它以为记忆就这么多）。
+    而它每一轮都注进 system，压缩器又不看 system 段。实测 append 200 次就有 30489 字符，
+    且只增不减——每轮 prompt 稳定膨胀，最后必然打爆上下文。
 
     为什么连「怎么用这份记忆」也一起注入（``USAGE_NOTE``）：只有工具清单里真有
     update_memory/read_memory 时才谈得上写，而这两件工具与这段注入同开同关
     （``--no-memory`` 时两者都不存在）。写在系统提示词里就成了永久陈述句，
-    关着记忆时反而教模型去调一个不存在的工具。
+    关着记忆时反而教模型去调一个不存在的工具。它每次常发，所以按 §5.7 第④条压到 ≤120 B
+    （原本 344 字那种「怎么理解计划卡生成行」的教程不在这里讲——那些行本身自带前缀，
+    语义写在 §5.4 的规划段与 USAGE_NOTE 之外的地方）。
     """
 
     name = "memory"
-    # 单条分类的上限与全量上限：按「中文字≈1 token」估，约合 1.5k~2k token。
-    per_category_chars = 2000
-    total_chars = 4000
+    # 注入预算**按字节**（UTF-8），不是按字：账面与 §5.4.1 的断值都是字节，
+    # 两个口径混用就会出现「账面说没超、实际超了」。全 CJK 最坏 3 B/字，
+    # 下面这两个数就是「最坏情况下也顶不穿 §5.4.1 那个 2 KB 断值」的上界。
+    per_category_bytes = 700
+    total_bytes = 1400
+    # 相关度召回取前几条（默认 6，与 §5.7 第④条的 k 一致）。
+    top_k = 6
     # 账面（§5.7 第①条）自报：这一段是**每轮无条件**发的，读它的是模型手上那两件
     # 记忆工具——注入的正文正是它们读写的对象，USAGE_NOTE 也只在它们存在时才写。
     ledger_kind = "always"
     ledger_referenced_by = ("update_memory", "read_memory")
 
-    USAGE_NOTE = (
-        "用法：前缀是「计划卡：」「换一版计划的理由」「成片退回重做」的行由服务端从用户"
-        "在计划卡上的实际操作**自动生成**，是事实不是转述——出下一版计划时照它们办："
-        "被跳过的那步默认不再排、被改过的参数直接摆成那个值、「手写诉求」当明确指令、"
-        "看到退回记录就先定位上一版哪一条证据没过，而不是原样再渲一次。"
-        "这些行记的是**动作**，同一类反复出现才算稳定偏好，与本轮诉求冲突时以本轮为准。"
-        "用户当面说出的新偏好要立刻用 update_memory 追加（偏好进 user、工具教训进 tool），"
-        "不要等他再说第二遍；重复啰嗦的行用 mode=replace 合并精简。"
-        "上面若出现「更早的记忆已省略 N 字」，那是超过注入上限，**不等于用户没说过**——"
-        "必要时先 read_memory 核对再动手。"
-    )
+    USAGE_NOTE = ("用法：偏好→user、教训→tool；新偏好立刻 update_memory，"
+                  "重复行 mode=replace 合并。")
 
     def __init__(self, store: MemoryStore, categories: list[str] | None = None,
-                 *, per_category_chars: int | None = None,
-                 total_chars: int | None = None) -> None:
+                 *, per_category_bytes: int | None = None,
+                 total_bytes: int | None = None, top_k: int | None = None) -> None:
         self._store = store
         self._categories = categories
-        if per_category_chars is not None:
-            self.per_category_chars = int(per_category_chars)
-        if total_chars is not None:
-            self.total_chars = int(total_chars)
+        if per_category_bytes is not None:
+            self.per_category_bytes = int(per_category_bytes)
+        if total_bytes is not None:
+            self.total_bytes = int(total_bytes)
+        if top_k is not None:
+            self.top_k = int(top_k)
 
-    def _clip(self, content: str, limit: int) -> str:
-        """超出上限时**保留最近写的部分**（记忆后写的通常更相关）。"""
-        if len(content) <= limit:
-            return content
-        kept = content[-limit:]
-        return f"（更早的记忆已省略 {len(content) - limit} 字）\n{kept}"
+    # ---- 召回 ----
 
-    async def render(self, query: str, *, user_id: str | None = None) -> str | None:  # noqa: ARG002 (query 预留给 RAG; user_id 由 MemoryStore 自身绑定)
+    @staticmethod
+    def _split(content: str) -> list[str]:
+        """分类正文 → 条目：一行一条（``append`` 就是按换行拼的）。"""
+        return [ln.strip() for ln in str(content or "").splitlines() if ln.strip()]
+
+    @classmethod
+    def terms(cls, query: str) -> set[str]:
+        """查询词 → 判据项：ASCII 词（小写，≥2 字）+ CJK 连续段的二元组。
+
+        用二元组而不是分词：没有词典、没有依赖，中文里「文案」这种词本来就会
+        跨词边界（「写文案」「文案风格」），二元组对这类匹配反而更稳。
+        单字 CJK 段（如「跑」）本身就是一个词，直接收。
+        """
+        text = str(query or "")
+        out = {m.group(0).lower() for m in _ASCII_WORD_RE.finditer(text)}
+        for run in _CJK_RUN_RE.findall(text):
+            if len(run) == 1:
+                out.add(run)
+            else:
+                out.update(run[i:i + 2] for i in range(len(run) - 1))
+        return out
+
+    @classmethod
+    def _score(cls, entry: str, terms: set[str]) -> int:
+        """命中的**去重**判据项个数。
+
+        去重而不是数出现次数：一条记忆把「文案」写十遍，不表示它比只写一遍的更相关；
+        重复计数会让啰嗦的条目挤掉真正切题的条目。
+        """
+        if not terms:
+            return 0
+        low = entry.lower()
+        words = {m.group(0).lower() for m in _ASCII_WORD_RE.finditer(entry)}
+        return sum(1 for t in terms if (t in words if t.isascii() else t in low))
+
+    async def render(self, query: str, *, user_id: str | None = None) -> str | None:  # noqa: ARG002 (user_id 由 MemoryStore 自身绑定)
         entries = await self._store.entries(self._categories)
         if not entries:
             return None
-        sections: list[str] = []
-        used = 0
+
+        terms = self.terms(query)
+        # (分类, 条目序号, 文本, 得分)：序号即写入先后（append 往后加）。
+        scored: list[tuple[str, int, str, int]] = []
         for cat, content in entries.items():
-            room = min(self.per_category_chars, max(0, self.total_chars - used))
-            if room <= 0:
-                sections.append(f"### {CATEGORIES[cat]}（memories.category='{cat}'）\n"
-                                f"（本次未注入：记忆总量已达上限 {self.total_chars} 字，"
-                                f"可用 update_memory 精简）")
+            for idx, line in enumerate(self._split(content)):
+                scored.append((cat, idx, line, self._score(line, terms)))
+
+        hits = [row for row in scored if row[3] > 0]
+        cat_order = {cat: i for i, cat in enumerate(entries)}
+        if hits:
+            # 同分时短的先上：同样切题，短的那条占的预算少，能让更多切题的条目挤进来。
+            hits.sort(key=lambda r: (-r[3], len(r[2]), r[0], -r[1]))
+            picked = hits[:self.top_k]
+            fallback = False
+        else:
+            # 一条都没命中 → 退回**每类最近 top_k 条**（不是「什么都不给」）。
+            # 为什么必须有这一腿：服务端自动生成的那些行（「计划卡：跳过第 N 步…」
+            # 「成片退回重做…」）记的是用户在上一版计划上的**动作**，它们跟这一轮
+            # 用户新提的诉求往往不同词——纯相关度召回会把这些「状态」判成无关而丢掉，
+            # 于是 USAGE_NOTE 里「被跳过的那步默认不再排」就成了空话。
+            # 按类取最近（而不是全局取最近）：两类独立，工具教训不会被用户偏好挤没。
+            picked = [row for cat in entries
+                      for row in [r for r in scored if r[0] == cat][-self.top_k:]]
+            fallback = True
+
+        # 预算内挑（选谁按相关度、摆谁按时间顺序：记忆读起来该像一本流水账）
+        kept: list[tuple[str, int, str, int]] = []
+        used_per: dict[str, int] = {}
+        used = 0
+        for cat, idx, line, score in picked:
+            n = len(line.encode("utf-8"))
+            if used_per.get(cat, 0) + n > self.per_category_bytes:
                 continue
-            body = self._clip(content, room)
-            used += len(body)
-            sections.append(
-                f"### {CATEGORIES[cat]}（memories.category='{cat}'）\n{body}")
-        # 用法段在预算之外：它是固定长度的说明，不参与「记忆内容截到哪」的计算。
+            if used + n > self.total_bytes:
+                continue
+            kept.append((cat, idx, line, score))
+            used_per[cat] = used_per.get(cat, 0) + n
+            used += n
+        kept.sort(key=lambda r: (cat_order.get(r[0], 0), r[1]))
+
+        injected: dict[str, list[str]] = {}
+        for cat, _idx, line, _score in kept:
+            injected.setdefault(cat, []).append(line)
+
+        sections: list[str] = []
+        for cat in entries:
+            lines = injected.get(cat)
+            if not lines:
+                continue
+            sections.append(f"### {CATEGORIES[cat]}（memories.category='{cat}'）\n"
+                            + "\n".join(lines))
+
+        dropped = len(scored) - len(kept)
+        if not sections:
+            # 连最近几条都装不下：**不能整段消失**，否则模型以为这个用户没有记忆。
+            sections.append(f"### 记忆（共 {len(scored)} 条，本轮未注入）")
+        sections.append(await self._receipt(len(scored), len(kept), dropped,
+                                           recent=fallback))
         return "\n\n".join(sections) + "\n\n" + self.USAGE_NOTE
+
+    async def _receipt(self, total: int, kept: int, dropped: int, *,
+                       recent: bool = False) -> str:
+        """未注入回执。**只说真话**：有多少、为什么、最早的那条起于哪里。
+
+        「最早一条 <时间戳>」这条要求（§5.7 第④条）在现有 schema 下只能给到分类粒度：
+        ``memories`` 表是 (user_id, category) 一行一块文本，**没有逐条时间戳**，
+        而 T39 明令只动读侧、不许给写侧加列。所以回执给的是「最早一条在该分类正文开头，
+        该分类最后更新于 <ISO>」——时间是从表里读的真值，不是编的（见 §9-Q102）。
+        """
+        why = "关键词未命中，已改注入最近几条" if recent else "关键词未命中或超预算"
+        if dropped <= 0:
+            return (f"（本轮注入 {kept} 条，共 {total} 条）" if not recent else
+                    f"（本轮关键词未命中，改注入最近 {kept} 条，共 {total} 条）")
+        stamp = ""
+        getter = getattr(self._store, "stamps", None)
+        if callable(getter):
+            try:
+                got = await getter()
+            except Exception:  # noqa: BLE001 - 回执是增益，读不到时间戳不影响注入
+                got = {}
+            for cat in self._categories or list(CATEGORIES):
+                if got.get(cat):
+                    stamp = f"；最早一条在 `{cat}` 正文开头，该分类最后更新于 {got[cat]}"
+                    break
+        return (f"（本轮注入 {kept} 条、未注入 {dropped} 条：{why}"
+                f"{stamp}；全量见 read_memory）")
+
+
+_ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]{2,}")
+_CJK_RUN_RE = re.compile(r"[一-鿿]+")
 
 
 # --------------------------------------------------------------------------
