@@ -787,7 +787,14 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
     `fields` 走 `cspec.field_values` 那一份扁表：与缓存键里的、闸⑥ 拿来当期望值的**是
     同一段代码算出的同一批字节**。两处各算一遍的话，「注入的是 41、账上期望的是 41.0」
     这种差异会让闸⑥ 稳定判红，而画面其实一张都没变。
+
+    R7-T22：入场/出场按**帧数**注入（`entranceFrames`/`exitFrames`），窗口的算术在
+    Python 侧（`cspec.shot_motion_window`）——母版只负责按这两个数插值。为什么要这么切：
+    窗口上限（这一镜的 10%）与闸④ 的采样点（0.15/0.5/0.85）是同一条算术关系，
+    在 TS 里再算一遍就有了第二个出处，将来谁把上限放宽一点，闸④ 会先在真机上开始误报
+    空壳，而没有人会想到去看母版那行代码。
     """
+    window = cspec.shot_motion_window(frames)
     return {
         # 镜号进 props 只为一件事：渲染侧据此把 `publicDir` 指到
         # `public/assets/<sid>/`（§4-5）。它**不进缓存键**——键是按代码字节 + 旋钮 +
@@ -805,6 +812,12 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
         "words": frame_words,
         "subtitleMode": str(spec.get("subtitle_mode") or "full"),
         "fields": cspec.field_values(shot),
+        # 母版进出场（T22）：档名 + 窗口帧数。`none` 或者窗口不足 2 帧时是 0/0，
+        # 母版据此完全不套那层动画（于是「不选进出场」的片子逐帧与从前一致）。
+        "entrance": str(spec.get("entrance") or "none"),
+        "exit": str(spec.get("exit") or "none"),
+        "entranceFrames": window,
+        "exitFrames": window,
     }
 
 
@@ -1219,8 +1232,24 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
     master = work / "master.mp4"
     await _emit(progress, {"stage": "assemble"})
     fps = int(spec["fps"])
-    await asyncio.to_thread(mediaops.concat, clips, master, fps=fps)
+    # R7-T22：转场落在**拼接层**（`mediaops.concat` → ffmpeg xfade），逐镜切片一个字节
+    # 都不动。两条判据都在这一趟、都拿实测秒数：一条判「这个时长配得上这条片子吗」
+    # （接缝处不得叠过短镜的一半），一条判「叠上了没有」（成片该短多少就短了多少）。
+    # 为什么不在分镜期判前一条：一镜多长是 TTS 说了算的，分镜那会儿手里只有下限。
+    plan = cspec.transition_plan(spec)
+    shot_secs = [(str(r["id"]), float(r.get("sec") or 0.0)) for r in ledger]
+    misfit = cspec.check_transition(shot_secs, style=plan["style"],
+                                    duration=plan["duration"])[0]
+    if misfit:
+        raise MediaError("一帧都没拼，先把转场说清楚：\n"
+                         + "\n".join(f"  · {e}" for e in misfit))
+    await asyncio.to_thread(mediaops.concat, clips, master, fps=fps, transition=plan)
     total = float(mediaops.probe(master)["duration"])
+    not_taken = cspec.check_transition_effect([sec for _, sec in shot_secs], total,
+                                              style=plan["style"],
+                                              duration=plan["duration"], fps=fps)
+    if not_taken:
+        raise MediaError("\n".join(f"  · {e}" for e in not_taken))
 
     texture_by_shot = {str(r["id"]): str(r.get("texture") or "none") for r in ledger}
     texture_filter = next((str(r.get("texture_filter") or "") for r in ledger
@@ -1249,6 +1278,21 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
             "texture": str(spec.get("texture") or "none"),
             "texture_by_shot": texture_by_shot,
             "texture_filter": texture_filter,
+            # 转场的账（T22）：选了什么、接缝几处、**实测**叠掉了多少秒
+            # （`overlap_sec` 与 `(接缝数 × 时长)` 对得上就是「转场真生效」的证据，
+            # 上面那条判据判的就是这个差；这里留数是为了出片回执能自己算）。
+            "transition": plan["style"],
+            "transition_sec": plan["duration"],
+            "transition_gaps": max(0, len(clips) - 1),
+            "overlap_sec": round(sum(sec for _, sec in shot_secs) - total, 3),
+            # 进出场同理：档名 + **逐镜**实际窗口帧数（窗口是该镜帧数的 10%、
+            # 封顶 15 帧，短镜不足 2 帧时是 0——那时它确实没有动作，
+            # 不许把「选了 fade」当成「淡入了」；这也是回执能自己核对的那一栏）
+            "entrance": str(spec.get("entrance") or "none"),
+            "exit": str(spec.get("exit") or "none"),
+            "motion_window_by_shot": {
+                r["id"]: cspec.shot_motion_window(int(r.get("planned_frames") or 0))
+                for r in ledger},
             "av_drift_sec": round(abs(info["duration"] - total), 3),
             "degraded": [f"{r['id']}：{r['degraded']}" for r in ledger if r["degraded"]],
             # 闸④ 两半的读数留在返回里：定 EMPTY_MIN_RATIO / SPAN_MIN 终值要的是

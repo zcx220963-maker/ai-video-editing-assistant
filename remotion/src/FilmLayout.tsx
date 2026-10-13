@@ -1,6 +1,8 @@
 import React from 'react';
 import {
   AbsoluteFill,
+  Easing,
+  getInputProps,
   interpolate,
   useCurrentFrame,
   useVideoConfig,
@@ -97,8 +99,132 @@ export interface FilmLayoutProps {
   words?: WordTiming[];
   subtitleMode?: SubtitleMode;
   aspect?: Aspect;
+  /** R7-T22 整片进出场档名（none/fade/rise/drop/zoom），由整片开关注入 */
+  entrance?: ShotMotionStyle;
+  exit?: ShotMotionStyle;
+  /** 入场/出场的窗口**帧数**。由 Python 侧算好注入（`cspec.shot_motion_window`）：
+   *  那条算术（这一镜的 10%、封顶 15 帧、不足 2 帧算没有）与闸④ 的采样点绑着，
+   *  母版这边再算一遍就有了第二个出处。0 = 这一镜不动作。 */
+  entranceFrames?: number;
+  exitFrames?: number;
   /** 镜头代码填进画面带的主体内容 */
   children?: React.ReactNode;
+}
+
+// ---------------------------------------------------------------------------
+// R7-T22 出场/入场：**母版**给每一镜套的那一小段动作
+//
+// 为什么在母版而不是镜头代码里：入场/出场是整片的一个观感决定（用户在计划卡上勾一次），
+// 让 20 份模型现写的代码各自插值一小段，等于把这件决定交给 20 次掷骰子，而闸⑤ 也判不出
+// 「这一镜没做入场」——它比的是 token。放在母版里，它是结构性的：勾了就有。
+//
+// 为什么不引 `@remotion/transitions`：那套 `<TransitionSeries>` 要求相邻片段在同一棵
+// React 树里，而我们逐镜独立渲、按 `shot_cache_key` 缓存——树内转场等于把逐镜缓存整条
+// 保证作废（§3.1 / §9-Q11）。镜头**之间**的转场因此落在拼接层（ffmpeg xfade，
+// 见 `mediaops._concat_xfade`），这里只做「这一镜自己怎么进、怎么出」。
+// ---------------------------------------------------------------------------
+
+export type ShotMotionStyle = 'none' | 'fade' | 'rise' | 'drop' | 'zoom';
+
+/** 动一动的幅度：画面高的 4%（竖屏 1920 → 77px）。按帧高而不是常量，
+ *  三种画幅下才是同一个观感——与字阶按 `width/1080` 缩放同一条理由。 */
+const MOTION_SHIFT_RATIO = 0.04;
+/** zoom 的两端：入场从 0.94 推上来，出场再推到 1.04。 */
+const MOTION_ZOOM_IN = 0.94;
+const MOTION_ZOOM_OUT = 0.04;
+
+export interface ShotMotion {
+  opacity: number;
+  transform: string;
+}
+
+/** 进度 → 这一档在这一刻的透明度与位移/缩放。纯函数，方便真渲夹具之外单独核。 */
+function motionAt(style: ShotMotionStyle, prog: number, entering: boolean,
+                  shift: number): ShotMotion {
+  if (style === 'none' || prog <= 0) return { opacity: 1, transform: 'none' };
+  const p = Math.min(1, Math.max(0, prog));
+  const dy = style === 'rise' ? (entering ? (1 - p) * shift : -p * shift)
+    : style === 'drop' ? (entering ? -(1 - p) * shift : p * shift) : 0;
+  const scale = style === 'zoom'
+    ? (entering ? MOTION_ZOOM_IN + (1 - MOTION_ZOOM_IN) * p : 1 + MOTION_ZOOM_OUT * p)
+    : 1;
+  const parts = [
+    dy ? `translateY(${Math.round(dy * 100) / 100}px)` : '',
+    scale !== 1 ? `scale(${Math.round(scale * 10000) / 10000})` : '',
+  ].filter(Boolean);
+  return {
+    opacity: style === 'fade' ? 1 - p : 1,
+    transform: parts.length ? parts.join(' ') : 'none',
+  };
+}
+
+/** 一镜的进出场合成。两个窗口分居这一镜的首尾（各 ≤10%），不可能同时进行；
+ *  出场用 `Easing.in(cubic)`（起步慢、走得快）是有意的：末段代表帧与字段盒探针
+ *  都在 `durationInFrames - 2` 那一帧上，缓入让那一帧离「落定」更近一点。 */
+export function shotMotion(
+  style: ShotMotionStyle, frames: number, frame: number,
+  durationInFrames: number, height: number, entering: boolean,
+): ShotMotion {
+  if (style === 'none' || frames < 2) return { opacity: 1, transform: 'none' };
+  const at = entering ? [0, frames] : [durationInFrames - frames, durationInFrames];
+  const prog = interpolate(frame, at, [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+    easing: entering ? Easing.out(Easing.cubic) : Easing.in(Easing.cubic),
+  });
+  return motionAt(style, prog, entering, height * MOTION_SHIFT_RATIO);
+}
+
+/** 把两段动作叠在一起：透明度相乘、transform 依次套。 */
+function composeMotion(a: ShotMotion, b: ShotMotion): ShotMotion {
+  const parts = [a.transform, b.transform].filter((t) => t && t !== 'none');
+  return {
+    opacity: a.opacity * b.opacity,
+    transform: parts.length ? parts.join(' ') : 'none',
+  };
+}
+
+/** 进出场的四条取值，解析完的形态。 */
+interface ShotMotionInputs {
+  entrance: ShotMotionStyle;
+  exit: ShotMotionStyle;
+  entranceFrames: number;
+  exitFrames: number;
+}
+
+const MOTION_STYLE_SET = new Set<string>(['none', 'fade', 'rise', 'drop', 'zoom']);
+
+/**
+ * 进出场四条：**显式 props 优先，没给就取 `/render-shot` 注入的那一份**
+ * （`code_render.shot_input_props`）。
+ *
+ * 为什么要这条回退：这四条与 `text`/`words` 不是一类——它们不是「镜头代码自己的数据」，
+ * 而是**整片开关**决定的母版输入。可镜头代码要拿到注入值，就得在自己的 `Shot(props)`
+ * 里把它们再抄一遍交给 `<FilmLayout>`，而模板里漏一行**画面只是静默地不演**：「没演」与
+ * 「这一镜没选进出场」在成片上长得一模一样，闸④/⑤/⑥ 一个都判不出来（token、版面读数、
+ * 空壳率全都不变）。母版自己从注入里取，这条链就只剩一处可能出错，且错在母版里、看得见。
+ *
+ * 显式 props 仍然优先：探针与单测靠它钉值，而生产里模板怎么写都不影响结果。
+ * `none` 与「没给」在这里是**两回事**（没给才回退），所以调用方不能再给默认值。
+ */
+function resolveShotMotion(props: Partial<ShotMotionInputs>, injected: unknown): ShotMotionInputs {
+  const src = (injected && typeof injected === 'object' ? injected : {}) as Record<string, unknown>;
+  const name = (v: unknown, fallback: unknown): ShotMotionStyle => {
+    const raw = v === undefined || v === null ? fallback : v;
+    const s = String(raw ?? 'none');
+    return (MOTION_STYLE_SET.has(s) ? s : 'none') as ShotMotionStyle;
+  };
+  const frames = (v: unknown, fallback: unknown): number => {
+    const raw = v === undefined || v === null ? fallback : v;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+  };
+  return {
+    entrance: name(props.entrance, src.entrance),
+    exit: name(props.exit, src.exit),
+    entranceFrames: frames(props.entranceFrames, src.entranceFrames),
+    exitFrames: frames(props.exitFrames, src.exitFrames),
+  };
 }
 
 /** `<F>` 的两个属性。 */
@@ -186,6 +312,46 @@ function measureBox(el: Element): PxBox | null {
   return { x: round(x), y: round(y), w: round(right - x), h: round(bottom - y) };
 }
 
+/**
+ * 屏幕盒 → **成片像素坐标**（`useBody()` 报的那一套：画面带左上角在 (gutter, topSafe)）。
+ *
+ * 为什么要有这一步：R7-T22 的进出场是母版套在整帧上的一层 `transform`，
+ * 而 `getBoundingClientRect()` 量出来的是**变换之后**的屏幕盒。不折回去的话，
+ * 一个「整片淡入 + 上浮」的片子会让闸⑧ 报一片「文字被画面带裁掉」（其实是被那层
+ * 变换推出去了）、闸⑪ 把一张**静态**图判成「参与动效」（两帧的盒差了那点位移）——
+ * 两条都是假读数，而它们读的是同一个 DOM。
+ *
+ * 折法：同一帧里量一次画面带自己的盒（`live`），再按它的缩放 `s = live.w / 静态宽`
+ * 把子元素的盒还原。带子与子元素被同一个变换影响，所以相除之后剩下的就是**代码写下的
+ * 那个位置**——「整片有进出场」于是对这两条判据完全透明。没有进出场的片子
+ * `live` 就等于静态盒、`s = 1`，这一步是恒等变换（老片子的读数一个字节不变）。
+ *
+ * 结果是四舍五入到 0.01px 的，而 ⑪ 是**逐字节**比两帧的盒：两帧的 `s` 不同，浮点尾数
+ * 就可能落在舍入边界的两侧（量级 1e-7/盒），那是噪声不是位移——真动起来的东西两帧差的是
+ * 若干个像素。这一层不做「容差比对」是有意的：容差会把「静态图在动与不动的边界上」这件事
+ * 一起放宽，而 ⑪ 要判的正是那个边界（`server.mjs` 的 `boxSame && transformSame &&
+ * opacitySame`）。
+ */
+function toCodeSpace(box: PxBox, live: PxBox, base: PxBox): PxBox {
+  const s = base.w > 0 && live.w > 0 ? live.w / base.w : 1;
+  const round = (n: number) => Math.round(n * 100) / 100;
+  return {
+    x: round((box.x - live.x) / s + base.x),
+    y: round((box.y - live.y) / s + base.y),
+    w: round(box.w / s),
+    h: round(box.h / s),
+  };
+}
+
+/** 画面带这一帧**实测**的盒（含母版进出场那层 transform）。量不到给 null，
+ *  调用方按「这一帧没有变换」处理（等于退回静态盒，宁可少折一次也不要报假读数）。 */
+function liveBand(el: HTMLElement | null): PxBox | null {
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  if (!(r.width > 0) || !(r.height > 0)) return null;
+  return { x: r.left, y: r.top, w: r.width, h: r.height };
+}
+
 // ---------------------------------------------------------------------------
 // 闸⑧ 版面回读：叠字 / 被画面带裁掉 / 引线指向空白
 //
@@ -252,6 +418,10 @@ function paintedWithin(root: Element, el: Element): boolean {
   return true;
 }
 
+/** 屏幕像素 → 成片像素的换算（见 :func:`toCodeSpace`）；纯点也走它，
+ *  所以「盒」与「引线端点」不会各折一次、折出两个口径。 */
+type Convert = (box: PxBox) => PxBox;
+
 /** 元素自己直接挂着的非空文本（不含子元素的文本，于是父子盒不会重复计）。 */
 function ownText(el: Element): string {
   return Array.from(el.childNodes)
@@ -272,7 +442,7 @@ function ownText(el: Element): string {
  * 结果带元素身份（而不只是盒）：判引线悬空时**必须把这条线自己剔掉**——线的端点天然
  * 落在自己的外接盒上，不剔就成了「另一端挨着画得出的东西」，dangling 这一路恒不响应。
  */
-function drawnBoxes(root: Element): { el: Element; box: PxBox }[] {
+function drawnBoxes(root: Element, convert: Convert): { el: Element; box: PxBox }[] {
   const out: { el: Element; box: PxBox }[] = [];
   const svgTags = new Set(['path', 'rect', 'circle', 'ellipse', 'polygon', 'polyline', 'line', 'image', 'text', 'tspan']);
   for (const el of Array.from(root.querySelectorAll('*'))) {
@@ -287,7 +457,7 @@ function drawnBoxes(root: Element): { el: Element; box: PxBox }[] {
     if (!painted) continue;
     if (!paintedWithin(root, el)) continue;
     const box = measureBox(el);
-    if (box && box.w >= 1 && box.h >= 1) out.push({ el, box });
+    if (box && box.w >= 1 && box.h >= 1) out.push({ el, box: convert(box) });
   }
   return out;
 }
@@ -345,8 +515,13 @@ function lineEnds(el: Element): [{ x: number; y: number }, { x: number; y: numbe
   return p0 && p1 ? [p0, p1] : null;
 }
 
-/** 母版在探针帧上做一次版面回读。 */
-function probeLayout(root: Element, band: PxBox) {
+/** 母版在探针帧上做一次版面回读。
+ *
+ *  `convert` 把这一帧量到的屏幕盒折回**成片像素**（见 :func:`toCodeSpace`）：
+ *  母版那层进出场变换是整帧一起动的，折回去之后三条判据读到的还是「代码写下的版面」。
+ *  没有进出场的片子 `convert` 是恒等变换，读数与从前逐字节相同。
+ */
+function probeLayout(root: Element, band: PxBox, convert: Convert) {
   const findings: LayoutFinding[] = [];
   let dropped = 0;
   const push = (f: LayoutFinding) => {
@@ -367,9 +542,9 @@ function probeLayout(root: Element, band: PxBox) {
     const text = ownText(el);
     if (!text) continue;
     if (!paintedWithin(root, el)) continue;
-    const box = measureBox(el);
-    if (!box || box.w < LAYOUT_PROBE.min_box_px || box.h < LAYOUT_PROBE.min_box_px) continue;
-    texts.push({ text: text.slice(0, 24), box, el });
+    const raw = measureBox(el);
+    if (!raw || raw.w < LAYOUT_PROBE.min_box_px || raw.h < LAYOUT_PROBE.min_box_px) continue;
+    texts.push({ text: text.slice(0, 24), box: convert(raw), el });
   }
 
   // 2) 叠字：两处各写各的文字压在一起
@@ -406,11 +581,17 @@ function probeLayout(root: Element, band: PxBox) {
     LAYOUT_PROBE.anchor_min_px,
     Math.round(LAYOUT_PROBE.anchor_ratio * Math.min(band.w, band.h)),
   );
-  const drawn = drawnBoxes(root);
+  const drawn = drawnBoxes(root, convert);
   const nearText = (p: { x: number; y: number }) => texts.find((t) => distToBox(p, t.box) <= anchor) ?? null;
   /** 落点判「挨着画得出的东西」——**这条线自己不算**：它的端点天然落在自己的盒上。 */
   const nearDrawn = (p: { x: number; y: number }, self: Element) =>
     drawn.some((d) => d.el !== self && distToBox(p, d.box) <= anchor);
+
+  /** 端点也走同一个换算：`getScreenCTM()` 给的是屏幕像素，判据的容差全是成片像素。 */
+  const convPoint = (p: { x: number; y: number }) => {
+    const c = convert({ x: p.x, y: p.y, w: 0, h: 0 });
+    return { x: c.x, y: c.y };
+  };
 
   let leaders = 0;
   for (const el of Array.from(root.querySelectorAll('line, polyline, path'))) {
@@ -418,8 +599,10 @@ function probeLayout(root: Element, band: PxBox) {
     const strokeWidth = Number(s.strokeWidth === '' ? 1 : parseFloat(s.strokeWidth)) || 0;
     if (s.stroke === 'none' || s.stroke === 'transparent' || strokeWidth <= 0) continue;
     if (!paintedWithin(root, el)) continue;
-    const ends = lineEnds(el);
-    if (!ends) continue;
+    const screen = lineEnds(el);
+    if (!screen) continue;
+    const ends: [{ x: number; y: number }, { x: number; y: number }] =
+      [convPoint(screen[0]), convPoint(screen[1])];
     if (Math.hypot(ends[0].x - ends[1].x, ends[0].y - ends[1].y) < LAYOUT_PROBE.leader_min_px) continue;
     leaders++;
     // 只报「一端明确是标签、另一端明确是空白」这一种：两端都空的是装饰线，
@@ -465,6 +648,12 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   words,
   subtitleMode = 'full',
   aspect = 'portrait',
+  // 这四条**不给默认值**：`resolveShotMotion` 要能分清「镜头代码没转交」与「转交了 none」，
+  // 前者回退到注入的那一份（模板漏抄一行不该让整片静默地不演）。
+  entrance,
+  exit,
+  entranceFrames,
+  exitFrames,
   children,
 }) => {
   const frame = useCurrentFrame();
@@ -481,6 +670,30 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
   });
+
+  // R7-T22 整片进出场：画面带与字幕带一起动（整帧的一个观感决定），背景留在外面。
+  // 窗口帧数由 Python 侧算好注入 —— 这里再算一遍那条 10%/15 帧的算术就有了第二个出处。
+  // 四条取值走 `resolveShotMotion`：镜头代码转交了就用它给的，没转交就取注入的那份。
+  const motionIn = resolveShotMotion({ entrance, exit, entranceFrames, exitFrames },
+                                     getInputProps());
+  const motion = composeMotion(
+    shotMotion(motionIn.entrance, motionIn.entranceFrames, frame, durationInFrames, height, true),
+    shotMotion(motionIn.exit, motionIn.exitFrames, frame, durationInFrames, height, false),
+  );
+
+  /**
+   * 这一帧的「屏幕 → 成片像素」换算（见 :func:`toCodeSpace`）。
+   *
+   * 闸⑥ 的字段盒、闸⑧ 的版面盒、闸⑪ 的资产盒**共用这一份**：三条判据读的是同一帧的
+   * 同一个 DOM，各量一次画面带就可能量出三个口径。量不到画面带时退回恒等变换
+   * （宁可少折一次，也不要报一个自己造出来的读数）。
+   * 在 effect 里调用（而不是渲染时算好）：`liveBand` 量的必须是**这一帧**的实况。
+   */
+  const frameConvert = (): Convert => {
+    const base = { x: body.x, y: body.y, w: body.w, h: body.h };
+    const live = liveBand(bodyRef.current);
+    return live ? (b: PxBox) => toCodeSpace(b, live, base) : (b: PxBox) => b;
+  };
 
   const used = {
     version: 'film-layout@2',
@@ -524,6 +737,7 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   const probeFrame = Math.max(0, durationInFrames - FIELD_PROBE_TAIL);
   React.useEffect(() => {
     if (frame !== probeFrame) return;
+    const convert = frameConvert();
     const marks = Array.from(document.querySelectorAll('[data-dg-field]')).map((el) => {
       const raw = el.getAttribute('data-dg-value');
       let value: unknown = raw;
@@ -532,7 +746,14 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
       } catch {
         value = raw;   // 标注写成非 JSON 时如实回读原串，由闸⑥ 报「对不上」
       }
-      return { name: el.getAttribute('data-dg-field') ?? '', value, box: measureBox(el) };
+      const box = measureBox(el);
+      return {
+        name: el.getAttribute('data-dg-field') ?? '',
+        value,
+        // 盒折回成片像素：闸⑥ 比的是「模型说它把 value 画在哪」与注入的版面，
+        // 整片那层进出场变换不该把这份对账搅成假读数（见 toCodeSpace）。
+        box: box ? convert(box) : null,
+      };
     });
     console.log(`${FIELD_LOG_MARKER}${JSON.stringify({ frame, marks })}`);
   }, [frame, probeFrame]);
@@ -554,7 +775,11 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
       })}`);
       return;
     }
-    const { findings, scanned } = probeLayout(root, { x: body.x, y: body.y, w: body.w, h: body.h });
+    const { findings, scanned } = probeLayout(
+      root,
+      { x: body.x, y: body.y, w: body.w, h: body.h },
+      frameConvert(),
+    );
     console.log(`${LAYOUT_LOG_MARKER}${JSON.stringify({ frame, findings, scanned, thresholds: LAYOUT_PROBE })}`);
   }, [frame, probeFrame, body.x, body.y, body.w, body.h]);
 
@@ -570,6 +795,10 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
     if (frame !== assetProbeEarly && frame !== probeFrame) return;
     const root = bodyRef.current;
     if (!root) return;
+    // 盒折回成片像素：两帧的**同一张静态图**在整片进出场下屏幕盒不同，
+    // 不折的话判据（逐字节比两帧的盒）会把静态摆图判成「参与动效」——一条假绿。
+    // 元素自身的 transform/opacity 照原样上报：母版那层变换挂在祖先上，读不到这里。
+    const convert = frameConvert();
     const assets = Array.from(root.querySelectorAll('img, video'))
       .filter((el) => paintedWithin(root, el))
       .map((el) => {
@@ -581,7 +810,7 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
         return {
           tag: el.tagName.toLowerCase(),
           src: src?.slice(-80),
-          box,
+          box: box ? convert(box) : null,
           transform: s.transform,
           opacity: Number(s.opacity === '' ? 1 : s.opacity),
         };
@@ -594,32 +823,37 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
       {/* 闸⑤ 的回读锚点：必须是「实际用上的值」，不是常量表副本 */}
       <meta name="dg-tokens" content={JSON.stringify(used)} />
 
-      {/* 画面带：镜头代码的全部可视范围就这一条，越界由母版裁掉。
-          盒的尺寸就是 useBody() 报出去的那一个——两侧同一个函数算的。 */}
-      <div
-        ref={bodyRef}
-        style={{
-          position: 'absolute',
-          left: body.x,
-          top: body.y,
-          width: body.w,
-          height: body.h,
-          overflow: 'hidden',
-        }}
-      >
-        {children}
-      </div>
+      {/* R7-T22 整片进出场：画面带 + 字幕带一起动，**背景留在这一层之外**——
+          连背景一起动的话位移就会露出画布边缘，一股「贴纸被推进来」的味道。
+          也没动 `<meta>`：闸⑤ 读的是排出去的几何，不是这一帧的瞬时状态。 */}
+      <AbsoluteFill style={{ opacity: motion.opacity, transform: motion.transform }}>
+        {/* 画面带：镜头代码的全部可视范围就这一条，越界由母版裁掉。
+            盒的尺寸就是 useBody() 报出去的那一个——两侧同一个函数算的。 */}
+        <div
+          ref={bodyRef}
+          style={{
+            position: 'absolute',
+            left: body.x,
+            top: body.y,
+            width: body.w,
+            height: body.h,
+            overflow: 'hidden',
+          }}
+        >
+          {children}
+        </div>
 
-      {subtitleMode !== 'none' && text ? (
-        <Caption
-          text={text}
-          highlight={highlight}
-          words={words}
-          mode={subtitleMode}
-          opacity={captionIn}
-          geo={geo}
-        />
-      ) : null}
+        {subtitleMode !== 'none' && text ? (
+          <Caption
+            text={text}
+            highlight={highlight}
+            words={words}
+            mode={subtitleMode}
+            opacity={captionIn}
+            geo={geo}
+          />
+        ) : null}
+      </AbsoluteFill>
     </AbsoluteFill>
   );
 };

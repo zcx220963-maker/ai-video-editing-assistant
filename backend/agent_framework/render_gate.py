@@ -170,7 +170,7 @@ def preview_summary(preview: Mapping[str, Any] | None) -> dict[str, str]:
 #: 为什么不在这里 import 那个模块：主服务不装配剪辑服务端的实现，而这里读错的后果
 #: 只是摘要少显示一个字段——它不参与任何执行判定。
 MOTION_KNOBS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode",
-                "texture")
+                "texture", "transition", "transition_sec", "entrance", "exit")
 
 #: 卡面要给人看的词，不是枚举字面量（用户不需要背 portrait / torn_highlight）。
 #: 这三张表只是**拿不到契约 value_labels 时的兜底**，取值与措辞都必须和
@@ -182,6 +182,23 @@ _SUBTITLE_LABELS = {"torn_highlight": "撕纸条·逐词点亮", "full": "整句
 _TEXTURE_LABELS = {"none": "不加（原片直出）", "film": "老胶片·颗粒与暗角",
                    "tv": "老电视·扫描线与色偏", "glow": "柔光·高光处泛开",
                    "bleach": "漂白·硬对比低饱和"}
+# R7-T22 的四条同规矩。**进出场分成两张表**：同一个取值「rise」在入场里是
+# 「自下浮入」、在出场里是「向上浮出」，共用一张表就会在确认卡上写出一句反话。
+_TRANSITION_LABELS = {"none": "硬切（镜镜直接接）",
+                      "fade": "淡叠·前一镜淡出后一镜淡入",
+                      "dissolve": "溶解·两边互相化开",
+                      "wipeleft": "左擦·新画面从右往左推过来",
+                      "wiperight": "右擦·新画面从左往右推过去",
+                      "slideup": "上滑·新画面自下而上顶入",
+                      "circleopen": "圆开·从中心扩开"}
+_TRANSITION_SEC_LABELS = {"0.2": "0.2 秒·一闪而过", "0.4": "0.4 秒·轻叠（默认）",
+                          "0.6": "0.6 秒·看得出", "0.9": "0.9 秒·很缓"}
+_ENTRANCE_LABELS = {"none": "直接开始（不动作）", "fade": "淡入",
+                    "rise": "自下浮入", "drop": "自上落入",
+                    "zoom": "轻推近·由小放大入画"}
+_EXIT_LABELS = {"none": "直接结束（不动作）", "fade": "淡出",
+                "rise": "向上浮出", "drop": "向下落出",
+                "zoom": "轻拉远·缩小出画"}
 
 
 def motion_summary(source: Mapping[str, Any] | None,
@@ -269,6 +286,24 @@ def motion_summary(source: Mapping[str, Any] | None,
             f"，{n_override} 镜点名换过档" if n_override else "")
     elif n_override:
         out["质感（逐镜点名）"] = f"整片不加，{n_override} 镜自己点了档"
+    # R7-T22：接缝与进出场。只在**不是硬切/不动**时才出一行——「硬切」是默认，
+    # 每张确认卡上都写一句「镜镜直接接」只会把真正要批的那几行淹掉。
+    trans_style = str(src.get("transition") or "none").strip().lower()
+    if trans_style and trans_style != "none":
+        trans = word("transition", trans_style, _TRANSITION_LABELS)
+        sec = word("transition_sec", src.get("transition_sec"),
+                   _TRANSITION_SEC_LABELS)
+        n_gaps = max(0, (shot_count or len(shots or [])) - 1)
+        out["接缝"] = "；".join(x for x in (
+            trans, f"每处叠 {sec}" if sec else "",
+            f"共 {n_gaps} 处" if n_gaps else "") if x)
+    enters = [(key, label) for key, label in (("entrance", _ENTRANCE_LABELS),
+                                              ("exit", _EXIT_LABELS))
+              if str(src.get(key) or "none").strip().lower() not in ("", "none")]
+    if enters:
+        out["每镜进出"] = " / ".join(
+            f"{'入' if key == 'entrance' else '出'}："
+            f"{word(key, src.get(key), label)}" for key, label in enters)
     bgm = src.get("bgm") if isinstance(src.get("bgm"), Mapping) else {}
     ref = str(bgm.get("ref") or "") if bgm else ""
     out["配乐"] = Path(ref).name[:18] if ref else "纯人声（无配乐）"

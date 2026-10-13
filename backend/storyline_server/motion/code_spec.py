@@ -30,7 +30,7 @@ import re
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 # ---------------------------------------------------------------------------
 # 整片开关（自旧 `spec.py` 搬入：P4 起这里就是唯一出处）
@@ -141,6 +141,54 @@ VOICES = (
 #: 滤镜串单源在 ``render.TEXTURE_FILTERS``——这里只列名与人话说明，
 #: 两边各写一遍就会出现「界面上有这档、渲出来是原片」。
 TEXTURES = ("none", "film", "tv", "glow", "bleach")
+
+# ---------------------------------------------------------------------------
+# 转场与入场/出场（R7-T22 / §3.1 / §9-Q11）
+# ---------------------------------------------------------------------------
+#: 镜**之间**的转场风格。落点是**拼接层**（ffmpeg `xfade`），不是镜头层——
+#: `@remotion/transitions` 的 `<TransitionSeries>` 要求相邻片段在**同一棵 React 树**里，
+#: 而我们逐镜独立渲、再拼（D 面那条逐镜缓存的保证全靠这个）。硬套那套包 = 逐镜缓存
+#: 直接作废，所以这里连 import 名单都不放它进（§3.1 已冻结）。
+#:
+#: 取值就是 ffmpeg `xfade` 的 `transition=` 名（`mediaops._XFADE` 那张表的键），
+#: 不另起一套别名：多一层映射就多一处「界面写 fade、命令行写别的」的机会。
+#: `none` 是默认——不选转场的片子逐字节不变，回归就永远有那一侧可以比。
+TRANSITION_STYLES = ("none", "fade", "dissolve", "wipeleft", "wiperight",
+                     "slideup", "circleopen")
+
+#: 转场时长（秒）。**做成枚举而不是自由数字**：计划卡的开关模型是「枚举 / 布尔 /
+#: 带界数值」三选一，而每一项都要能反查到取值来源、都要有一句中文标签
+#: （``plan/vocab.py::knob_facts`` 与 tests/test_motion_channel.py 第 ① 节按此断言）。
+#: 档位只留四档，四档之间是「切得干不干净」的观感差别，再细分没有意义。
+#: 上界 0.9 s 也不能乱给：真判它合不合法的是渲染期那条 :func:`check_transition`
+#: ——转场时长不得长过**相邻较短那一镜的一半**（xfade 拿两边的重叠区做混合，
+#: 重叠超过半镜就不是转场而是把这一镜换掉），而一镜多长要等 TTS 出来才知道。
+TRANSITION_SEC_CHOICES = ("0.2", "0.4", "0.6", "0.9")
+TRANSITION_SEC_DEFAULT = "0.4"
+
+#: 转场时长还不得长过**相邻较短那一镜的一半**：xfade 是拿两边的重叠区做混合的，
+#: 重叠超过半镜就不是转场而是「把这一镜换掉」。判据在 :func:`check_transition`，
+#: 边界取严格小于（等于半镜时第一段的 offset+duration 正好顶到它自己的末尾）。
+TRANSITION_SHOT_SHARE = 0.5
+
+#: 母版（`remotion/src/FilmLayout.tsx`）按注入的档名 + 帧数演的入场/出场。四档动作都是
+#: 「已经落定」之前/之后的那一小段：淡、上浮、下落、轻推近。工艺上全是
+#: `useCurrentFrame()+interpolate()`（§3.2：CSS `transition`/`animation` 在本链
+#: 逐帧 seek 下渲不正确）。同一个取值在入场与出场里是**互为反向**的两个动作
+#: （rise：自下浮入 ↔ 向上浮出），标签因此分两张表（见 ``KNOB_VALUE_LABELS``）。
+SHOT_MOTION_STYLES = ("none", "fade", "rise", "drop", "zoom")
+
+#: 入场/出场窗口的上限：这一镜的 10%，且不超过 15 帧。两条各自有理由——
+#: ① 10% 是为了**不碰闸④ 的采样点**：`EMPTY_SAMPLES=0.15/0.5/0.85`，入场窗口收在
+#:    0.15 之前，那一帧读到的就还是「落定后」的画面；② 15 帧（@15fps 是 1 秒、
+#:    @30fps 是半秒）是「入场抢的戏不该多过一镜的十分之一」在长镜上的兜底。
+#: **这两个数只在这一处**：窗口按帧数注入母版（`shot_input_props` 的
+#: `entranceFrames`/`exitFrames`），TS 那侧只负责按收到的帧数插值。母版是 TS，跨不了
+#: 语言，所以「TS 里别再算一遍」这件事靠的是**不把常量交到那边去**，而不是靠对账；
+#: tests/test_code_transition.py ⑤ 逐帧扫 2~600 帧，把「窗口从不碰 0.15」这条关系
+#: 钉成算术（不是注释里的一句好听的话）。
+SHOT_MOTION_MAX_SHARE = 0.10
+SHOT_MOTION_MAX_FRAMES = 15
 
 #: 母版 `<FilmLayout>` 真认的字幕形态。旧链那四档（torn/bottom…）随模板一起消失：
 #: 新链的字幕带只画在母版里，母版没实现的形态就不该出现在可选项里。
@@ -406,7 +454,15 @@ SHOT_KNOBS = ("text", "highlight", "min_duration_sec", "fields")
 #: 自带音轨，命中即整段跳过、连 TTS 都不重发），`subtitle_mode` 改的是母版字幕带的
 #: 画法。不进键的后果与旧链那条注释写过的同族——「少算一个键就是拿旧片冒充新片」。
 #: 反过来 `texture` **仍然不进**：它跑在缓存之后的那一趟滤镜上，换档 0 镜重烧（§5.3）。
-FILM_KNOBS = ("fps", "aspect", "narration", "voice", "rate", "subtitle_mode")
+#:
+#: R7-T22 加的 `entrance`/`exit` 也在这里，理由与 `subtitle_mode` 同一条：入场/出场是
+#: **母版**在切片里画的（`FilmLayout.tsx` 按 token 逐帧插值），所以它换的是切片像素。
+#: 而同一批加进来的 `transition`/`transition_sec` **故意不在**：转场跑在**拼接**那一趟
+#: （`mediaops.concat` → ffmpeg `xfade`），逐镜切片一个字节都不动——与 `texture` 同族，
+#: 进键的代价是「整片把淡出换成擦除」要重烧 20 镜的 Remotion 帧，而它本来只是一趟
+#: 拼接。tests/test_code_transition.py 对这两侧各有一支断言（在键 / 不在键）。
+FILM_KNOBS = ("fps", "aspect", "narration", "voice", "rate", "subtitle_mode",
+              "entrance", "exit")
 
 #: 选区改（P3）对代码镜只开这五条指针。`code` 的改动必须重过闸① 才允许落盘；
 #: `fields/{name}/value` 不动代码字节，改的是注入母版的值，所以不重跑 lint，
@@ -639,6 +695,43 @@ def validate_code_spec(raw: dict[str, Any], *,
         _err(errors, f"texture={texture!r} 没有对应的滤镜链（可用：{', '.join(TEXTURES)}）")
         texture = "none"
 
+    # R7-T22：镜间转场（拼接层）与母版进出场。三条都是**整片开关**，逐镜不覆盖——
+    # 转场天生是「两个镜之间」的东西，进出场是母版给每一镜套的同一套动作；
+    # 让它们逐镜可配就该配到「某两个镜之间」，那是另一件事（今天没有这个需求）。
+    transition = str(raw.get("transition") or "none").strip().lower()
+    if transition not in TRANSITION_STYLES:
+        _err(errors, f"transition={transition!r} 没有对应的转场"
+                     f"（可用：{', '.join(TRANSITION_STYLES)}）")
+        transition = "none"
+    # 时长按**档位**收（理由见 TRANSITION_SEC_CHOICES）。写成数字也收：
+    # 模型按 schema 的 number 提示写 0.4 是自然的，而 0.4 与 "0.4" 是同一个决定。
+    span = raw.get("transition_sec", TRANSITION_SEC_DEFAULT)
+    if span is None or (isinstance(span, str) and not span.strip()):
+        span = TRANSITION_SEC_DEFAULT
+    span_text = f"{float(span):g}" if _is_num(span) else str(span).strip()
+    normalized_none = transition == "none" and span_text == "0"
+    if span_text not in TRANSITION_SEC_CHOICES and not normalized_none:
+        _err(errors, f"transition_sec={span!r} 不在可选档位里"
+                     f"（可用：{', '.join(TRANSITION_SEC_CHOICES)} 秒）")
+        span_text = TRANSITION_SEC_DEFAULT
+    if transition == "none":
+        # 硬切＝重叠 0 秒。归一而不是留原值：留着的话，「none + 0.9」与「none + 0.4」
+        # 会在各处被读成两种片子（对账、确认卡），而画面上它们是同一件事。
+        #
+        # 这一格必须**收得下自己写下的 "0"**（上面那个 ``normalized_none``）：校验是
+        # 幂等的——补丁链会把一份过过校验的 spec 再校验一遍（`overlay_knobs` 那条
+        # 路两步都要过闸），不认自己的归一结果，第二次就会拿「账面 0 秒」报一个
+        # 「不在可选档位里」：校验器对自己刚写下的值报错，看起来像用户的错。
+        span_text = "0"
+    motions = {}
+    for key in ("entrance", "exit"):
+        value = str(raw.get(key) or "none").strip().lower()
+        if value not in SHOT_MOTION_STYLES:
+            _err(errors, f"{key}={value!r} 没有对应的动作"
+                         f"（可用：{', '.join(SHOT_MOTION_STYLES)}）")
+            value = "none"
+        motions[key] = value
+
     raw_shots = raw.get("shots")
     if not isinstance(raw_shots, list) or not raw_shots:
         _err(errors, "shots 为空——没有镜头就没有片子")
@@ -684,6 +777,10 @@ def validate_code_spec(raw: dict[str, Any], *,
         "rate": rate,
         "subtitle_mode": sub_mode,
         "texture": texture,
+        "transition": transition,
+        "transition_sec": span_text,
+        "entrance": motions["entrance"],
+        "exit": motions["exit"],
         "shots": shots,
         "bgm": {"ref": str(bgm.get("ref") or ""), "volume": bgm_volume,
                 "duck": bool(bgm.get("duck", True))},
@@ -1182,6 +1279,134 @@ def check_subject_named(shots: list[dict[str, Any]]) -> tuple[list[str], list[st
 #: 抽象词那条打回理由里给的改写示范——**刻意给一个器物**，因为真机上模型被拦之后
 #: 最常见的反应是把抽象词换个近义词（「理念」→「观念」），而不是去画一个东西。
 _SUBJECT_HINT = "活字盘"
+
+
+# ---------------------------------------------------------------------------
+# R7-T22 转场（拼接层）与进出场（母版）的**单源出口**
+# ---------------------------------------------------------------------------
+# 三件事在这一节里各有唯一一处实现：转场档位 → 给 ffmpeg 的两个数、入场/出场窗口 →
+# 给母版的帧数、以及「这个转场时长配得上这条片子的逐镜时长吗」这条判据。
+# 为什么都要出口：渲染趟（`code_render`）与离线测试读的是同一份数字，
+# 各转一遍 `transition_sec` 就会出现「回执写 0.4 秒、ffmpeg 收到 0」这种
+# 只有抽帧才发现的分歧——与 ``shot_texture`` 那条「记账与渲染不许各写一遍」同族。
+
+
+def transition_plan(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """整片转场（拼接层）→ ``{"style": str, "duration": float}``；不转场时 duration=0。
+
+    ``style`` 只可能是 :data:`TRANSITION_STYLES` 里的一个（越界按 none；调用它的那条
+    路上 spec 已经过 ``validate_code_spec``，这里是给「有人手搓一份 spec 直接渲」兜底）。
+    """
+    style = str(spec.get("transition") or "none").strip().lower()
+    if style not in TRANSITION_STYLES:
+        style = "none"
+    try:
+        span = float(spec.get("transition_sec") or 0.0)
+    except (TypeError, ValueError):
+        span = 0.0
+    if style == "none" or span <= 0:
+        return {"style": "none", "duration": 0.0}
+    return {"style": style, "duration": round(span, 3)}
+
+
+def shot_motion_window(frames: int) -> int:
+    """入场/出场窗口的帧数（母版按它逐帧插值）。→ 帧数，0 = 这一镜不动作。
+
+    窗口 = ``min(这一镜的 10%, SHOT_MOTION_MAX_FRAMES)``，短到 2 帧以下就当没有
+    ——1 帧的淡入不是「淡入」，是硬切上多一层闪。
+
+    **在 Python 侧算、按帧数注入母版**（`shot_input_props` 的 `entranceFrames`/
+    `exitFrames`），而不是在 TS 里再算一遍：闸④ 的采样点（0.15/0.5/0.85）与这个窗口
+    是同一条算术关系（窗口收在 0.15 之前），两处各算一遍迟早出现「窗口涨进采样点、
+    闸④ 开始误报空壳」这种只在真机上看得见的漂移。
+    """
+    span = min(int(round(int(frames) * SHOT_MOTION_MAX_SHARE)), SHOT_MOTION_MAX_FRAMES)
+    return span if span >= 2 else 0
+
+
+def check_transition(pairs: Sequence[tuple[str, float]], *, style: str,
+                     duration: float) -> tuple[list[str], list[str]]:
+    """转场的时长对账（T22；合成之前，与闸⑰ 同一档但不同事）。→ (打回, 提醒)。
+
+    ``pairs`` 是**逐镜实测秒数** ``[(镜号, 秒), …]``，按播放顺序。为什么这条判据没有
+    落在 ``validate_code_spec``（分镜期那一堆闸里）：**一镜多长是 TTS 说了算的**，
+    分镜那会儿手里只有 ``min_duration_sec`` 这个下限，拿它判会把「真实时长本来够」的
+    片子误杀。所以分镜期只收枚举与档位（见 ``TRANSITION_SEC_CHOICES``），
+    这条在渲染趟拿到真数之后、拼接之前判——那时一帧都还没拼，代价是几秒不是几分钟。
+
+    判据只有一条（但它是**会真的炸**的那条）：转场时长必须**短于**相邻较短那一镜的
+    一半。xfade 是拿两段的重叠区做混合的，重叠超过半镜就不是「转场」而是「把这一镜
+    换掉」——ffmpeg 到那时会报 ``Offset … is after the end`` 或悄悄吃掉整镜，
+    两种都是失败。边界取**严格小于**：等于半镜时第一段的 ``offset + duration``
+    正好顶到它的末尾，浮点误差会把一次好渲染挡在门外。
+    """
+    errors: list[str] = []
+    if style not in TRANSITION_STYLES or style == "none" or len(pairs) < 2:
+        return errors, []
+    if duration <= 0:
+        _err(errors, f"转场对账：transition={style} 但时长是 {duration}s——"
+                     f"选了转场就得给一个正数（可选 {', '.join(TRANSITION_SEC_CHOICES)} 秒）")
+        return errors, []
+    # 时长没拿到就不许判（也不许当通过）：`sec=0` 只可能来自「这一镜压根没算过时长」，
+    # 那种情况下任何结论都是猜的。
+    blank = [sid for sid, sec in pairs if not (float(sec) > 0)]
+    if blank:
+        _err(errors, f"转场对账：{len(blank)} 个镜头没有实测时长（{'、'.join(blank[:6])}…）"
+                     f"——这一趟拿不到时长就没法判转场合不合法，不许当通过")
+        return errors, []
+    violations: list[str] = []
+    for (sid_a, sec_a), (sid_b, sec_b) in zip(pairs, pairs[1:]):
+        limit = TRANSITION_SHOT_SHARE * min(float(sec_a), float(sec_b))
+        if duration < limit:
+            continue
+        short = sid_a if float(sec_a) <= float(sec_b) else sid_b
+        short_sec = min(float(sec_a), float(sec_b))
+        ok = [s for s in TRANSITION_SEC_CHOICES if float(s) < limit]
+        advice = (f"把 transition_sec 降到 {', '.join(ok)} 秒里的一档"
+                  if ok else
+                  f"本片没有一档转场落得进这半镜（[{', '.join(TRANSITION_SEC_CHOICES)}] 秒）")
+        violations.append(
+            f"{sid_a}→{sid_b} 这一处：转场 {duration}s ≥ 相邻较短那一镜（{short} "
+            f"{short_sec:.2f}s）的一半 {limit:.2f}s——xfade 拿重叠区做混合，"
+            f"重叠超过半镜就等于把这一镜换掉。{advice}，或把 {short} 这一镜加长"
+            f"（min_duration_sec）")
+    if violations:
+        # 一处超限往往意味着**每一处**都超限（同一个档位配同一批短镜），
+        # 逐处报会把打回清单淹掉：报第一处 + 总处数，其余是同一件事。
+        extra = f"（另有 {len(violations) - 1} 处同样超限）" if len(violations) > 1 else ""
+        _err(errors, f"转场对账：{len(violations)} 处接缝的转场时长超过半镜{extra}。"
+                     f"{violations[0]}")
+    return errors, []
+
+
+def check_transition_effect(secs: Sequence[float], total_sec: float, *,
+                            style: str, duration: float,
+                            fps: int) -> list[str]:
+    """转场**真的生效了**没有（T22 的机器判据）。→ 错误清单（空 = 生效或压根没选转场）。
+
+    怎么判：「叠 n−1 次、每次 d 秒」在成片时长上是可以算出来的——成片应当比
+    逐镜之和**短** ``(n−1)×d`` 秒。这不是间接指标，它就是这件事本身：xfade 把两段
+    的重叠区合成一段，合掉了多少秒是量得到的。拼接层哪天退回硬接（或 filter 图写错了
+    某一档），这条立刻红——而画面上「少了 4 秒」是看不出来的（这正是 P21 要的那种
+    机器判据：断言「逐镜独立渲染仍命中缓存」管住上限，这条管住下限）。
+
+    容差按帧给而不是按秒给：实测每次合并有约 1 帧的取整差（逐镜切片的容器时长与
+    ffmpeg 内部认为的那一段长度差一帧），所以 ``(接缝数 + 2) / fps``。
+    按秒给一个常数容差会在大镜数下把「一次都没生效」也放过去
+    （11 处接缝 × 0.4 s = 4.4 s 的缺口，容差只要小于它就能抓到）。
+    """
+    if style not in TRANSITION_STYLES or style == "none" or len(secs) < 2:
+        return []
+    want = (len(secs) - 1) * float(duration)
+    got = sum(float(x) for x in secs) - float(total_sec)
+    tol = (len(secs) - 1 + 2) / max(1, int(fps))
+    if abs(got - want) <= tol:
+        return []
+    return [f"转场没生效：选了 {style} {duration}s、{len(secs) - 1} 处接缝，"
+            f"成片本该比逐镜之和短 {want:.2f}s，实测只短了 {got:.2f}s"
+            f"（容差 {tol:.2f}s）——拼接层没按转场接，或那一档 filter 图没落进去。"
+            f"逐镜切片是好的（缓存那边对得上），问题在拼接这一趟"]
+
 
 
 # ---------------------------------------------------------------------------
@@ -1767,8 +1992,14 @@ def check_ink_contrast(shots: list[dict[str, Any]]
 #: 每一镜要不一样的观感就在自己的 `shots[].texture` 里覆盖它——卡面只问一次，
 #: 不该逼模型替每一镜决定。也正因为质感跑在切片缓存之后的那一趟滤镜上，
 #: 换档不重烧任何一镜——所以它**不进** ``FILM_KNOBS``。
+#:
+#: R7-T22 的四条（转场 + 进出场）也在这里，理由同 ``texture``：**整片一个决定**。
+#: 「第 3 镜和第 4 镜之间用圆开、其余硬切」不是没有意义的诉求，但它是另一件事
+#: （逐接缝的转场表），今天没有这个需求；而进出场天生是母版给每一镜套的同一套动作。
+#: 它们都在计划卡上（用户在批准之前就看得到「镜间怎么接、每镜怎么进」），
+#: 而卡面的每一项都要能反查到来源 + 有中文标签，所以档位全是枚举（见 TRANSITION_SEC_CHOICES）。
 KNOB_FIELDS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode",
-               "texture")
+               "texture", "transition", "transition_sec", "entrance", "exit")
 
 _VOICE_RE = re.compile(r"^[a-z]{2}(-[A-Za-z]{2,})?-[A-Za-z]+Neural$")
 _RATE_RE = re.compile(r"^[+-]\d{1,3}%$")
@@ -1812,6 +2043,24 @@ KNOB_VALUE_LABELS: dict[str, dict[str, str]] = {
     "texture": {"none": "不加（原片直出）", "film": "老胶片·颗粒与暗角",
                 "tv": "老电视·扫描线与色偏", "glow": "柔光·高光处泛开",
                 "bleach": "漂白·硬对比低饱和"},
+    # R7-T22：转场与进出场。措辞要说清「观众看到的是什么」，而不是抄 ffmpeg 的档名
+    # （wipeleft 这三个字母对人没有意义）。四条都在确认卡与计划卡两张卡上出现。
+    "transition": {"none": "硬切（镜镜直接接）", "fade": "淡叠·前一镜淡出后一镜淡入",
+                   "dissolve": "溶解·两边互相化开",
+                   "wipeleft": "左擦·新画面从右往左推过来",
+                   "wiperight": "右擦·新画面从左往右推过去",
+                   "slideup": "上滑·新画面自下而上顶入",
+                   "circleopen": "圆开·从中心扩开"},
+    "transition_sec": {"0.2": "0.2 秒·一闪而过", "0.4": "0.4 秒·轻叠（默认）",
+                       "0.6": "0.6 秒·看得出", "0.9": "0.9 秒·很缓"},
+    # 同一个取值在两张表里是**互为反向**的一件事：入场是「进来」，出场是「出去」。
+    # 共用一张表会把出场写成「自下浮入」——那正是确认卡上最容易被忽略的一种错话。
+    "entrance": {"none": "直接开始（不动作）", "fade": "淡入",
+                 "rise": "自下浮入", "drop": "自上落入",
+                 "zoom": "轻推近·由小放大入画"},
+    "exit": {"none": "直接结束（不动作）", "fade": "淡出",
+             "rise": "向上浮出", "drop": "向下落出",
+             "zoom": "轻拉远·缩小出画"},
 }
 
 #: 本链字幕档的单独视图（确认卡与母版参数都从这里取词）
@@ -1871,6 +2120,25 @@ def knob_props() -> dict[str, Any]:
         "texture": {
             "type": "string", "enum": list(TEXTURES), "default": "none",
             "description": "整片默认质感档；每一镜可用自己的 texture 覆盖它。换它不重烧镜头",
+        },
+        # R7-T22 的四条。description 收成一行、≤60 字（`knob_facts` 的 note 取前 60 字，
+        # 超了会截在半句话上），「怎么选」那套教程在技能正文里。
+        "transition": {
+            "type": "string", "enum": list(TRANSITION_STYLES), "default": "none",
+            "description": "镜与镜之间怎么接（拼接层做，不重烧任何一镜）",
+        },
+        "transition_sec": {
+            "type": "string", "enum": list(TRANSITION_SEC_CHOICES),
+            "default": TRANSITION_SEC_DEFAULT,
+            "description": "转场叠多久，四档；须短于相邻较短一镜的一半",
+        },
+        "entrance": {
+            "type": "string", "enum": list(SHOT_MOTION_STYLES), "default": "none",
+            "description": "每一镜怎么进（母版按 token 画，动作收在该镜前 10% 内）",
+        },
+        "exit": {
+            "type": "string", "enum": list(SHOT_MOTION_STYLES), "default": "none",
+            "description": "每一镜怎么出（母版按 token 画，动作收在该镜后 10% 内）",
         },
     }
     for key, spec in props.items():

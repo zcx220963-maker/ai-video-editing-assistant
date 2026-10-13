@@ -13,7 +13,7 @@ import subprocess
 import sys
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
@@ -153,17 +153,31 @@ def scene_ranges(src: str | Path, threshold: float = 0.3,
 
 
 def concat(clips: list[str | Path], dst: str | Path, *,
-           fps: float | None = None) -> Path:
+           fps: float | None = None,
+           transition: Mapping[str, Any] | None = None) -> Path:
     """按顺序拼接片段（concat filter 统一重编码，避免参数不一致导致的流错误）。
 
     ``fps`` 锁输出帧率：逐帧截图那条路（motion）的片段是「每段各自的秒数 × 同一帧率」，
     不锁帧率时 concat 会把段间时长差摊进时间戳，成片平均帧率掉到 9.7~9.84——
     画面看不出，但「成片字节量到的 fps」与 spec 对不上，机器证据只能标 UNVERIFIED。
+
+    ``transition`` 形如 ``{"style": "fade", "duration": 0.4}``（``style="none"`` 或省略＝
+    老路：硬接）。**转场落在这一层而不是镜头层**（R7-T22 / §3.1）：镜头层那套
+    `@remotion/transitions` 要求相邻片段在同一棵 React 树里，而我们逐镜独立渲、
+    按 `shot_cache_key` 缓存——树内转场等于把逐镜缓存整条保证作废。ffmpeg 在**拼接**
+    这一趟做 xfade，逐镜切片一个字节都不动，所以换转场 0 镜重烧（见 code_spec.FILM_KNOBS）。
     """
     if not clips:
         raise MediaError("concat 需要至少一个片段")
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
+    style = str((transition or {}).get("style") or "none").strip().lower()
+    try:
+        span = float((transition or {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        span = 0.0
+    if style != "none" and span > 0 and len(clips) > 1:
+        return _concat_xfade(clips, dst, fps=fps, style=style, span=span)
     args: list[str] = []
     for c in clips:
         args += ["-i", str(c)]
@@ -178,6 +192,74 @@ def concat(clips: list[str | Path], dst: str | Path, *,
     args += [str(dst)]
     ffmpeg(*args)
     return dst
+
+
+def _concat_xfade(clips: list[str | Path], dst: Path, *, fps: float | None,
+                  style: str, span: float) -> Path:
+    """带接缝转场的拼接：逐接缝一次 ``xfade`` + 一次 ``acrossfade``。
+
+    时长账（``offset`` 的算法）：两段叠上 d 秒后，合并流的长度 = 两段之和 − d。
+    所以第 k 次合并（把第 k 段接上去）的 offset = **此前累计长度 − d**，
+    下面用 ``acc`` 逐次推。两个流必须叠同样多，否则第 2 段起配音就跟画面对不上——
+    所以视频侧 xfade 与音频侧 acrossfade 用的是**同一个 d**。
+
+    每路输入先过一遍 ``fps/format/setsar`` 归一：xfade 要求两路尺寸、像素格式一致，
+    而逐镜切片虽然出自同一个母版，却各自过了一趟质感滤镜（`code_spec.TEXTURES`）——
+    归一放在这里比要求「滤镜链必须吐 yuv420p」可靠（后者是一句跨模块的约定，
+    改了没人知道）。``fps`` 给了就一并锁住，理由与 hardcut 那一路同族（帧率漂了，
+    成片字节量到的 fps 就与 spec 对不上）。
+    """
+    d = float(span)
+    durs: list[float] = []
+    for c in clips:
+        info = probe(c)
+        sec = float(info.get("duration") or 0.0)
+        if sec <= 0:
+            raise MediaError(f"{Path(c).name}：探不到时长（{sec}），转场的 offset 无从算起")
+        durs.append(sec)
+    # 每次合并要用掉 d 秒的重叠，且 xfade 要求 offset+d 落在**前一段合并流**之内。
+    # 判据在 code_spec.check_transition（渲染趟调它，报的是一句带镜号的错），
+    # 这一条是最后一道兜底：真正的调用者绕过了判据时，宁可在这里拒，也别让 ffmpeg
+    # 静默吃掉整镜（它的失败形态是「少一段」而不是报错，那种错抽帧才发现）。
+    shortest = min(durs)
+    if d >= shortest:
+        raise MediaError(
+            f"转场 {d}s 不短于最短的一镜（{shortest:.2f}s）——xfade 会吃掉整段，"
+            f"拒绝拼接")
+    name = _XFADE.get(style, "fade")
+    norm_v = (f"fps={_num(fps)}," if fps else "") + "format=yuv420p,setsar=1"
+    norm_a = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+    args: list[str] = []
+    for c in clips:
+        args += ["-i", str(c)]
+    chain: list[str] = [f"[0:v]{norm_v}[v0]", f"[0:a]{norm_a}[a0]"]
+    vprev, aprev, acc = "[v0]", "[a0]", durs[0]
+    for k in range(1, len(clips)):
+        offset = acc - d
+        if offset < 0:
+            raise MediaError(f"第 {k + 1} 段接上去时累计长度只有 {acc:.3f}s < 转场 {d}s")
+        chain.append(f"[{k}:v]{norm_v}[vin{k}]")
+        chain.append(f"[{k}:a]{norm_a}[ain{k}]")
+        chain.append(f"{vprev}[vin{k}]xfade=transition={name}:"
+                     f"duration={_num(d)}:offset={_num(offset)}[v{k}]")
+        chain.append(f"{aprev}[ain{k}]acrossfade=d={_num(d)}:c1=tri:c2=tri[a{k}]")
+        vprev, aprev = f"[v{k}]", f"[a{k}]"
+        acc = acc + durs[k] - d
+    args += ["-filter_complex", ";".join(chain), "-map", vprev, "-map", aprev,
+             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+             "-c:a", "aac"]
+    if fps:
+        args += ["-r", str(fps), "-vsync", "cfr"]
+    args += [str(dst)]
+    ffmpeg(*args)
+    if not dst.exists() or dst.stat().st_size == 0:
+        raise MediaError("带转场的拼接产物为空——转场没能落进成片")
+    return dst
+
+
+def _num(value: float) -> str:
+    """给 ffmpeg 的数字：固定三位小数，别让 `0.1+0.2` 那串尾数进命令行。"""
+    return f"{float(value):.3f}"
 
 
 def silent_wav(dst: str | Path, duration: float = 5.0) -> Path:
