@@ -17,6 +17,9 @@ ContextSource / compressor 均为可插拔接缝：记忆系统、SKILL 系统�
 from __future__ import annotations
 
 import datetime as _dt
+import json
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Protocol,
                     Sequence, runtime_checkable)
@@ -158,6 +161,193 @@ def render_attachments_section(rows: Sequence[Mapping[str, Any]],
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# 上下文面账面（R9-T37）与预算闸（R9-T38）——§5.7 第①条 / 闸㉓ 的合同部分
+#
+# 为什么要有它：装配面此前只有一张**人工**量出来的字节表（§5.4），而且常驻段
+# 完全不受压缩预算管——`compress.py:163-166` 把首条 system 摘出去永不压缩，
+# 这条本身是骨架要求的正确行为，它的**推论**才是缺陷：系统提示词堆多少发多少，
+# 没有任何东西会拦。账面把「堆了多少」变成产物，预算闸把「堆爆了」变成装配失败。
+# --------------------------------------------------------------------------
+
+# 块的三态：无条件常发 / 有条件常发 / 按需。账面只如实登记，判据在别处。
+LEDGER_KINDS = ("always", "conditional", "on_demand")
+
+# 账面在留档通道里的类型名（RunState.qa_parts 里的一行，与 prompt_fingerprint 同形）。
+# 格式是装配出口定的，所以名字也定在出口这一侧；消费方（agent 侧）引这个常量，
+# 别各写一遍字符串——两处各写一遍就是下一个「两份真相」。
+LEDGER_ENTRY_TYPE = "context_ledger"
+
+# 结构化装配块（系统提示词 / 运行时事实）的引用方：它们由装配本身消费。
+# 写出来是为了让 orphan_sections 那条判据有明确的反面——「常驻但没人读」指的
+# 是**没人声明读它**，而不是「没人声明」。
+ASSEMBLY_REF = ("assembly",)
+
+# §5.4 表末「预算」列的**可执行副本**（字节）——**这一列是闸㉓ 的真断值**，
+# 口径同附录 B（P95 × 1.15），只是 P95 还没跑：§8.1 十二支夹具的矩阵要等真机
+# 首轮，所以今天用的是**实测现值 × 1.15**（对固定形状的块）或**结构上限的字节
+# 折算**（对内容由用户/白名单决定的块）。十二支夹具跑完后按真 P95 替换，并
+# **同批**写回 §5.4 表——两处不同步由 tests/test_context_hygiene.py 的对账断言判红。
+#
+# 为什么不能照抄 §5.4 的「目标」列当断值：那几个数是写文档时按现值上浮拍的，
+# 而实测下来有三块**今天就已经超**（`<skills>` 清单 3,156 B vs 1,536 B、
+# 技能正文 31,186 B vs 16,384 B、`<memory>` 上限折算 13,312 B vs 2,048 B）——
+# 拿它们当断值，等于给每一条真机 run 判死刑。目标归目标（见 SECTION_BUDGET_DEBT，
+# 每个超目标块都挂着欠哪个任务）；断值归断值（下面这张表，今天就得能过）。
+#
+# 没列进表的块 = 不限量（`<runtime>`、`<attachments>`、按需 demo 语料）：
+# 「没预算」是明确的口径，不是漏填。
+SECTION_BUDGET_BYTES: dict[str, int] = {
+    # 固定形状的块：实测现值 × 1.15，拦的是「改文案时悄悄堆上去」
+    "system_prompt": 3257,        # 实测 2,832（prompts/system_prompt.md）
+    "skills": 3630,               # 实测 3,156（6 份清单连内层 <skills> 标签）
+    "skill_instructions": 35864,  # 实测 31,186（motion_explainer 正文，今天整段注入）
+    # 内容由上限决定的块：断值 = 结构上限的字节折算，拦的是「有人把上限删了/放开了」。
+    # 上限口径按最坏情况全 CJK（3 字节/字）折：4000 字正文（total_chars，memory.py:92）
+    # + 344 字 USAGE_NOTE + 两段「更早的记忆已省略 N 字」提示 + 两个分类标题 ≈ 4,466 字
+    # ≈ 13.4 KB，再留 ~400 B 余量。**这不是现值**——记忆的现值由用户内容决定，没有单一现值。
+    "memory": 13824,
+    # 全开金样实测 4,834 B。给 2× 而不是 ×1.15：这一段里有**用户可控文本**
+    # （feedback_quote / pending_asked 是用户原话，neutralize 只防注入不截长），
+    # 紧值会让「用户写了段长反馈」直接变成「出不了计划」。2× 是失控检测线，
+    # 不是预算——真正的紧值要等这一段的子块各自设限（§9-Q100 欠账）。
+    "planning_round": 8192,
+}
+
+# §5.4 的「目标」列：R9 要把这几块瘦到哪。**与上面那张断值表是两件事**——
+# 断值拦「今天会不会爆」，目标说「最终该多小」。账面上两种超线分开记，因为
+# 「今天没超」不等于「达标了」（§5.4 末列的「目标」数就是这一列）。
+SECTION_TARGET_BYTES: dict[str, int] = {
+    "system_prompt": 3072,
+    "skills": 1536,
+    "memory": 2048,
+    "planning_round": 5120,
+    "knobs": 1228,
+    "skill_instructions": 16384,
+    "tools": 40960,
+}
+
+# 今天**已经超目标**的那几块，逐块登记欠哪个任务（键必须同时在 SECTION_TARGET_BYTES 里）。
+# 为什么要有这张表：没有它，三块已知超标的东西会被 ×1.15 的断值洗成绿色，
+# R9 剩下的活也就没人记得了——账面要能区分「合规」与「还没还完的账」。
+#
+# 三个数一行：目标字节、T37 实测现值（字节，方向）、欠哪个任务。
+SECTION_BUDGET_DEBT: dict[str, tuple[int, int, str]] = {
+    "skills": (1536, 3156,
+               "描述瘦身（**没有任务号**）：T43 只去重内层 <skills> 标签，省不到 40 B"),
+    "memory": (2048, 13417,
+               "T39：读侧召回 + USAGE_NOTE 344→≤120 字（现值按**结构上限的最坏情况**算，"
+               "不是实时值——记忆大小由用户内容决定）"),
+    "knobs": (1228, 1829,
+               "T40：改条件注入（现值未标定，所以今天**不设断值**，标定要等真机首轮的账）"),
+    "skill_instructions": (16384, 31186, "T42：技能正文分段键"),
+}
+
+_AUTO_NAME_RE = re.compile(r"<\s*([A-Za-z_][\w.\-]*)([^>]*)>")
+_NAME_ATTR_RE = re.compile(r"""name\s*=\s*["']([^"']+)["']""")
+
+
+class ContextBudgetError(RuntimeError):
+    """㉓ 预算闸：某个常发块的字节顶穿了 §5.4 的断值（`context_ledger` 里那个），请求**不发出**。
+
+    刻意抛错而不是就地截断：截断是静默丢内容——`memory.py:116-121` 的「保尾部」
+    正是这个形状（看着还在，其实丢了头部）。这条链的规矩是「少带可以，但要说出来」，
+    说出来之后由人决定是压内容还是抬预算（抬预算要走 Q55，不许临场改）。
+    """
+
+
+def section_budget(name: str) -> int | None:
+    """块名 → 预算字节；没进表 = 不限量（返回 None）。
+
+    带 ``:`` 的动态块名（``skill_instructions:motion_explainer``）按前缀取：
+    预算是按**层**定的，不是按每份附件定。
+    """
+    if name in SECTION_BUDGET_BYTES:
+        return SECTION_BUDGET_BYTES[name]
+    return SECTION_BUDGET_BYTES.get(name.split(":", 1)[0])
+
+
+def section_target(name: str) -> int | None:
+    """块名 → §5.4 的**目标**字节（不是断值）；没进表 = 本文档没给它定目标。"""
+    if name in SECTION_TARGET_BYTES:
+        return SECTION_TARGET_BYTES[name]
+    return SECTION_TARGET_BYTES.get(name.split(":", 1)[0])
+
+
+def section_bytes(text: str) -> int:
+    """块的字节数。口径与 §5.7 一致：UTF-8 编码后的字节（不是字符数）。
+
+    为什么不用 `compress.py` 的 token 估算当账面：账面要能被逐字核对
+    （人对着 §5.4 表复核），token 是估算量、会随计数器改口径而漂。
+    两者分工：字节进账，token 进压缩预算（`estimate_tokens`，那条链不在这里）。
+    """
+    return len(text.encode("utf-8"))
+
+
+def section_name(text: str) -> str:
+    """裸段文本 → 块名：取首个标签，带 ``name="X"`` 就接上。
+
+    ``<planning_round>`` → ``planning_round``；
+    ``<skill_instructions name="motion_explainer">`` → ``skill_instructions:motion_explainer``。
+    认不出标签时回 ``"unlabeled"``——**不猜**：账面里出现 unlabeled 就是有人
+    在往装配里塞不带身份的裸串，值得看见。
+    """
+    m = _AUTO_NAME_RE.match(text.lstrip())
+    if not m:
+        return "unlabeled"
+    tag = m.group(1)
+    attr = _NAME_ATTR_RE.search(m.group(2) or "")
+    return f"{tag}:{attr.group(1)}" if attr else tag
+
+
+@dataclass(frozen=True)
+class Section:
+    """一个**带身份**的装配块。
+
+    裸字符串仍然能用（`build(extra_sections=[…])` 会自动取名），但那样账面里
+    只有名字、没有条件键与引用方：`kind` 一律 `on_demand`、`referenced_by` 空。
+    产出方知道得更多就该说更多——`knobs` 的字节、条件键、谁读它，都只有产出方知道。
+
+    ``sub_blocks``：这一段里**另有独立预算**的子块（现在只有规划轮段里的
+    `knobs` / `session_history_rows`——它们的字节已含在 ``text`` 里，
+    所以求和会重复计；账面因此是「逐块看」，不是「加起来看总账」）。
+    """
+
+    name: str
+    text: str
+    kind: str = "on_demand"
+    condition_key: str | None = None
+    referenced_by: tuple[str, ...] = ()
+    sub_blocks: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.kind not in LEDGER_KINDS:
+            raise ValueError(f"kind 必须是 {LEDGER_KINDS} 之一，收到 {self.kind!r}")
+
+
+def tools_box(definitions: Sequence[Mapping[str, Any]], *,
+              total_registered: int | None = None,
+              filter_name: str | None = None) -> dict[str, Any]:
+    """本轮真发出去的工具 schema → 账面上的 ``tools`` 栏。
+
+    ``sent`` 是**这一轮实际下发**的份数，``total_registered`` 是注册表里全部可见份数：
+    两者的差就是「按轮裁剪」省下的量（T41 的判据读它）。``largest`` 取字节最大的三份，
+    够定位「谁在顶预算」——列全了反而没人看。
+    """
+    rows = []
+    for d in definitions:
+        fn = d.get("function") or {}
+        rows.append({"name": str(fn.get("name") or "?"),
+                     "bytes": section_bytes(json.dumps(d, ensure_ascii=False))})
+    rows.sort(key=lambda r: (-r["bytes"], r["name"]))
+    return {
+        "sent": len(rows),
+        "total_registered": total_registered,
+        "filter": filter_name,
+        "largest": rows[:3],
+    }
+
+
 class ContextBuilder:
     def __init__(
         self,
@@ -183,6 +373,10 @@ class ContextBuilder:
         self.context_sources: list[ContextSource] = list(context_sources or [])
         self.runtime_context = runtime_context
         self.compressor = compressor
+        # 最近一次 ``build`` 产出的账面（§5.7 第①条格式）。装配方读它留档、
+        # agent 侧往 ``tools`` 栏补工具面。没跑过装配时为 None——**None 不是空账**，
+        # 谁读到 None 就该当「未判」，不许当成「没有超预算」。
+        self.last_ledger: dict[str, Any] | None = None
 
     def reload_prompts(self) -> str:
         """从磁盘重读系统提示词（热替换入口）；返回新的提示词指纹。
@@ -230,35 +424,70 @@ class ContextBuilder:
         *,
         attachments: Sequence[Mapping[str, Any]] = (),
         rejected_attachments: Sequence[str] = (),
-        extra_sections: Sequence[str] = (),
+        extra_sections: Sequence[str | Section] = (),
     ) -> list[Message]:
         """装配本轮上下文。
 
         ``extra_sections`` 是**本轮专属**的整段文本（计划门的批准计划 / 用户诉求 /
         预注入技能正文）：它们由服务端确定性代码产出、只对这一次执行有意义，
         不该做成常驻 ContextSource 让每轮都重跑一遍检索。
-        """
-        parts: list[str] = [self.system_prompt]
+        元素可以是裸串（自动命名）或 :class:`Section`（带条件键与引用方的好账）。
 
-        parts.extend(self._bootstrap_sections())
+        返回前产出一本账（``self.last_ledger``，格式见 §5.7 第①条）；
+        ``over_budget`` 非空即抛 :class:`ContextBudgetError`——**请求不发出**。
+        """
+        sections: list[Section] = []
+
+        def _add(sec: Section) -> None:
+            # 空段不进账面也不进提示：账要能逐行对上真发出去的东西，
+            # 记一条 0 字节的段只会让人怀疑「它到底发了没有」。
+            if sec.text and sec.text.strip():
+                sections.append(sec)
+
+        _add(Section(name="system_prompt", text=self.system_prompt,
+                     kind="always", condition_key=None, referenced_by=ASSEMBLY_REF))
+        for text in self._bootstrap_sections():
+            _add(Section(name=section_name(text), text=text, kind="always",
+                         condition_key=None, referenced_by=ASSEMBLY_REF))
 
         if self.runtime_context:
             rt = self.runtime_context()
             if rt:
-                parts.append(f"<runtime>\n{rt}\n</runtime>")
+                _add(Section(name="runtime", text=f"<runtime>\n{rt}\n</runtime>",
+                             kind="always", condition_key=None,
+                             referenced_by=ASSEMBLY_REF))
 
         for source in self.context_sources:
-            section = await source.render(current_input, user_id=session.user_id)
-            if section:
-                parts.append(f"<{source.name}>\n{section.strip()}\n</{source.name}>")
+            body = await source.render(current_input, user_id=session.user_id)
+            if body:
+                # 三个可选属性由 ContextSource 自己声明（协议仍是 `name` + `render`）：
+                # 装配侧不认识「记忆」或「技能」是什么，只认它自报的身份与消费者。
+                _add(Section(
+                    name=str(source.name),
+                    text=f"<{source.name}>\n{body.strip()}\n</{source.name}>",
+                    kind=str(getattr(source, "ledger_kind", "always")),
+                    condition_key=getattr(source, "ledger_condition_key", None),
+                    referenced_by=tuple(getattr(source, "ledger_referenced_by", ()) or ()),
+                ))
 
         att = render_attachments_section(attachments, rejected_attachments)
         if att:
-            parts.append(f"<attachments>\n{att}\n</attachments>")
+            _add(Section(name="attachments", text=f"<attachments>\n{att}\n</attachments>",
+                         kind="conditional", condition_key="attachments",
+                         referenced_by=("load_media",)))
 
-        parts.extend(s for s in extra_sections if s and s.strip())
+        for item in extra_sections:
+            if isinstance(item, Section):
+                _add(item)
+            elif item:
+                _add(Section(name=section_name(item), text=item))
 
-        system_content = "\n\n".join(p for p in parts if p)
+        system_content = "\n\n".join(s.text for s in sections)
+
+        ledger = self._ledger(sections)
+        self.last_ledger = ledger
+        if ledger["over_budget"]:
+            raise ContextBudgetError(self._over_budget_message(ledger))
 
         messages: list[Message] = [
             {"role": "system", "content": system_content},
@@ -269,3 +498,58 @@ class ContextBuilder:
         if self.compressor:
             messages = await self.compressor(messages, current_input)
         return messages
+
+    # ---- 账面 ----
+
+    def _ledger(self, sections: Sequence[Section]) -> dict[str, Any]:
+        """§5.7 第①条的账面格式。四个键的字段名与含义**冻结**，别在别处记账。"""
+        rows: list[dict[str, Any]] = []
+        for sec in sections:
+            rows.append(self._ledger_row(sec.name, sec.text, sec.kind,
+                                         sec.condition_key, sec.referenced_by))
+            for sub_name, sub_text in sec.sub_blocks:
+                if sub_text and sub_text.strip():
+                    # 子块的 kind/条件键跟着父段：它有没有出现，取决于父段的守卫，
+                    # 而那个守卫名只有产出方知道（现在由产出方写进父段的 condition_key）。
+                    rows.append(self._ledger_row(sub_name, sub_text, sec.kind,
+                                                 sec.condition_key, sec.referenced_by))
+        over = sorted({r["name"] for r in rows
+                       if (b := section_budget(r["name"])) is not None and r["bytes"] > b})
+        # 「超目标」与「超断值」分开记，因为它们是两件事：前者是 R9 还在还的账
+        # （每次都出现在账面上，直到那个任务落地），后者才是**这次请求不发出**。
+        over_target = sorted({r["name"] for r in rows
+                              if (t := section_target(r["name"])) is not None
+                              and r["bytes"] > t})
+        orphan = [r["name"] for r in rows if r["kind"] == "always" and not r["referenced_by"]]
+        return {
+            "sections": rows,
+            # 工具面要等 agent 侧拿到 registry 才填得出来（那里才知道注册了多少）；
+            # 这里先给一格**未判**的空位，而不是伪造 0。
+            "tools": {"sent": None, "total_registered": None, "filter": None,
+                      "largest": []},
+            "over_budget": over,
+            "over_target": over_target,
+            "orphan_sections": orphan,
+        }
+
+    @staticmethod
+    def _ledger_row(name: str, text: str, kind: str, condition_key: str | None,
+                    referenced_by: tuple[str, ...]) -> dict[str, Any]:
+        return {"name": name, "bytes": section_bytes(text), "kind": kind,
+                "condition_key": condition_key, "referenced_by": list(referenced_by)}
+
+    @staticmethod
+    def _over_budget_message(ledger: Mapping[str, Any]) -> str:
+        """报红要说清三件事：哪块超、超了多少、预算从哪来。只说「超预算了」等于没说。"""
+        lines = ["上下文预算闸㉓：以下装配块超出 §5.4 的断值，本次请求不发出（不许截断顶过去）："]
+        by_name = {r["name"]: r for r in ledger.get("sections") or []}
+        for name in ledger.get("over_budget") or []:
+            row = by_name.get(name) or {}
+            budget = section_budget(name)
+            lines.append(f"- {name}：{row.get('bytes')} B > 预算 {budget} B"
+                         f"（kind={row.get('kind')}，条件键={row.get('condition_key')}）")
+        lines.append("出路只有两条：把内容压回预算内，或按 Q55 走流程调预算"
+                     "（两处同批改：context.py 的 SECTION_BUDGET_BYTES 与 §5.4 表）。"
+                     "注意这不是「目标」列——目标见 SECTION_BUDGET_DEBT，那是 R9 要还的账，"
+                     "不在这里硬拦。")
+        return "\n".join(lines)

@@ -25,7 +25,7 @@ from ..plan_replay import (drain_plan_cards, drain_plan_round, record_plan_card,
                            reset_plan_cards)
 from .compile import PlanCompiler
 from .gate import PlanGate
-from .prompt import planning_section, render_injections
+from .prompt import planning_section, planning_section_blocks, render_injections
 from .reconcile import (NON_STEP_TOOLS, PlanCardHook, PlanReconcileHook,
                         reconcile)
 from .resume import pending_continuation
@@ -42,6 +42,7 @@ __all__ = [
     "PlanGate", "PlanVocabulary", "PlanValidator", "PlanCompiler",
     "SubmitPlanTool", "ConfirmPlanTool", "PlanIssues", "neutralize",
     "render_injections", "reconcile", "preload_skills", "planning_section",
+    "planning_section_blocks",
     "pending_continuation", "claims_plan_card", "claims_step_executed",
     "PlanCardHook", "PlanReconcileHook", "NON_STEP_TOOLS",
     "record_plan_card", "drain_plan_cards", "drain_plan_round", "reset_plan_cards",

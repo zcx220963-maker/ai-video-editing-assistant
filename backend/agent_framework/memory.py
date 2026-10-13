@@ -90,6 +90,10 @@ class MemoryContextSource:
     # 单条分类的上限与全量上限：按「中文字≈1 token」估，约合 1.5k~2k token。
     per_category_chars = 2000
     total_chars = 4000
+    # 账面（§5.7 第①条）自报：这一段是**每轮无条件**发的，读它的是模型手上那两件
+    # 记忆工具——注入的正文正是它们读写的对象，USAGE_NOTE 也只在它们存在时才写。
+    ledger_kind = "always"
+    ledger_referenced_by = ("update_memory", "read_memory")
 
     USAGE_NOTE = (
         "用法：前缀是「计划卡：」「换一版计划的理由」「成片退回重做」的行由服务端从用户"

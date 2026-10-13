@@ -263,10 +263,28 @@ async def planning_section(gate: PlanGate, *, feedback: str = "",
                            session_history: Sequence[Mapping[str, Any]] = (),
                            session_artifacts: Sequence[str] = (),
                            has_pending_plan: bool = False) -> str:
+    """规划轮的 system 段（纯文本）。账面要子块字节时用 ``planning_section_blocks``。"""
+    text, _blocks = await planning_section_blocks(
+        gate, feedback=feedback, prior=prior, pending=pending,
+        session_history=session_history, session_artifacts=session_artifacts,
+        has_pending_plan=has_pending_plan)
+    return text
+
+
+async def planning_section_blocks(gate: PlanGate, *, feedback: str = "",
+                                  prior: Sequence[Mapping[str, Any]] = (),
+                                  pending: Mapping[str, Any] | None = None,
+                                  session_history: Sequence[Mapping[str, Any]] = (),
+                                  session_artifacts: Sequence[str] = (),
+                                  has_pending_plan: bool = False,
+                                  ) -> tuple[str, tuple[tuple[str, str], ...]]:
     """规划轮的 system 段：本轮**没有**剪辑执行工具，出口只有 ``submit_plan`` 或直接回答。
 
-    文案住在 ``prompts/planning_round.md``（改一句话不必再动代码），这一函数只准备它
-    要插的**数据**；模板里的条件段由块守卫决定（有旧卡才提旧卡，以此类推）。
+    比 ``planning_section`` 多带一份 ``(子块名, 文本)``：R9-T37 的账面要按子块读字节，
+    而模板里只有 ``knobs``（参数教程，§5.4 末列单列一行）与 ``session_history_rows``
+    （同会话历史行）另有独立预算。子块字节已含在整段里，所以账面是逐块看、不是加起来
+    看总账——见 ``context.Section.sub_blocks``。两个出口同一份代码：各算一遍迟早会漂，
+    而账面的全部意义就是「能逐字对上」。
 
     节点白名单在这里给模型（机器名）：它只能从这份名单里挑，写名单外的名字
     会被四重校验打回。界面给人看的是块 A 换轨后的 ``*_display``，不在这层拼。
@@ -278,7 +296,7 @@ async def planning_section(gate: PlanGate, *, feedback: str = "",
     ``prior`` 是「换一版」那张旧卡的候选：卡面步骤不在会话历史里（历史只有那一轮的
     文字摘要），不把它写进提示，模型既无从做出可辨别的差异、也常常干脆不再出卡。
 
-    ``has_pending_plan`` 为真时，提示词里加一段 ``confirm_plan`` 工具的使用说明：
+    ``has_pending_plan`` 为真时，提示词里加一段 ``confirm_plan`` 的工具使用说明：
     用户在输入框打字确认已有计划（而非点按钮）时，LLM 调 ``confirm_plan`` 弹窗，
     不要反复说「本轮是规划轮」把用户困住。
     """
@@ -305,8 +323,12 @@ async def planning_section(gate: PlanGate, *, feedback: str = "",
     }
     library = getattr(gate, "prompt_library", None)
     if library is not None:
-        return library.blocks(PLANNING_PROMPT_FILE, _PLANNING_TEMPLATE, **values)
-    return render_blocks(_PLANNING_TEMPLATE, values)
+        text = library.blocks(PLANNING_PROMPT_FILE, _PLANNING_TEMPLATE, **values)
+    else:
+        text = render_blocks(_PLANNING_TEMPLATE, values)
+    blocks = tuple((key, str(values.get(key) or ""))
+                   for key in ("knobs", "session_history_rows") if values.get(key))
+    return text, blocks
 
 
 def _explicit_nodes(gate: Any) -> list[str]:

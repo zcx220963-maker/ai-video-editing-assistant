@@ -27,15 +27,15 @@ from .ask_gate import (NO_POPUP_NOTE, PLAN_CARD_NUDGE, looks_like_asking_user,
 from .checkpoint import Checkpoint, CheckpointManager
 from .catalog import get_catalog
 from .compress import _repair_orphans
-from .context import ContextBuilder
+from .context import ContextBuilder, LEDGER_ENTRY_TYPE, Section, tools_box
 from .hooks import AgentHook, AgentHookContext, CompositeHook, _current_hook_ctx, _current_hooks
 from .identity import (current_identity, rebind_artifact_scope,
                        storyline_session_id, use_identity, use_identity_or_inherit)
 from .llm import LLMClient, LLMResponse
 from .messages import ToolCall, assistant, system, tool_result, user
 from .plan import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_step_executed,
-                        pending_continuation, planning_section, preload_skills,
-                        reconcile, render_injections)
+                        pending_continuation, planning_section_blocks,
+                        preload_skills, reconcile, render_injections)
 from .plan_retro import (PlanRetrospective, plan_card_lines, rework_line,
                          revise_line)
 from .render_gate import (ADJUST_OPTION, CONFIRM_OPTION,
@@ -542,6 +542,9 @@ class AgentOnceRun:
                 session, message, attachments=rows, rejected_attachments=rejected,
                 extra_sections=extra_sections,
             )
+            # 账面**就地取走**，不留到后面从 builder 上读：ContextBuilder 是跨 run 共享的，
+            # `last_ledger` 是最后写者赢——两条 run 交错时读到的是别人的账。
+            context_ledger = self.context_builder.last_ledger
             # 附件随 user 行入库（spec §5 步骤 7）：先落库再进循环，崩溃恢复时这轮信息不丢。
             await self._persist_user_message(session, message, ids)
             cp: Checkpoint | None = None
@@ -558,7 +561,7 @@ class AgentOnceRun:
             return await self._drive(
                 session, message, messages, 0, cp, stream, resuming=False, run_id=run_id,
                 registry=registry, approved_plan=approved_plan, planning=planning,
-                interactive=interactive,
+                interactive=interactive, context_ledger=context_ledger,
             )
 
     async def _resolve_attachments(
@@ -675,18 +678,22 @@ class AgentOnceRun:
         approval_decision: str | None = None,
         approval_note: str = "",
         interactive: bool = True,
+        context_ledger: dict[str, Any] | None = None,
     ) -> str:
         """一次执行的骨架：开账 → 循环 → 交付。
 
         循环本身只做三件事：在一致点落盘、叫 LLM、把切出去的三块串起来——
         ``_tool_round``（这一轮要调工具：审批/渲染/提问三类挂起与分叉交接）、
         ``_nudge_back``（收尾前的四条硬保证）、``_deliver``（终答的兜底核对与落库）。
+
+        ``context_ledger`` 只有**刚装配过上下文**的那条入口传得出来（``run``）；
+        从断点续跑的三条入口传 None——那半截没有重新装配，账得沿用快照里那份。
         """
         r = self._open_run(
             session, messages, start_iteration, cp, run_id=run_id, registry=registry,
             approved_plan=approved_plan, planning=planning,
             approval_decision=approval_decision, approval_note=approval_note,
-            interactive=interactive)
+            interactive=interactive, context_ledger=context_ledger)
         # 暴露当前 ctx 与 hooks 给工具（如 SpawnTool）触发子 Agent 生命周期节点。
         hooks_token = _current_hooks.set(self.hooks)
         ctx_token = _current_hook_ctx.set(r.ctx)
@@ -749,7 +756,8 @@ class AgentOnceRun:
                   registry: ToolRegistry | None,
                   approved_plan: dict[str, Any] | None, planning: bool,
                   approval_decision: str | None, approval_note: str,
-                  interactive: bool) -> "_Round":
+                  interactive: bool,
+                  context_ledger: dict[str, Any] | None = None) -> "_Round":
         """开一本循环账：恢复可恢复状态、装配本轮 ctx、发三道打回预算。"""
         reg = registry if registry is not None else self.registry
         # 跨挂起仍然成立的事实从指针行恢复（没有 checkpoint 时就是全新的）：执行轮在渲染
@@ -773,6 +781,10 @@ class AgentOnceRun:
             state.qa_parts.append(
                 {"type": "prompt_fingerprint",
                  "fingerprint": self.context_builder.fingerprint()})
+        # 上下文面账面（R9-T37，§5.7 第①条）：与指纹同一条留档通道、同样只记一次
+        # （续跑那半截沿用快照里那份，别在历史里留两本同一轮的账）。
+        self._record_context_ledger(state, reg, user_id=session.user_id,
+                                    planning=planning, ledger=context_ledger)
         r = _Round(
             ctx=ctx, state=state, reg=reg, messages=messages, iteration=start_iteration,
             cp=cp, run_id=run_id, planning=planning, interactive=interactive,
@@ -786,6 +798,29 @@ class AgentOnceRun:
             plan_nudges=max(0, self.config.plan_card_nudges))
         state.persist(cp)
         return r
+
+    def _record_context_ledger(self, state: RunState, reg: ToolRegistry, *,
+                               user_id: str | None, planning: bool,
+                               ledger: dict[str, Any] | None) -> None:
+        """把本轮的上下文面账面写进 qa_parts（R9-T37，§5.7 第①条）。
+
+        两栏各有出处，别混：
+        - ``sections`` 来自装配出口（``ContextBuilder.build`` 返回前算的那份），
+          只有**刚装配过上下文**的那条入口拿得到；
+        - ``tools`` 只有这里算得对——装配出口不认识工具注册表，而
+          ``sent``/``total_registered`` 这两个数正是「按轮裁剪省了多少」的判据（T41）。
+
+        ``ledger`` 为 None（断点续跑那三条入口）时**什么都不写**：那半截没有重新装配，
+        现算一个「这轮的工具面」只会与快照里那份 sections 不同批。
+        """
+        if ledger is None:
+            return
+        entry: dict[str, Any] = {"type": LEDGER_ENTRY_TYPE, **ledger}
+        entry["tools"] = tools_box(
+            reg.get_definitions(user_id=user_id),
+            total_registered=len(self.registry.get_definitions(user_id=user_id)),
+            filter_name="planning_registry" if planning else None)
+        state.qa_parts.append(entry)
 
     async def _tool_round(self, r: "_Round", resp: LLMResponse) -> str | None:
         """模型这一轮要调工具：记账 → 三类挂起 → 真执行 → 分叉交接或推进迭代。
@@ -2001,14 +2036,19 @@ class Agent:
             except Exception:
                 has_pending_plan = False
         async with self._lock_for(session.session_id):
+            # 账面要按子块读字节（`knobs` 在 §5.4 末列单列一行），所以走带子块的出口：
+            # 整段文本与 `planning_section` 逐字相同，只是多带一份「子块 → 文本」。
+            plan_text, plan_blocks = await planning_section_blocks(
+                gate, feedback=feedback, prior=prior, pending=pending,
+                session_history=session_history, session_artifacts=session_artifacts,
+                has_pending_plan=has_pending_plan)
             return await self.runner.run(
                 session, message, run_id=run_id, stream=stream, attachments=attachments,
                 registry=self._planning_registry(gate), planning=True,
-                extra_sections=[await planning_section(gate, feedback=feedback,
-                                                       prior=prior, pending=pending,
-                                                       session_history=session_history,
-                                                       session_artifacts=session_artifacts,
-                                                       has_pending_plan=has_pending_plan)],
+                extra_sections=[Section(
+                    name="planning_round", text=plan_text, kind="conditional",
+                    condition_key="planning_round", referenced_by=("submit_plan",),
+                    sub_blocks=plan_blocks)],
             )
 
     async def _prior_plans(self, revise_of: str) -> list[dict[str, Any]]:

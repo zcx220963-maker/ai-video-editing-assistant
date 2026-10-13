@@ -279,6 +279,10 @@ class SkillManifestContextSource:
     """ContextSource：注入轻量技能清单；always 技能附完整正文。"""
 
     name = "skills"
+    # 账面（§5.7 第①条）自报：清单每轮无条件发（无技能才返 None），
+    # 读它的是 load_skill——清单上的名字就是能被按需拉取的技能。
+    ledger_kind = "always"
+    ledger_referenced_by = ("load_skill",)
 
     def __init__(self, loader: SkillLoader) -> None:
         self._loader = loader
