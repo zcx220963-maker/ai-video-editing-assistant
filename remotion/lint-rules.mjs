@@ -11,7 +11,7 @@
  * 也是为什么这一份清单必须由调用方（Python 侧的 `code_spec`）交过来而不是从代码里猜。
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,6 +26,32 @@ try {
     JSON.parse(readFileSync(join(__dirname, 'font-whitelist.json'), 'utf8')),
   );
 } catch {}
+
+/** R5-T16：随镜像发出去的自有 webfont 字族，从注册表 `src/fonts.ts` 里读。
+ *
+ *  为什么从源文件读、不另写一份 JSON：这份名单的**唯一判据是「本仓库当场加载了它」**。
+ *  另写一份清单就有了两处真相——注册表加了字族而清单没加，镜头里写它就误红；
+ *  反过来清单加了而没人加载，就是「写了但没人接」那种假绿。读同一个文件，
+ *  两份名单天然同步。正则而不是 import：这里是纯 Node（ESLint 进程），没有打包器，
+ *  而 `src/fonts.ts` 是 TS + JSX 生态里的文件，import 不动。 */
+let WEB_FONT_FAMILIES = new Set();
+try {
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const fontsTs = readFileSync(join(__dirname, 'src', 'fonts.ts'), 'utf8');
+  const m = /export const WEB_FONT_FAMILIES\s*=\s*\[([^\]]*)\]/.exec(fontsTs);
+  if (m) WEB_FONT_FAMILIES = new Set(
+    [...m[1].matchAll(/['"]([^'"]+)['"]/g)].map((x) => x[1]),
+  );
+} catch {}
+
+/** webfont 字节的落点。`DG_PUBLIC_ROOT` 只给测试用（与 assetgate 同一个口子）：
+ *  想造「loadFont 指着一个不存在的文件」这个红样，不该先往真 public/ 里摆假货。 */
+const PUBLIC_ROOT = (() => {
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  return process.env.DG_PUBLIC_ROOT
+    ? join(process.env.DG_PUBLIC_ROOT)
+    : join(__dirname, 'public');
+})();
 
 /** CSS 泛型字族——永远放行，不在白名单里也不报。 */
 const GENERIC_FAMILIES = new Set([
@@ -60,6 +86,27 @@ export const ALLOWED_IMPORTS = new Set([
   '@remotion/shapes',
   '@remotion/motion-blur',
   '@remotion/layout-utils',
+  // R5-T16：官方写法块点名的四件 + 字幕 token 化的那件（§3.1 的「新增进白名单」集合）。
+  // fonts 治第六根因（静默回落）；rough-notation 是手绘标注族；noise 的 noise2D/3D/4D
+  // 与「禁 Math.random」同向（种子确定）；animation-utils 目前只有 getSpringFrame。
+  '@remotion/fonts',
+  '@remotion/captions',
+  '@remotion/rough-notation',
+  '@remotion/noise',
+  '@remotion/animation-utils',
+  // R5-T16b：官方效果件。入场券是 `tests/effects-probe.mjs` 那三条**真渲**判据
+  // （不崩 / 画面里没有参数外的颜色 / 挂错宿主是静默空操作），不是「Remotion 有这个东西」
+  // ——这一族是 WebGL2 着色器，历史上的坏法是**悄悄染一层颜色**，任何「渲染返回 200」
+  // 都判不出来。只在 `<Img>/<Solid>/<HtmlInCanvas>` 上生效，别处是静默空操作。
+  //
+  // **为什么按子路径逐件列、而不是放行包名 `@remotion/effects`**（§9-Q89）：
+  // 4.0.534 的桶文件 `dist/index.d.ts` 只重导 11 件，`paper`/`halftone` 都不在其中，
+  // 它们只能从 `@remotion/effects/paper` 这样拿。放行桶名等于同时放行两种坏：
+  // ① 那 11 件没经过先验就先得了票；② 更要命的是**看着像放行了 paper，实际拿到
+  // `undefined`**——`import { paper } from '@remotion/effects'` 打包期不报错，
+  // 到渲染时才炸一句「paper is not a function」。所以这里只列**先验过的**两件。
+  '@remotion/effects/paper',
+  '@remotion/effects/halftone',
   // 画法通道：真三维与手绘斜纹。这两个家族在 package.json + lockfile 里躺着，
   // 且 2026-10-11 那批六支真渲夹具（roughjs / three / KaTeX × 两画幅）就是它们渲出来的
   'three',
@@ -71,6 +118,9 @@ export const ALLOWED_IMPORTS = new Set([
   // 母版与 token 走别名
   '@dg/film',
   '@dg/tokens',
+  // R5-T16：webfont 注册表。镜头代码写 `@dg/fonts` 的那一下，就是把
+  // loadFont + 101 片 unicode-range 拉进依赖图——字族白名单也读这个文件。
+  '@dg/fonts',
   // shot 配方卡的基础动效件（_fixtures 是真实现，不是桩）
   '@dg/motion',
   '@dg/polish',
@@ -612,15 +662,36 @@ export const dgPlugin = {
     }),
 
     'staticfile-asset-check': {
-      meta: { type: 'problem', schema: [{ type: 'array', items: { type: 'string' } }],
+      // options[0] 从「一个名字数组」改成 { declared, staged }：
+      //   · declared —— 这一镜在分镜里**声明**了哪些素材名（调用方传的名单）；
+      //   · staged   —— 这些素材**真投到渲染容器了没有**的账（`assets/<sid>/_manifest.json`）。
+      // staged 是 null 表示「看不见投递账」（比如只问代码合不合规的 /lint 口），
+      // 此时那一半不判——把「没看见」当成「没投递」会误杀，把「没投递」当成通过
+      // 才是这条规则要防的，两种错事重量不一样。
+      meta: { type: 'problem',
+              schema: [{ type: 'object', properties: {
+                declared: { type: 'array', items: { type: 'string' } },
+                staged: { type: ['array', 'null'], items: { type: 'string' } },
+              }, additionalProperties: false }],
               messages: {
                 undeclared: 'staticFile("{{arg}}") 引用了未声明的资产。本镜可用：{{alt}}',
                 nonLiteral: 'staticFile 的实参必须是字符串字面量，变量拼路径让机器无法核对',
+                unstaged: 'staticFile("{{arg}}") 的名字声明了，但**没投到渲染容器**——'
+                  + '这一镜的 public/assets/<镜号>/ 里没有它。声明与投递是两条腿：'
+                  + '声明归分镜，投递归 Python 侧按 sha256 取字节那一步。'
+                  + '此时渲染出来的是空白图，闸⑬ 也会拒。',
                 unused: '声明了资产 "{{name}}" 但代码里没有对应的 staticFile 调用',
               } },
       create(context) {
-        const declared = context.options[0] ?? [];
+        const opts = context.options[0] ?? {};
+        const declared = Array.isArray(opts.declared) ? opts.declared : [];
+        const staged = opts.staged == null ? null : opts.staged;   // null = 未判
         const used = new Set();
+        // `fonts/` 是**随镜像发出去**的命名空间（R5-T16），与「这一镜的素材」是两件事：
+        // 素材按镜投递、按镜声明，而字体是构建产物，任何一镜都能用、也不需要谁声明。
+        // 不豁免的话，母版加载字体会让**每一镜**都报「引用了未声明的资产」——一条
+        // 天天误红的规则等于没有规则，人很快学会忽略它。
+        const SHIPPED = 'fonts/';
         return {
           CallExpression(node) {
             if (node.callee.type !== 'Identifier' || node.callee.name !== 'staticFile') return;
@@ -630,9 +701,12 @@ export const dgPlugin = {
               return;
             }
             used.add(arg.value);
+            if (arg.value.startsWith(SHIPPED)) return;
             if (!declared.includes(arg.value)) {
               context.report({ node, messageId: 'undeclared',
                 data: { arg: arg.value, alt: declared.join(', ') || '（本镜未声明任何资产）' } });
+            } else if (staged !== null && !staged.includes(arg.value)) {
+              context.report({ node, messageId: 'unstaged', data: { arg: arg.value } });
             }
           },
           'Program:exit'() {
@@ -656,18 +730,23 @@ export const dgPlugin = {
         },
       },
       create(context) {
-        if (FONT_WHITELIST.size === 0) return {};
+        // 两类合法字族：① 镜像里装着的（构建期 fc-list 生成的白名单）；
+        // ② 本仓库当场加载的（`src/fonts.ts` 的 WEB_FONT_FAMILIES，R5-T16）。
+        // 少了第②类，随我们发出去的 webfont 就永远写不进 fontFamily——治第六根因
+        // 的那一半会被自己的闸挡住。
+        const allowed = new Set([...FONT_WHITELIST, ...WEB_FONT_FAMILIES]);
+        if (allowed.size === 0) return {};
         const constStrings = new Map();
 
         const check = (node, value) => {
           if (typeof value !== 'string') return;
           for (const name of parseFontFamilies(value)) {
             if (GENERIC_FAMILIES.has(name.toLowerCase())) continue;
-            if (FONT_WHITELIST.has(name)) continue;
+            if (allowed.has(name)) continue;
             context.report({
               node,
               messageId: 'notInWhitelist',
-              data: { family: name, allowed: [...FONT_WHITELIST].join(', ') },
+              data: { family: name, allowed: [...allowed].join(', ') },
             });
           }
         };
@@ -705,6 +784,107 @@ export const dgPlugin = {
         };
       },
     },
+
+    // ── R5-T16「加载即断言」───────────────────────────────────────────────
+    // 上面那条管「写了哪个字族的名字」，这条管「那个字族的字节到底在不在」。
+    // 两件事都会让画面上的字与代码里写的不是一个东西，但红法不同：
+    // 前者是名字没登记，后者是**登记了却指空**——`loadFont` 指向一个不存在的
+    // 文件时，Remotion 不会报错，浏览器只是继续用回落字族，而那次渲染照样出片。
+    'font-load-check': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          notStaticFile:
+            'loadFont 的 url 必须是 `staticFile(\'fonts/….woff2\')`。这里是 {{what}}——' +
+            '渲染容器没有外网（也没有浏览器侧的 CDN），远端字体只会静默加载失败，' +
+            '然后浏览器拿回落字族把这一镜画完。',
+          outsideFonts:
+            'loadFont 指向 `{{path}}`，但 webfont 的落脚点是 public/fonts/（`staticFile` 的根是 ' +
+            'public/）。放别处的字体进不了镜像的约定位置——.dockerignore 只挡 `public/assets/*`，' +
+            '别的目录没人保证会跟着走。',
+          missingFile:
+            'loadFont 指向 `{{path}}`，但 public/ 下没有这个文件。**这条不会在渲染时报错**：' +
+            '浏览器静默回落到别的字族，出片看着正常，只是字不对。要发字体先跑 ' +
+            '`node scripts/fetch_fonts.mjs`。',
+          badFormat:
+            'loadFont 的 format 是 {{format}}，与文件后缀 `{{ext}}` 对不上。写错的 format ' +
+            '会让浏览器拒收这份字节，同样静默回落。',
+        },
+      },
+      create(context) {
+        const files = new Map();      // 已判过的路径，省掉重复 stat
+        const exists = (relPath) => {
+          if (!files.has(relPath)) {
+            try {
+              files.set(relPath, statSync(join(PUBLIC_ROOT, relPath)).isFile());
+            } catch {
+              files.set(relPath, false);
+            }
+          }
+          return files.get(relPath);
+        };
+        const EXT_FORMAT = {
+          '.woff2': 'woff2', '.woff': 'woff',
+          '.ttf': 'truetype', '.otf': 'opentype', '.eot': 'embedded-opentype',
+        };
+
+        return {
+          CallExpression(node) {
+            const callee = node.callee;
+            if (!callee || callee.type !== 'Identifier') return;
+            if (callee.name !== 'loadFont') return;      // 名字判据：官方 API 就叫这个
+            const arg = node.arguments[0];
+            if (!arg || arg.type !== 'ObjectExpression') return;
+
+            let urlNode = null;
+            let formatValue = null;
+            for (const p of arg.properties) {
+              if (!p.key) continue;
+              const key = p.key.name || p.key.value;
+              if (key === 'url') urlNode = p.value;
+              if (key === 'format' && p.value && p.value.type === 'Literal') {
+                formatValue = p.value.value;
+              }
+            }
+            if (!urlNode) return;
+
+            let relPath = null;
+            if (urlNode.type === 'CallExpression'
+                && urlNode.callee && urlNode.callee.name === 'staticFile') {
+              const a = urlNode.arguments[0];
+              if (a && a.type === 'Literal' && typeof a.value === 'string') relPath = a.value;
+            }
+            if (relPath == null) {
+              const what = urlNode.type === 'Literal' && typeof urlNode.value === 'string'
+                && /^(https?:)?\/\//.test(urlNode.value)
+                ? '一个直接写出来的远端 URL' : '一段运行时才算得出来的表达式';
+              context.report({ node: urlNode, messageId: 'notStaticFile', data: { what } });
+              return;
+            }
+            if (!relPath.startsWith('fonts/')) {
+              context.report({
+                node: urlNode, messageId: 'outsideFonts', data: { path: relPath },
+              });
+            }
+            if (!exists(relPath)) {
+              // 最后一条也报：路径与存在性是两件事，一句话只说一件事，退回的人才改得动
+              context.report({
+                node: urlNode, messageId: 'missingFile', data: { path: relPath },
+              });
+            }
+            const dot = relPath.lastIndexOf('.');
+            const ext = dot >= 0 ? relPath.slice(dot).toLowerCase() : '';
+            if (formatValue && EXT_FORMAT[ext] && formatValue !== EXT_FORMAT[ext]) {
+              context.report({
+                node: urlNode, messageId: 'badFormat',
+                data: { format: formatValue, ext },
+              });
+            }
+          },
+        };
+      },
+    },
   },
 };
 
@@ -737,3 +917,5 @@ export const RESTRICTED_SYNTAX = [
 export const STATICFILE_RULE = 'dg/staticfile-asset-check';
 // R4: 字体白名单规则
 export const FONT_RULE = 'dg/font-family-whitelist';
+// R5: webfont「加载即断言」规则（loadFont 指的字节必须在 public/fonts/ 里真存在）
+export const FONT_LOAD_RULE = 'dg/font-load-check';

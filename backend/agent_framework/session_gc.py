@@ -31,6 +31,11 @@ SESSION_TABLES = ("artifacts", "render_jobs", "checkpoints", "token_usage")
 #: 会话前缀下的对象目录：成片与逐帧/命中表（renders/）、节点自产中间件（derived/）、
 #: 逐镜切片缓存（motion-shots/）、逐窗切片缓存（render-windows/）。
 #: 素材字节在 users/{用户}/convs/{对话}/ 下，归用户且随素材行留存，这里不列它。
+#:
+#: 这张表里**永远不列 `assets/`**（T14；测试见 tests/test_session_gc.py ⑤）。
+#: `assets/` 是内置素材库的命名空间，全局共享、不属任何会话——一条字节可能被几十个
+#: 会话引用过，按会话回收一旦误判就是不可逆损失。它自己不归这里管：会不会越攒越多由
+#: `scripts/asset_gc_report.py` 巡检报给人看，删不删人工定（§9-Q26：不做自动删除）。
 OBJECT_PREFIXES = ("renders/", "derived/", "motion-shots/", "render-windows/")
 
 

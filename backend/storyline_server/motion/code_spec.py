@@ -55,6 +55,32 @@ MAX_HIGHLIGHTS_PER_SHOT = 4
 _SKILL_DIR = Path(__file__).resolve().parents[2] / "examples/skills/motion_explainer"
 
 @lru_cache(maxsize=1)
+def motion_skill_name() -> str:
+    """本技能在 ``skills`` 表里的名字（= ``SKILL.md`` frontmatter 的 ``name``）。
+
+    为什么要读而不是写死一个常量：取材轮给模型的提示里要出现
+    ``load_skill(name=…)``，而 ``load_skill`` 只认 frontmatter 那个名字——它**不等于**
+    目录名（目录叫 ``motion_explainer``，技能叫 ``motion_explainer_skill``）。在这里
+    再抄一份常量，改 frontmatter 时就漂，而漂移的表现是「提示让模型去 load_skill，
+    模型照做却得到『未找到技能』」。
+
+    读不到返回空串：调用方据此**不说**「用这个名字」——说错名字比不说更坏。
+    """
+    md = _SKILL_DIR / "SKILL.md"
+    if not md.is_file():
+        return ""
+    try:
+        text = md.read_text("utf-8")
+    except OSError:
+        return ""
+    m = re.match(r"^---\r?\n(.*?)\r?\n---", text, re.S)
+    if not m:
+        return ""
+    nm = re.search(r"^name:\s*(\S+)\s*$", m.group(1), re.M)   # 只在 frontmatter 里找
+    return nm.group(1) if nm else ""
+
+
+@lru_cache(maxsize=1)
 def _known_card_ids() -> frozenset[str]:
     shots_dir = _SKILL_DIR / "shots"
     if not shots_dir.is_dir():
@@ -76,7 +102,26 @@ def _known_demo_relpaths() -> frozenset[str]:
     except Exception:
         return frozenset()
 
-#: 相似度阈值（标定 2026-10-12：正样本138对全=1.0，负样本138对范围0.067~0.603中位0.424）
+#: 相似度阈值。**现值由 `scripts/calibrate_derived_sim.py` 复现**（Q7 的要求：标定脚本
+#: 在容器内跑不出来这个数，闸⑫ 就算未完成）。2026-10-13 全语料实测（158 份可比 demo、
+#: 12403 对负样本、扰动种子 20261012）：
+#:
+#:   正样本（一份 demo ↔ 换掉文案/色号/import 的它自己）  158/158 = 1.000
+#:   负样本（两份不同 demo）  min 0.028  median 0.400  p95 0.578  p98 0.605  max 0.736
+#:   在 0.61 上的负样本通过率 = 1.690%（线：≤ 2%）
+#:
+#: 选阈值的规则是「满足正样本召回 ≥95% 且负样本通过 ≤2% 的**最小**格点」，扫下来
+#: 0.60 → 2.400%（超线）、0.61 → 1.690%，所以 0.61 就是那个边界上的最小值，不是拍的。
+#: 取最小的理由：这条闸打回的是**声明造假**，阈值抬高会误伤真派生的镜，而误伤的代价
+#: 是模型把 `derived_from` 当成形式主义填。
+#:
+#: 上面这几个十进制数是**容器里**跑出来的（`docker run --rm --entrypoint sh
+#: creation-app:latest -c 'cd /app && python scripts/calibrate_derived_sim.py'`）。
+#: 拿 Windows 工作区（`core.autocrlf=true`，检出来是 CRLF）跑同一个脚本，通过率会是
+#: 1.685%，分位点一模一样——差别只在 LF/CRLF 让少数几份 demo 的 token 串动了几个，
+#: 所以**发布口径认容器那一组数**。别照着本机屏幕上那个数改这里。
+#:
+#: 换种说法：这一组数不是「某次跑出来的」，是「在 sanctioned 环境里每次跑都一样的」。
 DERIVED_MIN_SIM = 0.61
 
 #: 旁白音色（edge-tts 中文音色，实测 14 个；值随服务商变，故也放行合规格式）
@@ -409,12 +454,74 @@ def _norm_assets(raw: Any, sid: str, errors: list[str]) -> list[dict[str, Any]]:
     return out
 
 
+#: ``derived_from`` 的两种写法：``MANIFEST.json`` 里的 relpath 是**相对 ``demos/``**的
+#: （``opening/fracture/Fracture.tsx``），而 ``load_skill(name, path=…)`` 要的是**相对技能
+#: 目录**的（``demos/opening/fracture/Fracture.tsx``）。**同一份文件两个写法**，而模型
+#: 看到的契约里两处都写着（schema 的示例写带前缀的，白名单是不带的）——只认一边的话，
+#: 照着另一边抄的模型会收到一整片「不在白名单中」，而它抄的明明是同一份文件。
+#: 所以这里归一：两种都收，**存下来的只有一种**（不然闸⑫ 会拿到两种拼法的同一个 relpath，
+#: 逐镜账里也就分不清「引用的是哪一份」）。
+DEMO_PREFIX = "demos/"
+
+
+def _norm_demo_relpath(d: str) -> str:
+    """``demos/x/y.tsx`` / ``./demos/x/y.tsx`` / ``x/y.tsx`` → ``x/y.tsx``（其余原样返回）。"""
+    d = d.strip()
+    while d.startswith("./"):
+        d = d[2:]
+    return d[len(DEMO_PREFIX):] if d.startswith(DEMO_PREFIX) else d
+
+
+def _norm_cite(raw: Mapping[str, Any], sid: str,
+               errors: list[str]) -> tuple[str, list[str]]:
+    """``card`` / ``derived_from`` 两栏的归一与白名单校验——**单源**。
+
+    为什么抽出来：这两栏在**两个地方**被读——分镜轮（``_norm_shot`` 经
+    ``validate_code_spec``）与取材轮（``collect_demos``）。两处各写一遍「从哪张卡来、
+    派生自哪几份 demo」的判断，就会出现「取材轮放行了分镜轮不认的 relpath」这种
+    「取材白取了」的形状：模型拿到全文、写完代码、再被同一个白名单打回。
+    所以白名单只有这里一份，两轮共用。
+
+    「为空」也要在这里报：取材轮不经过 ``validate_code_spec``，不在这里拦，
+    一份没声明出处的骨架会被当成取材成功——那正是「手搓」的入口。
+    """
+    card = str(raw.get("card") or "").strip()
+    if not card:
+        _err(errors, f"{sid}：card 为空——每一镜必须声明选了哪张 shot 配方卡（格式：<类别>/<卡名>）")
+    else:
+        known = _known_card_ids()
+        if known and card not in known:
+            _err(errors, f"{sid}：card={card!r} 不在卡库中（共 {len(known)} 张卡），"
+                         f"模型不能自创卡名，必须从 shots/INDEX.md 里选")
+
+    derived_from = raw.get("derived_from") or []
+    if not isinstance(derived_from, list):
+        derived_from = [str(derived_from)]
+    derived_from = [_norm_demo_relpath(str(d)) for d in derived_from if str(d).strip()]
+    derived_from = [d for d in derived_from if d]
+    if not derived_from:
+        _err(errors, f"{sid}：derived_from 为空——每一镜必须声明代码来自哪些 demo（relpath 列表）")
+    else:
+        known_demos = _known_demo_relpaths()
+        if known_demos:
+            for d in derived_from:
+                if d not in known_demos:
+                    _err(errors, f"{sid}：derived_from={d!r} 不在 demo 语料白名单中"
+                                 f"（共 {len(known_demos)} 个 demo），"
+                                 f"必须从 demos/MANIFEST.json 里选")
+    return card, derived_from
+
+
 def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int) -> dict[str, Any]:
     sid = str(raw.get("id") or f"s{i + 1:02d}")
-
     code = str(raw.get("code") or "")
     if not code.strip():
-        _err(errors, f"{sid}：code 为空——新链每一镜必须交一段真实代码，没有默认版式可退")
+        # 提示按「怎么改」写而不是按「错在哪」写：真机上模型交一份没带 code 的骨架时，
+        # 它想要的多半是取材（见 ``forage_scan``），而这句话是它唯一能看到的岔路口。
+        _err(errors, f"{sid}：code 为空——新链每一镜必须交一段真实代码，没有默认版式可退"
+                     "（想先读被引用 demo 的全文再写码，就把这一轮交成**取材轮**："
+                     "所有镜都带上 card 与 derived_from、都**不带 code**，本工具会把那几份"
+                     "全文回给你；只带一部分镜是分不清意图的写法，会被打回）")
     n = len(code.encode("utf-8"))
     if n > MAX_CODE_BYTES:
         _err(errors, f"{sid}：代码 {n} 字节 > {MAX_CODE_BYTES}，一镜一次浏览器，这个体积不接")
@@ -453,29 +560,7 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         tex = ""
 
     # R1: card / derived_from 契约栏
-    card = str(raw.get("card") or "").strip()
-    if not card:
-        _err(errors, f"{sid}：card 为空——每一镜必须声明选了哪张 shot 配方卡（格式：<类别>/<卡名>）")
-    else:
-        known = _known_card_ids()
-        if known and card not in known:
-            _err(errors, f"{sid}：card={card!r} 不在卡库中（共 {len(known)} 张卡），"
-                         f"模型不能自创卡名，必须从 shots/INDEX.md 里选")
-
-    derived_from = raw.get("derived_from") or []
-    if not isinstance(derived_from, list):
-        derived_from = [str(derived_from)]
-    derived_from = [str(d).strip() for d in derived_from if str(d).strip()]
-    if not derived_from:
-        _err(errors, f"{sid}：derived_from 为空——每一镜必须声明代码来自哪些 demo（relpath 列表）")
-    else:
-        known_demos = _known_demo_relpaths()
-        if known_demos:
-            for d in derived_from:
-                if d not in known_demos:
-                    _err(errors, f"{sid}：derived_from={d!r} 不在 demo 语料白名单中"
-                                 f"（共 {len(known_demos)} 个 demo），"
-                                 f"必须从 demos/MANIFEST.json 里选")
+    card, derived_from = _norm_cite(raw, sid, errors)
 
     return {
         "id": sid,
@@ -489,16 +574,24 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         "card": card,
         "derived_from": derived_from,
         "assets": _norm_assets(raw.get("assets"), sid, errors),
+        # 闸⑯ 的两栏（R5-T15）。归一在这里、判据在整片层（check_subject_named）——
+        # 与 card/derived_from 同一分工：这一层只把形状收干净（去空白、通道名统一小写），
+        # 「填没填、有没有证据」是那一层的事，因为它要读**代码**算通道。
+        "subject": str(raw.get("subject") or "").strip(),
+        "subject_channel": str(raw.get("subject_channel") or "").strip().lower(),
     }
 
 
-def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+def validate_code_spec(raw: dict[str, Any], *,
+                       has_stage_leg: bool | None = None) -> tuple[dict[str, Any], list[str]]:
     """→ (规范化后的 spec, 错误清单)。错误清单非空即**不可渲染**。
 
     这一层管两类事：① 逐镜「一定会把画面写坏」的几件事（代码在不在、文案超不超
-    字幕容量、高亮词是不是子串、枚举在不在白名单内）；② **整片层**的三道硬闸——
+    字幕容量、高亮词是不是子串、枚举在不在白名单内）；② **整片层**的五道硬闸——
     :func:`check_style_quota`（风格配额与纯文字镜占比）、:func:`check_shot_structure`
-    （闸⑨：跨镜骨架同构）、:func:`check_ink_contrast`（闸⑩：字色在底色上读不读得出）。
+    （闸⑨：跨镜骨架同构）、:func:`check_ink_contrast`（闸⑩：字色在底色上读不读得出）、
+    :func:`check_layout_family`（闸⑮：版式族配额）、:func:`check_subject_named`
+    （闸⑯：画面主体具名）。
     代码**内容**对不对归闸①（容器里的 lint）与闸④（画面上有没有东西），史实对不对归
     出处闸与证据账。这几道只出**提醒**的那几份不从本函数返回——它们不拦，由
     ``style_facts`` 在计划卡与出片回执那两处点名。
@@ -559,13 +652,19 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     if len(shots) != len(raw_shots):
         _err(errors, "有镜头不是对象，已丢弃")
 
-    # 闸⑦⑨⑩ 的硬判据（整片风格配额与纯文字镜占比 / 跨镜同构 / 前景底色对比度）都挂在
-    # 这里：三个调用点——plan_motion 入库前、render_motion_code 烧像素前、
-    # patch_motion_code 落盘前——调的都是这一个函数，规则因此不可能只在一路上生效。
+    # 闸⑦⑨⑩⑮⑯ 的硬判据（整片风格配额与纯文字镜占比 / 跨镜同构 / 前景底色对比度 /
+    # 版式族配额 / 主体具名）都挂在这里：三个调用点——plan_motion 入库前、
+    # render_motion_code 烧像素前、patch_motion_code 落盘前——调的都是这一个函数，
+    # 规则因此不可能只在一路上生效。
     # 提醒那一份从这里单独取（见 style_facts）。
     for checker in (check_style_quota, check_derived_similarity,
-                    check_shot_structure, check_ink_contrast):
+                    check_shot_structure, check_ink_contrast,
+                    check_layout_family, check_subject_named):
         errors.extend(checker(shots)[0])
+    # 闸⑱：投递腿存在性。只有调用方**知道**客户端能力时才判（None = 不判）——
+    # plan_motion 那一侧还没有客户端，硬塞一个 None 当 False 会把「没接腿」误判成「缺腿」。
+    if has_stage_leg is not None:
+        errors.extend(check_stage_leg_present(shots, has_stage_leg=has_stage_leg)[0])
 
     bgm = raw.get("bgm") if isinstance(raw.get("bgm"), dict) else {}
     try:
@@ -822,6 +921,16 @@ def style_facts(shots: list[dict[str, Any]]) -> dict[str, Any]:
         "channels": channels,
         "all_channels": all_channels,
         "variety": sorted(variety),
+        # 闸⑮ 的账：这一镜选的那张卡属于哪个族（`card` 空着的镜记空串，不当成「text 族」——
+        # 「没选卡」与「选了某族」在账上是两件事）。
+        "card_families": {sid: card_family(str(s.get("card") or ""))
+                          for sid, s in zip(ids, shots)},
+        # 闸⑯ 的账：逐镜把**申报的**通道与**代码里认得的**通道摆在一起。两栏都在这里出现，
+        # 是为了让「申报 rough 而代码里是 vector」这种镜在账面上自己现形，而不是只留一句打回。
+        "subject_channels": {
+            sid: {"declared": str(s.get("subject_channel") or ""),
+                  "detected": sorted(shot_all_channels(str(s.get("code") or "")))}
+            for sid, s in zip(ids, shots)},
         "text_only": [sid for sid, c in channels.items() if c == TEXT_CHANNEL],
         "text_only_middle": [sid for sid, c in middle if c == TEXT_CHANNEL],
         "hollow": [str(s.get("id") or f"i{i + 1}") for i, s in enumerate(shots)
@@ -832,6 +941,27 @@ def style_facts(shots: list[dict[str, Any]]) -> dict[str, Any]:
         "contrast": contrast,
         "contrast_unjudged": len(shots) - len(contrast),
     }
+
+
+def check_stage_leg_present(shots: list[dict[str, Any]], *,
+                            has_stage_leg: bool) -> tuple[list[str], list[str]]:
+    """闸⑱：声明了 `assets` 就必须真有**投递腿**（渲染客户端暴露 `stage_asset`）。
+
+    为什么把这条前移到这里：`code_render._stage_shot_assets` 里那条 ``MediaError``
+    本身写得好，但它是**运行期**才响的——等到烧到那一镜才炸，前面几镜白烧，而失败
+    消息还裹在渲染报错里。判据要的是**一帧都没烧之前**把话说清楚：要么补投递腿
+    （R1 收的口），要么去掉 `assets` 声明。这样「缺腿」从运行期事故变成开始前的可报告状态。
+
+    为什么不在 shots 里逐镜报：这是**整片级**能力缺失，不是某一镜写错了——报几十条
+    同义错误只会淹掉真正要改的那一处，所以合并成一条并带上镜数。
+    """
+    if has_stage_leg:
+        return [], []
+    n = sum(1 for s in shots if s.get("assets"))
+    if not n:
+        return [], []
+    return ([f"投递腿缺失：{n} 个镜头声明了 assets，但渲染客户端没有 stage_asset 口——"
+             "素材字节投不进渲染容器，烧到那一镜必炸。先补投递腿，或去掉 assets 声明。"], [])
 
 
 def check_style_quota(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
@@ -896,6 +1026,165 @@ def check_style_quota(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]
 
 
 # ---------------------------------------------------------------------------
+# 闸⑮ 版式族配额 / 闸⑯ 画面主体具名（R5-T15；与 ⑦ 一样判在烧像素之前）
+# ---------------------------------------------------------------------------
+
+#: 闸⑮：同一**族**最多几镜。族 = 卡库里那个类别目录名（`card` 写成 `<类别>/<卡名>`）。
+LAYOUT_FAMILY_MAX_SHOTS = 2
+
+#: ⑯ 的通道白名单。**与 :func:`shot_style_channel` 的返回值是同一套词**（不多不少）——
+#: 两处对得上，才谈得上「申报的通道」与「代码里认得的通道」逐字对账。`text` 不在里面：
+#: 那一档是 ⑦ 允许的纯文字/纯色块镜，⑯ 对它另有规矩（见 :func:`check_subject_named`）。
+SUBJECT_CHANNELS: tuple[str, ...] = ("rough", "three", "katex", "vector", "image")
+
+#: `subject` 的长度上下界（字符）。太短是「东西」「这个」这类指代，太长是整句话而不是
+#: 名词短语——⑯ 要的是**能被认出的那个东西**的名字，不是论题。
+SUBJECT_MIN_CHARS = 2
+SUBJECT_MAX_CHARS = 24
+
+#: 抽象词拒绝名单：⑯ 要的是画面上能被认出的**东西**，而这些词指的是观点而不是物件。
+#: 名单**只认名单**，不做词法推断：中文里「理念」「趋势」是抽象词，「温度」「等高线」
+#: 一样是抽象名词却是真东西——靠后缀（性/感/化）或词性去猜必然误伤后者。
+#: 名单是**会长大的**（与 ⑳ 的坏形态清单同规）：真机上模型又用哪个抽象词蒙混，就往这里
+#: 补一行，而不是把判据改成「更聪明的那个」。
+ABSTRACT_SUBJECTS: frozenset[str] = frozenset({
+    "理念", "概念", "观念", "意义", "价值", "影响", "趋势", "精神", "文化", "文明",
+    "思想", "内涵", "本质", "特点", "特色", "作用", "功能", "优势", "劣势", "未来",
+    "发展", "变化", "变革", "效率", "情感", "情绪", "氛围", "风格", "设计", "艺术",
+    "科技", "技术", "创新", "智慧", "力量", "主题", "故事", "内容", "信息", "知识",
+    "方法", "方式", "过程", "系统", "模式", "结构", "关系", "因素", "现象", "状态",
+    "东西", "事物", "问题", "事情", "情况", "方面", "层面", "维度", "视角", "角度",
+})
+
+
+def card_family(card: str) -> str:
+    """卡 id → 版式**族**：``data/chart-live-moves`` → ``data``（卡库的类别目录名）。"""
+    return str(card or "").split("/", 1)[0].strip()
+
+
+def check_layout_family(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """闸⑮：整片层的版式族配额。→ (打回清单, 提醒清单)。
+
+    两条判据，读的都是**已经过白名单的** ``card``（见 :func:`_norm_cite`）：
+
+    1. `card` **取值**（卡名）种类 ≥ ``ceil(镜数 / 4)``——整片至少要有那么多个不同的版式；
+    2. 同一**族**（卡库里的类别，`<类别>/<卡名>` 的前半截）最多 ``LAYOUT_FAMILY_MAX_SHOTS`` 镜。
+
+    第 2 条蕴含第 1 条（同族 ≤2 镜 ⇒ n 镜至少要 n/2 个族 ⇒ n/2 ≥ ceil(n/4)）。两条都判不是
+    啰嗦：合同把两条都冻结了，而第 1 条是「族」这个口径万一被放松时还站着的那道地板。
+
+    **为什么族取卡库目录名，而不是让模型自报一栏 `layout`**：自报的自由字符串没有任何
+    白名单，写什么都能凑够「取值种类」——而这条闸要拦的恰恰是「每镜换一个名字、画面上
+    还是同一张卡」。卡库的类别是**已经存在、已经被 `_known_card_ids()` 当白名单使的**
+    东西，不新造字段：一份片子里 `data` 族摆三镜，观众看到的就是同一套版式在重复。
+    §9-Q84 记了这条口径（同时也记了合同原话里那个不存在的 `layout` 栏）。
+
+    纯文字/纯色块族受 ⑦ 的 1/3 约束（:func:`check_style_quota` 第 3 条），不在这里重算。
+    镜数不到 ``MIN_SHOTS_FOR_QUOTA`` 不判——三镜片谈「族配额」连分母都不成立。
+    `card` 为空的那几镜不在这里喊第二遍（``_norm_cite`` 已经逐镜报过），配额账只把
+    **选定了卡**的镜算进分母与族账。
+    """
+    errors: list[str] = []
+    n = len(shots)
+    if n < MIN_SHOTS_FOR_QUOTA:
+        return errors, []
+    pairs = [(str(s.get("id") or f"s{i + 1:02d}"), str(s.get("card") or "").strip())
+             for i, s in enumerate(shots)]
+    pairs = [p for p in pairs if p[1]]
+    if not pairs:
+        return errors, []       # 一镜都没选卡：那是出处/卡名那一栏的错，不在这儿喊第二遍
+    kinds: dict[str, list[str]] = {}
+    fams: dict[str, list[str]] = {}
+    for sid, card in pairs:
+        kinds.setdefault(card, []).append(sid)
+        fams.setdefault(card_family(card), []).append(sid)
+
+    want = -(-n // 4)                                     # ceil(n/4)，整数运算不引 float
+    if len(kinds) < want:
+        errors.append(
+            f"闸⑮ 版式族配额：{n} 镜只用了 {len(kinds)} 张不同的卡（"
+            + "、".join(f"{c}×{len(v)}" for c, v in kinds.items())
+            + f"），这一档至少要 {want} 张。同一张卡摆好几镜，画面上就是同一个母题换了文案"
+            "——把重复的那几镜换成别的卡（卡库按类别分好了，见 shots/INDEX.md）")
+    over = {f: v for f, v in fams.items() if len(v) > LAYOUT_FAMILY_MAX_SHOTS}
+    if over:
+        errors.append(
+            f"闸⑮ 版式族配额：{n} 镜里 "
+            + "；".join(f"{f} 族占了 {len(v)} 镜（{'、'.join(v)}）" for f, v in over.items())
+            + f"——同一族最多 {LAYOUT_FAMILY_MAX_SHOTS} 镜。族是卡库的类别目录名，"
+            "同一族连着摆好几镜，观众看到的是同一套版式在重复。当前族分布："
+            + "、".join(f"{f}×{len(v)}" for f, v in fams.items()))
+    return errors, []
+
+
+def check_subject_named(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """闸⑯：每镜 `subject` 具名、`subject_channel` 有证据。→ (打回清单, 提醒清单)。
+
+    ⑯ 判的是「这一镜画面上**能被认出的那个东西**有没有被说出来」——机器认证词、人认证物，
+    而判据只取机器判得动的那一半：
+
+    - ``subject``：**每镜必填**。非空、``SUBJECT_MIN_CHARS``~``SUBJECT_MAX_CHARS`` 字、
+      不在 :data:`ABSTRACT_SUBJECTS` 里。抽象词机器认不出、画面上也认不出，等于没写。
+    - ``subject_channel``：**有图形主体的镜必填**（取值 = :data:`SUBJECT_CHANNELS` 五选一），
+      且必须是**这一镜代码里真用上的**通道之一（:func:`shot_all_channels`）。自报的通道
+      必须有证据——「写着 rough 而代码里一个 roughjs 都没有」正是 ⑦ 要拦的那种形状，
+      ⑯ 不再开一个能自报的后门。
+    - 纯文字/纯色块镜（⑦ 允许的那 ≤1/3）：**不许**填 ``subject_channel``——它代码里一条
+      画法通道都没有，填了就是自报无证据。这一档的 ``subject`` 照样要写（字也可以是主体，
+      如「「毕昇」两个字」；连一个具体名词都写不出来，说明这一镜本来就该补画面）。
+
+    ⑯ 判不了「画出来的那个东西像不像 ``subject`` 说的那个」——那是 ⑲-b（盲描述）的活。
+    它判的是**有没有具名、名字有没有证据**，这两件事机器判得动，也正是「卡片+文字」那一类
+    镜最缺的一格（合同 §5.3 把 ``subject``/``subject_channel`` 挂在 ``card`` 里描述，
+    实现上它们是镜头上的两个平级键：``card`` 在本仓已是**字符串**卡 id，见 §9-Q85）。
+    """
+    errors: list[str] = []
+    for i, s in enumerate(shots):
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        head = f"闸⑯ 主体具名：{sid}："      # 与 ⑦⑨⑩ 同形：闸号 + 镜号，打回清单能直接点名
+        subject = str(s.get("subject") or "").strip()
+        if not subject:
+            _err(errors, f"{head}subject 为空——每一镜要说清画面上那个「能被认出的东西」"
+                         f"是什么（名词短语，如「活字盘」「三条等高线」「一张 1900 年的地图」），"
+                         f"不是主题词。⑯ 判的就是这一格有没有填")
+        elif subject in ABSTRACT_SUBJECTS:
+            _err(errors, f"{head}subject={subject!r} 是抽象词（在拒绝名单里）——⑯ 要的是"
+                         f"画面上能被认出的**东西**，抽象词既画不出来也认不出来；"
+                         f"改写成具体器物的名词短语（如「{_SUBJECT_HINT}」）")
+        elif not SUBJECT_MIN_CHARS <= len(subject) <= SUBJECT_MAX_CHARS:
+            _err(errors, f"{head}subject={subject!r} 长度 {len(subject)} 字，"
+                         f"要 {SUBJECT_MIN_CHARS}~{SUBJECT_MAX_CHARS} 字——太短是指代"
+                         f"（「东西」「这个」），太长是整句话而不是主体名")
+        # 通道这一栏两向都判：有图形主体的镜必填且要有证据，纯文字镜填了就是自报。
+        declared = str(s.get("subject_channel") or "").strip().lower()
+        detected = sorted(shot_all_channels(str(s.get("code") or "")))
+        if not detected:
+            if declared:
+                _err(errors, f"{head}这一镜的代码里只有文字与色块（一条画法通道都没用上），"
+                             f"却申报了 subject_channel={declared}——纯文字镜不填这一栏，"
+                             f"填了就是自报无证据（⑦ 允许的这类镜有 1/3 的上限）")
+            continue
+        if not declared:
+            _err(errors, f"{head}这一镜画了图形主体（代码里认得的通道：{'、'.join(detected)}），"
+                         f"但没填 subject_channel——五选一：{'、'.join(SUBJECT_CHANNELS)}，"
+                         f"填**主体**是用哪条通道画的")
+            continue
+        if declared not in SUBJECT_CHANNELS:
+            _err(errors, f"{head}subject_channel={declared!r} 不在白名单"
+                         f"（{'、'.join(SUBJECT_CHANNELS)}）")
+        elif declared not in detected:
+            _err(errors, f"{head}申报 subject_channel={declared}，而这一镜代码里用的是"
+                         f"{'、'.join(detected)}——自报的通道必须有证据。要么把这一镜的主体"
+                         f"改成用 {declared} 画，要么按代码里真用的那条申报")
+    return errors, []
+
+
+#: 抽象词那条打回理由里给的改写示范——**刻意给一个器物**，因为真机上模型被拦之后
+#: 最常见的反应是把抽象词换个近义词（「理念」→「观念」），而不是去画一个东西。
+_SUBJECT_HINT = "活字盘"
+
+
+# ---------------------------------------------------------------------------
 # 闸⑨ 跨镜结构雷同（同一张卡复制一份只换色相 → 在烧像素之前打回）
 # ---------------------------------------------------------------------------
 
@@ -910,16 +1199,30 @@ _SHAPE_HEX_RE = re.compile(r"#[0-9a-fA-F]{3,8}\b")
 _SHAPE_IMPORT_RE = re.compile(
     r"""^[ \t]*(?:import|export)[\s\S]{0,400}?from[ \t]+['"][^'"]+['"];?[ \t]*$""",
     re.M)
+#: 上面那条的 `[\s\S]{0,400}?` 是一个**跨行窗口**：行首的 `export` 只要在 400 字节内
+#: 能摸到一条 `from "…"`，中间整段都会被当成同一条 import 剥掉。实测 158 份 demo 里
+#: 没有触发（真代码的 import 都在顶部，末尾不会紧跟一条 import），但**标定脚本里踩过**：
+#: 扰动时把 import 追加到文件末尾，末尾那句 `export const X = 140;` 就跟它并成一条、
+#: 一起被剥，正样本凭空掉到 0.92。这里记一笔是为了下一次有人看到「明明只加了 import，
+#: 骨架怎么少了」时不用再查一遍。
 _SHAPE_TOKEN_RE = re.compile(r"[A-Za-z_$][\w$]*|\d+(?:\.\d+)?|[^\sA-Za-z0-9_$]")
 
 #: 骨架短于这个 token 数的镜不参与比对（三五行代码怎么比都是噪声，宁可不判）。
 _SHAPE_MIN_TOKENS = 40
 
-#: 打回线 0.88 与提醒线 0.78 不是拍的：2026-10-12 拿 `remotion/src/demos/` 里
-#: **152 个**剥后仍不少于 40 个 token 的参考实现两两比过，**互不相同的两份代码
-#: 最高只到 0.736**（SlideSpotlightPan ↔ GlowWakeSleepPanel），中位 0.619；
-#: 而把其中任意一份只换字符串与颜色，相似度是 **1.000**。两条线都落在 0.736 之上，
-#: 所以「真换了写法」的片子不会被这一条误伤。
+#: 打回线 0.88 与提醒线 0.78 不是拍的：拿技能语料里剥后仍不少于 40 个 token 的
+#: 参考实现两两比过，**互不相同的两份代码最高只到 0.736**（SlideSpotlightPan ↔
+#: GlowWakeSleepPanel），而把其中任意一份只换字符串与颜色，相似度是 **1.000**。
+#: 两条线都落在 0.736 之上，所以「真换了写法」的片子不会被这一条误伤。
+#:
+#: 这两个数**与 `DERIVED_MIN_SIM` 那段是同一张分布表**（都由
+#: `scripts/calibrate_derived_sim.py` 的负样本那一栏产出：158 份可比 demo、12403 对、
+#: max 0.736）。这段注释原先写的是「152 个 / 中位 0.619」——**今天复现不出来**，
+#: 三种语料口径都试过：158 份技能语料与 158 份去 `_legacy` 的 `remotion/src/demos`
+#: 都是中位 0.400 / max 0.736（两组是同一批文件），全量 226 份（含 `_legacy`）是
+#: 中位 0.344 / max 1.000（max 到 1.000 正是 `_legacy` 里躺着字面重复件的证据，也是
+#: 它不进口语料的原因）。**两处都复现不出来就不给它编一个原因**——按可复跑的那一份写。
+#: 判据那两条线（0.88 / 0.78）没有变，而它们依赖的**事实**换了口径。
 #:
 #: 为什么这条必须做在契约层：画面语义没有机器判据（闸④ 只判「带子里有没有东西」，
 #: 一个母题重复十二镜在它那里全是绿的），而 2026-10-11 那四条片子的观感恰恰是
@@ -964,8 +1267,12 @@ def check_derived_similarity(shots: list[dict[str, Any]]
     """闸（derived_from）：本镜代码与声明的 demo 源文件骨架相似度 ≥ DERIVED_MIN_SIM。
 
     模型声明 ``derived_from: ["demos/opening/fracture/Fracture.tsx"]`` 但代码与该 demo
-    的骨架相似度低于阈值 → 声明是假的，打回。阈值 0.61 是标定值（见 calibrate_derived_sim.py）：
-    正样本（卡→自己 demo）全 =1.0，负样本（卡→异类 demo）最高 0.603。
+    的骨架相似度低于阈值 → 声明是假的，打回。
+
+    两边的实测数都在 ``DERIVED_MIN_SIM`` 那段（158 份可比 demo、扰动种子 20261012）：
+    正样本（一份 demo ↔ 换掉文案/色号/import 的它自己）全 1.000，负样本（两份不同 demo）
+    p98 = 0.605、max = 0.736、在 0.61 上的通过率 1.690%。**别在这里另抄一份数**——
+    那是这段注释上一次的样子（写着「最高 0.603」），而它早已不是语料的事实。
 
     只出打回不出提醒：这一条的性质是「声明造假」，没有「可疑」档。
     """
@@ -997,6 +1304,154 @@ def check_derived_similarity(shots: list[dict[str, Any]]
                 "声明 derived_from 但代码与该 demo 无结构关联——要么改代码让它真正"
                 "从该 demo 演化而来，要么改 derived_from 指向真正来源的 demo")
     return errors, warns
+
+
+# ---------------------------------------------------------------------------
+# 取材轮（P9 / T20）：模型「读得到卡、读不到码」——先把被引用 demo 的**全文**交给它
+# ---------------------------------------------------------------------------
+#
+# 为什么需要一轮单独的调用，而不是在分镜轮里顺手把 demo 附上：
+# ``plan_motion`` 一次调用里模型**同时**写 ``code`` 与 ``derived_from``。也就是说，
+# 等闸知道「这一镜引用的是哪几份 demo」时，代码那一段字节**已经写完了**——那时候再
+# 注入就是事后补票，模型写码那一刻手里没有 demo 全文，它只能凭记忆手搓，而闸⑫ 还会
+# 因为它照着 demo 的**样子**写而判它「真派生过」。所以顺序必须反过来：先声明引用哪几份
+# （只有声明、没有代码），拿回全文，再写代码。这就是取材轮。
+#
+# 它与「让模型自己调 load_skill」的区别是**判定与取字节同源**：取材轮声明的 relpath
+# 过的就是 ``_norm_cite`` 那把白名单尺（与闸⑫ 同一份 MANIFEST），取到的文本逐字节
+# 等于盘上那份文件（见 ``collect_demos`` 的断言口径）。模型点 load_skill 也对，
+# 但那要求它先猜到路径、再抄对；取材轮把「引用了什么」变成一次可校验的声明。
+
+#: 取材轮一次回执最多带回多少字节的 demo 全文。
+#:
+#: **超线不截断**：一份断在中间的 TSX 比不给更坏——模型会顺着断口把剩下半段写完，
+#: 而闸⑫ 比的正是骨架，「半份 + 自己补的另一半」照样能过线。所以超线的那几件进
+#: ``forage_oversize`` 名单（点名 + 字节数），让模型用 ``load_skill(name, path=…)``
+#: 逐件取回；**每一份要么全文要么不在**，这条不变式由 ``collect_demos`` 保证。
+#:
+#: 取值理由：语料里最大的一份约 36 KB，一镜引用两份的中位片约 30 KB。120 KB 装得下
+#: 3~8 份（多数片子用不完），又不至于把一轮上下文顶穿。
+FORAGE_MAX_BYTES = 120_000
+
+#: 取材轮判据的三种结果（外加「不像取材轮」）。做成常量是为了让「三态分清」这件事
+#: 在测试里按**集合**断言，而不是在断言里再抄一遍字符串。
+FORAGE_MODES = ("forage", "code", "mixed", "none")
+
+
+def _demo_file(relpath: str) -> Path:
+    return _SKILL_DIR / "demos" / str(relpath)
+
+
+def demo_bytes(relpath: str) -> bytes | None:
+    """盘上一份 demo 的原始字节；读不到返回 None（与 ``_demo_shape`` 同一把尺）。"""
+    f = _demo_file(relpath)
+    if not f.is_file():
+        return None
+    try:
+        return f.read_bytes()
+    except OSError:
+        return None
+
+
+def forage_scan(raw: Any) -> tuple[str, list[dict[str, Any]]]:
+    """读一遍这次调用的形状，判它是不是**取材轮** → ``(mode, 逐镜清单)``。
+
+    ``mode`` 取 ``FORAGE_MODES`` 之一：
+
+    * ``forage``——**一镜都没交代码**，且至少一镜声明了 ``card``/``derived_from``。
+      这就是取材轮：逐镜清单里带 id/card/derived_from，``collect_demos`` 据此取全文。
+    * ``code``——每一镜都交了代码。正常的分镜轮，照老路走校验器。
+    * ``mixed``——有的交了有的没交。**打回**：两件事（取材 / 出分镜）必须各调一次，
+      因为「这一镜的代码怎么还没写」在服务端分不出来是漏填还是想先取材，而猜错的
+      代价是整片烧完才现形。
+    * ``none``——一镜没交码、也一镜没声明出处。不是取材轮，交给校验器照常报
+      「code 为空」（那句话里写着取材轮怎么交）。
+
+    判据刻意只认「有没有 code」这一件事：模型在骨架里多写一句 text、少写一个 highlight
+    都不该改变这一次调用的性质。
+    """
+    shots = raw.get("shots") if isinstance(raw, Mapping) else None
+    if not isinstance(shots, (list, tuple)) or not shots:
+        return "none", []
+    with_code = 0
+    without: list[dict[str, Any]] = []
+    for i, s in enumerate(shots):
+        if not isinstance(s, Mapping):
+            return "none", []                      # 形状坏到没法判，交给校验器报
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        derived = s.get("derived_from") or []
+        if not isinstance(derived, (list, tuple)):
+            derived = [derived]
+        derived = [str(d).strip() for d in derived if str(d).strip()]
+        if str(s.get("code") or "").strip():
+            with_code += 1
+        else:
+            without.append({"id": sid, "card": str(s.get("card") or "").strip(),
+                            "derived_from": derived})
+    if with_code and without:
+        return "mixed", without
+    if with_code:
+        return "code", []
+    if any(row["derived_from"] or row["card"] for row in without):
+        return "forage", without
+    return "none", []
+
+
+def collect_demos(plan: list[dict[str, Any]]
+                  ) -> tuple[dict[str, Any], list[str]]:
+    """取材轮取字节 → ``(取材账, 错误清单)``。错误非空即**没有回任何字节**。
+
+    账的形状（``tests/test_code_forage.py`` 按它断言）：
+
+    - ``demos``：``[{relpath, bytes, sha16, text}]``，**逐字节全文**——``text`` 按 UTF-8
+      解码后编码回去必须等于盘上那份文件的字节（这条就是 T20 的判据：注入内容里含
+      被引用 demo 的字节）。
+    - ``oversize``：超出 ``FORAGE_MAX_BYTES`` 没随本轮回执给出的 ``[{relpath, bytes}]``。
+      它们是**没给**，不是**没内容**——所以点名列出，让模型去 ``load_skill(path=…)`` 取。
+    - ``demos_bytes``：本轮真给出去了多少字节（``demos`` 之和，不含 ``oversize``）。
+
+    ``relpath`` 走 ``_norm_cite``——与闸⑫/分镜轮同一份白名单；不在册的当场打回，
+    **不给字节**（给了就等于承认了一个不存在的出处，模型照着写出来的代码回头必被闸⑫ 打回）。
+    """
+    errors: list[str] = []
+    rows: list[dict[str, Any]] = []
+    for row in plan:
+        sid = str(row.get("id") or "")
+        card, derived = _norm_cite(row, sid, errors)
+        rows.append({"id": sid, "card": card, "derived_from": derived})
+
+    demos: list[dict[str, Any]] = []
+    oversize: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    total = 0
+    for row in rows:
+        for rel in row["derived_from"]:
+            if rel in seen:
+                continue
+            seen.add(rel)
+            data = demo_bytes(rel)
+            if data is None:
+                errors.append(
+                    f"取材轮：demo {rel!r} 在 MANIFEST 里，盘上却读不到"
+                    "——这一份的字节取不回来，取材不算完成（先修语料，别拿记忆补）")
+                continue
+            # 第一份无论多大都照给：一份全文都比「一份都不给」有用，而这个上限
+            # 本来就是防「一轮塞太多」，不是防「单件太大」。
+            if demos and total + len(data) > FORAGE_MAX_BYTES:
+                oversize.append({"relpath": rel, "bytes": len(data)})
+                continue
+            total += len(data)
+            demos.append({
+                "relpath": rel,
+                "bytes": len(data),
+                # sha16 让模型（与逐镜账）能指名「我读的是这一版的这份文件」；
+                # 与闸⑬ 给素材算 sha16 是同一套写法，两处不共享代码但共享口径。
+                "sha16": hashlib.sha256(data).hexdigest()[:16],
+                "text": data.decode("utf-8", "replace"),
+            })
+    return ({"forage_plan": rows, "forage_demos": demos,
+             "forage_bytes": total, "forage_oversize": oversize,
+             "forage_max_bytes": FORAGE_MAX_BYTES}, errors)
 
 
 def structure_pairs(codes: list[str]) -> list[tuple[int, int, float]]:
@@ -1139,6 +1594,10 @@ def palettes() -> dict[str, dict[str, str]]:
 
     读不到返回空表：那时 :func:`resolve_color` 认不出 `palettes["x"].text` 这种写法，
     闸⑩ 就退化成只判字面 hex，并在事实里记一笔「本片未判」——不装成通过。
+
+    同一个文件里还住着 `preset` 段（三档风格组合，R4-T8-1 从 styles.json 并进来的）。
+    它也是 dict，但**不是色板**：放行会让闸⑩ 把 `palettes["preset"].text` 当成一个合法
+    颜色写法，而八色板的自检（T9）会数成九个。所以这里按名字剔除，不是按形状猜。
     """
     p = _master_file("src/themes/palettes.json")
     if not p:
@@ -1147,7 +1606,8 @@ def palettes() -> dict[str, dict[str, str]]:
         data = json.loads(p.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return {}
-    return {k: v for k, v in data.items() if isinstance(v, dict)}
+    return {k: v for k, v in data.items()
+            if isinstance(v, dict) and k != "preset"}
 
 
 @lru_cache(maxsize=1)
@@ -1434,12 +1894,28 @@ IMPORT_WHITELIST: tuple[str, ...] = (
     "react", "react-dom", "remotion",
     "@remotion/paths", "@remotion/shapes",
     "@remotion/motion-blur", "@remotion/layout-utils",
+    # R5-T16：官方写法块点名的四件 + 字幕 token 化的那件。**顺序与
+    # lint-rules.mjs 的 ALLOWED_IMPORTS 逐字相同**（两侧名单由 test_code_spec 第 ⑤ 节
+    # 对账；fonts 治的是第六根因「硬写字族 → 静默回落」）。
+    "@remotion/fonts", "@remotion/captions", "@remotion/rough-notation",
+    "@remotion/noise", "@remotion/animation-utils",
+    # R5-T16b：官方效果件。入场券是 `remotion/tests/effects-probe.mjs` 那三条真渲
+    # 判据（不崩 / 参数外没有别的颜色 / 挂错宿主是静默空操作）。**只对
+    # `<Img>/<Solid>/<HtmlInCanvas>` 生效**，写在别处是一声不响的空操作。
+    #
+    # 按**子路径逐件**列，不放行包名 `@remotion/effects`（§9-Q89）：4.0.534 的桶文件
+    # 只重导 11 件，`paper`/`halftone` 都不在里面——写包名会放行一条**打包期不报错、
+    # 渲染期才炸**的 import（`import { paper } from '@remotion/effects'` 拿到 undefined）。
+    "@remotion/effects/paper", "@remotion/effects/halftone",
     # 画法通道：手绘斜纹与真三维。这两族在 package.json + lockfile 里躺着，
     # 2026-10-11 那批六支真渲夹具（roughjs / three / KaTeX × 两画幅）就是它们渲的。
     "three", "@react-three/fiber", "@remotion/three", "roughjs",
     "katex", "katex/dist/katex.min.css",
     # 母版与 token 走别名；镜头代码只能拿到这两个文件级入口
     "@dg/film", "@dg/tokens",
+    # webfont 注册表（R5-T16）。import 它就是当场把那 101 片注册进 document.fonts；
+    # 镜头代码写 `@dg/fonts` 导出的字族名才算「这个字族真有人加载」。
+    "@dg/fonts",
     # 参考实现的动效件（_fixtures 是真实现，不是桩）。**只列文件级路径**：
     # 裸目录名（`@dg/lib`、`@dg/themes`、`@dg/demos`、`@dg/fixtures`）那些目录里
     # 没有 index 文件，Remotion 打包器的 resolve.extensions 不认目录——名单里写着它，
@@ -1533,7 +2009,7 @@ def spec_schema() -> dict[str, Any]:
                                "（min_duration_sec 给 1.5~2.5，代码画封面与落款就行）",
                 "items": {
                     "type": "object",
-                    "required": ["code", "text", "card", "derived_from"],
+                    "required": ["code", "text", "card", "derived_from", "subject"],
                     "properties": {
                         "id": {"type": "string",
                                "description": "镜号，省略则按顺序补 s01/s02…"},
@@ -1549,13 +2025,34 @@ def spec_schema() -> dict[str, Any]:
                                                 "如 opening/fracture。必须命中卡库（见 shots/INDEX.md）"},
                         "derived_from": {"type": "array", "items": {"type": "string"},
                                          "description": "代码来自哪些 demo 的 relpath 列表，"
-                                                        "如 [\"demos/opening/fracture/Fracture.tsx\"]。"
-                                                        "每个都必须命中 demos/MANIFEST.json 白名单"},
+                                                        "如 [\"opening/fracture/Fracture.tsx\"]"
+                                                        "（相对 demos/ 的路径，与 "
+                                                        "demos/MANIFEST.json 里的写法一致；"
+                                                        "带 demos/ 前缀的写法也收，会归一）。"
+                                                        "每个都必须命中该白名单"},
+                        # 闸⑯ 的两栏（R5-T15）。subject 进 required：它是「这一镜画的是
+                        # 什么东西」那句白纸黑字的话，缺了这一格，整片就退回「卡片+文字」
+                        # 那个在评审里被驳回过的形态而我们事后判不出来。subject_channel
+                        # 不进 required——纯文字/纯色块镜（⑦ 允许的 ≤1/3）**不许**填它，
+                        # 填了就是自报无证据，所以它的必填性由 check_subject_named 按
+                        # 「这一镜代码里有没有画法通道」逐镜定，schema 这一层写不出来。
+                        "subject": {"type": "string", "maxLength": SUBJECT_MAX_CHARS,
+                                    "description": "这一镜画面上**能被认出的那个东西**"
+                                                   "（名词短语，2~24 字），如「活字盘」"
+                                                   "「三条等高线」「一张 1900 年的地图」。"
+                                                   "不许写抽象词（理念/趋势/意义/文化…"
+                                                   "既画不出来也认不出来）"},
+                        "subject_channel": {"type": "string", "enum": list(SUBJECT_CHANNELS),
+                                            "description": "主体是用哪条画法通道画的"
+                                                           "（rough/three/katex/vector/image）。"
+                                                           "必须与代码里真用上的通道一致"
+                                                           "（闸⑯ 按代码对账）；这一镜只有"
+                                                           "文字与色块时**不要填**"},
                         "assets": {"type": "array",
                                    "description": "本镜引用的素材资产。每个声明 name/sha256/ext/source/alpha/layer。"
                                                   "代码里用 staticFile(\"<name>\") 引用，lint 做双向对账。"
                                                   "sha256 是全 64 位十六进制——渲染前按 sha256 从 asset_library 取字节、"
-                                                  "投到渲染容器 public/<name>",
+                                                  "投到渲染容器 public/assets/<本镜镜号>/<name>",
                                    "items": {"type": "object",
                                              "required": ["name", "sha256", "ext"],
                                              "properties": {

@@ -122,6 +122,11 @@ class PlanMotionNode(StoryNode):
         "同时回一份「将要渲成什么样」的账（镜头数、总字数、按字数估的秒数区间、"
         "与目标时长的偏差提醒、每镜交出的字段清单）。"
         "本节点**不渲染、不烧像素**：改文案只需重调本工具。"
+        "两轮走法：**取材轮**——只交骨架（所有镜都带 card 与 derived_from、都**不带 code**），"
+        "本工具把每一镜被引用 demo 的**全文**回给你（逐件带 relpath/bytes/sha16/text）；"
+        "**分镜轮**——所有镜都带上 code 再调一次。先取材再写码是要求不是建议："
+        "闸（derived_from）会按代码骨架与所声明 demo 的相似度核对声明，"
+        "没读过 demo 就写出来的代码过不了，而读过了就不必手搓。"
         "画面全部来自代码——图示、手绘质感（rough.js）、立体几何（three.js）、公式（katex）"
         "都是真代码；每镜的 code 必须顶层 import 并把画面包进母版 <FilmLayout>，"
         "版式与字幕带由母版统一给，不在代码里自己画一遍。"
@@ -142,6 +147,8 @@ class PlanMotionNode(StoryNode):
             **cspec.spec_schema(),
             "description": "代码分镜 spec：每镜 code + text + highlight + 可选 fields + "
                            "可选 source（逐字段含义见结构；没有 card/visual/主题那几栏——"
+                           "取材轮交的就是**没有 code 的那一份**：每镜只给 id/text/card/"
+                           "derived_from，本工具回被引用 demo 的全文且什么都不入库。"
                            "版式与字幕在母版里，画面在代码里）。"
                            "本节点是**校验闸**：代码没交、文案超出字幕容量、高亮词不是文案子串、"
                            "字段声明越界都会带镜号退回，改完重调即可，不烧像素。"
@@ -178,6 +185,25 @@ class PlanMotionNode(StoryNode):
         if not isinstance(raw, Mapping) or not raw:
             raise ValueError(
                 "plan_motion：spec 必须是对象且非空——每镜至少交一句文案和一段真实代码")
+        # 取材轮排在**一切校验之前**：它根本不是一份分镜（没有 code、没有 aspect），
+        # 放进 validate_code_spec 只会得到一屏「code 为空」的清单。判定只看一件事——
+        # 这一轮有没有交 code（见 cspec.forage_scan）。
+        mode, forage = cspec.forage_scan(raw)
+        if mode == "mixed":
+            ids = "、".join(f"{r['id']}（{r['card'] or '未声明卡'}）" for r in forage)
+            raise ValueError(
+                "plan_motion：这次调用有的镜交了 code、有的没交（没交的：" + ids + "）"
+                "——服务端分不出「漏填」与「想先取材」，所以这两种意图要各调一次："
+                "取材轮**所有镜都不带 code**（带 card 与 derived_from），"
+                "分镜轮**所有镜都带 code**。没入库，改完重调。")
+        if mode == "forage":
+            account, errs = cspec.collect_demos(forage)
+            if errs:
+                raise ValueError(
+                    "取材轮未通过，一份 demo 的字节都没回（照清单改完再调本工具）：\n"
+                    + "\n".join(f"  · {e}" for e in errs[:12])
+                    + (f"\n  · …另有 {len(errs) - 12} 条同类错误" if len(errs) > 12 else ""))
+            return forage_payload(account)
         # 顶层开关先并进来再校验：卡上勾了 landscape 就得渲成横屏，模型在 spec 里写的
         # portrait 让位；并早并晚都要过校验器，越界照样回清单。
         spec, errors = cspec.validate_code_spec(cspec.overlay_knobs(dict(raw), inputs))
@@ -199,6 +225,41 @@ class PlanMotionNode(StoryNode):
                 + "\n".join(f"  · {e}" for e in cited[:12])
                 + (f"\n  · …另有 {len(cited) - 12} 条同类错误" if len(cited) > 12 else ""))
         return plan_payload(spec, target=target, gate=gate)
+
+
+def forage_payload(account: dict[str, Any]) -> dict[str, Any]:
+    """取材轮的产物：被引用 demo 的**全文** + 一份字节账。**不落库、不渲任何东西**。
+
+    ``__no_store__`` 是这条链既有的写法（见 ``render_video`` 的 dry_run）：这一次调用
+    确实产出了一样东西（模型上下文里的那几份源码），但它**不是**本会话的 ``motion_spec``
+    ——落库就成了「这一步已经有分镜了」的假象，而出片节点读的正是那一格。
+
+    ``next`` 写的是下一步该干什么，不是客套：取材轮最容易出的岔路是模型拿回全文之后
+    又调一次取材（换个说法问同样的事），那会白烧一轮上下文。所以这里把「现在去写 code」
+    与「超线的那几份用 load_skill 取」两件事都点名。
+    """
+    oversize = list(account.get("forage_oversize") or [])
+    next_hint = ("现在把每一镜的 code 写出来，连同 card 与 derived_from 一起重调本工具"
+                 "（这一次所有镜都带 code）。代码要从上面那份全文演化而来——"
+                 "闸（derived_from）会按骨架相似度核对你写的代码与声明的 demo，"
+                 "相似度低于阈值的声明会被打回。")
+    if oversize:
+        names = "、".join(str(o.get("relpath")) for o in oversize)
+        # 技能名从 SKILL.md 的 frontmatter 读（它不等于目录名），读不到就只说 path，
+        # 不编一个名字出来——「照提示去 load_skill 却查无此技能」比不提这件事更坏。
+        skill = cspec.motion_skill_name()
+        how = (f'load_skill(name="{skill}", path="<relpath>")' if skill
+               else 'load_skill（技能名见 <skills> 清单, path="<relpath>"）')
+        next_hint += (f"另有 {len(oversize)} 份超出本轮上限没随回执给出（{names}）："
+                      "它们是**没给**不是**没内容**，用 "
+                      f"{how} 逐件取全文——不要凭记忆写这几镜的代码。")
+    return {
+        "__no_store__": True,
+        "forage": True,
+        "stored": False,
+        **account,
+        "next": next_hint,
+    }
 
 
 def plan_payload(spec: dict[str, Any], *, target: float | None = None,
@@ -240,6 +301,15 @@ def plan_payload(spec: dict[str, Any], *, target: float | None = None,
             # 「12 镜里 9 镜 style=text」才会说「补画面」，这一栏的全部价值在这。
             "style": facts["channels"][str(s["id"])],
             "concrete": cspec.has_concrete_item(text),
+            # 闸⑯ 的两栏（申报侧）：subject 是模型自报的「这一镜画的是什么」，subject_channel
+            # 是它自报的通道。**与上面那栏 style 挨着放是刻意的**——style 是代码里认得的、
+            # subject_channel 是自报的，两栏不一致的镜 validate_code_spec 已经拦掉了，
+            # 留下的这一份让用户在确认卡上直接看见「这一镜说它画的是什么」。
+            "subject": str(s.get("subject") or ""),
+            "subject_channel": facts["subject_channels"][str(s["id"])]["declared"],
+            # 闸⑮ 的账：这一镜选的卡属于哪个**族**。用户在卡上看见「data×3」才会说
+            # 「版式重复了」——族配额那句打回理由指的正是这一栏。
+            "family": facts["card_families"][str(s["id"])],
             # 这一镜**实际生效**的质感档（跟随整片时与顶层同值，点名不要时是 none）。
             # 判档只走 `cspec.shot_texture` 那一个出处：这里再写一遍「有就用、没有问整片」，
             # 就会出现卡上写 film、画上是原片。
@@ -255,7 +325,8 @@ def plan_payload(spec: dict[str, Any], *, target: float | None = None,
     # 错误那三份都在 validate_code_spec 里拦过了；这里取的是**拦完之后给人看的提醒**，
     # 三道闸各出一份，合流成一栏，用户在同一张卡上看得见「哪几镜其实是同一张卡」。
     quota_warns = cspec.check_style_quota(shots)[1] \
-        + cspec.check_shot_structure(shots)[1] + cspec.check_ink_contrast(shots)[1]
+        + cspec.check_shot_structure(shots)[1] + cspec.check_ink_contrast(shots)[1] \
+        + cspec.check_layout_family(shots)[1] + cspec.check_subject_named(shots)[1]
 
     return {
         "motion_spec": spec,

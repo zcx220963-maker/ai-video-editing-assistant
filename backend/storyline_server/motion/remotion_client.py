@@ -6,7 +6,9 @@
     GET  /healthz       → {ok, node, remotion, chromium, gl, master_hash, lockfile_hash}
     POST /lint          → {ok, errors:[{rule,line,column,msg}], declared}   恒 200
     POST /render-shot   → {ok, cache_key, artifact, bytes, composition,
-                            probed, timings, tokens, fields_used, layout_used, warnings}
+                            probed, timings, tokens, fields_used, layout_used,
+                            assets_gate, motion, warnings}
+
     GET  /artifact/{k}  → video/mp4 字节
     POST /stage-assets  → {ok, relpath, sha16, bytes} | {ok, relpath, sha16, idempotent}
 

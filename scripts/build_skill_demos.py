@@ -44,7 +44,11 @@ def main():
         dst_file.parent.mkdir(parents=True, exist_ok=True)
         content = f.read_text(encoding="utf-8")
         content = rewrite_imports(content)
-        dst_file.write_text(content, encoding="utf-8")
+        # newline="\n" 是必须的：不写它，Windows 上 write_text 会把 \n 翻成 \r\n，
+        # 于是「盘上写出的字节」比下面记的 `len(content.encode())` 多出一个行数
+        # —— 清单里那个数就成了一枚说谎的常量（158/158 全差）。钉死 LF 之后，
+        # 写出的字节、记下的字节、`.gitattributes` 的 `eol=lf` 三处一致。
+        dst_file.write_text(content, encoding="utf-8", newline="\n")
         manifest.append({
             "relpath": str(rel).replace("\\", "/"),
             "bytes": len(content.encode("utf-8")),

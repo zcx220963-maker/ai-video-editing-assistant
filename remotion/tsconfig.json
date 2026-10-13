@@ -14,6 +14,7 @@
     "paths": {
       "@dg/film": ["src/FilmLayout.tsx"],
       "@dg/tokens": ["src/tokens.ts"],
+      "@dg/fonts": ["src/fonts.ts"],
       "@dg/motion": ["src/demos/_fixtures/Motion.tsx"],
       "@dg/polish": ["src/demos/_fixtures/Polish.tsx"],
       "@dg/brand": ["src/demos/_fixtures/Brand.tsx"],

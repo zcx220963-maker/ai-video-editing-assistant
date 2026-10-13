@@ -727,6 +727,49 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
   以及**字节落了桶、行却没落**的崩溃残留(`orphan_scopes`——成片先 publish、`artifacts` 行随后才写,
   中间进程没了就只剩字节)。只剩已入库字节的作用域**不算孤儿**:那版字节归素材行管,
   否则每次开机都重扫一个永远删不动的作用域,对账就不幂等了。
+- **`assets/` 不在回收网里,而且有测试钉住**(T14):内置素材库的命名空间全局共享、不属任何
+  会话(`asset_library` 是唯一登记口),一条字节可能被几十个会话引用过,按会话回收误判一次
+  就是不可逆损失。`session_gc.OBJECT_PREFIXES` 因此**永远不列 `assets/`**,
+  `tests/test_session_gc.py` ⑤ 用行为断言钉住(删会话与开机对账都跑一遍,连**没人指向**的
+  库素材也不许少)。它自己会不会越攒越多由只读巡检回答:
+  `python scripts/asset_gc_report.py`(线上 `pg_minio`;`--backend memory` 不连网自检)
+  列出 `dangling`(库里有行、桶里没字节)/`orphan`(无人指向且超 30 天)/`young`/`unknown_age`
+  四栏,退出码 1 表示前两栏非空可挂告警。**脚本没有 `--delete`,这是决定不是遗漏**
+  (Q26):巡检负责把账摊开,删不删人工定。对象存储没给 `last_modified` 时单列 `unknown_age`——
+  说不清年龄就不许当成「年老」。
+- **母版字体栈里的 `Noto Sans SC` 现在真有字节了**(T16):`TOKENS.fontStack` 一直是
+  `"Noto Sans SC", "Noto Sans CJK SC", sans-serif`,而镜像 `fc-list` 里只有后者——
+  前一个名字**从没被任何人加载过**,写它等于写了个空名,渲染时静默回落到系统字族。
+  修法是随镜像发一份 webfont:上游(Google Fonts)对 CJK **没有单文件形态**,`css2` 按
+  `unicode-range` 回了 101 个不同的 woff2,于是照它的切法全收(101 片共 4.50 MB,
+  `remotion/public/fonts/NotoSansSC-000.woff2`…`-100.woff2`),由
+  `scripts/fetch_fonts.mjs` 生成、`node scripts/fetch_fonts.mjs --check` 离线核对
+  「切片表 ↔ 盘上字节 ↔ `wOF2` 魔数」。注册表在 `remotion/src/fonts.ts`
+  (`WEB_FONT_FAMILIES` + 逐个 `loadFont`),由**母版** `FilmLayout` 副作用 import
+  `@dg/fonts` 加载——所以每一镜都带着它,不必自己写。三条判据随闸① 走
+  (`dg/font-load-check` + 字族白名单 + `staticFile('fonts/…')` 豁免):`loadFont` 指
+  远端 URL、指到 `public/fonts/` 之外、指一个不存在的切片、`format` 与后缀对不上,
+  四句话各不相同。**不做 `text=` 子集**:子集只含点名的那几个字,别的字照样静默回落,
+  等于把要治的病再造一遍。
+- **随镜像发的字节与按镜投递的素材是两个根,而 `staticFile` 只认一个**(真机抓到的 404):
+  `bundle({publicDir})` 只把一个目录铺成渲染期 `staticFile()` 的根,而按镜渲染的那个根是
+  `public/assets/<镜号>/`(素材必须落在根上,模型才写得成 `staticFile("<name>")`);字体在
+  `public/fonts/`,于是**每一镜**都 500——`Failed to load font "/public/fonts/NotoSansSC-025.woff2":
+  404 Not Found`,而同一时刻容器里 `ls /srv/public/fonts/` 是 101 片、逐片 md5 与宿主一致。
+  **盘上有、服务端读不到**,前两级取证在这里全绿也证明不了字体会加载。修法是 bundle 之前把
+  `public/` 下除 `assets/` 以外的每一项软链进这一镜的目录(`assetgate.linkShippedNamespaces`;
+  Remotion 的 `copyDir` 会按 realpath 转投,容器里指得到)。判据:构建期 `test -d public/fonts` +
+  `node tests/shipped-namespace.mjs`(12 项,含「源头缺了同一断言必须塌」那一支红样,以及
+  「真根上 101 片逐字一致」),外加真渲三支夹具都拿到读数才算数。
+- **闸⑭ 动效事件密度:「有动效但看不出动」在像素上可数**(T18):`remotion/motionsample.mjs` 把
+  渲出来的 mp4 按 8 Hz 抽成灰度小图,逐对相邻采样算平均绝对差,按地板线 1.5 切成**先后变化段**
+  (进入过地板线、离开过回落线,滞回),判「每镜 ≥2 段、相邻段起点 ≥0.4 s」。判的是**画面**,
+  不是代码里 `card.motion` 的自报。红绿都用真渲钉住:静帧镜 0 段、三件齐发镜 1 段、先后三件 3 段
+  (`remotion/tests/motion-probe.mjs`)。容器回传读数,**退镜在 Python 侧**(`motion_error`,排在
+  切片进缓存之前——退回去的镜不该在缓存里留一份不合格的切片),`motion_warnings`/`motion_unjudged`
+  进回执与模型侧白名单。初版还有一条「隔 ≤1 格就合并」的规则被真渲证伪后**删掉**:一支三件先后
+  滑入(每件 0.35 s、彼此隔 0.6 s)的合法片被它并成一段判红——8 Hz 下一格 0.125 s,判据要的
+  「相邻 ≥0.4 s」在画面上只剩 1~2 格安静,合并吃掉的正是判据要量的那个间隔(见 §9-Q79)。
 
 **边界(不粉)**:① 回收的触发点是「删对话」和「开机/周期对账」,**没有 TTL**——对话不删,
 产物与切片就一直涨(`render-windows/*`、`motion-shots/*` 的保留期仍未定,见 §17 边界②);
@@ -970,10 +1013,10 @@ docker compose --profile app up -d --build    # + editor(:8001) + remotion(:8010
 
 | 层 | 内容 | 怎么跑 |
 |---|---|---|
-| 离线回归 | `backend/tests/` **93 份**脚本式套件(2026-10-11 实测 **1105 条断言全过、红文件数 0**)——每份自带 `asyncio.run(main())` 与断言计数,pytest 把**整份脚本**收成一个用例、以子进程执行(全量输出落 `.tmp/reg_pytest/`)。pytest 从脚本内部还会解析出 15 个假用例(`async def` 缺插件 / 缺 `tmp` fixture),由 `conftest.py` 在收集后丢弃——否则标准入口的结论全是假故障 | **以 `creation-app` 容器内那一趟为准**:镜像里没装 pytest,逐份 `PYTHONPATH=/app python tests/test_xxx.py`(宿主机 python 的版本与依赖都不是运行时那份)。宿主机标准入口:`cd backend && python -m pytest` |
-| 渲染容器自闸 | `remotion/tests/gate1-lint.mjs`——闸① 的先证红再证绿:**落点模板 `src/user-shots/shot.tsx` 必须绿**(模板自己红,用户写第一镜就挨打),四类违规必须红并带规则名与行列号(未包裹 `<FilmLayout>`、越界 import、代码里取随机/时间/网络/外部字体、字段声明与代码读/标注三相对不上账)。**它跑在 Dockerfile 层末**——红就烤不出镜像,报警发生在构建期而不是模型写完代码那一趟 | `docker build -t creation-remotion:latest ./remotion`(或容器内 `cd /srv && node tests/gate1-lint.mjs`) |
+| 离线回归 | `backend/tests/` **110 份**脚本式套件(2026-10-13 **容器内**实测 **4689 条断言**、逐文件 `rc==0`、**1 支未判**(`test_question_card_queue.py` 没有汇总行,解析不出总数——**不按 0 计**);当前唯一红是 `test_code_gates.py` 的**未判档**那一条——它是 T28 的驱动红,「未判」尚未升级成阻断档之前就该红,不是故障)——每份自带 `asyncio.run(main())` 与断言计数 | **固定入口:`cd backend && python scripts/run_tests.py`**(逐文件 `rc==0`、不 fail-fast、汇总断言总数并校验不低于历史底线 1176——**只增不减**,是个地板不是当前值)。**以 `creation-app` 容器内那一趟为准**:镜像里没装 pytest,逐份 `PYTHONPATH=/app python tests/test_xxx.py`(宿主机 python 的版本与依赖都不是运行时那份)。**但那趟之前必须先重建容器**:`app` 服务是 `image: creation-app:latest` 且**没有 `build:`**,`editor` 烤完新镜像后**tag 移了容器不动**——直接 `docker exec creation-app` 跑到的可能是几天前那份镜像(实测踩过:里面 101 支用例,新写的这份压根不存在)。要么 `docker compose --profile app up -d --force-recreate app`,要么先比 `docker inspect -f '{{.Image}}' creation-app` 与 `docker images --format '{{.ID}}' creation-app:latest` 是不是同一个 ID(§9-Q81)。**再进一步:别只看那个 ID,直接逐件对字节**——`PYTHONIOENCODING=utf-8 python scripts/image_parity.py --dockerfile Dockerfile --context . --container creation-app`(清单**现读 Dockerfile**、不是人手维护的表;逐件 `docker exec md5sum` 与盘上比;退出码 0 全对上 / 1 有红 / 2 只未判)。remotion 那一侧同理:`--dockerfile remotion/Dockerfile --context remotion --container creation-remotion --ignore remotion/.dockerignore`。2026-10-13 两腿实测 **575/575** 与 **430/430**(§9-Q86)。**不要单独依赖 `python -m pytest`**:本批用例是「模块级脚本 + 末尾 `sys.exit`」的形态,pytest 收集会在 `conftest.py` 那里 INTERNALERROR(它还会从脚本内部解析出十几个假用例),标准入口的结论因此是假故障 |
+| 渲染容器自闸 | `remotion/tests/gate1-lint.mjs`——闸① 的先证红再证绿:**落点模板 `src/user-shots/shot.tsx` 必须绿**(模板自己红,用户写第一镜就挨打),四类违规必须红并带规则名与行列号(未包裹 `<FilmLayout>`、越界 import、代码里取随机/时间/网络/外部字体、字段声明与代码读/标注三相对不上账)。**它跑在 Dockerfile 层末**——红就烤不出镜像,报警发生在构建期而不是模型写完代码那一趟。另有**两支运行时探针**(要容器活着才跑得动,所以不在构建期):`tests/gl-probe.mjs` 判四档 GL 谁能拿到 WebGL2(现档 `swangle`)、`tests/effects-probe.mjs` 是 `@remotion/effects` 那两件的**入场券**——换 Chromium / 改 GL 档 / 进新效果件之前先跑它,红则**不进白名单**(§9-Q89) | `docker build -t creation-remotion:latest ./remotion`(或容器内 `cd /srv && node tests/gate1-lint.mjs`;探针:`docker exec -e DG_BASE=http://127.0.0.1:8010 creation-remotion sh -c 'cd /srv && node tests/effects-probe.mjs'`) |
 | 真机冒烟 | `backend/.smoke/` **24 个** `*_smoke.py`(b3~b16 + `settings_key`/`thinking_off`/`vl_shared_key` + `b22_code_chain_render`/`b23_field_patch`/`b24_code_ui` 这条代码链 + `t5_track_patch` 口播选区改)+ **23 个**探针/种子脚本(含 b18 搜索链六路探针);**旧声明式链的 17 份夹具与用例归档在 `.smoke/_archived_p4_declarative/`**(含 b17/b19/b21 与四条零素材样片),归档不是可跑路径,跑前先读那份 README | 依赖模型的那批带 `credit_gate()` 前置闸:额度不就绪直接 SKIP 并打印原因,不会把"账户空了"报成"代码坏了" |
-| 关键路径的钉子 | 计划门(`test_plan_gate`)· 出口中文(`test_display_outlets`)· 存储契约(`test_storage_contract` 212 项)· 渲染跟随(`test_render_follow`)· dry-run 路由(`test_dry_run_dispatch`)· 修字(`test_transcript_correction`)· 复盘(`test_plan_retrospective`)· 判断模型(`test_judge_gate`)· 代码镜契约与缓存键(`test_code_spec` 168 项:字节级幂等、闸⑦ 配额与技能正文逐行比对)· 八道闸本体(`test_code_gates` 109 项:每道判红的闸一条先证红再证绿)、闸⑧ 版面回读三态与只记账(`test_code_layout` 50 项:missing/unscanned/scanned 两两不同、畸形读数不许抛、措辞不抄常量表、layout 在缓存还原名单里)· 字段通道与闸⑥(`test_code_fields` 138 项)· 逐镜质感(`test_code_texture` 48 项)· 两条链的 HTTP 口(`test_patch_endpoints` 33 项:三口都在、点名跟着真实节点走)· 图形通道与链无关的那批约定(`test_motion_channel` 217 项:开关名单同源、七个开关真上计划卡、契约标签走到确认卡,外加旧链下线后由它代管的六件事——出处闸的凭据语义、局部改读哪一版、命中表与代表帧发布、切片缓存的收发协议与质感滤镜、JSON 指针工具、词时间轴贴字符)· 成片入库与按会话回收(`test_session_gc` 56 项:两种 `session_id` 拼法都清、同对象键重烧只更新一行、`materials.object_key` 的保护名单护住已入库字节、在途渲染拒绝回收、开机对账幂等) | 见各文件头的"钉住 N 件事" |
+| 关键路径的钉子 | 计划门(`test_plan_gate`)· 出口中文(`test_display_outlets`)· 存储契约(`test_storage_contract` 212 项)· 渲染跟随(`test_render_follow`)· dry-run 路由(`test_dry_run_dispatch`)· 修字(`test_transcript_correction`)· 复盘(`test_plan_retrospective`)· 判断模型(`test_judge_gate`)· 代码镜契约与缓存键(`test_code_spec` 175 项:字节级幂等、闸⑦ 配额与技能正文逐行比对)· 八道闸本体(`test_code_gates` 109 项:每道判红的闸一条先证红再证绿)、闸⑧ 版面回读三态与只记账(`test_code_layout` 50 项:missing/unscanned/scanned 两两不同、畸形读数不许抛、措辞不抄常量表、layout 在缓存还原名单里)· 字段通道与闸⑥(`test_code_fields` 138 项)· 逐镜质感(`test_code_texture` 48 项)· 两条链的 HTTP 口(`test_patch_endpoints` 33 项:三口都在、点名跟着真实节点走)· 闸⑭ 动效事件密度(`test_motion_density` 27 项:三态分开、两份证据打架时以细的为准、阈值不抄第二份)· 图形通道与链无关的那批约定(`test_motion_channel` 217 项:开关名单同源、七个开关真上计划卡、契约标签走到确认卡,外加旧链下线后由它代管的六件事——出处闸的凭据语义、局部改读哪一版、命中表与代表帧发布、切片缓存的收发协议与质感滤镜、JSON 指针工具、词时间轴贴字符)· 成片入库与按会话回收(`test_session_gc` 56 项:两种 `session_id` 拼法都清、同对象键重烧只更新一行、`materials.object_key` 的保护名单护住已入库字节、在途渲染拒绝回收、开机对账幂等)· 横屏母题占比回归(`test_motif_share` 34 项:记录在案那批 `fill_span` 9%~36% 各被哪条规则接住、整帧分母会把铺满读成 68%、「实心块 31%~44% 是两条硬闸之间的已知边界」如实钉住——§9-Q88)· 镜像逐件对账的清单(`test_image_parity` 54 项:清单**现读 Dockerfile**、`.dockerignore` 六形态、`--from=` 只查存在、构建期重写的两个假阳样本必须不被挪走、运行期改写那一栏从 CMD 点名的服务入口现读「子路径两把尺」的真文件与 exports 入口各一个样本——§9-Q86/Q87/Q89) | 见各文件头的"钉住 N 件事" |
 | 提示词回归 | `tests/data/planning_round_golden.json` 金样逐字比对 + `scripts/run_eval.py` 的 prompt fingerprint | 改提示词后先跑这两个 |
 
 > **重要**:`backend/tests/`、`backend/.smoke/`、`backend/scripts/`、`backend/docs/`、`backend/pytest.ini`、
@@ -1033,13 +1076,25 @@ docker compose --profile app up -d --build    # + editor(:8001) + remotion(:8010
 - **这一批的证据分两档,不许混着说**:
   ①**离线全绿**(容器内 `PYTHONPATH=/app` 才算):`test_code_spec`(契约、缓存键字节级幂等、
   闸⑦ 配额与技能正文逐行比对)、`test_code_gates` 109 条(判红的闸各一条先证红再证绿)、`test_code_layout` 50 条(闸⑧ 三态与不拦截)、
+  `test_motion_density` 27 条(闸⑭ 三态分开、退镜排在切片进缓存之前、阈值只认容器回传那份)、
+  `test_motif_share` 34 条(**横屏**母题占比回归:横屏带子 1800×732、记录在案那批 `fill_span` 9%~36% 各被哪条规则接住、
+  同一份字节按整帧量只有 68%、以及「实心块 31%~44% 是两条硬闸之间的已知边界」——§9-Q88)、
+  `test_layout_subject` 109 条(闸⑮ 版式族配额 + 闸⑯ 主体具名:两条判据各自独立证红、常量↔技能正文单源钉)、
+  `test_image_parity` 54/46 条(T21 镜像逐件对账的清单算得对不对:`.dockerignore` 六形态、`--from=` 只查存在、
+  构建期重写的两个假阳样本必须不被挪走——§9-Q86/Q87)、
   `test_code_fields` 138 条(字段通道 + 闸⑥)、`test_code_texture`(逐镜质感三形态、账与滤镜同源)、
   `test_patch_endpoints`(两条链共用的三个 HTTP 口:读表/取帧/提交,钉的是三口都在、
   点名跟着真实节点走、body 键原样透传、base 号一定换新);
   ②**真渲过的**只有单镜级与短片级:`.smoke/b22_code_chain_render_smoke.py`(整链出片)、
   `b23_field_patch_smoke.py`(改一个字段只重烧一镜、`cached_shots=1`)、B1-3 的三条风格通道 × 两画幅六支、
   `remotion/tests/layout-probe.mjs` 六支(闸⑧:叠字/越带/引线悬空各真渲一镜,含两支**必须不响**的钉住 0.4 与
-  3px 那条线、一支把引线藏在 `<g transform>` 里钉住 `getScreenCTM` 映射)。同一批按纪律先证过红:
+  3px 那条线、一支把引线藏在 `<g transform>` 里钉住 `getScreenCTM` 映射)、
+  `remotion/tests/motion-probe.mjs` 三支(闸⑭:静帧镜必须拒、三件齐发镜必须拒、先后三件必须放,
+  `remotion/tests/effects-probe.mjs` 4 支真渲 + 2 支判据自检(R5-T16b:`@remotion/effects` 那两件的入场券——
+  `paper()` 不崩且画面没有参数外颜色、`halftone()` 的点真画出来且只有声明的两种色、挂错宿主逐字节相同;
+  另有 D-红先自检:把真帧绿通道压一半品红探测器必须红、同一张图不挂 effects「点真画出来了」必须红——
+  绿而判据是哑的与红一样没用。结论:过了,但**按子路径逐件进名单**,桶名不进——§9-Q89),
+  A 半 14 项另有构造曲线钉住地板线/滞回/「只安静一格仍是两段」;渲不成的镜记未判、不算通过)。同一批按纪律先证过红:
   把母版的 `ref={bodyRef}` 摘掉再跑,六支全部退回「版面没扫:画面带 ref 未挂载」,恢复后 ALL PASSED。
   **整片端到端的「多风格 + 配音」真机样片还没跑**——那句「可以生成高质量多风格视频」要等这一跑才能声称,
   §15 与设计文档 §8 都记着这笔;

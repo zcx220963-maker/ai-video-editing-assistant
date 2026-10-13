@@ -64,6 +64,7 @@ from .storage import Cond
 from .consumer import CHAT_TOPIC, SessionConsumer, session_key
 from .heartbeat import Heartbeat
 from .ingest import IngestRejected, ingest_bytes
+from .library_pick import pick_library_asset
 from .identity import storyline_session_id
 from .orchestration import _safe
 from . import judge as judge_mod
@@ -1758,6 +1759,25 @@ def create_app(
                 "url": url, "origin": r.get("origin", "upload"),
             })
         return {"materials": items}
+
+    @app.post("/library/pick")
+    async def library_pick(asset_id: str, conversation_id: str = "",
+                           user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """把内置库的一条素材投进本会话的素材库（R3/T11-T45），回 material_id。
+
+        这是「库 132 行 → 链上可见」的唯一投递口：投完 ``materials`` 多一行
+        ``origin='library'``，渲染链那条只认 material_id 的路才走得通。
+        归属人由 token 反查（客户端改不掉），库那份共享底本不动，只复制字节。
+        """
+        material_id, note = await pick_library_asset(
+            storage, storyline_session_id(user_id, conversation_id), asset_id,
+            conversation_id=conversation_id or None)
+        if not material_id:
+            # 库里没有 / 已停用 / 需署名 → 409（调用方选错了）；其余（存储不可用等）→ 502
+            status = 409 if ("不存在" in note or "已停用" in note
+                             or "需要署名" in note) else 502
+            raise HTTPException(status, note)
+        return {"material_id": material_id, "note": note}
 
     @app.delete("/materials/{material_id}")
     async def delete_material(material_id: str,

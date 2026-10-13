@@ -23,6 +23,9 @@ BGM 闪避。本文件只管代码镜这一段：
                      所以在烧像素之前就判完了（`code_spec.validate_code_spec`）
     闸⑧ 版面回读    :func:`summarize_layout` 母版在探针帧扫画面带里的叠字/被裁/悬空引线，
                      **只记账不拦截**（八道里唯一不设红的那道，理由写在那段的 docstring 里）
+    闸⑭ 动效密度    :func:`summarize_motion` 容器按 8 Hz 抽帧数「先后变化段」，
+                     :func:`motion_error` 把「静帧 / 一次跳变 / 挨太近」翻成退镜
+                     （**判在烧像素之后**：自报的 `card.motion` 不是证据，像素才是）
 
 三条不能忘的口径：
 
@@ -40,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
@@ -97,10 +101,13 @@ FILL_TARGET = 0.60
 #: `layout` 同理（闸⑧ 的版面回读）：不还原的话，缓存镜在整片账上就成了「没报问题」，
 #: 而它其实是「这一次压根没扫」——两者在回执上必须能分开。缓存键含母版哈希，母版探针
 #: 一改所有旧缓存自然失效，所以这一栏加进去不会多烧一镜。
+#: `motion` 是闸⑭ 的动效采样读数（段数、间隔、阈值）。**这一栏尤其不能丢**：丢了的镜
+#: 在整片账上就成了「动效没判过」却没有任何痕迹，而这一闸判的是「有动效但看不出动」——
+#: 正是那种只有账能说话、人眼在成片里看不出来的缺陷。
 META_FIELDS = ("sec", "speech_sec", "planned_frames", "frames", "words", "degraded",
                "measured_sec", "width", "height", "fps", "empty_ratio", "fill_span",
                "tokens", "field_checks", "render_timings", "cache_key", "layout",
-               "asset_motion")
+               "asset_motion", "assets", "motion")
 
 #: 母版回读字段盒的探针帧尾偏移（`durationInFrames - 本值`）。**必须与
 #: `remotion/src/tokens.ts` 的 `FIELD_PROBE_TAIL` 同值，两处一起改**：闸⑥ 比的是那一刻
@@ -461,6 +468,58 @@ def _thresh(value: Any) -> dict[str, Any] | None:
     return dict(value) if isinstance(value, Mapping) else None
 
 
+def summarize_assets(shot_id: str, gate: Any) -> dict[str, Any]:
+    """闸⑬：把容器回传的资产判据收成一镜一份稳定的账。
+
+    三态与闸⑪/闸⑧ 同规，且**必须**在账上分开：
+
+    - `ok`            每一件素材都在盘上、sha16 对得上、且判据全过。
+    - `undetermined` 这一镜的投递账看不见（没镜号 / 读不到 manifest），或某一件的格式
+                      解不出主色（渐进式 JPEG、隔行 PNG…）。**不许**折成 ok——那正是
+                      「未判当通过」这条纪律要防的事。
+    - `rejected`     严格说走不到这里：那一档在 `/render-shot` 口就 400 了，本函数
+                      只在补跑/旧网络返回这类边缘情况下见到它，见到就如实记下。
+
+    `items` 逐件留 `{name, verdict, sha16, width, height, colors}`：回执要能回答
+    「是哪一件、错在哪」，而不只是「这一镜的图有问题」。 """
+    if gate is None:
+        return {"shot": shot_id, "status": "undetermined", "items": [],
+                "reason": "容器没回传资产判据（这一镜的闸⑬ 等于没跑过）"}
+    if not isinstance(gate, Mapping):
+        return {"shot": shot_id, "status": "undetermined", "items": [],
+                "reason": f"资产判据形状不认：{type(gate).__name__}"}
+    status = str(gate.get("status") or "")
+    if status not in ("ok", "undetermined", "rejected"):
+        return {"shot": shot_id, "status": "undetermined", "items": [],
+                "reason": f"资产判据的状态不认识：{status!r}"}
+    items = gate.get("items")
+    # 逐件账在、但不是一列：这份账读不成条目，那「几件、各判成什么」就无从谈起。
+    # 此时整份状态再乐观也不许记 ok——`ok` 的意思是「逐件都验过」，而逐件根本读不出来。
+    if "items" in gate and not isinstance(items, (list, tuple)):
+        return {"shot": shot_id, "status": "undetermined", "items": [],
+                "reason": f"逐件账不是一列（items 是 {type(items).__name__}）——"
+                          "这一镜的素材没人验过，整份状态再乐观也不算数"}
+    kept: list[dict[str, Any]] = []
+    for it in (items if isinstance(items, (list, tuple)) else []):
+        if not isinstance(it, Mapping):
+            continue
+        colors = it.get("colors")
+        kept.append({
+            "name": str(it.get("name") or ""),
+            "verdict": str(it.get("verdict") or ""),
+            "sha16": str(it.get("actual_sha16") or ""),
+            "width": it.get("width"), "height": it.get("height"),
+            "format": it.get("format"),
+            # 只留判据用到的几个数，不留整份直方图：账要能被人读。
+            "colors": ({"distinct": colors.get("distinct"),
+                        "top_share": colors.get("top_share")}
+                       if isinstance(colors, Mapping) else None),
+            "reason": str(it.get("reason") or "")[:300],
+        })
+    return {"shot": shot_id, "status": status, "items": kept,
+            "reason": str(gate.get("reason") or "")[:600] or None}
+
+
 def summarize_layout(shot_id: str, layout_used: Any) -> dict[str, Any]:
     """闸⑧：把容器回传的版面回读收成一镜一份稳定的账。**只记账，永不拦截**。
 
@@ -504,6 +563,106 @@ def summarize_layout(shot_id: str, layout_used: Any) -> dict[str, Any]:
 _SIDE_CN = {"left": "左", "right": "右", "top": "上", "bottom": "下"}
 
 
+def _int_or_none(value: Any) -> int | None:
+    """账里的帧号只认真数；`True`/字符串/None 一律拿不到（`bool` 是 `int` 的子类，
+    不排掉的话 `True` 会被读成第 1 帧——一条假读数比没有读数更难发现）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def summarize_motion(shot_id: str, motion: Any) -> dict[str, Any]:
+    """闸⑭：把容器回传的动效采样收成一镜一份稳定的账。
+
+    三态与闸⑬/闸⑪ 同规：
+
+    - `ok`            像素上数得出 ≥2 段先后变化，且相邻段起点 ≥0.4 s。
+    - `rejected`      数不出来——静帧（所有元素第 0 帧就已到位）、一次跳变（所有元素挤在
+                      同一段时间里一起变）、或挨得太近。**这一档会退镜**，翻成 `MediaError`
+                      的那一步在 `motion_error`。
+    - `undetermined`  抽帧失败（ffmpeg 拿不到）或容器太旧（压根没回传这一行）。**不许**折成
+                      ok：「这一镜的动效没人判过」与「判过没问题」是两件事。
+
+    容器那边的词是 `reject`，账上按本族的词记 `rejected`（与闸⑬ 同规），免得下游要同时
+    认两个拼法。`thresholds` **原样搬运**、不在 Python 侧另写一份判据数字：两处各写一遍
+    就会出现「容器改了阈值、回执还按旧值解释读数」（与闸⑦ 的 quota_want 同一条理由）。
+
+    原始差值曲线**不进账**（8 Hz × 20 s 就是一两百个数）：账要能被人读，而红的时候那句
+    `reason` 已经把段数、间隔、帧号一并报出来了。这里只留 `events`（逐段起止帧与峰值）
+    与 `min_gap_frames`——回执要能回答「它到底数到几段、最紧的一对隔多少」。
+    """
+    if motion is None:
+        return {"shot": shot_id, "status": "undetermined", "events": [], "samples": 0,
+                "min_gap_frames": None, "thresholds": None,
+                "reason": "容器没回传动效采样行（这一镜的闸⑭ 等于没跑过）"}
+    if not isinstance(motion, Mapping):
+        return {"shot": shot_id, "status": "undetermined", "events": [], "samples": 0,
+                "min_gap_frames": None, "thresholds": None,
+                "reason": f"动效采样行形状不认：{type(motion).__name__}"}
+    raw_status = str(motion.get("status") or "")
+    # 容器写 reject、账上写 rejected：两个拼法都认，其余一律按未判收（不认识的
+    # 状态最乐观的读法就是「没人判过」，把它读成 ok 正是这一族最坏的写法）。
+    status = {"ok": "ok", "reject": "rejected", "rejected": "rejected",
+              "undetermined": "undetermined"}.get(raw_status, "undetermined")
+    events: list[dict[str, Any]] = []
+    for e in (motion.get("events") if isinstance(motion.get("events"), (list, tuple)) else []):
+        if not isinstance(e, Mapping):
+            continue
+        start = _int_or_none(e.get("start_frame"))
+        if start is None:
+            continue
+        events.append({"start_frame": start, "end_frame": _int_or_none(e.get("end_frame")),
+                       "start_sec": e.get("start_sec"), "peak_diff": e.get("peak_diff")})
+    gaps = [b["start_frame"] - a["start_frame"]
+            for a, b in zip(events, events[1:]) if isinstance(a["start_frame"], int)]
+    samples = _int_or_none(motion.get("samples")) or 0
+    out = {"shot": shot_id, "status": status, "events": events, "samples": samples,
+           "sample_hz": motion.get("sample_hz"), "min_gap_frames": min(gaps) if gaps else None,
+           "thresholds": _thresh(motion.get("thresholds")),
+           "reason": (str(motion.get("reason"))[:600] or None)
+                     if motion.get("reason") else None}
+    if status == "undetermined" and not out["reason"]:
+        out["reason"] = f"容器报了个不认识的状态：{raw_status!r}"
+    # 两份证据打架：整份状态写 ok，逐段账却数不出阈值要求的那几段。**以细的那份为准**，
+    # 降成未判而不是跟着 ok 走——`ok` 的含义是「判过且过」，而这里恰恰是判据自己
+    # 说不圆。阈值取容器回传的那份（本函数不持有第二个拷贝），拿不到就不做这项核对。
+    want = (out["thresholds"] or {}).get("min_events")
+    if status == "ok" and isinstance(want, int) and not isinstance(want, bool) \
+            and len(events) < want:
+        out["status"] = "undetermined"
+        out["reason"] = (f"容器判 ok，但账上只有 {len(events)} 段（它自己报的判据要 "
+                         f"≥{want} 段）——两份证据打架时以细的那份为准，这一镜不算判过")
+    return out
+
+
+def motion_error(shot_id: str, motion: Mapping[str, Any] | None) -> str | None:
+    """账 → 「这一镜该退」的一句人话；通过或未判返回 `None`。
+
+    未判在这里**不退出**（那时判据压根没跑成），但它照样不是通过——`describe_motion`
+    会把它单独列一行，报告层按未判计。这一闸要拦的是「有动效但看不出动」，
+    不是「容器里的 ffmpeg 不见了」：把后者也判成片的罪，等于让工具故障冒充内容缺陷。
+    """
+    if not isinstance(motion, Mapping) or str(motion.get("status")) != "rejected":
+        return None
+    th = motion.get("thresholds") if isinstance(motion.get("thresholds"), Mapping) else {}
+    want, gap_sec = th.get("min_events"), th.get("min_gap_sec")
+    evs = [e for e in (motion.get("events") or [])
+           if isinstance(e, Mapping) and isinstance(e.get("start_frame"), int)]
+    # 「数到 1 段」这种拒法（静帧除外）最要紧的是**它把那一段量在了哪几帧上**：
+    # 只报段数，模型与人都没法判断是「三件齐发」还是「隔得太近」，而这两者的改法完全不同。
+    span = ""
+    if evs:
+        end = evs[-1].get("end_frame")
+        span = f"，跨帧 {evs[0]['start_frame']}–{end if isinstance(end, int) else '?'}"
+    tight = motion.get("min_gap_frames")
+    tight_txt = f"（最紧的一对的起点隔 {tight} 帧）" if isinstance(tight, int) else ""
+    return (f"闸⑭ 动效事件密度未通过，{shot_id} 退回（切片没进缓存、母带没开始）：\n"
+            f"  · {motion.get('reason') or '容器没给出理由'}\n"
+            f"  · 判据：每镜 ≥{want if isinstance(want, int) else '?'} 段先后变化、"
+            f"相邻段的起点 ≥{gap_sec if gap_sec is not None else '?'} s；"
+            f"这一镜数到 {len(evs)} 段{span}{tight_txt}")
+
+
 def _num(value: Any) -> str:
     """读数里的数字 → 两位小数；杂色写成「拿不到读数」。
 
@@ -514,6 +673,41 @@ def _num(value: Any) -> str:
         return f"{float(value):.2f}"
     except (TypeError, ValueError):
         return "拿不到读数"
+
+
+def describe_assets(shot_id: str, assets: Mapping[str, Any] | None) -> list[str]:
+    """一镜的资产判据 → 逐条人话（整片账与回执都用这一份措辞，别处不另抄）。
+
+    `ok` 不吭声——那是「判过且过」，与版面那条的「扫过且干净」同理：正常的一镜
+    不该在回执里占一行。而 `undetermined` **必须**出一条，且要说明是哪几件、为什么
+    没判：那一档的意思是「这件素材没人验过」，写成沉默就等于把它读成通过。
+    同理，整份状态写 `ok` 而逐件账里有点不是 pass 的（两份证据打架）也要出声，
+    以逐件为准——这条比版面那侧严一档，因为资产判据是机器判的、不存在「几何猜错了」
+    的余地：一份自相矛盾的账只可能是账坏了。
+    """
+    if not isinstance(assets, Mapping):
+        # 账整个缺失（容器没回传 / 回传了杂色）：这不是「pass」，是「没人验过」。
+        what = "容器没回传资产判据" if assets is None else f"资产账形状不认：{type(assets).__name__}"
+        return [f"闸⑬ {shot_id}：资产账缺失（{what}）——这一镜的素材没人验过，"
+                "不许当成「图上没问题」"]
+    a = assets
+    st = str(a.get("status") or "undetermined")
+    items = a.get("items") if isinstance(a.get("items"), (list, tuple)) else []
+    bad = [i for i in items if isinstance(i, Mapping) and i.get("verdict") != "pass"]
+    if st == "ok" and not bad:
+        return []
+    who = "；".join(f"{i.get('name') or '?'}（{i.get('reason') or i.get('verdict') or '?'}）"
+                    for i in bad) or str(a.get("reason") or "没给出理由")
+    if st == "rejected":
+        return [f"闸⑬ {shot_id}：文案里用了图，但图上不了屏——{who}"]
+    if st == "ok":
+        # 整份状态写 ok、逐件账里却有点不是 pass 的：两份证据打架。**以更细的那份为准**
+        # 并出声——按整份状态沉默，就等于把一件没验过的素材读成通过，而这一栏存在的
+        # 全部理由就是不让这件事发生。
+        return [f"闸⑬ {shot_id}：整份状态写 ok，逐件账里却有 {len(bad)} 件不是 pass（{who}）——"
+                "两份证据打架时以逐件为准，这一镜的图不算验过"]
+    return [f"闸⑬ {shot_id}：{len(bad) or '有'} 件素材没判（{who}）——"
+            "「没判」不等于「没问题」，这一镜的画面主体等于没人验过"]
 
 
 def describe_layout(shot_id: str, layout: Mapping[str, Any] | None) -> list[str]:
@@ -559,6 +753,30 @@ def describe_layout(shot_id: str, layout: Mapping[str, Any] | None) -> list[str]
     return out
 
 
+def describe_motion(shot_id: str, motion: Mapping[str, Any] | None) -> list[str]:
+    """一镜的动效读数 → 逐条人话（整片账与回执都用这一份措辞，别处不另抄）。
+
+    `ok` 不吭声（判过且过的一镜不该在回执里占一行）。`rejected` 与 `undetermined`
+    **各出一条**，而且说法必须不同：前者的意思是「这一镜的像素上确实看不出先后动」，
+    后者是「这一镜压根没判过」。把后者写成沉默或写成前者的语气，都是拿未判当通过。
+    """
+    m = motion if isinstance(motion, Mapping) else {}
+    st = str(m.get("status") or "undetermined")
+    if st == "ok":
+        return []
+    th = m.get("thresholds") if isinstance(m.get("thresholds"), Mapping) else {}
+    want = th.get("min_events", "未知")
+    gap = th.get("min_gap_sec", "未知")
+    got = len(m.get("events") or []) if isinstance(m.get("events"), (list, tuple)) else "?"
+    tight = m.get("min_gap_frames")
+    if st == "rejected":
+        return [f"闸⑭ {shot_id}：像素上数不出「先后动」——{m.get('reason') or '容器没给出理由'}"
+                f"（数到 {got} 段、最紧一对隔 {tight if tight is not None else '—'} 帧，"
+                f"判据 ≥{want} 段、相邻起点 ≥{gap} s）。这一镜已经带镜号退回，没有进成片"]
+    return [f"闸⑭ {shot_id}：动效没人判过（{m.get('reason') or '容器没回传采样行'}）——"
+            "「没判」不等于「看得出动」，这一镜的动效读数在整片账上算未判"]
+
+
 def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
                      frames: int, frame_words: list[dict[str, Any]]) -> dict[str, Any]:
     """`/render-shot` 的 `input_props`：母版要的排班全在这里，镜头代码一样也拿不到。
@@ -571,6 +789,12 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
     这种差异会让闸⑥ 稳定判红，而画面其实一张都没变。
     """
     return {
+        # 镜号进 props 只为一件事：渲染侧据此把 `publicDir` 指到
+        # `public/assets/<sid>/`（§4-5）。它**不进缓存键**——键是按代码字节 + 旋钮 +
+        # 整片开关 + assets 的 sha/name 对算的（`shot_cache_key`），与镜号无关；
+        # 两镜交出同一段代码本就该共用一份切片。所以它也不能反过来影响画面：
+        # 母版读不到它就当没有。
+        "shotId": str(shot.get("id") or ""),
         "fps": int(spec["fps"]),
         "durationInFrames": int(frames),
         "aspect": str(spec["aspect"]),
@@ -641,21 +865,34 @@ async def _shot_texture(clip: Path, dst_dir: Path, *, shot: Mapping[str, Any],
 
 
 async def _stage_shot_assets(shot: Mapping[str, Any], *, sid: str,
-                             storage: Any, client: dict[str, Any]) -> None:
-    """渲染前把本镜 assets 的字节投到渲染容器 public/ 下。
+                             storage: Any, client: dict[str, Any]) -> list[dict[str, Any]]:
+    """渲染前把本镜 assets 的字节投到渲染容器 `public/assets/<sid>/` 下，并留一份 manifest。
 
-    链路：shot.assets[].sha256 → asset_library 表查 object_key → MinIO 取字节 →
-    POST /stage-assets（sha16=sha256[:16] 校验 + 幂等落盘）。
+    链路（§4-5「投递方向唯一」）：shot.assets[].sha256 → asset_library 表查 object_key →
+    MinIO 取字节 → **本机先算一遍 sha16** → `POST /stage-assets`（服务端再按字节算一次，
+    对不上直接 400）→ 落 `public/assets/<sid>/<name>` → 投完写
+    `public/assets/<sid>/_manifest.json`。
+
+    **为什么是 `<sid>/` 而不是平铺在 `public/` 下**：两镜各要一张 `chart.png`、内容不同，
+    平铺时后投的那张会把先投的覆盖掉（或恰好相反——服务端的幂等短路看见文件在就不写，
+    于是**第二镜静默拿到第一镜的字节**）。按镜号分目录之后，同名不同内容的素材互不相干；
+    渲染侧也据此把这一镜的 `publicDir` 指到 `public/assets/<sid>`，`staticFile("<name>")`
+    才落得进这一镜自己的那份字节。
+
+    **三处 sha16 必须一致**（申报 / 落盘 / 闸⑬ 回读），所以这里在投之前先按库里的字节
+    自己算一遍：库行被换过、或对象被同名覆盖过，都在这里红，而不是等画面上出现一张
+    跟声明对不上的图。
 
     没声明 assets 的镜头直接过。asset_library 里查不到的 sha256 抛错——
     模型填了一个素材库里没有的 sha256，渲出来就是空白，不如在这里就红。
     """
     assets = shot.get("assets") or []
     if not assets:
-        return
+        return []
     stage = client.get("stage_asset")
     if stage is None:
         raise MediaError(f"{sid}：声明了 {len(assets)} 个素材但渲染客户端没有 stage_asset 口")
+    items: list[dict[str, Any]] = []
     for a in assets:
         sha256 = str(a.get("sha256") or "").strip().lower()
         name = str(a.get("name") or "").strip()
@@ -675,8 +912,29 @@ async def _stage_shot_assets(shot: Mapping[str, Any], *, sid: str,
             buf.extend(chunk)
         raw_bytes = bytes(buf)
         sha16 = sha256[:16]
-        bytes_b64 = base64.b64encode(raw_bytes).decode("ascii")
-        await asyncio.to_thread(stage, name, sha16, bytes_b64)
+        real16 = hashlib.sha256(raw_bytes).hexdigest()[:16]
+        if real16 != sha16:
+            raise MediaError(
+                f"{sid}：素材 {name} 的库内字节与登记的 sha256 对不上（登记 {sha16}…，"
+                f"实算 {real16}…）——库行被换过或对象被同名覆盖过，先重新入库再来。"
+                "带着这份字节去渲染，画面上出现的跟账上写的会是两张图")
+        await asyncio.to_thread(stage, f"assets/{sid}/{name}", sha16,
+                                base64.b64encode(raw_bytes).decode("ascii"))
+        items.append({"name": name, "sha16": sha16, "bytes": len(raw_bytes),
+                      "ext": str(a.get("ext") or ""),
+                      # 这张素材自己是动图还是静图。三档（animated/static/undetermined）
+                      # 由闸⑪ 那一路回读填写，这里拿不到就如实写 undetermined——
+                      # 编一个 static 会让闸⑪ 的「动图当静图用」判据永远绿。
+                      "motion": "undetermined"})
+    # manifest 也走同一个口投，不复用别的写入通道：它是「这一镜**真投成功了什么**」的
+    # 记录，而 lint 期要拿它判「声明了但没投递」。跟素材一起走同一条腿，两边的失败方式
+    # 才一致（投递腿断了，manifest 也不会凭空出现在容器里）。
+    blob = json.dumps({"sid": sid, "items": items},
+                      ensure_ascii=False, sort_keys=True).encode("utf-8")
+    await asyncio.to_thread(stage, f"assets/{sid}/_manifest.json",
+                            hashlib.sha256(blob).hexdigest()[:16],
+                            base64.b64encode(blob).decode("ascii"))
+    return items
 
 
 async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
@@ -712,6 +970,13 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
                 meta = None            # 读不成不是事故：这一镜照实重渲一遍
             if meta and all(k in meta for k in META_FIELDS):
                 rec = {k: v for k, v in meta.items() if k in META_FIELDS}
+                # 命中缓存也要过闸⑭：判据的阈值（段数、间隔）**不在缓存键里**，
+                # 所以缓存里的那一镜只证明「按当时的判据它是绿的」。阈值一改，
+                # 复用切片的那几镜就会带着旧判据的读数直接进母带——这里补一刀，
+                # 拒因与现渲的那一路同源（同一个 `motion_error`）。
+                cached_reject = motion_error(sid, rec.get("motion"))
+                if cached_reject:
+                    raise MediaError(f"{cached_reject}（这一镜来自缓存，按当前判据重判不过）")
                 # 命中缓存**不等于**这一镜可以跳过滤镜：缓存里的那一镜是没加质感的像素，
                 # 质感在缓存之后按镜补。跳过它就成了「整片加了质感、命中缓存的那几镜是
                 # 原片」，而同一版片子里两种像素并存是没人看得见的错（闸⑤ 只管数值一致）。
@@ -760,6 +1025,13 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
         raise MediaError(
             f"闸⑥ 字段级对账未通过，{sid} 退回（切片没进缓存、母带没开始）：\n"
             + "\n".join(f"  · {e}" for e in field_errs[:10]))
+    # 闸⑭ 排在闸④ 之前，与闸⑥ 同一条理由：读数就在这次响应里，一次 ffmpeg 都不开。
+    # **必须在切片进缓存之前判**——退回去的一镜不该在缓存里留一份「动效不合格」的切片，
+    # 否则下一次同一个 cache_key 命中缓存、从缓存那一路进来（那一路只认读数不重判内容）。
+    motion = summarize_motion(sid, resp.get("motion"))
+    motion_err = motion_error(sid, motion)
+    if motion_err:
+        raise MediaError(motion_err)
     tokens = resp.get("tokens") or None
     fill = await _empty_check(sid, raw, bg_hex=_bg_of(tokens),
                               size=size, duration=float(info["duration"]),
@@ -795,6 +1067,13 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
         # 闸⑪ 资产动效三态：'static'（打回）/ 'animated'（通过）/ 'undetermined'（未判）。
         # 未判不许记成通过——回执必须如实区分。
         "asset_motion": resp.get("asset_motion") or {"status": "undetermined", "reason": "容器没回传资产行"},
+        # 闸⑬ 资产存在且非纯色：逐件回执（每件的 sha16 / 尺寸 / 主色档数 + 三态）。
+        # 拒的那一档在渲染口就 400 了、走不到这里；能进来的只有 ok / undetermined，
+        # 而 undetermined **必须**原样留档——把它折成「没问题」正是这个字段存在的理由。
+        "assets": summarize_assets(sid, resp.get("assets_gate")),
+        # 闸⑭ 动效事件密度：上面那一刀只拦 rejected；能走到这里的是 ok 或 undetermined，
+        # 后者的意思是「这一镜的动效没人判过」，必须原样留档（未判不许折成通过）。
+        "motion": motion,
         "render_timings": resp.get("timings") or {}, "cache_key": key,
         "chain": "remotion",
         "lint_warnings": [str(w)[:200] for w in (resp.get("warnings") or [])][:8],

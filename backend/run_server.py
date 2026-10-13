@@ -114,6 +114,14 @@ BACKEND_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = BACKEND_ROOT.parent
 DEFAULT_MCP_CONFIG = BACKEND_ROOT / "mcp.json"
 DEFAULT_STORYLINE_CONFIG = BACKEND_ROOT / "examples" / "storyline" / "config.toml"
+# 滚动历史的分级压缩预算（T15c/Q29）。为什么是 64 K：
+#   ①2^16 是个二进制整口——预算表、日志与 `--max-context-tokens` 三处对齐时不会冒出
+#     65535/65537 这种噪声，改动也一眼看得出是「抬/降了一档」而不是「改了个数」。
+#   ②这条预算约束的是**常量段之外**的滚动历史：`compress.py:163-166` 明文规定首条
+#     system 永不进摘要输入（骨架要求的正确行为，不许顺手优化），所以常驻的系统提示词
+#     与技能块不受它管——64 K 取的是与现代长上下文模型可用窗口同量级、又给常驻段留了
+#     余量的位置。常驻段真正的字节账由 ㉓/T37 的 `context_ledger` 出，不由这个数兜。
+#   ③它可被 CLI `--max-context-tokens` 覆盖，`<=0` 显式关闭压缩（run_server.py:388-391）。
 DEFAULT_MAX_CONTEXT_TOKENS = 65_536
 # 主服务侧会话工作区的过期回收线（与 Storyline 的 [storage].workspace_ttl_sec 对齐）：
 # 崩溃/异常退出遗留的 {会话}/{产物} 目录（含 _files 沙箱）在启动时按 mtime 扫掉。

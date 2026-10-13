@@ -112,8 +112,11 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                 "render_motion_code：没有 spec 参数，Store 里也没有 plan_motion 产物——"
                 "先调 plan_motion 出代码分镜，或把 spec 直接传进来")
         # 顶层开关并进来再过一次校验——与 plan_motion 入库前调的是同一个 validate_code_spec：
-        # 越界的值不许走到烧像素。
-        spec, errors = cspec.validate_code_spec(cspec.overlay_knobs(dict(raw), inputs))
+        # 越界的值不许走到烧像素。闸⑱（投递腿存在性）只有在这里才判：这个节点才持有
+        # 渲染客户端，「缺 stage_asset 口」这句话也只有在这里是真的。
+        spec, errors = cspec.validate_code_spec(
+            cspec.overlay_knobs(dict(raw), inputs),
+            has_stage_leg="stage_asset" in self._client())
         # 出处闸在代码链上的第二个调用点：闸的本体在 plan_motion（入库前），这里只兜住
         # 「没经过 plan_motion、直接塞 inline 代码分镜」那一路——判据仍是同一份 source_gate。
         await self._gate_inline(state, inputs, spec, errors)
@@ -360,7 +363,9 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         facts = cspec.style_facts(spec["shots"])
         style_warns = (cspec.check_style_quota(spec["shots"])[1]
                        + cspec.check_shot_structure(spec["shots"])[1]
-                       + cspec.check_ink_contrast(spec["shots"])[1])
+                       + cspec.check_ink_contrast(spec["shots"])[1]
+                       + cspec.check_layout_family(spec["shots"])[1]
+                       + cspec.check_subject_named(spec["shots"])[1])
         ch_counts: dict[str, int] = {}
         for ch in facts["channels"].values():
             ch_counts[ch] = ch_counts.get(ch, 0) + 1
@@ -386,6 +391,27 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                           if (r.get("layout") or {}).get("status") == "scanned"]
         layout_missing = sorted(str(r.get("id")) for r in ledger
                                 if (r.get("layout") or {}).get("status") != "scanned")
+        # 闸⑬ 的整片账：逐件点名的措辞由 code_render.describe_assets 单源产出。
+        # 「未判」的镜必须单独点名——把「没判」混进「没问题」是这一族最坏的写法。
+        assets_ok = [r for r in ledger if (r.get("assets") or {}).get("status") == "ok"]
+        assets_undet = sorted(str(r.get("id")) for r in ledger
+                              if (r.get("assets") or {}).get("status") == "undetermined")
+        assets_warns = [w for r in ledger
+                        for w in code_render.describe_assets(str(r.get("id")), r.get("assets"))]
+        # 闸⑭ 的整片账：措辞同样单源（code_render.describe_motion）。`ok` 的镜不占行，
+        # 「没看出先后动」与「压根没判过」各一条且说法不同——未判单独点名，
+        # 理由与 layout_unscanned / assets_unjudged 同：两者在回执上必须是两句话。
+        motion_shot = [r for r in ledger
+                       if isinstance(r.get("motion"), dict)
+                       and r["motion"].get("status") == "ok"]
+        motion_undet = sorted(str(r.get("id")) for r in ledger
+                              if str((r.get("motion") or {}).get("status") or "undetermined")
+                              != "ok")
+        motion_warns = [w for r in ledger
+                        for w in code_render.describe_motion(str(r.get("id")), r.get("motion"))]
+        motion_tight = [r["motion"].get("min_gap_frames") for r in motion_shot
+                        if isinstance(r["motion"].get("min_gap_frames"), int)]
+        motion_segs = [len(r["motion"].get("events") or []) for r in motion_shot]
         per_shot_ms = [float((r.get("render_timings") or {}).get("per_frame_ms") or 0.0)
                        for r in burned]
 
@@ -462,6 +488,31 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                       "误报的代价是整条通道"
                       "没人再看。扫过的镜 findings 为空才是「干净」；没扫的镜单独点名，"
                       "不混进 0 告警里"
+                if ledger else "这份分镜没有镜头"),
+            _ev(f"闸⑬ 资产存在且非纯色：{len(assets_ok)}/{len(ledger)} 镜的投递素材都真在盘上、"
+                f"sha16 对得上、且至少两档主色（1×1 与纯色占位在这一档打回）"
+                + (f"；**未判**的镜：{'、'.join(assets_undet)}（未判 ≠ 通过）"
+                   if assets_undet else ""),
+                "machine", verified=bool(ledger) and len(assets_ok) == len(ledger),
+                proof="判在**盘上的字节**：容器把 `public/assets/<镜号>/` 下每一件的 sha16 "
+                      "现算一遍与 manifest 对账（写进账的和落到盘的不是同一份字节就报），"
+                      "再解码取主色——PNG 走 zlib 全解，JPEG 走基线 DC 级（只取每 8×8 块的"
+                      "均值），SVG 按它声明的颜色计。解不出主色的格式（渐进式 JPEG、隔行 "
+                      "PNG）记 undetermined 并在这里点名，不许静默放行"
+                if ledger else "这份分镜没有镜头"),
+            _ev(f"闸⑭ 动效事件密度：{len(motion_shot)}/{len(ledger)} 镜在**渲出来的像素**上"
+                f"数得出 ≥2 段先后变化"
+                + (f"（每镜 {min(motion_segs)}~{max(motion_segs)} 段，"
+                   f"最紧的一对变化起点隔 {min(motion_tight)} 帧）"
+                   if motion_segs and motion_tight else "")
+                + (f"；**未判**的镜：{'、'.join(motion_undet)}（未判 ≠ 通过）"
+                   if motion_undet else ""),
+                "machine", verified=bool(ledger) and len(motion_shot) == len(ledger),
+                proof="判的是**画面**不是代码：容器把渲出来的 mp4 按 8 Hz 抽成灰度小图，"
+                      "逐对相邻采样算平均绝对差，按地板线切成先后变化段，再判段数与相邻间隔"
+                      "（相邻 <0.4 s 的两段在画面上读不出先后）。代码里声明了 `card.motion` "
+                      "而画面上从第 0 帧就在终态的镜，在这一档按「静帧」退回——"
+                      "自报不是证据，像素才是"
                 if ledger else "这份分镜没有镜头"),
             _ev(f"闸⑨ 跨镜同构：{len(spec['shots'])} 镜里"
                 + (f"有 {len(facts['same_shape_groups'])} 组代码结构几乎一样（"
@@ -673,6 +724,16 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             # 因为「这一镜没扫」与「这一镜扫了且干净」在回执上必须是两句话。
             "layout_warnings": layout_warns,
             "layout_unscanned": layout_missing,
+            # 闸⑬：`ok` 的镜不占行；被判据拒或被记成未判的镜逐条点名（describe_assets
+            # 单源措辞）。`assets_unjudged` 单独一栏的理由与 layout_unscanned 同：
+            # 「这件素材没人验过」与「验过且没问题」在回执上必须是两句话。
+            "assets_warnings": assets_warns,
+            "assets_unjudged": assets_undet,
+            # 闸⑭ 同规：`ok` 不占行；`rejected`（退回的那一档，正常走不到这里）与
+            # `undetermined`（这一镜的动效没人判过）各一条。`motion_unjudged` 单独一栏，
+            # 理由与上面两栏一样：「没判」和「判过且没问题」在回执上必须是两句话。
+            "motion_warnings": motion_warns,
+            "motion_unjudged": motion_undet,
             "master_hash": out["master_hash"],
             "lockfile_hash": out["lockfile_hash"],
             "gl": out["gl"],

@@ -61,6 +61,32 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 技能正文教模型「有告警就照条目点名、有没扫的镜就如实说没验过」，这两个键只活在回执里，
     # schema 扫不出来，不收就是假告警。
     "layout_warnings", "layout_unscanned",
+    # 闸⑬（资产存在且非纯色）的产物键，与上一栏同形同理由：assets_warnings 是逐镜带镜号
+    # 的人话（哪一件素材被拒、错在哪），assets_unjudged 点名的不是「这一镜的图没问题」
+    # 而是「这一镜没人验过」。技能正文教模型「被判据拒的镜要点名说图上不了屏、未判的镜
+    # 要如实说没验过」，这两个键只活在回执里，schema 扫不出来，不收就是假告警——
+    # 而这一栏比版面那栏更刺眼：模型嘴上说着「画面主体已核实」而账上写着未判，
+    # 正是 D-未判不绿 要防的那件事。
+    "assets_warnings", "assets_unjudged",
+    # 闸⑭（动效事件密度）的产物键，与上两栏同形同理由：motion_warnings 是逐镜带镜号的人话
+    # （「像素上数不出先后动」是哪一镜、数到几段、最紧一对隔多少帧），motion_unjudged 点名
+    # 的不是「动效没问题」而是「这一镜的动效没人判过」（抽帧拿不到 / 容器比判据旧）。
+    # 技能正文教模型「被判据拒的镜要说清是哪一镜、差在哪，未判的镜要如实说没判过」，
+    # 这两个键只活在回执里，schema 扫不出来，不收就是假告警。
+    "motion_warnings", "motion_unjudged",
+    # 闸⑮（版式族配额）与闸⑯（主体具名）的产物键：技能正文要教模型「每镜写清 subject
+    # 与 subject_channel」，卡面的逐镜账里这两栏与 style（代码里认得的通道）并排摆着。
+    # `subject`/`subject_channel` **在 plan_motion 的 schema 里**（不是臆造名），但
+    # 计划文案的词表只扫工具 schema 的**顶层**键（`vocab.props_for`），分镜里那层扫不到——
+    # 技能正文教了模型就会写，不收就是假告警（与 `min_duration_sec` 同一形状）。
+    # `family` 是闸⑮ 的产物键（族名），只活在卡面账里，schema 也扫不出来。
+    "subject", "subject_channel", "family",
+    # 取材轮（T20）的产物键：forage_plan 是逐镜「这一镜要哪几份 demo」，forage_demos 是
+    # 那几份的**全文**（逐件 relpath/bytes/sha16/text），forage_bytes 是本轮真给出去的
+    # 字节数，forage_oversize 是超线没给全文的那几件。四个键都只活在取材轮的回执里，
+    # schema 扫不出来——技能正文要教模型「按 forage_oversize 点名的那几件去 load_skill
+    # 逐件取，别凭记忆写码」，不收就是假告警：模型照实报出这个名字反而被拦。
+    "forage_plan", "forage_demos", "forage_bytes", "forage_oversize",
     # 口播 / 素材片那一路（patch_video）：segment_cache 是产物里的逐窗账
     # （windows/rebuilt/reused/ledger 那一整块的顶层键名），segment_id 是补丁条目里
     # 与指针交叉核对的段号。两者都不是入参键也不是工具名，不收就是假告警——

@@ -42,18 +42,38 @@ COPY . .
 # 这类错误镜像能烤成功、运行时才炸，所以必须在构建期拦）；闸① 真能加载
 # （ESLint 配置与自定义规则都在这一层）；母版文件真在。
 #
+# public/assets/ 那一验（R1-T4）：`.dockerignore` 里 `public/assets/*` 把素材字节挡在
+# 上下文外，只留 `.gitkeep` 这个脚手架——两行规则谁写漏一行，`COPY . .` 都会静静地
+# 什么都不带，镜像照样烤成功，而 `/stage-assets` 到运行时才发现没有落脚点。
+# 所以「目录真在」由构建层自己说话，不靠人记得。
+#
 # 白名单 ↔ node_modules 这一条也在构建期：ALLOWED_IMPORTS 是「模型可以写哪些 import」，
 # package.json 是「镜像里真装了哪些包」，两份名单各写一遍、不在同一个进程里。
 # 白名单多出一个名字时，构建照样成功、lint 照样放行——炸的是打包期那句「解析失败」，
 # 而收到它的是照着白名单写代码的模型，看到的是一行跟它写的 import 长得不一样的错。
 # 烤不成功的镜像才是会报警的那一个。
+#
+# 这一验用 `import.meta.resolve` 而不是 `createRequire(...).resolve`：后者按 **require**
+# 条件解析，而 `@remotion/rough-notation` 这类包的 `exports` 只给了 `import` 条件
+# （`{".": {"types":…, "module":…, "import":…}}`，没有 `require`）——包**装着**，
+# 按要求解析却报 ERR_PACKAGE_PATH_NOT_EXPORTED，构建因此红在一个假故障上。
+# 我们要判的是「模型照白名单写的 `import` 在打包期解不解得开」，那就得按 import 条件问。
 RUN node -e "const{execSync}=require('child_process');const fs=require('fs');const out=execSync('fc-list : family',{encoding:'utf8'});const fams=[...new Set(out.split('\n').flatMap(l=>l.split(',').map(s=>s.trim())).filter(Boolean))].sort();fs.writeFileSync('font-whitelist.json',JSON.stringify(fams,null,2));const need=['Noto Sans CJK SC','Noto Serif CJK SC','Noto Sans Mono CJK SC'];const miss=need.filter(f=>!fams.includes(f));if(miss.length)throw new Error('镜像缺字体：'+miss.join(', '));console.log('字体白名单',fams.length,'族')" \
     && node --check server.mjs \
     && node -e "import('./lint.mjs').then(async (m) => { const r = await m.lintShotCode('x'); if (r.ok) throw new Error('空代码竟然过了 lint'); console.log('lint 闸就绪，空代码报', r.errors.length, '条'); })" \
     && node -e "const p=require('./package.json'); if (!p.dependencies.remotion) throw new Error('remotion 没进依赖'); console.log('remotion', p.dependencies.remotion)" \
-    && node --input-type=module -e "const m = await import('./lint-rules.mjs'); const {createRequire} = await import('node:module'); const req = createRequire('/srv/x.mjs'); const bad = []; for (const p of m.ALLOWED_IMPORTS) { if (p.startsWith('@dg/')) continue; try { req.resolve(p); } catch { bad.push(p); } } if (bad.length) throw new Error('import 白名单里的包镜像里没装：' + bad.join(', ') + '——要么装进 package.json，要么从白名单删掉'); console.log('import 白名单', m.ALLOWED_IMPORTS.size, '项全部可解析')" \
+    && node --input-type=module -e "const m = await import('./lint-rules.mjs'); const bad = []; for (const p of m.ALLOWED_IMPORTS) { if (p.startsWith('@dg/')) continue; try { import.meta.resolve(p); } catch (e) { bad.push(p + '（' + (e.code || e.message) + '）'); } } if (bad.length) throw new Error('import 白名单里的包镜像里没装：' + bad.join('、') + '——要么装进 package.json，要么从白名单删掉'); console.log('import 白名单', m.ALLOWED_IMPORTS.size, '项全部可解析')" \
     && test -f src/FilmLayout.tsx && test -f src/index.ts \
-    && node tests/gate1-lint.mjs
+    && test -d public/assets \
+    && test -d public/fonts \
+    && node tests/gate1-lint.mjs \
+    && node tests/gate13-assets.mjs \
+    && node tests/shipped-namespace.mjs
+
+# 闸⑬ 的三张红样（1×1 / 全白 / manifest 有记录但文件缺）也在构建期跑：判据里的
+# 阈值（纯色占比、主色档数）是可调的旋钮，调坏了不会让任何功能挂掉，只会让闸
+# 永远放行——那种失效在任何一次真渲染里都看不出来，只有红样会说话。测试把
+# public/ 指到临时目录（DG_PUBLIC_ROOT），不碰镜像里的 public/assets/。
 
 # DG_GL 是实测出来的，不是猜的（容器内 Chromium 154 + 一段 three.js 四棱锥探针，
 # 见 tests/gl-probe.mjs）：angle / egl / swiftshader 三档全部

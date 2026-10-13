@@ -68,8 +68,16 @@ demo 实现是参数的真相——你的工作是**选卡 + 把 demo 代码适�
 
 每张卡的「参考实现」指向 `demos/<category>/<card-name>/` 下的 TSX 文件。适配步骤：
 
-1. **读 demo 源码**：用 `load_skill` 读技能目录 `demos/<category>/<card-name>/<ComponentName>.tsx`
-   （不是 `read_file` 读 `remotion/src/demos/`——那个路径在容器里不可达）
+1. **先取材，再写码**：把这一版分镜写成**只有骨架**的一份（每镜带 `id`/`text`/`card`/
+   `derived_from`，**一镜都不带 `code`**）交给 `plan_motion`。这一轮叫**取材轮**：它不回
+   分镜账、不落库，只把每一镜被引用 demo 的**全文**（逐件带 `relpath`/`bytes`/`sha16`/`text`）
+   回给你。然后再把每镜的 `code` 补上重调一次——**取材轮与分镜轮的所有镜都必须是同一种
+   形状**（要么都不带 code，要么都带），混着交会被打回。
+   为什么必须这样：闸（`derived_from`）会按**代码骨架与所声明 demo 的相似度**核对你的
+   声明。没读到 demo 就写出来的代码，要么过不了闸，要么只能靠猜着"像"它——那正是要避免的。
+   取材轮单件的体积有上限，超线的几件在 `forage_oversize` 里点名：它们是**没给**不是
+   **没内容**，用 `load_skill(name="motion_explainer_skill", path="<relpath>")` 逐件取，
+   不要凭记忆写那几镜。
 2. **替换 import 路径**：demo 用相对路径（`../../_fixtures/Motion`），你必须改成别名：
    - `../../_fixtures/Motion` → `@dg/motion`
    - `../../_fixtures/Polish` → `@dg/polish`
@@ -132,7 +140,7 @@ import { fitText as remFitText } from "@remotion/layout-utils";
 
 ## 3 档风格组合
 
-`remotion/src/themes/styles.json` 定义三档**固定组合**（色板 + 质感 + 字幕档 + 主体来源 + 素材源白名单）。
+`remotion/src/themes/palettes.json` 的 `preset` 段定义三档**固定组合**（色板 + 质感 + 字幕档 + 主体来源 + 素材源白名单）。
 模型只选档，不自由搭配——这是"多风格"与"风格漂移"的分界。
 
 | 档 | 色板 | texture | 字幕档 | 主体来源 | 适用选题 |
@@ -141,7 +149,7 @@ import { fitText as remFitText } from "@remotion/layout-utils";
 | `tech-data` | `modern-light` / `color-play` | `none` | `full` | 代码优先：矢量图、公式、数据卡、图标 | 概念解释、数据对比、流程 |
 | `night-concept` | `deep-ocean` / `midnight` / `obsidian-violet` | `glow` | `torn_highlight` | 3D/光优先：三维、光效、人物剪影 | 科学、宇宙、抽象概念 |
 
-选档时把 `palette`/`texture`/`subtitle_mode` 写进 spec 顶层，`asset_sources` 限定本片只能从素材库的这几个来源检索。
+选档时把 `palette`/`texture`/`subtitle_mode` 写进 spec 顶层。档位→色板/质感/字幕/主体来源的对应关系是固定组合，见 `remotion/src/themes/palettes.json` 的 `preset` 段——模型只选档，不自由搭配。
 
 ## 代码模板
 
@@ -204,6 +212,15 @@ export default Shot;
 - **随机种子**：`rough.generator` 等 API 要传 seed，`seed 必须给`固定值，保证逐帧可复现。
 - **音频时长**：长样本（>5s）要显式给 `durationInFrames`，否则会拖到动作结束后还在响。
 
+## 官方写法（六条，只此六条）
+
+1. 动效全由 `useCurrentFrame()`+`interpolate()` 承载——CSS `transition`/`animation` 逐帧渲不对。
+2. 默认缓动取 `@dg/motion` 的共享件 `E.standard`（`Easing.bezier(0.16,1,0.3,1)`）与 `E.spring200`（`damping:200`），别自选曲线。
+3. 观感线性给 `output:'perceptual-scale'`；台阶感给 `posterize:3`。
+4. 位移/缩放/旋转用独立属性（`scale`/`translate`/`rotate`），不拼 `transform` 串。
+5. `interpolate()` 写在 `style` 内联里（闸⑥ 靠它读字段标记）。
+6. 秒→帧用 `useVideoConfig().fps` 换，不许写死 30。
+
 # 一镜只有七栏
 
 `shots[]` 每一项：**id**（卡的 `card` 标识，必填）、**code**（必填）、**text**（必填）、
@@ -219,11 +236,13 @@ export default Shot;
 - 首尾各留一镜：开场与收尾的呼吸镜（`min_duration_sec` 给 1.5~2.5）。
 - `source` 如实填。没查到的不要写上去。
 - `card` 填卡名（如 `aurora-bloom-bg-flip`），`derived_from` 填 demo 的 relpath
-  （如 `demos/effects/aurora-bloom-bg-flip/AuroraBloomBgFlip.tsx`）。闸 `derived_from` 校验
-  白名单读 `demos/MANIFEST.json`，不在清单里的路径逐镜打回。
-- `assets` 每项含 `{relpath, sha256, bytes}`。`staticFile(relpath)` 引图时，lint 规则
-  `dg/staticfile-asset-check` 双向对账：代码里引了但 `assets` 没声明 → 打回；
-  `assets` 声明了但代码没引 → 提醒。
+  （如 `effects/aurora-bloom-bg-flip/AuroraBloomBgFlip.tsx`——**相对 `demos/` 的写法**，
+  与 `demos/MANIFEST.json` 里的键一致；带 `demos/` 前缀的写法也收，会归一）。
+  闸 `derived_from` 校验白名单读的就是那份 MANIFEST，不在清单里的路径逐镜打回。
+- `assets` 每项含 `{name, sha256, ext}`（可选 `source`/`alpha`/`layer`）。`staticFile(name)`
+  引图时，lint 规则 `dg/staticfile-asset-check` 双向对账：代码里引了但 `assets` 没声明 →
+  打回；`assets` 声明了但代码没引 → 提醒。`sha256` 要**完整 64 位十六进制**——投递腿按它
+  取字节、渲染前按它逐件对账，短一位整条都对不上。
 
 # 时长与镜数
 
@@ -242,7 +261,7 @@ export default Shot;
 
 # 查资料：后端链与出处账
 
-- web_search 的结果带 `source_url`、`source_title`，调 plan_motion 时原样填进 `source`。
+- web_search 的每条结果都带标题与网址（第一行是标题，其下是该页 URL），调 plan_motion 时把这些原样填进 `source`。
 - 查不到就说查不到，不要编。`source` 留空比编一个强。
 - 出处不进画面（除非用户要求），但进分镜卡和逐镜账。
 
@@ -286,8 +305,10 @@ export default Shot;
 | ⑨ | 跨镜同构（`STRUCT_SAME=0.88`） | 换卡/调参数 |
 | ⑩ | 字色对比度（`3:1` 正文 / `4.5:1` 强调） | 换色 |
 | ⑪ | 资产动效（三态：static 打回 / animated 通过 / undetermined 未判） | 给资产加动效 |
+| ⑮ | 版式族配额（卡名种类 ≥ `ceil(镜数/4)`；同一**族** ≤2 镜） | 换卡 |
+| ⑯ | 主体具名（每镜 `subject` + 有图形主体的镜 `subject_channel` 与代码对账） | 补 subject / 改申报 |
 
-闸 ⑦⑨⑩ 在 `plan_motion` 时就**硬拦**（不烧像素），改十遍只花几秒。
+闸 ⑦⑨⑩⑮⑯ 在 `plan_motion` 时就**硬拦**（不烧像素），改十遍只花几秒。
 闸 ① 在容器 lint（渲染前）。闸 ②③④⑤⑥⑧ 在渲染时判。闸 ⑪ 在出片后判。
 
 **未判不是通过**：闸 ⑪ 返回 `undetermined`（探针采不到资产盒）时，不是"通过了"——
@@ -315,21 +336,57 @@ export default Shot;
 - `MAX_TEXT_ONLY_SHARE = 1/3`：纯文字/纯色块镜不超过中间镜的三分之一。这两条是**打回**的。
 - `CONCRETE_SHARE_TARGET = 0.40`（40%）：中间镜里含具体项（数字/引号术语/拉丁缩写）的占比目标 40%。这条只出提醒，不打回——地名人名机器认不出，所以不拦。
 
+# 版式族与主体具名（闸⑮⑯）
+
+**每镜两个新字段**（与 `card`/`derived_from` 平级，缺 `subject` 会被 schema 直接拒）：
+
+- `subject`：这一镜画面上**能被认出的那个东西**（名词短语，2~24 字）。写成
+  「活字盘」「三条等高线」「一张 1900 年的地图」这种**器物/图形**的名字；
+  **不许写抽象词**（理念/趋势/意义/文化/效率…——既画不出来也认不出来，闸 ⑯ 有一份
+  拒绝名单）。这一格是给人看的：用户扫一眼卡面就知道每镜到底画了什么。
+- `subject_channel`：**主体是用哪条通道画的**，取值五选一（`rough`/`three`/`katex`/
+  `vector`/`image`）。规则两向都判：
+  - 这一镜的代码里**有**画法通道 → 必填，且必须是代码里真用到的那条（`style` 那栏就是
+    代码里认得的通道）。写着 `rough` 而代码里一个 `roughjs` 都没有 → 打回。
+  - 这一镜只有文字与色块（⑦ 允许的那 ≤1/3）→ **不要填**。填了就是自报无证据。
+    这一档的 `subject` 照样要写（字也可以是主体，如「「毕昇」两个字」）。
+
+**版式族配额**（闸⑮，跟 ⑦ 一样在 `plan_motion` 时就硬拦）：
+
+- 卡名（`card` 的完整值）种类 ≥ `ceil(镜数/4)`；
+- 同一**族**——就是卡库的那个类别目录名（`card` 写成 `<类别>/<卡名>`，
+  如 `data/chart-live-moves` 的族是 `data`）——**最多 2 镜**。
+
+族配额是「整片不许一个版式重复摆」那条要求的机器形态：8 镜片只用了 `data` 一族、
+或者同一个卡名摆三镜，都在 `plan_motion` 就被退回（不烧像素）。选卡时**先看类别**：
+一条 10 镜片至少要用到 5 个不同的类别，卡库按类别分了十类，见 `shots/INDEX.md`。
+
 # 镜头代码的 import 名单
 
-lint 白名单 36 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
+lint 白名单 44 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 
 `react`、`react-dom`、`remotion`、`@remotion/paths`、`@remotion/shapes`、
 `@remotion/motion-blur`、`@remotion/layout-utils`、
+`@remotion/fonts`、`@remotion/captions`、`@remotion/rough-notation`、
+`@remotion/noise`、`@remotion/animation-utils`、
+`@remotion/effects/paper`、`@remotion/effects/halftone`、
 `three`、`@react-three/fiber`、`@remotion/three`、`roughjs`、
 `katex`、`katex/dist/katex.min.css`、
-`@dg/film`、`@dg/tokens`、`@dg/motion`、`@dg/polish`、`@dg/brand`、
+`@dg/film`、`@dg/tokens`、`@dg/fonts`、`@dg/motion`、`@dg/polish`、`@dg/brand`、
 `@dg/fixtures/Motion`、`@dg/fixtures/Polish`、`@dg/fixtures/Brand`、
 `@dg/fixtures/Fixtures`、`@dg/fixtures/Look`、`@dg/fixtures/PageCam2D`、
 `@dg/lib/Caption`、`@dg/lib/ClipCard`、`@dg/lib/DigitRoll`、`@dg/lib/FlashCut`、
 `@dg/lib/PageCam`、`@dg/lib/VerticalTicker`、`@dg/lib/FlatPanel`、
 `@dg/lib/helpers/motion`、`@dg/lib/helpers/rand`、`@dg/lib/helpers/shake`、
 `@dg/lib/helpers/camera`、`@dg/themes/palettes.json`。
+
+两条注意（都是**静默失效**那一类，写错了不会报错、只是画面不对）：
+
+- **效果件按子路径引**：`import { paper } from '@remotion/effects/paper'`、
+  `import { halftone } from '@remotion/effects/halftone'`。写包名 `'@remotion/effects'`
+  在**打包期不报错**，到渲染时才炸一句「`paper` is not a function」——那两件不在桶文件里。
+- **`effects` 只挂在 `<Img>`/`<Solid>`/`<HtmlInCanvas>` 上**。挂到 `<div>`/`<AbsoluteFill>`
+  上 React 既不报错也不警告，只是**一声不响地没效果**（实测两支渲出来逐字节相同）。
 
 # TOKENS
 
@@ -355,7 +412,7 @@ lint 白名单 36 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 
 每镜可声明 `assets` 数组，每项含：
 - `name`：文件名（代码里 `staticFile("<name>")` 引用，也是渲染容器 `public/` 下的相对路径）
-- `sha256`：完整 64 位十六进制 sha256——渲染前按它从 `asset_library` 表取字节、投到渲染容器
+- `sha256`：完整 64 位十六进制 sha256——渲染前由执行层按它取字节并投递，模型只管填对
 - `ext`：扩展名（如 `png`、`svg`）
 
 可选字段：`source`（来源信息对象）、`alpha`（是否有 alpha 通道）、`layer`（`fg`/`bg`/`cutout`）。
@@ -373,23 +430,31 @@ lint 规则 `dg/staticfile-asset-check` 双向对账：
 
 ## 资产入库
 
-渲染前，执行层按每镜 `assets` 栏的 `sha256` 从 `asset_library` 表查到 `object_key`，
-从对象存储取字节，经 `POST /stage-assets` 投到渲染容器 `public/<name>`（sha256 前 16 位校验 + 幂等）。
-`materials.origin` 支持 `'art'`（代码生成的素材）。全局素材库 `asset_library` 表不属任何用户。
+渲染前，执行层按每镜 `assets` 栏的 `sha256` 取字节，经 `POST /stage-assets` 投到渲染容器
+`public/<name>`（按 sha256 前 16 位对账 + 幂等落盘）。素材必须先入全局素材库；填一个库里没有的
+sha256，渲染前一帧都不烧就会红。素材来源分类 `materials.origin` 支持 `'art'`（代码生成的素材）。
 
 # 字体白名单
 
-镜像内已装字族 18 个（构建期 `fc-list : family` 生成 `font-whitelist.json`）：
+字族只许从这两类里取，写别的**逐镜打回**（lint 规则 `dg/font-family-whitelist`，
+逐 `fontFamily` 属性检查，含 JSX 属性与常量解析）：
 
+**① 镜像里装着的**（构建期 `fc-list : family` 生成 `font-whitelist.json`，18 族）：
 `Noto Sans CJK SC`、`Noto Serif CJK SC`、`Noto Sans Mono CJK SC`、
-`Noto Sans SC`、`Noto Serif SC`、`Noto Sans Mono CJK SC`（别名）、
-`DejaVu Sans`、`DejaVu Sans Mono`、`DejaVu Serif`、
-`DejaVu Math Text`、`DejaVu Sans Condensed`、`DejaVu Sans Narrow`、
-`DejaVu Serif Condensed`、`DejaVu Serif Display`、`DejaVu Sans Extralight`、
-`DejaVu Serif Condensed`、`Liberation Sans`、`Liberation Mono`、`Liberation Serif`。
+`DejaVu Sans`、`DejaVu Sans Mono`、`DejaVu Serif`、`DejaVu Math Text`、
+`DejaVu Sans Condensed`、`DejaVu Sans Narrow`、`DejaVu Serif Condensed`、
+`DejaVu Serif Display`、`DejaVu Sans Extralight`、
+`Liberation Sans`、`Liberation Mono`、`Liberation Serif`
+（CJK 另有 HK/JP/KR/TC 四个地区变体，同样在册）。
 
-lint 规则 `dg/font-family-whitelist` 逐 `fontFamily` 属性检查（含 JSX 属性和常量解析），
-非白名单字族逐镜打回。用 `fitText` 时默认走 `TOKENS.fontStack`（Noto Sans CJK SC），不用手写字族名。
+**② 我们自己随镜像发出去的 webfont**：`Noto Sans SC`。
+它由母版 `@dg/film` 副作用 import `@dg/fonts` 当场加载（`@remotion/fonts` 的 `loadFont`，
+101 片 woff2 落在 `public/fonts/`，`display: 'block'`——字形没到不先用回落字族顶着画）。
+`TOKENS.fontStack` 的第二项就是它，所以走 `fitText`/`TOKENS.fontStack` 的写法天然用它。
+
+**别写 `SF Pro Display`/`Avenir`/`Google Fonts` 那一类名字**：镜像里没有、渲染容器也不联网，
+浏览器**不报错**、直接回落成默认字族——代码里写的和画面上出现的不是一回事（闸① 的
+`dg/font-load-check` 就是为这条：`loadFont` 指的字节必须在 `public/fonts/` 里真存在）。
 
 # 闸⑪：资产动效
 

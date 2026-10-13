@@ -20,6 +20,9 @@ import { execFileSync, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { lintShotCode } from './lint.mjs';
+import { PUBLIC, shotPublicDir, linkShippedNamespaces, readAssetManifest,
+         gateAssets } from './assetgate.mjs';
+import { motionDensity } from './motionsample.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const OUT = path.join(ROOT, 'out');
@@ -130,11 +133,23 @@ async function renderShot(payload) {
   const code = String(payload.code ?? '');
   const declaredFields = declaredFrom(payload);
   const assetNames = (payload.assets ?? []).map(a => a.name ?? a).map(String);
-  const lint = await lintShotCode(code, declaredFields, assetNames);
+  // 镜号在 props 里（`code_render.shot_input_props`）——用它定位 publicDir 与 manifest。
+  const shotId = String(payload.input_props?.shotId ?? '');
+  const staged = await readAssetManifest(shotId);
+  const lint = await lintShotCode(code, declaredFields, assetNames, staged);
   if (!lint.ok) {
     const err = new Error('闸① lint 未通过');
     err.status = 400;
     err.lint = lint.errors;
+    throw err;
+  }
+
+  // 闸⑬ 在熔合之前：盘上字节已就位，此时拒掉省下的是一整镜的烧渲染。
+  const assetsGate = await gateAssets(shotId);
+  if (assetsGate.status === 'rejected') {
+    const err = new Error(assetsGate.reason);
+    err.status = 400;
+    err.assets_gate = assetsGate;
     throw err;
   }
 
@@ -161,6 +176,14 @@ async function renderShot(payload) {
   const { bundle, selectComposition, renderMedia } = await loadRemotion();
   await fs.mkdir(path.dirname(SHOT_FILE), recursiveDir);
   await fs.mkdir(OUT, recursiveDir);
+  // publicDir 是 bundle 的入参：目录不存在 bundler 会当场炸，而「这一镜一件素材都没有」
+  // 是完全正常的一镜。先建出来，代价是一次 mkdir。
+  const publicDir = shotPublicDir(shotId);
+  await fs.mkdir(publicDir, recursiveDir);
+  // `bundle()` 只铺一个目录当 `staticFile()` 的根，而字体不在这一镜的素材目录里
+  // （`public/fonts/` 是随镜像发的公共命名空间）——先接进来，否则每一个镜头都会
+  // 因为母版加载字体而 404 收场。详见 `linkShippedNamespaces` 的注释。
+  const shipped = await linkShippedNamespaces(shotId);
   await fs.writeFile(SHOT_FILE, code, 'utf8');
 
   const warnings = [];
@@ -169,7 +192,7 @@ async function renderShot(payload) {
   const t0 = now();
   const serveUrl = await bundle({
     entryPoint: path.join(ROOT, 'src', 'index.ts'),
-    publicDir: path.join(ROOT, 'public'),
+    publicDir,
     webpackOverride: (cfg) => ({
       ...cfg,
       resolve: {
@@ -178,6 +201,7 @@ async function renderShot(payload) {
           ...(cfg.resolve?.alias ?? {}),
           '@dg/film': path.join(ROOT, 'src', 'FilmLayout.tsx'),
           '@dg/tokens': path.join(ROOT, 'src', 'tokens.ts'),
+          '@dg/fonts': path.join(ROOT, 'src', 'fonts.ts'),
           '@dg/motion': path.join(ROOT, 'src', 'demos', '_fixtures', 'Motion.tsx'),
           '@dg/polish': path.join(ROOT, 'src', 'demos', '_fixtures', 'Polish.tsx'),
           '@dg/brand': path.join(ROOT, 'src', 'demos', '_fixtures', 'Brand.tsx'),
@@ -298,7 +322,8 @@ async function renderShot(payload) {
     `字段=${fieldsUsed ? `${(fieldsUsed.marks ?? []).length}处/${declaredFields.length}声明` : `无/${declaredFields.length}声明`} ` +
     `版面=${layoutUsed ? (layoutUsed.scanned
       ? `${(layoutUsed.findings ?? []).length}告警/扫${layoutUsed.scanned.texts}字${layoutUsed.scanned.leaders}线`
-      : `落空(${String(layoutUsed.reason ?? '无').slice(0, 24)})`) : '无'}`);
+      : `落空(${String(layoutUsed.reason ?? '无').slice(0, 24)})`) : '无'}` +
+    `公共命名空间=${shipped.length ? shipped.join('+') : '无'}`);
   if (browserLogTruncated) warnings.push('[browser] 日志超过 20 条，其余已略');
   if (!tokens) warnings.push('闸⑤ 回读落空：这一镜没读到母版 token，跨镜一致性比对对它跳过');
   // 声明了字段却没回读到行＝这一镜一处 `<F>` 标注都没标到（或母版那侧的通道没跑起来）。
@@ -389,6 +414,24 @@ async function renderShot(payload) {
   } else if (assetMotion.status === 'undetermined') {
     warnings.push(`闸⑪ 资产动效：未判——${assetMotion.reason}`);
   }
+  if (assetsGate.status === 'undetermined') {
+    warnings.push(`闸⑬ 资产存在且非纯色：未判——${assetsGate.reason}`);
+  }
+
+  // 闸⑭ 动效事件密度：抽帧算相邻差，切成「先后变化段」。
+  // 为什么放在 ffprobe 前后无所谓、但**必须在渲染之后**：它判的是成片的像素，
+  // 代码里的 `interpolate()` 窗口只是声明，把窗口全写成 [0,0] 的镜照样能「声明有动效」。
+  // 抽帧失败时如实记 undetermined，**不许折成通过**——一个拿不到判据的闸闭嘴，
+  // 与一个判成「没问题」的闸，在回执上必须是两种样子。
+  const motion = motionDensity(outputLocation, {
+    execFileSync, fps: composition.fps,
+    srcWidth: composition.width, srcHeight: composition.height,
+  });
+  if (motion.status === 'reject') {
+    warnings.push(`闸⑭ 动效事件密度：${motion.reason}`);
+  } else if (motion.status === 'undetermined') {
+    warnings.push(`闸⑭ 动效事件密度：未判——${motion.reason}`);
+  }
 
   let probed = {};
   try {
@@ -439,6 +482,15 @@ async function renderShot(payload) {
     // 闸⑪ 资产动效三态：'static'（打回）/ 'animated'（通过）/ 'undetermined'（未判）。
     // 未判不许记成通过——下游回执必须如实区分。
     asset_motion: assetMotion,
+    // 闸⑭ 动效事件密度的原料：抽帧曲线的**逐格差**、切出来的**先后变化段**、
+    // 以及那一组阈值。判（段数 ≥2、相邻 ≥0.4 s）由 Python 侧做——那里才是闸的出口，
+    // 而这一层只负责把像素变成可数的东西。阈值随行是为了让红的时候能核对
+    // 「它按哪条线判的」，不是让人在回执里改的。
+    motion,
+    // 闸⑬ 资产存在且非纯色：逐件判据回执（status 三态 + 每件的 sha16/尺寸/主色）。
+    // `undetermined` 与闸⑪ 同规：如实回传，下游不许读成通过。rejected 在这一步
+    // 根本走不到这里（熔合前就 400 了），能到这个字段的只有 ok / undetermined。
+    assets_gate: assetsGate,
     warnings,
   };
 }
@@ -454,7 +506,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/lint') {
       const body = await readBody(req);
       const assetNames = (body.assets ?? []).map(a => a.name ?? a).map(String);
-      return send(res, 200, await lintShotCode(body.code ?? '', declaredFrom(body), assetNames));
+      // 这个口是「只问这段代码合不合规」——它不带镜号，于是**看不见投递账**。
+      // 看不见就不判那一半（readAssetManifest 给 null），只比代码与声明名单。
+      // 若这里也按「没投递」判红，局部改代码那条路（只重过闸①、不重烧）会整条断掉。
+      const staged = body.shot_id ? await readAssetManifest(String(body.shot_id)) : null;
+      return send(res, 200, await lintShotCode(body.code ?? '', declaredFrom(body),
+                                               assetNames, staged));
     }
     if (req.method === 'POST' && url.pathname === '/render-shot') {
       const body = await readBody(req);
@@ -468,8 +525,10 @@ const server = http.createServer(async (req, res) => {
       const bytesB64 = String(body.bytes_b64 ?? '');
       if (!relpath || !sha16 || !bytesB64)
         return send(res, 400, { ok: false, error: 'relpath/sha16/bytes_b64 缺一不可' });
-      const safe = path.join(ROOT, 'public', relpath);
-      if (!safe.startsWith(path.join(ROOT, 'public')))
+      // 落点与闸⑬/`shotPublicDir` 同源（`assetgate.PUBLIC`）：投到哪、判哪，
+      // 只能是一处算出来的，否则闸判的是一个空目录而投递落在另一个。
+      const safe = path.join(PUBLIC, relpath);
+      if (!safe.startsWith(PUBLIC))
         return send(res, 400, { ok: false, error: 'relpath 穿越' });
       const bytes = Buffer.from(bytesB64, 'base64');
       const hash = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
@@ -496,6 +555,7 @@ const server = http.createServer(async (req, res) => {
       ok: false,
       error: String(err?.message ?? err),
       ...(err.lint ? { errors: err.lint } : {}),
+      ...(err.assets_gate ? { assets_gate: err.assets_gate } : {}),
     });
   }
 });

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent_framework.identity import storyline_session_id
+from agent_framework.library_pick import pick_library_asset
 from agent_framework.orchestration import NodeState
 
 from .core_nodes import StoryNode, _obj
@@ -79,7 +81,7 @@ class SelectIllustrationNode(StoryNode):
         if row.get("attribution_required"):
             raise ValueError(f"select_illustration：asset_id {asset_id} 需要署名（attribution_required=true），"
                              "不进检索结果（§5.2）")
-        return {
+        out = {
             "asset_id": row["id"], "name": row.get("src_id") or row.get("caption") or "",
             "sha256": row["sha256"], "ext": row["ext"],
             "subject": row.get("subject") or "", "style_family": row.get("style_family") or "",
@@ -87,6 +89,20 @@ class SelectIllustrationNode(StoryNode):
             "object_key": row.get("object_key") or "",
             "width": row.get("width"), "height": row.get("height"),
         }
+        # T45：选用的同时把字节投进本会话的 materials（origin='library'），让
+        # 「检索 → 选用 → 上屏」闭环——只回一个 asset_id 的话，下游那条「只认
+        # material_id」的路仍然拿不到字节。投递失败不改判这次选用：回执里带
+        # `material_note` 说明原因（`pick_library_asset` 的形制就是不抛异常）。
+        if state.user_id and state.conversation_id:
+            mid, note = await pick_library_asset(
+                self.storage, storyline_session_id(state.user_id, state.conversation_id),
+                row["id"], conversation_id=state.conversation_id)
+            out["material_id"] = mid
+            out["material_note"] = note
+        else:
+            out["material_id"] = ""
+            out["material_note"] = "没有会话身份（离线直调），这条库素材没投进素材库"
+        return out
 
 
 ASSET_NODE_CLASSES = [SearchIllustrationNode, SelectIllustrationNode]

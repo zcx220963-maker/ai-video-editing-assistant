@@ -12,9 +12,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 让 asset_common 可导入
+
+from asset_common import classify_failure  # noqa: E402
 
 UA = "CodeArts-AssetProbe/1.0 (https://codearts.huaweicloud.com)"
 
@@ -57,11 +62,16 @@ def probe_one(source: str, endpoint: str, url: str, location: str) -> dict:
         }
     except Exception as e:  # noqa: BLE001
         ms = int((time.monotonic() - started) * 1000)
+        # 以前这里 http_code 一律写 0——把「对面回 403」这个**最有信息量的一格**丢了，
+        # 回执就只剩一句看不懂的异常名。改走共用的分类器（T10）：码照抄真的那个，
+        # 并附一句「代码还救不救得了」。
+        rec = classify_failure(e)
         return {
             "source": source, "endpoint": endpoint, "url": url,
-            "http_code": 0, "bytes": 0,
+            "http_code": rec["http_code"] or 0, "bytes": 0,
             "location": location, "latency_ms": ms,
-            "ok": False, "error": f"{type(e).__name__}: {e}",
+            "ok": False, "fixable": rec["fixable"], "advice": rec["advice"],
+            "error": f"{rec['kind']}: {rec['error']}",
         }
 
 

@@ -26,6 +26,8 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # 让 asset_common 可导入
+
 UA = "CodeArts-AssetIngest/1.0 (https://codearts.huaweicloud.com)"
 ALLOWED_SPDX = {"MIT", "Apache-2.0", "CC0", "CC0-1.0", "BSD", "ISC", "BSD-2-Clause", "BSD-3-Clause"}
 PD_LICENSES = {"PD", "PD-old", "PD-old-100", "PD-US", "PD-US-expired", "CC0", "cczero", "CC0-1.0"}
@@ -87,6 +89,13 @@ def _guess_mime(url: str) -> str:
     if low.endswith(".webp"):
         return "image/webp"
     return "application/octet-stream"
+
+
+# ── 失败回执（T10）：不许把「源不可达」报成「源里没素材」 ─────────────
+# 判据与探测脚本共用一份，见 `scripts/asset_common.py`（同一件事的两半：这边入库、
+# 那边探可达性）。
+from asset_common import (  # noqa: E402  —— 同目录脚本，sys.path 由 main 的入口补
+    get_failures, record_failure, reset_failures)
 
 
 # ── (a) Iconify ──────────────────────────────────────────────────────
@@ -171,7 +180,7 @@ def ingest_wikimedia(*, storage: Any, limit: int = 50, dry_run: bool = False) ->
                 "srlimit": "20", "format": "json",
             })
         except Exception as e:
-            print(f"[wikimedia] 搜索失败: {e}", file=sys.stderr)
+            record_failure("wikimedia-commons", "search", e)
             continue
         search_results = data.get("query", {}).get("search", []) or []
         titles = [r["title"] for r in search_results if r.get("title")]
@@ -185,7 +194,7 @@ def ingest_wikimedia(*, storage: Any, limit: int = 50, dry_run: bool = False) ->
                 "titles": "|".join(titles[:20]), "format": "json",
             })
         except Exception as e:
-            print(f"[wikimedia] 元数据获取失败: {e}", file=sys.stderr)
+            record_failure("wikimedia-commons", "metadata", e)
             continue
         pages = (data2.get("query", {}).get("pages", {}) or {}).values()
         for page in pages:
@@ -207,7 +216,8 @@ def ingest_wikimedia(*, storage: Any, limit: int = 50, dry_run: bool = False) ->
             try:
                 img_bytes = _fetch(thumb_url, timeout=30)
             except Exception as e:
-                print(f"[wikimedia] 下载失败 {page.get('title')}: {e}", file=sys.stderr)
+                record_failure("wikimedia-commons", "download", e,
+                               url=thumb_url, detail=str(page.get("title") or ""))
                 continue
             sha = _sha256(img_bytes)
             title = page.get("title", "").replace("File:", "")
@@ -241,7 +251,7 @@ def ingest_polyhaven(*, storage: Any, limit: int = 20, dry_run: bool = False) ->
     try:
         data = _fetch_json("https://api.polyhaven.com/assets")
     except Exception as e:
-        print(f"[polyhaven] 列资产失败: {e}", file=sys.stderr)
+        record_failure("polyhaven", "list", e)
         return []
     results = []
     count = 0
@@ -254,7 +264,7 @@ def ingest_polyhaven(*, storage: Any, limit: int = 20, dry_run: bool = False) ->
         try:
             img_bytes = _fetch(img_url, timeout=30)
         except Exception as e:
-            print(f"[polyhaven] 下载失败 {asset_id}: {e}", file=sys.stderr)
+            record_failure("polyhaven", "download", e, detail=str(asset_id))
             continue
         sha = _sha256(img_bytes)
         ext = ".jpg"
@@ -283,7 +293,7 @@ def ingest_ambientcg(*, storage: Any, limit: int = 20, dry_run: bool = False) ->
     try:
         html = _fetch("https://ambientcg.com/list?category=All", timeout=30).decode("utf-8", errors="replace")
     except Exception as e:
-        print(f"[ambientcg] 列质感失败: {e}", file=sys.stderr)
+        record_failure("ambientcg", "list", e)
         return []
     import re
     ids = re.findall(r'/details\.php\?id=([A-Za-z0-9_-]+)', html)
@@ -329,7 +339,7 @@ def ingest_openpeeps(*, storage: Any, limit: int = 50, dry_run: bool = False) ->
     try:
         html = _fetch("https://openpeeps.com", timeout=20).decode("utf-8", errors="replace")
     except Exception as e:
-        print(f"[open-peeps] 失败: {e}", file=sys.stderr)
+        record_failure("open-peeps", "site", e)
         return []
     import re
     svg_urls = re.findall(r'href="(/[^"]*\.svg)"', html)
@@ -418,12 +428,12 @@ async def _store_asset(storage: Any, row: dict, data: bytes) -> None:
                                   content_type=row.get("mime", ""),
                                   size=len(data))
     except Exception as e:
-        print(f"  MinIO put 失败 {object_key}: {e}", file=sys.stderr)
+        record_failure("store", "minio_put", e, detail=object_key)
         return
     try:
         await storage.assets.add(**row)
     except Exception as e:
-        print(f"  asset_library add 失败 {row['src_id']}: {e}", file=sys.stderr)
+        record_failure("store", "asset_library_add", e, detail=str(row.get("src_id")) or "")
 
 
 async def _store_batch(storage: Any, items: list[tuple[dict, bytes]]) -> None:
@@ -443,6 +453,17 @@ def _write_manifest(results: list[dict], path: str) -> None:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _write_failures(rows: list[dict], path: str) -> None:
+    """失败回执落盘（每行一条 JSON）。与成功 manifest 分开写：两份口径不同，
+    混在一起会让「入库 N 条」这个数里混进 N 条没入的。"""
+    from pathlib import Path
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 # ── 主入口 ──────────────────────────────────────────────────────────
 
 SOURCES = {
@@ -458,6 +479,7 @@ async def main_async(args: argparse.Namespace) -> int:
     from agent_framework.storage import build_storage
     storage = build_storage("pg_minio")
     await storage.start()
+    reset_failures()                                # 每次运行一份干净的回执
 
     all_results: list[dict] = []
     manifest_path = args.manifest or "assets/manifest.jsonl"
@@ -483,8 +505,23 @@ async def main_async(args: argparse.Namespace) -> int:
         _write_manifest(all_results, manifest_path)
         print(f"manifest 追加 {len(all_results)} 行 → {manifest_path}", file=sys.stderr)
 
+    # T10：失败回执与成功回执一起落盘，「不可达」和「没素材」从此分得开。
+    if get_failures():
+        fail_path = str(Path(manifest_path).with_name("failures.jsonl"))
+        _write_failures(get_failures(), fail_path)
+        hard = [f for f in get_failures() if not f["fixable"]]
+        print(f"\n⚠ {len(get_failures())} 处失败（其中 {len(hard)} 处「代码修不了」，"
+              f"见回执 {fail_path}）：", file=sys.stderr)
+        for f in get_failures():
+            print(f"    - [{f['source']}/{f['stage']}] {f['error']} → {f['advice']}",
+                  file=sys.stderr)
+
     print(f"\n总计入库 {len(all_results)} 个素材", file=sys.stderr)
     await storage.close()
+    # 「一条没进 + 有失败」是唯一要外壳调用方也看得见的形态：0 条本身不是错误，
+    # 但「0 条且不是因为没素材」必须非零退出，否则又落回「跑完了，0 条」那种静默。
+    if not all_results and get_failures():
+        return 1
     return 0
 
 

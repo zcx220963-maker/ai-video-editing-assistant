@@ -6,6 +6,11 @@ import {
   useVideoConfig,
 } from 'remotion';
 import { fitText as remotionFitText } from '@remotion/layout-utils';
+// 副作用 import（R5-T16）：把 webfont 注册表拉进每一镜的依赖图。母版是硬性包裹层，
+// 所以「用了母版就一定有字体」。TOKENS.fontStack 里那个 `"Noto Sans SC"` 过去是个
+// **装不出来的名字**（镜像的 fc-list 里只有 "Noto Sans CJK SC"），浏览器不报错、
+// 直接回落——这正是第六根因。现在它由 @dg/fonts 当场加载进来，名字与字节都对得上。
+import '@dg/fonts';
 import {
   ASPECTS,
   ASSET_LOG_MARKER,
