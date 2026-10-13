@@ -72,6 +72,39 @@ _SKILL_NOT_TOOLS = frozenset({
     #   material_id  —— search_media 结果里的素材 id（load_media 的入参叫 material_ids）
     "asr_segments", "material_id", "clip_captions", "shot_count", "kept_sec",
     "rough_clips", "group_scripts", "transitions", "text_effects", "voiceover",
+    # R11 部件档那两节正文（`asset-parts` / `scale-safe`，T57）里的九个名字。
+    # 2026-10-14 真机启动日志把它们整批报成「技能正文点名了不存在的工具」，
+    # 逐条对着 SKILL.md 读，**没有一个是让模型去调的东西**：全是回执里的栏位名、
+    # 栏位的**取值**、或一个带点的常量路径。技能正文是教模型「照这份回执说话」的
+    # 自然语言文档（本模块开篇那句话），里面的名字只要不是工具就该在这里收下。
+    #
+    # 为什么收在**这一份**而不是 `plan.support.OUTPUT_FIELD_NAMES`：那一份会经
+    # `plan/vocab.py:301` 进计划文案的词表，收进来等于放宽「卡面 why/expectation 里
+    # 引用了不存在的名字」这条提醒——而下面第三个（`subject_terms`）恰恰是正文
+    # 明令**别写**的栏（SKILL.md:567/626 两处都写了「今天 schema 里没有这一栏，
+    # 别写」）。把它放进计划侧白名单会与那两句话打架：**文案层的豁免范围要按份分开，
+    # 技能正文说得出、不等于计划卡里引用得到。**
+    #
+    #   `search_illustration` 回执 `found[]` 上的读数（:552）与它旁边那栏「没量过」的
+    #   说明（:585）。`asset_role` 不在这里——它是该工具的**入参键**，schema 那一路
+    #   已经收下（同一个词既是入参又是回执栏位，按入参那处豁免就够，两处各收一遍
+    #   就是又一个「两份真相」）：
+    "scale_safe", "scale_note",
+    #   同一个回执的 `reason` **三态取值**（:557-558）：正文教模型「后两态都不是
+    #   『那你画一个吧』」。不收它就等于逼正文把「库内确无此类目」与「这条腿今天没通」
+    #   压成一句含糊话——D-未判不绿在文案层的形状。
+    "no_match", "source_not_available",
+    #   闸㉕ 打回时与 `band` 一起摆出来的逐件盒（:556）。
+    "subject_boxes",
+    #   `code_spec.contrast_ratio`：一个**带点的常量路径**（:591，`code_spec.CONTRAST_MIN`
+    #   那条），正文拿它跟 `scale_safe` 划界（「墨色与所在底色的对比不在这一栏里」）。
+    #   `_TOOLISH` 按 `\b` 切词，两段各自被扫出来，所以两个都要收。
+    "code_spec", "contrast_ratio",
+    #   下面两个是**明令别写**的栏：`subject_terms`（:567/626「今天 schema 里没有这一栏」）、
+    #   `text_share`（⑲-a 的读数，:610 写着它**把母版字幕层也算进去了**、Q119 只做提醒）。
+    #   进这份表不是「可以用」，是「不是工具名」——正文为了说「别写它 / 别拿它自证」
+    #   而点名这两栏，不该挂成臆造工具告警。
+    "subject_terms", "text_share",
 })
 
 # 明确不是工具名的**形态**（技能正文里大量出现，属正常内容）：

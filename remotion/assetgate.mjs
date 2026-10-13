@@ -8,7 +8,7 @@
  * 目录约定（Python 侧 `code_render._stage_shot_assets` 投递的目标）：
  *
  *     <root>/public/assets/<镜号>/<名字>          ← 素材字节
- *     <root>/public/assets/<镜号>/_manifest.json  ← {sid, items:[{name,sha16,bytes,ext,motion}]}
+ *     <root>/public/assets/<镜号>/_manifest.json  ← {sid, items:[{name,sha16,bytes,ext,motion,canvas_check}]}
  *
  * 一镜一个子目录，是因为服务端的 `/stage-assets` 对同名文件走幂等短路（存在即回 ok、
  * 不比对字节）：两镜撞名时，平铺布局会让后投的那一镜静默拿到先投的字节。
@@ -96,13 +96,20 @@ export async function linkShippedNamespaces(sid) {
   return out;
 }
 
-/** 读这一镜的投递 manifest。返回**整份 items**（`{name,sha16,bytes,ext,motion}`）；
- *  `null` = 拿不到这份账（镜号没给、或 manifest 读不着）。
+/** 读这一镜的投递 manifest。返回**整份 items**
+ *  （`{name,sha16,bytes,ext,motion,canvas_check}`）；`null` = 拿不到这份账
+ *  （镜号没给、或 manifest 读不着）。
  *
  *  null 与 [] 是两个意思：[] 是「这一镜确实投过，一件都没成」，而 null 是
  *  「这一镜的投递状态未知」——lint 与闸⑬ 对这两者的态度必须不同，否则手写请求
  *  或者补跑 lint 的那条路会因为「没看见 manifest」被判成「没投递」。
- *  闸⑬ 要 sha16 与 ext，所以账在这一层留整份原样，不在下面截成名字。 */
+ *  闸⑬ 要 sha16 与 ext，所以账在这一层留整份原样，不在下面截成名字。
+ *
+ *  **这一层按名字取栏，不做「字段集全等」的判断。** 判据不许对新增栏过敏：
+ *  `canvas_check` 是 R12-T59 第二半加的（揭示画布 vs 素材真实尺寸，由 Python 侧
+ *  `code_render._check_reveal_canvas` 写入），JS 侧今天没人读它；将来再加栏也一样。
+ *  真要冻结字段集，那一份断言在 Python 侧（`tests/test_asset_delivery.py`），
+ *  与写入处同一门语言——两边各冻一份就是两份真相。 */
 export async function readAssetManifestItems(sid) {
   if (!sid) return null;
   try {

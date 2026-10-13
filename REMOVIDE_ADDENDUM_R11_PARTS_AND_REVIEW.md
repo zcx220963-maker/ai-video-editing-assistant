@@ -395,7 +395,7 @@ R12 全做完，仍然治不好这条，而且它在 R12 里比在 R11 里**更�
 | **T54** | **做完** | `agent_framework/asset_scale.py`（实测回执 + `measured_min_stroke_px`）· 落库那一格是 `scale_verdict_from(scale_facts)` 的**唯一投影**（写入路径不收 `scale_safe` 入参）· 检索侧对 `icon`/`part` 过这一关 | 真机对 132 行实测 |
 | **T55** | **做完** | `motion/review_loop.py`（`GATE = "26"` 的事件形状 + 复用 judge 三件套） | 真机盲测自证（两支夹具分不分得开）；`subject_terms` 不在 schema 里 → 今天落未判（Q131） |
 | **T56** | **做完** | 同一模块：只开红/未判的镜 · 每镜 ≤2 轮 · 走 `patch_motion_code` → `shot_cache_key` 自然只重烧该镜 · 判据不可用即阻断出片 | 真机「红→看帧→改代码→只重烧该镜→绿」那一趟 |
-| **T57** | **做完（离线绿）** | `SKILL.md` 的 `asset-parts` / `scale-safe` 两节 + `scripts/skill_contract_gate.py`（双向对账 + 默认集不涨，**32 条全绿**） | 无（这两节的真机效果＝T58） |
+| **T57** | **做完（离线绿）** | `SKILL.md` 的 `asset-parts` / `scale-safe` 两节 + `scripts/skill_contract_gate.py`（双向对账 + 默认集不涨，**32 条全绿**） | 无（这两节的真机效果＝T58）。**2026-10-14 补一次真机回执**：这两节进正文后真机启动日志挂出九条假告警（正文里的读数名被当成臆造工具），**已修**（收进 `consistency._SKILL_NOT_TOOLS`，理由与「为什么不进 `OUTPUT_FIELD_NAMES`」见指南 §9-Q138）；重建后同一行转为 `一致性检查通过`。`skill_contract_gate.py` 那 32 条照旧绿——**它管的是「字段在 schema 里都有」，与「是不是工具名」不是同一件事**，所以这次假告警它一条都照不出来 |
 | **T58** | **未跑** | 无新代码（本卷唯一一条真机对照实验） | 有部件 vs 无部件两支的逐镜账 |
 | **T59** | **做完** | `reveal.regions[]` 进 `code_spec`（挂 `motion` 那一族，不另起申报口）· 闸㉘ `check_reveal_regions` · ㉘ 后半段（`canvas` vs 库行 `width/height`，在 `code_render._stage_shot_assets`） | 无（真机三支非法写法由离线夹具钉住） |
 | **T60** | **做完·探针未跑** | `FilmLayout` 的逐区域掩码（`revealMasks`/`subtractRects`/`clipPathOf`）· `layout-probe.mjs` 的真渲夹具（未到点的块零面积 · 只报点名帧 · 扣完不越界 · 渲两遍逐字相等 · 没申报回 null） | 那支夹具本身（要活的渲染容器） |
