@@ -1324,6 +1324,116 @@ def shot_motion_window(frames: int) -> int:
     return span if span >= 2 else 0
 
 
+# ---- 闸⑰ 音画数据对账（R7-T23）---------------------------------------------
+#
+# P20 的原话是「声画只有形容词」：BGM 短成片、旁白关着却有旁白轨，都没人查。这一道把
+# 其中**能量成数**的三件事判成数与字节，判在**合成之前**（那时一帧都还没拼，红了只是
+# 几秒的代价）：
+#   ① BGM 素材 ≥ 成片 × 0.98；
+#   ② 旁白开着就得真有声、关着就得真静（判的是**逐镜切片**的音轨电平）；
+#   ③ 接缝的字尾账：转场把两侧尾巴交叠的那个窗口（长度 = 每处转场时长 d）里，
+#      语音会跟着淡出——所以 d 不得大于两侧各自的**语音尾余量**，否则话被吃掉半句。
+#
+# 三条都是「量出来的数对不上」才红，没有一条是形容词；量不到的（没有音轨、
+# volumedetect 没吐数）**记提醒、不当通过**——「未判」在这一道同样不算绿。
+
+#: BGM 素材至少要占成片时长的这个比例。为什么要这条而不是让混音那趟自己报错：
+#: `render._mux_bgm` 用的是 `-stream_loop -1`——BGM 短了**不报错、不静音，而是从头
+#: 反复**：10 秒成片配 3 秒曲子会循环三遍多，听感是「这段音乐怎么又来了」，而链上
+#: 没有任何一层会说话。0.98 留的是收尾那点淡出余量（差 0.2 秒以内听不出来，
+#: 也就没必要为这点差把好素材打回）。
+AV_BGM_MIN_SHARE = 0.98
+#: 静音线：低于 −50 dB 算听不见。`anullsrc` 编出来的静音垫片实测在 −91 dB 上下，
+#: 真说话的旁白在 −20 ~ −30 dB——中间留得很宽，因为这一条判的是**有没有**，
+#: 不是**多响**（响度是混音那趟的事）。
+AV_SILENT_DB = -50.0
+#: 接缝字尾账的容差：一帧。d 与尾余量相等时，最后那个字的淡出正好落在镜尾，
+#: 听感上已经没有了；给一帧的余量，免得浮点把一次过得去的片子挡在门外。
+AV_TAIL_SLACK_SEC = 1.0 / 30.0
+
+
+def check_av_accounting(*, narration: bool, film_sec: float, clip_db: float | None,
+                        clips_with_audio: int, bgm_sec: float | None, gaps: int,
+                        overlap_sec: float,
+                        voice_tails: Sequence[tuple[str, float]],
+                        fps: int) -> tuple[list[str], list[str]]:
+    """闸⑰：合成之前把声画对成数。→ (打回, 提醒)。
+
+    * ``film_sec`` —— 成片该有多长，按**账**算：逐镜实测秒数之和 − 接缝数 × d
+      （与 T22 的 ``check_transition_effect`` 判的是同一个数，那条用成片实测复核它）。
+    * ``clip_db`` / ``clips_with_audio`` —— 逐镜切片里**最响的那一条**的峰值声压
+      （dB）与带音轨的镜数。判在切片而不是成片上：这一步发生在拼接之前，
+      红了连一帧都不用拼。
+    * ``bgm_sec`` —— BGM 素材自己的实测时长；没选 BGM 时传 ``None``（那一档不判，
+      不是「通过」）。
+    * ``voice_tails`` —— ``[(镜号, 语音结束到镜尾的余量秒)]``，接缝字尾账读它。
+      余量的算法在渲染那一层（``code_render``，用的是 ``render.BREATH_*`` 那几个常量），
+      这里只判「够不够容下这个转场」——两处各算一遍那条呼吸算术就又有了第二个出处。
+    * ``overlap_sec`` —— 每处转场的时长 d（``transition_plan`` 那一份），``gaps`` 是接缝数。
+    """
+    errors: list[str] = []
+    warns: list[str] = []
+
+    # ① BGM 够不够长（够不够在整片里只放一遍）。
+    if bgm_sec is not None:
+        need = film_sec * AV_BGM_MIN_SHARE
+        if bgm_sec < need:
+            times = film_sec / bgm_sec if bgm_sec > 0 else float("inf")
+            errors.append(
+                f"闸⑰ BGM 太短：素材 {bgm_sec:.2f}s 不够成片 {film_sec:.2f}s 的"
+                f" {AV_BGM_MIN_SHARE:g} 倍（要 ≥ {need:.2f}s）。混音那趟把 BGM 喂给"
+                f" `-stream_loop -1`，短了**不报错而是从头反复**——这条片子会把这支曲子"
+                f"循环约 {times:.1f} 遍，听感是「这段音乐怎么又来了」。换一支够长的，"
+                "或者让成片短下来（这一条判的是素材与片长的关系，不是音质）")
+
+    # ② 旁白到底在不在。两个方向都判，缺一条就会有半边永远没人看：
+    #    关着却有声 → 有东西混进了旁白轨（旧轨残留、静音垫片被换成了真音）；
+    #    开着却是静 → 话根本没进片子（TTS 降级成一个空壳）。
+    if not narration:
+        # 「一条音轨都没有」是一个**确定的事实**（旁白关着，本来就该没有），不是未判：
+        # 这一档在回执上就是「0 镜带音轨」。只有「有音轨却量不出电平」才记未判。
+        if clips_with_audio == 0:
+            pass
+        elif clip_db is None:
+            warns.append("闸⑰ 旁白关着，切片带着音轨，但电平没量出来（volumedetect 没吐数）"
+                         "——这一档**不判**，不当通过：量不到与很安静在回执上是两句话")
+        elif clip_db > AV_SILENT_DB:
+            errors.append(
+                f"闸⑰ 旁白关着，切片里却响着 {clip_db:.1f} dB（静音线 "
+                f"{AV_SILENT_DB:.0f} dB，{clips_with_audio} 镜带音轨）——旁白轨没关干净")
+    else:
+        if clips_with_audio == 0:
+            errors.append("闸⑰ 旁白开着，但没有一镜带音轨——话一帧都没进片子。"
+                          "先查逐镜的 `degraded`（TTS 是不是降级成了静音垫片）")
+        elif clip_db is None:
+            warns.append("闸⑰ 旁白开着，却没量到电平——这一档**不判**，不当通过")
+        elif clip_db <= AV_SILENT_DB:
+            errors.append(
+                f"闸⑰ 旁白开着，切片里最响也只有 {clip_db:.1f} dB（静音线 "
+                f"{AV_SILENT_DB:.0f} dB）——这是一条静音垫片，不是旁白。"
+                "「加了静音轨」不等于「有配音」，两者在时长上一模一样")
+
+    # ③ 接缝的字尾账：转场把两侧各 d 秒的尾巴交叠起来淡出，而语音就住在尾巴前面。
+    #    所以每一处接缝上，d 必须 ≤ 两侧**语音之后剩下的余量**——不然那个字还没说完
+    #    就被淡掉了，而片子照样出得来、闸②③④ 全都绿。这一条是 T22 的 acrossfade
+    #    那笔账的落点：`check_transition` 判的是「d 短于半镜」（会不会炸），
+    #    这一条判的是「d 吃不吃得下这条片子自己的字尾」（会不会切到字）。
+    if gaps > 0 and overlap_sec > 0 and len(voice_tails) >= 2:
+        for i in range(min(gaps, len(voice_tails) - 1)):
+            sid_a, tail_a = voice_tails[i]
+            sid_b, tail_b = voice_tails[i + 1]
+            room = min(tail_a, tail_b)
+            if overlap_sec > room + AV_TAIL_SLACK_SEC:
+                errors.append(
+                    f"闸⑰ 接缝 {i + 1}（{sid_a}→{sid_b}）的转场会切到字：d="
+                    f"{overlap_sec:.2f}s，而两侧语音之后的余量只有 {tail_a:.2f}s / "
+                    f"{tail_b:.2f}s。转场是把两侧尾巴**交叠淡出**的，余量比它短的那一侧"
+                    "会有半句话在淡出里——请把 d 降一档，或让这两镜各自长一点"
+                    "（`min_duration_sec` 是一个下限，不是精确时长）")
+
+    return errors, warns
+
+
 def check_transition(pairs: Sequence[tuple[str, float]], *, style: str,
                      duration: float) -> tuple[list[str], list[str]]:
     """转场的时长对账（T22；合成之前，与闸⑰ 同一档但不同事）。→ (打回, 提醒)。

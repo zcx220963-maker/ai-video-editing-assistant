@@ -1243,6 +1243,46 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
     if misfit:
         raise MediaError("一帧都没拼，先把转场说清楚：\n"
                          + "\n".join(f"  · {e}" for e in misfit))
+
+    # ---- 闸⑰ 音画数据对账（R7-T23）：判在**拼接之前**，红了连一帧都不用拼 ----
+    # 三条量出来的事实：BGM 够不够在整片里只放一遍、旁白到底在不在（逐镜切片的电平）、
+    # 以及接缝上的字尾账（转场那个交叠窗口吃不吃得下两侧语音之后的余量）。
+    # 成片长度按**账**算（逐镜实测之和 − 接缝数 × d）：那条算术与 T22 的
+    # `check_transition_effect` 是同一个数，后者拿成片实测复核它——两处口径必须一致，
+    # 不一致时以成片实测为准，那条判据会红。
+    clip_db: float | None = None
+    clips_with_audio = 0
+    for clip in clips:
+        try:
+            info = await asyncio.to_thread(mediaops.probe, clip)
+        except MediaError:
+            continue
+        if not info.get("has_audio"):
+            continue
+        clips_with_audio += 1
+        try:
+            db = float(mediaops.audio_levels(clip)["max_db"])
+        except MediaError:
+            continue
+        clip_db = db if clip_db is None else max(clip_db, db)
+    bgm_sec: float | None = None
+    if bgm is not None and Path(bgm).exists():
+        bgm_sec = float(mediaops.probe(bgm)["duration"])
+    planned_film_sec = (sum(sec for _, sec in shot_secs)
+                        - max(0, len(clips) - 1) * plan["duration"])
+    voice_tails = [(str(r["id"]),
+                    max(0.0, float(r.get("sec") or 0.0)
+                        - (float(r.get("speech_sec") or 0.0) + rpipe.BREATH_LEAD_SEC)))
+                   for r in ledger]
+    av_errors, av_warns = cspec.check_av_accounting(
+        narration=bool(spec.get("narration")), film_sec=planned_film_sec,
+        clip_db=clip_db, clips_with_audio=clips_with_audio, bgm_sec=bgm_sec,
+        gaps=max(0, len(clips) - 1), overlap_sec=plan["duration"],
+        voice_tails=voice_tails, fps=fps)
+    if av_errors:
+        raise MediaError("闸⑰ 声画对账未通过，母带还没开始（一帧都没拼）：\n"
+                         + "\n".join(f"  · {e}" for e in av_errors))
+
     await asyncio.to_thread(mediaops.concat, clips, master, fps=fps, transition=plan)
     total = float(mediaops.probe(master)["duration"])
     not_taken = cspec.check_transition_effect([sec for _, sec in shot_secs], total,
@@ -1294,6 +1334,22 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
                 r["id"]: cspec.shot_motion_window(int(r.get("planned_frames") or 0))
                 for r in ledger},
             "av_drift_sec": round(abs(info["duration"] - total), 3),
+            # 闸⑰ 的读数（T23）：这一道判在拼接之前，但账要出在回执上——
+            # 「BGM 只放了一遍没有」与「旁白到底在不在」都得能自己算，
+            # 而不是只留一句「闸⑰ 通过」。未判那一档（量不到电平）在这里是 `None`，
+            # 与「很安静」不是同一个值。
+            "av_accounting": {
+                "narration": bool(spec.get("narration")),
+                "film_sec_planned": round(planned_film_sec, 3),
+                "clip_max_db": None if clip_db is None else round(clip_db, 2),
+                "clips_with_audio": clips_with_audio,
+                "bgm_sec": None if bgm_sec is None else round(bgm_sec, 3),
+                "bgm_share": (None if not bgm_sec else
+                              round(bgm_sec / planned_film_sec, 3)
+                              if planned_film_sec > 0 else None),
+                "voice_tails": {sid: round(t, 3) for sid, t in voice_tails},
+                "warnings": list(av_warns),
+            },
             "degraded": [f"{r['id']}：{r['degraded']}" for r in ledger if r["degraded"]],
             # 闸④ 两半的读数留在返回里：定 EMPTY_MIN_RATIO / SPAN_MIN 终值要的是
             # 这些数字的分布，只留布尔就再不知道那条线离实际有多远

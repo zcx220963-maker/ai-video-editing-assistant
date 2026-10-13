@@ -262,6 +262,28 @@ def _num(value: float) -> str:
     return f"{float(value):.3f}"
 
 
+def audio_levels(path: str | Path) -> dict[str, float]:
+    """一条音轨的声压读数（dB）→ ``{mean_db, max_db}``（R7-T23，闸⑰ 的音频侧）。
+
+    为什么正则抠 ffmpeg 的 stderr 而不是改用别的库：`volumedetect` 是**在这条链同一个
+    二进制**上跑的，与拼接/混音读的是同一批字节；换一个解码器量出来的电平会有系统差，
+    而闸⑰ 判的正是「旁白关着成片却有声」这种**字节层面的**事实。
+
+    量不到（没有音频流、或 volumedetect 没吐数）就**抛**，绝不返回 0 冒充安静——
+    那会把「没量到」写成「很安静」，于是「关着旁白却有旁白轨」这条判据恰好在它该响的时候
+    闭嘴。调用方拿 `has_audio` 先分岔，走到这里就该有音轨。
+    """
+    p = Path(path)
+    proc = run(["ffmpeg", "-hide_banner", "-i", str(p), "-vn",
+                "-af", "volumedetect", "-f", "null", "-"], timeout=300)
+    tail = proc.stderr[-2000:]
+    mean = re.search(r"mean_volume:\s*(-?[\d.]+)\s*dB", tail)
+    peak = re.search(r"max_volume:\s*(-?[\d.]+)\s*dB", tail)
+    if not mean or not peak:
+        raise MediaError(f"volumedetect 没吐出电平（{p}）：{tail[-300:]}")
+    return {"mean_db": float(mean.group(1)), "max_db": float(peak.group(1))}
+
+
 def silent_wav(dst: str | Path, duration: float = 5.0) -> Path:
     """生成静音 wav —— TTS 不可用时的配音降级，保证时间线可渲染。"""
     dst = Path(dst)

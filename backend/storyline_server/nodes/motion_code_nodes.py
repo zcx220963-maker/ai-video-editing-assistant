@@ -412,6 +412,11 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         motion_tight = [r["motion"].get("min_gap_frames") for r in motion_shot
                         if isinstance(r["motion"].get("min_gap_frames"), int)]
         motion_segs = [len(r["motion"].get("events") or []) for r in motion_shot]
+        # 闸⑰ 的整片账（T23）：这一道判在拼接之前（红了根本出不了片），所以它的读数由
+        # 渲染层带回来（`code_render` 的 `av_accounting`），报告层只**摊开**不重算——
+        # 重算就会出现「判的时候 0.97、报的时候 0.99」这种两把尺。
+        av = dict(out.get("av_accounting") or {})
+        av_warns = list(av.get("warnings") or [])
         per_shot_ms = [float((r.get("render_timings") or {}).get("per_frame_ms") or 0.0)
                        for r in burned]
 
@@ -514,6 +519,28 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                       "而画面上从第 0 帧就在终态的镜，在这一档按「静帧」退回——"
                       "自报不是证据，像素才是"
                 if ledger else "这份分镜没有镜头"),
+            _ev(f"闸⑰ 音画数据对账："
+                + (f"BGM {av['bgm_sec']}s / 成片 {av['film_sec_planned']}s"
+                   f"（{av['bgm_share']:.2f}×）"
+                   if av.get("bgm_sec") else "本片没有 BGM（这一档不存在）")
+                + "；"
+                + (f"旁白**开着**，{av.get('clips_with_audio')} 镜带音轨、最响 "
+                   f"{av.get('clip_max_db')} dB"
+                   if av.get("narration") else
+                   f"旁白**关着**，{av.get('clips_with_audio')} 镜带音轨、最响 "
+                   f"{av.get('clip_max_db')} dB（静音垫片也算带音轨——判的是电平）")
+                + (f"；**未判**：{'；'.join(av_warns)}" if av_warns else ""),
+                "machine",
+                verified=bool(av) and not av_warns
+                and not (av.get("bgm_sec") and (av.get("bgm_share") or 0) < 0.98),
+                proof="三条都是量出来的：① BGM 素材时长 ≥ 成片 × 0.98（混音用的是 "
+                      "`-stream_loop -1`，短了不报错而是从头反复）；② 逐镜切片的音轨电平"
+                      "——旁白开着必须真响、关着必须真静（`ffmpeg volumedetect`，"
+                      "静音垫片 −91dB 与真说话 −25dB 分得开，而两者**时长完全一样**）；"
+                      "③ 接缝的字尾账：转场把两侧各 d 秒的尾巴交叠淡出，d 不得大于两侧"
+                      "语音之后的余量，否则话被淡掉半句。量不到电平的那一档记"
+                      "「未判」并按 UNVERIFIED 交出——未判不是通过"
+                if av else "这一趟渲染没有回传音画账（旧版本地缓存？）"),
             _ev(f"闸⑨ 跨镜同构：{len(spec['shots'])} 镜里"
                 + (f"有 {len(facts['same_shape_groups'])} 组代码结构几乎一样（"
                    + "；".join("、".join(g) for g in facts["same_shape_groups"]) + "）"
