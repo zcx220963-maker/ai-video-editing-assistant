@@ -2893,8 +2893,10 @@ const searchDraft = ref({ provider: "", base_url: "", api_key: "" });
 const savingSearch = ref(false);
 const testingSearch = ref(false);
 const testSearchResult = ref(null);
-// 图像出图后端：provider + 密钥/自建地址，全空 = 降级为素材库检索
-const imageDraft = ref({ provider: "", base_url: "", api_key: "" });
+// 图像出图后端：provider + 密钥/自建地址 + 模型/尺寸，全空 = 降级为素材库检索。
+// model/size 是 T24 新增的两栏：以前模型名写死在请求体里（doubao-seedream-5-0-pro），
+// 换一家后端就会把火山那个模型名原样发给别家。两栏留空 = 用该后端的默认值。
+const imageDraft = ref({ provider: "", base_url: "", api_key: "", model: "", size: "" });
 const savingImage = ref(false);
 const testingImage = ref(false);
 const testImageResult = ref(null);
@@ -2923,9 +2925,13 @@ async function loadSettings() {
   };
   testSearchResult.value = null;
   imageDraft.value = {
+    // 这两栏填的是**页面原文**（用户自己填的），空着显示空——生效值走 effective_model，
+    // 见上方面板里那行状态文字。混用会让「我没填怎么冒出一个模型名」变成一团雾。
     provider: j.image?.provider || "",
     base_url: j.image?.base_url || "",
     api_key: "",
+    model: j.image?.model || "",
+    size: j.image?.size || "",
   };
   testImageResult.value = null;
   return j;
@@ -3201,6 +3207,8 @@ async function saveImage() {
         provider: imageDraft.value.provider,
         base_url: imageDraft.value.base_url.trim(),
         api_key: imageDraft.value.api_key.trim(),
+        model: imageDraft.value.model.trim(),
+        size: imageDraft.value.size.trim(),
       }),
     });
     const j = await r.json().catch(() => ({}));
@@ -3223,7 +3231,9 @@ async function clearImageOverride() {
     const r = await fetch("/settings/image", {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ provider: "", base_url: "", api_key: "" }),
+      // 五项一起清：留空的项后端按「清除页面覆盖」处理（模型/尺寸回该后端默认），
+      // 只清前三项会让模型名变成一份没人记得从哪来的页面覆盖。
+      body: JSON.stringify({ provider: "", base_url: "", api_key: "", model: "", size: "" }),
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
@@ -3246,7 +3256,13 @@ async function testImageConn() {
     const r = await fetch("/settings/image/test", {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ prompt: "" }),
+      // 带上草稿里的模型/尺寸：可以「先试再存」。留空则由后端回落到已保存的配置，
+      // 所以自检跑的就是链上真正会用的那个模型——不是页面上的一个平行世界。
+      body: JSON.stringify({
+        prompt: "",
+        model: imageDraft.value.model.trim(),
+        size: imageDraft.value.size.trim(),
+      }),
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
@@ -4495,8 +4511,16 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <input v-model.trim="imageDraft.base_url" spellcheck="false"
                  placeholder="自建实例地址 http(s)://…（留空用默认）"
                  :disabled="savingImage" />
-          <input v-model="imageDraft.api_key" type="password" autocomplete="off"
+          <input v-model.trim="imageDraft.api_key" type="password" autocomplete="off"
                  spellcheck="false" placeholder="出图 API Key（不改则留空）"
+                 :disabled="savingImage" />
+        </div>
+        <div class="set-line">
+          <input v-model.trim="imageDraft.model" spellcheck="false"
+                 :placeholder="`模型名（留空用后端默认${settings && settings.image && settings.image.default_model ? '：' + settings.image.default_model : '（该后端没有默认值，必须填）'}）`"
+                 :disabled="savingImage" />
+          <input v-model.trim="imageDraft.size" spellcheck="false"
+                 placeholder="尺寸 宽x高，如 1024x1024（留空用默认）"
                  :disabled="savingImage" />
         </div>
         <div class="set-line">
@@ -4512,13 +4536,23 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         <p class="set-note">
           siliconflow / minimax / zhipu / aliyun / volc 都要 API Key；留空即降级为素材库检索，保存即生效不重启。
         </p>
+        <!-- 「我明明没填，为什么会有个模型名」要在这一行就能回答：页面原文为空时显示
+             生效值（后端默认）。自检落一张 PNG 到工作区，这里只报路径与 sha16，不打印密钥。 -->
+        <p v-if="settings && settings.image && settings.image.provider" class="set-note">
+          会用：{{ settings.image.effective_model || "（该后端没有默认模型，必须自己填）" }}
+          · {{ settings.image.effective_size || "1024x1024" }}
+        </p>
         <div v-if="testImageResult" class="probe">
           <div>
             <b :class="testImageResult.ok ? 'ok' : 'bad'">{{ testImageResult.provider || "未配置" }}</b>
             {{ testImageResult.ok
-               ? `出图成功 · ${testImageResult.latency_ms || 0}ms`
+               ? `出图成功 · ${testImageResult.model || "?"} · ${testImageResult.width || "?"}×${testImageResult.height || "?"} · ${testImageResult.latency_ms || 0}ms`
                : "不通 · " + (testImageResult.message || "未知错误") }}
           </div>
+          <div v-if="testImageResult.ok" class="set-note">
+            落盘 {{ testImageResult.artifact }}（{{ testImageResult.bytes }} 字节，sha16 {{ testImageResult.sha16 }}）
+          </div>
+          <div v-for="n in testImageResult.notes || []" :key="n" class="set-note bad">{{ n }}</div>
         </div>
         <div v-if="keyError" class="set-v bad">{{ keyError }}</div>
       </div>

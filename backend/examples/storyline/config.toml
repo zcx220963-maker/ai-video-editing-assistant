@@ -29,6 +29,12 @@ available_nodes = [
     # 局部改：只对已出片的某一版重烧受影响的镜/窗口，不重做整片。
     # 白名单少一行就等于「那一版改不动」：工具列不出来，前端选区改的派发直接失败。
     "patch_motion_code", "patch_video",
+    # 素材供给（R3 + R6-T24）：先检索内置策展库、未命中再出图。
+    # 这三行以前**不在这里**——节点类写好了、用例也绿，但生产注册表按本白名单过滤，
+    # 于是模型手里从来没有这两个工具，「检索 → 选用 → 上屏」整条 R3 链在真机上等于没接。
+    # 判据就是 T15b 新写的那条：白名单里的每个名字都必须真的注册出来（少一行 = 那条链
+    # 在真机上不存在，而离线用例照样全绿——正是这份文档一路在治的那种假绿）。
+    "search_illustration", "select_illustration", "imagegen",
     # 控制面工具（非 DAG 节点）：read_node_history 读 Store，render_status 轮询渲染任务。
     # 少了 render_status，模型收到「去轮询」的指示却没有可轮询的工具，等于没改。
     "read_node_history", "render_status",

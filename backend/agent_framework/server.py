@@ -54,7 +54,7 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from . import model_probe, secrets, uploads
+from . import image_backend, model_probe, secrets, uploads
 from .agent import Agent
 from .auth import Authenticator
 from .catalog import get_catalog
@@ -659,17 +659,30 @@ class SearchTestRequest(BaseModel):
 
 
 class ImageBackendRequest(BaseModel):
-    """POST /settings/image：图像出图后端三件套。api_key 传空 = 清除已存密钥。"""
+    """POST /settings/image：图像出图后端五件套。api_key 传空 = 清除已存密钥。
+
+    ``model`` / ``size`` 从 T24 起也按身份热读：以前它们写死在请求体里
+    （`doubao-seedream-5-0-pro`），换一家后端就会把火山那个模型名发给别家。
+    空串 = 清除页面覆盖 → 用该 provider 的默认模型 / 默认尺寸（不是「不传 model」）。
+    """
 
     provider: str = ""      # siliconflow|minimax|zhipu|aliyun|volc；空 = 降级为素材库检索
     base_url: str = ""      # 自建实例地址；填了才生效
     api_key: str = ""
+    model: str = ""         # 模型名；空 = 该 provider 的默认模型
+    size: str = ""          # 尺寸，如 1024x1024；空 = 默认尺寸
 
 
 class ImageTestRequest(BaseModel):
-    """POST /settings/image/test：出图自检——真发一条出图请求看有没有图回来。"""
+    """POST /settings/image/test：出图自检——真发一条出图请求，把回来的字节落盘。
+
+    ``prompt`` 可自带；``model`` / ``size`` 可临时压过设置里那两栏，用来在页面上
+    「换一个模型试试」而不必先保存。
+    """
 
     prompt: str = ""
+    model: str = ""
+    size: str = ""
 
 
 class QuotaRequest(BaseModel):
@@ -2018,7 +2031,10 @@ def create_app(
         i_base = await secrets.get_user_key(user_id, secrets.IMAGE_BASE_KEY)
         i_key_row = await storage.secrets.row(user_id, secrets.IMAGE_API_KEY_NAME)
         i_key = (i_key_row or {}).get("value", "")
+        i_model = await secrets.get_user_key(user_id, secrets.IMAGE_MODEL_KEY)
+        i_size = await secrets.get_user_key(user_id, secrets.IMAGE_SIZE_KEY)
         _, _, _, i_source = await secrets.resolve_image_config(user_id)
+        eff_model, eff_size, _ = await secrets.resolve_image_options(user_id)
         q_limit, q_window, q_source = await secrets.resolve_quota(
             user_id, default_limit=quota_limit, default_window=quota_window)
         q_status = await quota_status(storage.db, user_id, limit=q_limit, window=q_window)
@@ -2055,10 +2071,19 @@ def create_app(
             "image": {
                 "provider": i_provider or "",
                 "base_url": i_base or "",
+                "model": i_model or "",
+                "size": i_size or "",
+                # 生效值（页面 → env → provider 默认）与页面原文分开给：页面那两栏为空
+                # 时输入框该是空的（用户没填），而「会用哪个模型」得能显示出来——
+                # 只给生效值会让「我没填但怎么有个模型名」变成一团雾。
+                "effective_model": eff_model,
+                "effective_size": eff_size,
+                "default_model": image_backend.default_model(
+                    (i_provider or "").strip().lower(), i_model or ""),
                 "configured": bool(i_key or i_base),
                 "masked": secrets.mask(i_key) if i_key else "",
                 "source": i_source,
-                "overridden": bool(i_provider or i_base or i_key),
+                "overridden": bool(i_provider or i_base or i_key or i_model or i_size),
                 "providers": list(KEYED_IMAGE_PROVIDERS),
             },
             "quota": {
@@ -2277,14 +2302,22 @@ def create_app(
     @app.post("/settings/image")
     async def settings_image(req: ImageBackendRequest,
                              user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """图像出图后端三件套：provider/base_url/api_key 各写各的，空串即清除该项。
+        """图像出图后端五件套：provider/base_url/api_key/model/size 各写各的，
+        空串即清除该项。
 
         与 /settings/search 同一套模式：provider 为空 = 没配出图后端，整条出图路径
-        优雅降级为素材库检索（§5.3）。
+        优雅降级为素材库检索（§5.3）。model/size 是 T24 新增的两栏——它们与 provider
+        **分开**读写，所以「换了后端但没换模型」在页面上是看得见的一件事。
         """
         provider = (req.provider or "").strip().lower()
         base = (req.base_url or "").strip().rstrip("/")
         key = (req.api_key or "").strip()
+        model = (req.model or "").strip()
+        size = (req.size or "").strip()
+        if model and any(c.isspace() for c in model):
+            raise HTTPException(400, "模型名格式不对：不能包含空格或换行")
+        if size and not re.fullmatch(r"\d{2,5}x\d{2,5}", size):
+            raise HTTPException(400, "尺寸要写成 宽x高，例如 1024x1024")
         if provider and provider not in KEYED_IMAGE_PROVIDERS:
             raise HTTPException(
                 400, f"不认识的出图后端 {provider!r}（可用：{', '.join(KEYED_IMAGE_PROVIDERS)}；"
@@ -2297,7 +2330,9 @@ def create_app(
             raise HTTPException(400, "填了密钥或实例地址但没选后端——无法判断该把 key 交给谁")
         for name, value in ((secrets.IMAGE_PROVIDER_KEY, provider),
                              (secrets.IMAGE_BASE_KEY, base),
-                             (secrets.IMAGE_API_KEY_NAME, key)):
+                             (secrets.IMAGE_API_KEY_NAME, key),
+                             (secrets.IMAGE_MODEL_KEY, model),
+                             (secrets.IMAGE_SIZE_KEY, size)):
             if value:
                 await secrets.put_user_key(user_id, name, value)
             else:
@@ -2311,13 +2346,21 @@ def create_app(
     async def settings_image_test(req: ImageTestRequest,
                                   user_id: str = Depends(auth.http_user_id)
                                   ) -> dict[str, Any]:
-        """出图自检：真发一条出图请求看有没有图回来。
+        """出图自检：真发一条出图请求，**把回来的字节落盘**，再回 ok。
 
-        自检口径照 L2 教训：没有真出图就报 ok:false + 原因，不许回 ok:true「后端有响应」。
-        未配 key 时报 ok:false 并提示"未配出图后端，当前走素材库检索降级"。
+        自检口径照 L2 教训，并往前推一步。原实现只判 ``bool(data["data"][0]["url"])``
+        ——「后端回了个 URL」就算成功；那张 URL 可能 404、可能指向一张 1×1 占位图、
+        也可能根本拉不动。那种「自检绿、链上取不到图」的组合正是最难查的假绿。
+        现在：字节必须真的拿回来、认得出是位图、写进 ``<cache_root>/image-selftest/``
+        （**落盘**），并把路径/字节数/sha16 一起回报——判据从「有响应」变成「有图」。
+        请求由 ``image_backend`` 构造，与 ``imagegen`` 节点**同一个函数**，自检过的
+        就是链上跑的那条。密钥只在这里被读出来交给后端，绝不进返回值。
         """
         provider, key, base, source = await secrets.resolve_image_config(user_id)
         provider = (provider or "").strip().lower()
+        cfg_model, cfg_size, _ = await secrets.resolve_image_options(user_id)
+        model = (req.model or "").strip() or cfg_model
+        size = (req.size or "").strip() or cfg_size
         prompt = (req.prompt or "").strip() or "一只蓝色的鸟站在树枝上"
         if not (provider or key or base):
             return {"ok": False, "provider": "", "source": source,
@@ -2325,38 +2368,29 @@ def create_app(
         if not provider:
             return {"ok": False, "provider": "", "source": source,
                     "message": "填了密钥或实例地址但没选后端，无法判断该把 key 交给谁"}
-        started = time.monotonic()
         try:
-            import urllib.request
-            api_base = base or {
-                "siliconflow": "https://api.siliconflow.cn/v1",
-                "minimax": "https://api.minimax.chat/v1",
-                "zhipu": "https://open.bigmodel.cn/api/paas/v4",
-                "aliyun": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                "volc": "https://ark.cn-beijing.volces.com/api/v3",
-            }.get(provider, "")
-            if not api_base:
-                return {"ok": False, "provider": provider, "source": source,
-                        "message": f"未知 provider {provider!r}，没有默认 base_url"}
-            url = f"{api_base.rstrip('/')}/images/generations"
-            body = json.dumps({"model": "doubao-seedream-5-0-pro", "prompt": prompt,
-                               "n": 1, "size": "1024x1024"}).encode("utf-8")
-            request = urllib.request.Request(url, data=body, method="POST")
-            request.add_header("Content-Type", "application/json")
-            request.add_header("Authorization", f"Bearer {key}")
-            resp = await asyncio.to_thread(urllib.request.urlopen, request, 30)
-            data = json.loads(resp.read(65536))
-            latency = int((time.monotonic() - started) * 1000)
-            has_image = bool(data.get("data") and data["data"][0].get("url"))
-            return {"ok": has_image, "provider": provider, "source": source,
-                    "latency_ms": latency,
-                    "message": ("出图成功" if has_image
-                                else f"后端有响应但没回图：{json.dumps(data)[:200]}")}
-        except Exception as e:  # noqa: BLE001
-            latency = int((time.monotonic() - started) * 1000)
+            result = await asyncio.to_thread(
+                image_backend.generate, provider=provider, key=key, base=base,
+                prompt=prompt, model=model, size=size)
+        except image_backend.ImageBackendError as exc:
             return {"ok": False, "provider": provider, "source": source,
-                    "latency_ms": latency,
-                    "message": f"{type(e).__name__}: {e}"}
+                    "model": model, "size": size, "message": str(exc)}
+
+        # 落盘：自检的意义就是「这条路走到底了」。目录挂在 workspace 根下（可丢弃的
+        # 中转区，见 spec §3.6），不占对象存储——它只是一次探针的产物。
+        out_dir = Path(storage.workspace.root) / "image-selftest"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"{user_id[:24] or 'anon'}-{result.sha16}.{result.ext}"
+        out.write_bytes(result.data)
+        return {"ok": True, "provider": provider, "source": source,
+                "model": result.model, "size": result.size,
+                "latency_ms": result.latency_ms,
+                "bytes": result.bytes, "sha16": result.sha16,
+                "width": result.width, "height": result.height,
+                "artifact": str(out),
+                "notes": list(result.notes),
+                "message": (f"出图成功：{result.provider}/{result.model} "
+                            f"{result.bytes} 字节，已落盘 {out.name}")}
 
     @app.websocket("/ws/{conversation_id}")
     async def ws_endpoint(websocket: WebSocket, conversation_id: str) -> None:

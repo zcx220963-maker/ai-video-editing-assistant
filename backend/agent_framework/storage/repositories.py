@@ -1349,8 +1349,15 @@ class AssetLibraryRepo(_Repo):
                   subject: str = "", style_family: str = "",
                   tags: str = "[]", caption: str = "", era: str = "",
                   width: int | None = None, height: int | None = None,
+                  enabled: bool = True,
                   asset_id: str | None = None) -> dict[str, Any]:
-        """入库一行素材。每行必须带 license（§5.2 硬约束）。"""
+        """入库一行素材。每行必须带 license（§5.2 硬约束）。
+
+        ``enabled`` 默认 True（入库即启用，策展库的常规路径）。出图产物走
+        ``enabled=False``（见 ``imagegen_library``）：它需要的是「按 sha 找得到字节」
+        ——``get_by_sha`` 不看这一列——但**不该进** ``search()`` 的检索面，否则别人在
+        自己会话里会搜到用户 A 刚生成的图。
+        """
         return await self.db.upsert(self.table, {
             "id": asset_id or f"ast-{sha256[:12]}",
             "sha256": sha256, "bytes": bytes_, "mime": mime, "ext": ext,
@@ -1359,7 +1366,7 @@ class AssetLibraryRepo(_Repo):
             "attribution_required": attribution_required,
             "license_url": license_url, "subject": subject,
             "style_family": style_family, "tags": tags, "caption": caption,
-            "era": era, "enabled": True, "fetched_at": _now(),
+            "era": era, "enabled": enabled, "fetched_at": _now(),
         })
 
     async def get(self, asset_id: str) -> dict[str, Any] | None:

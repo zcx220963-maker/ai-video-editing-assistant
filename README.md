@@ -885,8 +885,13 @@ HTTP 口 `backend/agent_framework/server.py`(`/motion/hitmap` `/motion/frame` `/
 - **扩展管理**:`/tools` · `/skills*`(含 .zip 技能包) · `/mcp/servers*`(热连热断)
 - **设置**:`/settings*`(模型密钥、主模型选型、判断模型三件套 + `POST /settings/judge/test` 连通性自检;
   检索后端三件套 `POST /settings/search` 写 + `POST /settings/search/test` 试一路;
+  出图后端**五件套** `POST /settings/image`(`provider` / `base_url` / `api_key` /
+  `model` / `size`,空串＝清页面覆盖、`model`/`size` 留空＝该 provider 的默认值)
+  + `POST /settings/image/test` 出图自检——它**真发一条请求、把回来的字节落盘**
+  (判据是「有图」不是「有响应」:字节必须认得出版位图魔数、写进工作区、回报 sha16);
   配额 `POST /settings/quota`——字段**缺省＝不动、空串＝清页面覆盖、`"0"`＝关拦截**;
-  后两组与「设置」页对应区块都是 2026-10-11 落地的,此前文档里写过但代码没有,见 §16 订正)
+  后三组与「设置」页对应区块都是 2026-10-11 之后陆续落地的,此前文档里写过但代码没有,见 §16 订正;
+  出图那两组是 R6-T24 落的,见 §9-Q90)
 - **运维**:`GET /health` 存活探针。免凭证的只有它和三个**签发凭证**的入口
   (`/auth/login` · `/auth/register` · `/register`),其余全部要求凭证。
 
@@ -1002,10 +1007,11 @@ docker compose --profile app up -d --build    # + editor(:8001) + remotion(:8010
 - `remotion` 反过来**刻意不进** `depends_on`:存储没就绪服务必然起不来,而渲染服务没就绪只是「这一镜渲失败」,
   做成启动依赖等于让图形链的故障半径扩大到整站。它的 healthcheck 用 node 自带 fetch 真打 `/healthz`
   (端口开着不等于应答),地址走 `REMOTION_URL`(默认 `http://remotion:8010`,`app` 与 `editor` 共用同一份环境锚);
-- 接线成功的判据(启动日志明说,2026-10-11 重烤后实测):
-  `[startup] Storyline 已接入 27 个剪辑节点（DAG 契约 25 节点，rerun_from 可用）`
-  + `[startup] 中文名词表已装载：57 条（工具 / 剪辑节点 / 技能），参数标签 92 条`;
-  数字跟着白名单走(`examples/storyline/config.toml`:25 个 DAG 节点 + 2 个控制节点),改名单就得回来看这一行;
+- 接线成功的判据(启动日志明说,2026-10-13 重烤后实测):
+  `[startup] Storyline 已接入 30 个剪辑节点（DAG 契约 28 节点，rerun_from 可用）`
+  + `[startup] 中文名词表已装载：60 条（工具 / 剪辑节点 / 技能），参数标签 92 条`;
+  数字跟着白名单走(`examples/storyline/config.toml` 与 `config.docker.toml` **两份必须逐项相同**:
+  各 28 个 DAG 节点 + 2 个控制节点),改名单就得回来看这一行;
 - `deploy/Caddyfile` 默认 `:80 reverse_proxy app:8000`,配 `SITE_DOMAIN` 后取消注释出 HTTPS;
 - `WHISPER_PRELOAD` 构建参数可预下载 ASR 权重;`caddy` 没有 healthcheck(它不是依赖项)。
 
@@ -1013,9 +1019,9 @@ docker compose --profile app up -d --build    # + editor(:8001) + remotion(:8010
 
 | 层 | 内容 | 怎么跑 |
 |---|---|---|
-| 离线回归 | `backend/tests/` **110 份**脚本式套件(2026-10-13 **容器内**实测 **4689 条断言**、逐文件 `rc==0`、**1 支未判**(`test_question_card_queue.py` 没有汇总行,解析不出总数——**不按 0 计**);当前唯一红是 `test_code_gates.py` 的**未判档**那一条——它是 T28 的驱动红,「未判」尚未升级成阻断档之前就该红,不是故障)——每份自带 `asyncio.run(main())` 与断言计数 | **固定入口:`cd backend && python scripts/run_tests.py`**(逐文件 `rc==0`、不 fail-fast、汇总断言总数并校验不低于历史底线 1176——**只增不减**,是个地板不是当前值)。**以 `creation-app` 容器内那一趟为准**:镜像里没装 pytest,逐份 `PYTHONPATH=/app python tests/test_xxx.py`(宿主机 python 的版本与依赖都不是运行时那份)。**但那趟之前必须先重建容器**:`app` 服务是 `image: creation-app:latest` 且**没有 `build:`**,`editor` 烤完新镜像后**tag 移了容器不动**——直接 `docker exec creation-app` 跑到的可能是几天前那份镜像(实测踩过:里面 101 支用例,新写的这份压根不存在)。要么 `docker compose --profile app up -d --force-recreate app`,要么先比 `docker inspect -f '{{.Image}}' creation-app` 与 `docker images --format '{{.ID}}' creation-app:latest` 是不是同一个 ID(§9-Q81)。**再进一步:别只看那个 ID,直接逐件对字节**——`PYTHONIOENCODING=utf-8 python scripts/image_parity.py --dockerfile Dockerfile --context . --container creation-app`(清单**现读 Dockerfile**、不是人手维护的表;逐件 `docker exec md5sum` 与盘上比;退出码 0 全对上 / 1 有红 / 2 只未判)。remotion 那一侧同理:`--dockerfile remotion/Dockerfile --context remotion --container creation-remotion --ignore remotion/.dockerignore`。2026-10-13 两腿实测 **575/575** 与 **430/430**(§9-Q86)。**不要单独依赖 `python -m pytest`**:本批用例是「模块级脚本 + 末尾 `sys.exit`」的形态,pytest 收集会在 `conftest.py` 那里 INTERNALERROR(它还会从脚本内部解析出十几个假用例),标准入口的结论因此是假故障 |
+| 离线回归 | `backend/tests/` **111 份**脚本式套件(2026-10-13 **容器内**实测 **4761 条断言**、逐文件 `rc==0`、**1 支未判**(`test_question_card_queue.py` 没有汇总行,解析不出总数——**不按 0 计**);当前唯一红是 `test_code_gates.py` 的**未判档**那一条——它是 T28 的驱动红,「未判」尚未升级成阻断档之前就该红,不是故障)——每份自带 `asyncio.run(main())` 与断言计数 | **固定入口:`cd backend && python scripts/run_tests.py`**(逐文件 `rc==0`、不 fail-fast、汇总断言总数并校验不低于历史底线 1176——**只增不减**,是个地板不是当前值)。**以 `creation-app` 容器内那一趟为准**:镜像里没装 pytest,逐份 `PYTHONPATH=/app python tests/test_xxx.py`(宿主机 python 的版本与依赖都不是运行时那份)。**但那趟之前必须先重建容器**:`app` 服务是 `image: creation-app:latest` 且**没有 `build:`**,`editor` 烤完新镜像后**tag 移了容器不动**——直接 `docker exec creation-app` 跑到的可能是几天前那份镜像(实测踩过:里面 101 支用例,新写的这份压根不存在)。要么 `docker compose --profile app up -d --force-recreate app`,要么先比 `docker inspect -f '{{.Image}}' creation-app` 与 `docker images --format '{{.ID}}' creation-app:latest` 是不是同一个 ID(§9-Q81)。**再进一步:别只看那个 ID,直接逐件对字节**——`PYTHONIOENCODING=utf-8 python scripts/image_parity.py --dockerfile Dockerfile --context . --container creation-app`(清单**现读 Dockerfile**、不是人手维护的表;逐件 `docker exec md5sum` 与盘上比;退出码 0 全对上 / 1 有红 / 2 只未判)。remotion 那一侧同理:`--dockerfile remotion/Dockerfile --context remotion --container creation-remotion --ignore remotion/.dockerignore`。2026-10-13 两腿实测 **579/579** 与 **430/430**(§9-Q86;app 那腿从 575 涨到 579 是 R6 新增的四个文件进了构建上下文)。**不要单独依赖 `python -m pytest`**:本批用例是「模块级脚本 + 末尾 `sys.exit`」的形态,pytest 收集会在 `conftest.py` 那里 INTERNALERROR(它还会从脚本内部解析出十几个假用例),标准入口的结论因此是假故障 |
 | 渲染容器自闸 | `remotion/tests/gate1-lint.mjs`——闸① 的先证红再证绿:**落点模板 `src/user-shots/shot.tsx` 必须绿**(模板自己红,用户写第一镜就挨打),四类违规必须红并带规则名与行列号(未包裹 `<FilmLayout>`、越界 import、代码里取随机/时间/网络/外部字体、字段声明与代码读/标注三相对不上账)。**它跑在 Dockerfile 层末**——红就烤不出镜像,报警发生在构建期而不是模型写完代码那一趟。另有**两支运行时探针**(要容器活着才跑得动,所以不在构建期):`tests/gl-probe.mjs` 判四档 GL 谁能拿到 WebGL2(现档 `swangle`)、`tests/effects-probe.mjs` 是 `@remotion/effects` 那两件的**入场券**——换 Chromium / 改 GL 档 / 进新效果件之前先跑它,红则**不进白名单**(§9-Q89) | `docker build -t creation-remotion:latest ./remotion`(或容器内 `cd /srv && node tests/gate1-lint.mjs`;探针:`docker exec -e DG_BASE=http://127.0.0.1:8010 creation-remotion sh -c 'cd /srv && node tests/effects-probe.mjs'`) |
-| 真机冒烟 | `backend/.smoke/` **24 个** `*_smoke.py`(b3~b16 + `settings_key`/`thinking_off`/`vl_shared_key` + `b22_code_chain_render`/`b23_field_patch`/`b24_code_ui` 这条代码链 + `t5_track_patch` 口播选区改)+ **23 个**探针/种子脚本(含 b18 搜索链六路探针);**旧声明式链的 17 份夹具与用例归档在 `.smoke/_archived_p4_declarative/`**(含 b17/b19/b21 与四条零素材样片),归档不是可跑路径,跑前先读那份 README | 依赖模型的那批带 `credit_gate()` 前置闸:额度不就绪直接 SKIP 并打印原因,不会把"账户空了"报成"代码坏了" |
+| 真机冒烟 | `backend/.smoke/` **26 个** `*_smoke.py`(b3~b16 + `settings_key`/`thinking_off`/`vl_shared_key` + `b22_code_chain_render`/`b23_field_patch`/`b24_code_ui` 这条代码链 + `t5_track_patch` 口播选区改 + `t24_imagegen` 出图配置口/自检/落盘)+ **23 个**探针/种子脚本(含 b18 搜索链六路探针);**旧声明式链的 17 份夹具与用例归档在 `.smoke/_archived_p4_declarative/`**(含 b17/b19/b21 与四条零素材样片),归档不是可跑路径,跑前先读那份 README | 依赖模型的那批带 `credit_gate()` 前置闸:额度不就绪直接 SKIP 并打印原因,不会把"账户空了"报成"代码坏了" |
 | 关键路径的钉子 | 计划门(`test_plan_gate`)· 出口中文(`test_display_outlets`)· 存储契约(`test_storage_contract` 212 项)· 渲染跟随(`test_render_follow`)· dry-run 路由(`test_dry_run_dispatch`)· 修字(`test_transcript_correction`)· 复盘(`test_plan_retrospective`)· 判断模型(`test_judge_gate`)· 代码镜契约与缓存键(`test_code_spec` 175 项:字节级幂等、闸⑦ 配额与技能正文逐行比对)· 八道闸本体(`test_code_gates` 109 项:每道判红的闸一条先证红再证绿)、闸⑧ 版面回读三态与只记账(`test_code_layout` 50 项:missing/unscanned/scanned 两两不同、畸形读数不许抛、措辞不抄常量表、layout 在缓存还原名单里)· 字段通道与闸⑥(`test_code_fields` 138 项)· 逐镜质感(`test_code_texture` 48 项)· 两条链的 HTTP 口(`test_patch_endpoints` 33 项:三口都在、点名跟着真实节点走)· 闸⑭ 动效事件密度(`test_motion_density` 27 项:三态分开、两份证据打架时以细的为准、阈值不抄第二份)· 图形通道与链无关的那批约定(`test_motion_channel` 217 项:开关名单同源、七个开关真上计划卡、契约标签走到确认卡,外加旧链下线后由它代管的六件事——出处闸的凭据语义、局部改读哪一版、命中表与代表帧发布、切片缓存的收发协议与质感滤镜、JSON 指针工具、词时间轴贴字符)· 成片入库与按会话回收(`test_session_gc` 56 项:两种 `session_id` 拼法都清、同对象键重烧只更新一行、`materials.object_key` 的保护名单护住已入库字节、在途渲染拒绝回收、开机对账幂等)· 横屏母题占比回归(`test_motif_share` 34 项:记录在案那批 `fill_span` 9%~36% 各被哪条规则接住、整帧分母会把铺满读成 68%、「实心块 31%~44% 是两条硬闸之间的已知边界」如实钉住——§9-Q88)· 镜像逐件对账的清单(`test_image_parity` 54 项:清单**现读 Dockerfile**、`.dockerignore` 六形态、`--from=` 只查存在、构建期重写的两个假阳样本必须不被挪走、运行期改写那一栏从 CMD 点名的服务入口现读「子路径两把尺」的真文件与 exports 入口各一个样本——§9-Q86/Q87/Q89) | 见各文件头的"钉住 N 件事" |
 | 提示词回归 | `tests/data/planning_round_golden.json` 金样逐字比对 + `scripts/run_eval.py` 的 prompt fingerprint | 改提示词后先跑这两个 |
 
