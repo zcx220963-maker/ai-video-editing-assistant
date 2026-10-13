@@ -18,6 +18,21 @@ from .structure import StructureChecks
 from .vocab import PlanVocabulary
 
 
+def _knob_keys_hint(fact: Mapping[str, Any]) -> str:
+    """「这个节点能上卡的开关是：…」——打回消息里回喂给模型的那半句。
+
+    为什么必须回喂（T40）：开关清单从此只在本轮计划命中该节点时才进提示段，
+    冷启动那一轮模型看不到它。模型凭印象造了一个键名时，校验器只回一句
+    「没有这个参数」，它就只剩「换个名字再猜」这一条路——真机实测那条路烧掉的是
+    一整轮迭代预算。这里把真键名一次给全；节点真的没有可上卡开关时如实说没有，
+    不给一张空清单蒙它。
+    """
+    keys = [str(k) for k in fact.get("keys") or ()]
+    if not keys:
+        return "这个节点没有能上卡的开关，"
+    return "这个节点能上卡的开关是：" + "、".join(keys) + "；"
+
+
 class PlanValidator:
     """候选计划的服务端校验：errors 非空即打回，warnings 只在卡上挂角标。"""
 
@@ -197,6 +212,7 @@ class PlanValidator:
             issues.error(f"计划 {tag} 第 {index} 步的 param_options 必须是列表。")
             return
         props = self.vocab.props_for(norm["node"])
+        hint = ""                      # 该节点真实开关清单，第一次要用时才去算（见下）
         for raw in raw_opts:
             if not isinstance(raw, Mapping):
                 issues.error(f"计划 {tag} 第 {index} 步的参数项不是对象。")
@@ -204,8 +220,15 @@ class PlanValidator:
             key = clean(raw.get("key"))
             spec = props.get(key)
             if spec is None:
+                # 打回时把**该节点真实的开关键**一并交出（T40 起这条比过去更必要）：
+                # 开关清单不再每个规划轮常发，只发本轮计划命中的那几个节点；冷启动
+                # （本会话还没有计划上下文）那一轮模型没有清单可抄，凭印象造键名时
+                # 唯一的出路不该是「再猜一次」。判据与规划段那份清单同一份
+                # （`vocab.knob_facts_for`），所以这里不会告诉它一个上不了卡的键。
+                if not hint:
+                    hint = _knob_keys_hint(await self.vocab.knob_facts_for(norm["node"]))
                 issues.error(f"计划 {tag} 第 {index} 步（{norm['node']}）没有参数「{key}」，"
-                             f"不许在卡上造这个开关；这类诉求请走「其他」。")
+                             f"不许在卡上造这个开关；{hint}这类诉求请走「其他」。")
                 continue
             options = raw.get("options")
             if not isinstance(options, list) or not options:

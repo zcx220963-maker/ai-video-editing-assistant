@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from ..prompts import render_blocks
+from .knobs import knob_facts_for_round, knob_lines
 from .support import clean, neutralize
 
 if False:  # TYPE_CHECKING
@@ -222,9 +223,10 @@ _PLANNING_TEMPLATE = """<planning_round>
 {?must_include}
 其中 {must_include} 必须**显式写进这张计划的 steps**：它们要用你传的创意决策参数，执行期不会被自动补齐——漏了这张卡会被服务端打回。
 
+{?knobs}
 {knobs}
-
 卡面开关（param_options）只能从上面这份清单里挑，值要能反查（枚举 / 布尔开关 /带界数值 / 曲库真实标签）；节点没有的能力不要造开关，用户另有诉求留给计划卡上的「其他」。
+
 节点参数**不需要也不能**再去查：执行前 Store 是空的，拿 read_node_history 猜 dag_contract / node_schema:* 这类键名只会一直报错。
 提交成功后只需简短说明各版本的思路差异并等用户确认，**不得声称已经开始剪辑或已经产出成片**。
 选哪一版、卡面开关取什么值，都由**卡上的点击**完成：不要用 ask_user 重问卡面已经在问的事（弹窗是单例，会把用户正填着的计划卡顶掉、选了一半的答案全丢），也不必写「你点选确认后我再开始」这类话——把卡交出去、等用户点即可。
@@ -289,9 +291,12 @@ async def planning_section_blocks(gate: PlanGate, *, feedback: str = "",
     节点白名单在这里给模型（机器名）：它只能从这份名单里挑，写名单外的名字
     会被四重校验打回。界面给人看的是块 A 换轨后的 ``*_display``，不在这层拼。
 
-    节点参数事实也在这段里一次给全（``gate.knob_facts()``，与卡面校验同一套判据）：
+    节点参数事实也在这段里给（``gate.knob_facts_for()``，与卡面校验同一套判据）：
     规划轮唯一的查参路径是猜 Store 键名，而执行前 Store 必空——真机实测模型为此
     连着错了六十次。不写清「不用再查」，这段提示就成了烧迭代预算的指令。
+    **但这份清单不是常驻的**（T40）：只发本轮**计划上下文命中**的那几个节点，
+    一条都没命中就一条不发（判据见 `knobs.plan_node_hits`）——此前只要白名单非空就整份发，
+    是「参数教程常发」的最后一条残留。
 
     ``prior`` 是「换一版」那张旧卡的候选：卡面步骤不在会话历史里（历史只有那一轮的
     文字摘要），不把它写进提示，模型既无从做出可辨别的差异、也常常干脆不再出卡。
@@ -302,13 +307,17 @@ async def planning_section_blocks(gate: PlanGate, *, feedback: str = "",
     """
     nodes = sorted(gate.whitelist())
     must_include = _explicit_nodes(gate)
-    facts = [f for f in await gate.knob_facts() if f["knobs"]]
+    # 「谁该发」的判据在 `plan/knobs.py`（T40）：只发本轮计划命中的那几个节点，
+    # 无命中就一条都不发（判据见 `knobs.plan_node_hits`）——这里只负责把它排进段里。
+    facts = await knob_facts_for_round(gate, nodes, prior=prior, pending=pending,
+                                       session_history=session_history,
+                                       feedback=feedback)
     note = clean(feedback)
     brief = _prior_brief(prior)
     values: dict[str, Any] = {
         "nodes": "、".join(nodes) if nodes else "（当前没有可用的剪辑节点）",
         "must_include": "、".join(must_include),
-        "knobs": "\n".join(_knob_lines(facts)),
+        "knobs": "\n".join(knob_lines(facts)),
         "has_pending_plan": bool(has_pending_plan),
         "prior_cards": "\n".join(brief),
         "feedback_quote": neutralize(note) if note else "",
@@ -344,21 +353,6 @@ def _explicit_nodes(gate: Any) -> list[str]:
         return sorted(str(n) for n in getter() if n)
     except Exception:  # noqa: BLE001 - 契约读不到只是少一句提示，不该让规划轮拼不出提示
         return []
-
-
-def _knob_lines(facts: Sequence[Mapping[str, Any]]) -> list[str]:
-    """把 ``knob_facts`` 排成提示段里的开关清单（一节点一行，机器名照旧）。"""
-    if not facts:
-        return ["（当前没有可上卡的节点参数开关：版本差异请写在 why 里，或留给「其他」）"]
-    lines = ["能上卡的开关（服务端按节点真实 schema 现取，与卡面校验同一份判据）："]
-    for fact in facts:
-        parts = []
-        for knob in fact["knobs"]:
-            tail = f"；默认 {knob['default']}" if knob["default"] else ""
-            note = f"——{knob['note']}" if knob["note"] else ""
-            parts.append(f"{knob['key']}({knob['kind']}: {knob['values']}{tail}){note}")
-        lines.append(f"· {fact['node']}：" + "｜".join(parts))
-    return lines
 
 
 def _prior_brief(prior: Sequence[Mapping[str, Any]]) -> list[str]:

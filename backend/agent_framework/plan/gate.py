@@ -101,6 +101,10 @@ class PlanGate:
     async def knob_facts(self) -> list[dict[str, Any]]:
         return await self.vocab.knob_facts()
 
+    async def knob_facts_for(self, node: str) -> dict[str, Any]:
+        """单个节点的开关事实（T40 的规划段只发本轮命中的节点，见 ``vocab.knob_facts_for``）。"""
+        return await self.vocab.knob_facts_for(node)
+
     # ---- 校验与编译：转发 ----
 
     async def validate(self, payload: Any) -> tuple[list[dict[str, Any]], PlanIssues]:

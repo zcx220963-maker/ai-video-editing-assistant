@@ -214,42 +214,58 @@ class PlanVocabulary:
         服务端（契约 + 工具声明）——模型若被提示「自己去查参数」，唯一的路径就是拿
         ``read_node_history`` 猜键名，而执行前 Store 必空，真机实测这么连着错了六十次
         也没出卡。参数由这一层直接写进提示段，模型无从猜。
+
+        T40 起这份清单**不再整批进提示段**（谁发由 ``plan/prompt.py`` 按本轮计划命中的
+        节点决定）；逐节点的那一半是 ``knob_facts_for``，两边同一套判据。
         """
-        out: list[dict[str, Any]] = []
-        for node in sorted(self.whitelist()):
-            knobs: list[dict[str, str]] = []
-            props = self.props_for(node)
-            for key in sorted(props):
-                spec = props[key]
-                if not isinstance(spec, Mapping):
-                    continue
-                source = await self.enum_source(node, key, spec)
-                if source is None:
-                    continue
-                kind, data = source
-                if kind == "number":
-                    low, high = data
-                    unit = clean(spec.get("unit"))
-                    span = "~".join("" if v is None else f"{v:g}" for v in (low, high))
-                    values = f"数值 {span or '?'}{unit}"
-                elif kind == "label":
-                    names = sorted(str(v) for v in data)
-                    values = "、".join(names[:8]) + ("…" if len(names) > 8 else "")
-                else:
-                    # 带上声明里的中文标签：模型「默认照抄」时抄到的是人话，
-                    # 而不是把 portrait 原样摆到用户面前
-                    labels = spec.get("value_labels") if isinstance(spec, Mapping) else None
-                    labels = labels if isinstance(labels, Mapping) else {}
-                    values = "、".join(
-                        f"{v} {labels.get(v, '')}".strip() for v in sorted(
-                            str(x) for x in data))
-                knobs.append({
-                    "key": key, "kind": kind, "values": values,
-                    "default": as_card_value(spec.get("default")),
-                    "note": clean(spec.get("description"))[:60],
-                })
-            out.append({"node": node, "knobs": knobs})
-        return out
+        return [await self.knob_facts_for(node) for node in sorted(self.whitelist())]
+
+    async def knob_facts_for(self, node: str) -> dict[str, Any]:
+        """**单个**节点的开关事实：``{"node": …, "knobs": [...], "keys": [...]}``。
+
+        为什么要有「只算一个节点」这个口（T40 起两个消费者都只要一个）：
+        规划轮的 ``knobs`` 段只发本轮计划命中的那几个节点，校验器打回「造了这个
+        开关」时要把该节点**真实的**开关键回喂给模型——两处都不该为了一个节点把
+        整份白名单算一遍，而 ``enum_source`` 的曲库标签那一路是真去取标签的。
+        判据仍然只有 ``enum_source`` 一份：逐个算与整批算的结果逐字一致
+        （``tests/test_plan_gate.py`` 的 ⑬ 把两边的键集对了一遍）。
+
+        ``keys`` 是校验器回喂用的键名清单，**只含 ``enum_source`` 真认得的键**（枚举 /
+        布尔 / 带界数值 / 曲库标签四类之一）；不额外算一遍，就是上面那批 ``knobs``。
+        """
+        knobs: list[dict[str, str]] = []
+        props = self.props_for(node)
+        for key in sorted(props):
+            spec = props[key]
+            if not isinstance(spec, Mapping):
+                continue
+            source = await self.enum_source(node, key, spec)
+            if source is None:
+                continue
+            kind, data = source
+            if kind == "number":
+                low, high = data
+                unit = clean(spec.get("unit"))
+                span = "~".join("" if v is None else f"{v:g}" for v in (low, high))
+                values = f"数值 {span or '?'}{unit}"
+            elif kind == "label":
+                names = sorted(str(v) for v in data)
+                values = "、".join(names[:8]) + ("…" if len(names) > 8 else "")
+            else:
+                # 带上声明里的中文标签：模型「默认照抄」时抄到的是人话，
+                # 而不是把 portrait 原样摆到用户面前
+                labels = spec.get("value_labels") if isinstance(spec, Mapping) else None
+                labels = labels if isinstance(labels, Mapping) else {}
+                values = "、".join(
+                    f"{v} {labels.get(v, '')}".strip() for v in sorted(
+                        str(x) for x in data))
+            knobs.append({
+                "key": key, "kind": kind, "values": values,
+                "default": as_card_value(spec.get("default")),
+                "note": clean(spec.get("description"))[:60],
+            })
+        return {"node": node, "knobs": knobs,
+                "keys": [k["key"] for k in knobs]}
 
     async def _external(self, node: str, key: str) -> list[str]:
         if self._extra_options is None:
