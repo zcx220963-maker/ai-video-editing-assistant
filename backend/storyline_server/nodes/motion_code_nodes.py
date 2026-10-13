@@ -416,6 +416,19 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         # 重算就会出现「判的时候 0.97、报的时候 0.99」这种两把尺。
         av = dict(out.get("av_accounting") or {})
         av_warns = list(av.get("warnings") or [])
+        # 闸⑲-a 的账（T30）：三个原始占比逐镜摊开 + 两个出口（提醒/未判）。
+        subj = dict(out.get("subject_presence") or {})
+        subj_shots = dict(subj.get("shots") or {})
+        subj_warns = list(subj.get("warnings") or [])
+        subj_undet = list(subj.get("undetermined") or [])
+        subj_measured = {sid: r for sid, r in subj_shots.items()
+                         if r.get("subject_share") is not None}
+        subj_tight = {sid: r for sid, r in subj_shots.items()
+                      if r.get("subject_share") is not None
+                      and float(r["subject_share"]) < float(subj.get("min_bbox") or 0)}
+        subj_tight_txt = "、".join(
+            "{0} {1:.0f}%".format(sid, float(row["subject_share"]) * 100)
+            for sid, row in subj_tight.items())
         per_shot_ms = [float((r.get("render_timings") or {}).get("per_frame_ms") or 0.0)
                        for r in burned]
 
@@ -540,6 +553,23 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                       "语音之后的余量，否则话被淡掉半句。量不到电平的那一档记"
                       "「未判」并按 UNVERIFIED 交出——未判不是通过"
                 if av else "这一趟渲染没有回传音画账（旧版本地缓存？）"),
+            _ev(f"闸⑲-a 画面主体在场（几何那一半，**不需要任何模型**）："
+                f"{len(subj_measured)}/{len(spec['shots'])} 镜量到了主体件占带的多少"
+                + (f"，最小 {min(r['subject_share'] for r in subj_measured.values()) * 100:.0f}%"
+                   f"（线 {float(subj.get('min_bbox') or 0) * 100:.0f}%）"
+                   if subj_measured else "（一镜都没量到——见下面的未判栏）")
+                + (f"；主体偏小的镜：{subj_tight_txt}" if subj_tight else ""),
+                "machine",
+                verified=(bool(subj_measured) and not subj_tight and not subj_undet
+                          and len(subj_measured) == len(spec["shots"])),
+                proof="判在**产物上**：母版在探针帧上把画得出图形的元素（SVG 形状 / 位图 / "
+                      "三维画布——**涂了底色的 div 不算**，那正是「卡片」本身）框成并集外接盒，"
+                      "与画面带相交后除以带面积。与闸⑳(a) 联合判：主体 <"
+                      f"{float(subj.get('min_bbox') or 0) * 100:.0f}% 且文字 >"
+                      f"{float(subj.get('text_dominant') or 0) * 100:.0f}% 才是「卡片+文字」，"
+                      "单踩一条只提醒——满屏大字配小图标的封面镜不该被这条拦住。"
+                      "读数取不到的那一档记未判（不是通过）"
+                if subj else "这一趟渲染没有回传主体读数（旧版本地缓存？）"),
             _ev(f"闸⑨ 跨镜同构：{len(spec['shots'])} 镜里"
                 + (f"有 {len(facts['same_shape_groups'])} 组代码结构几乎一样（"
                    + "；".join("、".join(g) for g in facts["same_shape_groups"]) + "）"
@@ -759,6 +789,15 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             # 未判档单列（T28）：与 style_warnings 分开是这一条的**全部意思**——
             # 看一眼这两个键的读者必须能立刻分出「不达标但出得来」与「没人量过」。
             "style_unjudged": list(style_unjudged),
+            # 闸⑲-a 的账（T30）：逐镜三个原始占比 + 提醒/未判两个出口。取证用它，
+            # 前端用它，⑳(a) 也读这一份（不再各算一遍）。
+            "subject_presence": {
+                "min_bbox": subj.get("min_bbox"),
+                "text_dominant": subj.get("text_dominant"),
+                "shots": subj_shots,
+                "warnings": subj_warns,
+                "undetermined": subj_undet,
+            },
             "fill_warnings": [f"{sid}：内容只铺开画面带短边的 {spans[sid] * 100:.0f}%"
                               f"（目标 {int(code_render.FILL_TARGET * 100)}%）"
                               for sid in tight],

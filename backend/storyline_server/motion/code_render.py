@@ -554,7 +554,10 @@ def summarize_layout(shot_id: str, layout_used: Any) -> dict[str, Any]:
                 "thresholds": _thresh(layout_used.get("thresholds")),
                 "reason": str(layout_used.get("reason") or "母版没扫这一帧")}
     return {"shot": shot_id, "status": "scanned", "findings": findings,
-            "scanned": {k: scanned.get(k) for k in ("texts", "leaders", "drawn", "dropped")},
+            "scanned": {k: scanned.get(k) for k in ("texts", "leaders", "drawn", "dropped",
+                                                    # 闸⑲-a / ⑳(a) 的两个读数（T30）：母版量、
+                                                    # 这一层只搬，判在 code_spec。
+                                                    "subjects", "subject_share", "text_share")},
             "band": scanned.get("band") if isinstance(scanned.get("band"), Mapping) else None,
             "thresholds": _thresh(layout_used.get("thresholds")),
             "frame": layout_used.get("frame"), "reason": None}
@@ -1283,6 +1286,28 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
         raise MediaError("闸⑰ 声画对账未通过，母带还没开始（一帧都没拼）：\n"
                          + "\n".join(f"  · {e}" for e in av_errors))
 
+    # ---- 闸⑲-a 画面主体在场（R8-T30）：也是判在拼接之前 ----
+    # 读数来自每一镜烧完之后母版的版面回读（闸⑧ 那条通道顺路带回的两个数），所以这一道
+    # 只能在**产物上**判；但判的地方仍然放在拼接之前——「这一镜画面上是卡片+文字」是
+    # 逐镜的事，拼完再判等于让整片白拼一次。
+    subject_scanned = {str(r["id"]): r.get("layout") for r in ledger}
+    sub_errors, sub_warns, sub_undet = cspec.check_subject_present(
+        spec["shots"], scanned=subject_scanned)
+    if sub_errors:
+        raise MediaError("闸⑲-a 画面主体在场未通过，母带还没开始（一帧都没拼）：\n"
+                         + "\n".join(f"  · {e}" for e in sub_errors))
+    # 回执上的读数：逐镜三个原始值（母版量的），取证要的是数不是「过了」。
+    subject_readings: dict[str, dict[str, Any]] = {}
+    for i, s in enumerate(spec["shots"]):
+        row = subject_scanned.get(str(s.get("id") or f"s{i + 1:02d}")) or {}
+        sc = row.get("scanned") if isinstance(row.get("scanned"), Mapping) else {}
+        subject_readings[str(s.get("id") or f"s{i + 1:02d}")] = {
+            "subjects": (sc or {}).get("subjects"),
+            "subject_share": (sc or {}).get("subject_share"),
+            "text_share": (sc or {}).get("text_share"),
+            "status": row.get("status"),
+        }
+
     await asyncio.to_thread(mediaops.concat, clips, master, fps=fps, transition=plan)
     total = float(mediaops.probe(master)["duration"])
     not_taken = cspec.check_transition_effect([sec for _, sec in shot_secs], total,
@@ -1349,6 +1374,16 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
                               if planned_film_sec > 0 else None),
                 "voice_tails": {sid: round(t, 3) for sid, t in voice_tails},
                 "warnings": list(av_warns),
+            },
+            # 闸⑲-a 的读数（T30）：逐镜两个原始占比 + 三个出口。取证要的是**原始读数**，
+            # 不是「过了」。未判那一档（母版没回读到）在这里是 status != scanned，
+            # 与「量到了、很小」不是同一句话。
+            "subject_presence": {
+                "min_bbox": cspec.SUBJECT_MIN_BBOX,
+                "text_dominant": cspec.TEXT_DOMINANT_SHARE,
+                "shots": subject_readings,
+                "warnings": list(sub_warns),
+                "undetermined": list(sub_undet),
             },
             "degraded": [f"{r['id']}：{r['degraded']}" for r in ledger if r["degraded"]],
             # 闸④ 两半的读数留在返回里：定 EMPTY_MIN_RATIO / SPAN_MIN 终值要的是

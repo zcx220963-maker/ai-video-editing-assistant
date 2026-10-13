@@ -515,6 +515,47 @@ function lineEnds(el: Element): [{ x: number; y: number }, { x: number; y: numbe
   return p0 && p1 ? [p0, p1] : null;
 }
 
+/** 闸⑲-a 的**主体件**：画得出**图形**的那几类元素（SVG 形状 / 位图 / 三维画布）。
+
+ *  纯 `<div>` 加背景色**不算**，这一条是判据的命门：卡片就是一张涂了底色的 div，
+ *  把 div 算进主体，等于这条闸自己把要拦的东西放行（「卡片+文字」镜会绿得非常稳）。
+ *  同一口径也写在 Python 侧（`code_spec._VECTOR_MARKUP_RE` 那句「色块不是图形主体」）。
+ *  这里只报**读数**（个数与包围盒占比），阈值归 Python——这条链的规矩是「母版报原始
+ *  读数、判据与数字在 Python 一处」，两边各写一个 0.18 就会出现两把尺。
+ */
+const SUBJECT_TAGS = new Set([
+  'path', 'rect', 'circle', 'ellipse', 'polygon', 'polyline', 'line',
+  'canvas', 'img', 'video',
+]);
+
+function subjectBoxes(root: Element, convert: Convert): PxBox[] {
+  const out: PxBox[] = [];
+  for (const el of Array.from(root.querySelectorAll('*'))) {
+    if (!SUBJECT_TAGS.has(el.tagName.toLowerCase())) continue;
+    if (!paintedWithin(root, el)) continue;
+    const raw = measureBox(el);
+    if (!raw || raw.w < 1 || raw.h < 1) continue;
+    out.push(convert(raw));
+  }
+  return out;
+}
+
+/** 一组盒的**并集外接盒**与画面带相交之后，占带面积的比例（0~1）。
+ *
+ *  为什么取并集外接盒而不是并集面积：判据问的是「主体件铺开了多大一片画面」，
+ *  而不是「主体的墨水占了多少面积」——一只描边的圆，墨水占比接近 0，但它确实
+ *  占了画面里很大一块。两条口径给出的数差一个数量级，取哪个必须先说清楚。
+ */
+function shareOfBoxes(boxes: PxBox[], band: PxBox): number {
+  if (!boxes.length || band.w <= 0 || band.h <= 0) return 0;
+  const x = Math.max(band.x, Math.min(...boxes.map((b) => b.x)));
+  const y = Math.max(band.y, Math.min(...boxes.map((b) => b.y)));
+  const right = Math.min(band.x + band.w, Math.max(...boxes.map((b) => b.x + b.w)));
+  const bottom = Math.min(band.y + band.h, Math.max(...boxes.map((b) => b.y + b.h)));
+  if (right <= x || bottom <= y) return 0;
+  return ((right - x) * (bottom - y)) / (band.w * band.h);
+}
+
 /** 母版在探针帧上做一次版面回读。
  *
  *  `convert` 把这一帧量到的屏幕盒折回**成片像素**（见 :func:`toCodeSpace`）：
@@ -582,6 +623,9 @@ function probeLayout(root: Element, band: PxBox, convert: Convert) {
     Math.round(LAYOUT_PROBE.anchor_ratio * Math.min(band.w, band.h)),
   );
   const drawn = drawnBoxes(root, convert);
+  // 闸⑲-a / ⑳(a) 的两个读数（T30）：主体件占带多少、文字占带多少。判据在 Python，
+  // 这里只把这一帧量到的两个数如实报上去（量不到就是 0，别编一个「差不多」的数）。
+  const subject = subjectBoxes(root, convert);
   const nearText = (p: { x: number; y: number }) => texts.find((t) => distToBox(p, t.box) <= anchor) ?? null;
   /** 落点判「挨着画得出的东西」——**这条线自己不算**：它的端点天然落在自己的盒上。 */
   const nearDrawn = (p: { x: number; y: number }, self: Element) =>
@@ -628,6 +672,10 @@ function probeLayout(root: Element, band: PxBox, convert: Convert) {
       drawn: drawn.length,
       band: { w: Math.round(band.w), h: Math.round(band.h) },
       dropped,
+      // 闸⑲-a / ⑳(a)：主体件个数与两个占比（原始读数，阈值在 Python）。
+      subjects: subject.length,
+      subject_share: Math.round(shareOfBoxes(subject, band) * 10000) / 10000,
+      text_share: Math.round(shareOfBoxes(texts.map((t) => t.box), band) * 10000) / 10000,
     },
   };
 }

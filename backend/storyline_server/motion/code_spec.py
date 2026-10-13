@@ -1274,6 +1274,105 @@ def check_subject_named(shots: list[dict[str, Any]]) -> tuple[list[str], list[st
     return errors, []
 
 
+# ---------------------------------------------------------------------------
+# 闸⑲-a 画面主体在场（T30）：几何那一半，不需要任何模型
+# ---------------------------------------------------------------------------
+
+#: 主体件（画得出**图形**的那几类元素：SVG 形状 / 位图 / 三维画布）的并集外接盒
+#: 至少要占画面带的这一比例。数字的来源与 ⑳(a) 同一处：2026-10-11 那批片子上
+#: 「画了个东西但画面仍旧是卡片+文字」的镜，主体件占比实测都在 0.1 以下。
+SUBJECT_MIN_BBOX = 0.18
+
+#: 文字占带的这一比例以上算「文字主导画面」。与 :data:`SUBJECT_MIN_BBOX` **联合**判
+#: 才是「卡片+文字」那条退化形态（⑳(a)）：单独一条都拦不住合法片子——满屏大字配一只
+#: 小图标的封面镜、以及只有一行字的过渡镜，各自只踩其中一条。
+TEXT_DOMINANT_SHARE = 0.45
+
+
+def check_subject_present(shots: list[dict[str, Any]], *,
+                          scanned: Mapping[str, Any] | None = None
+                          ) -> tuple[list[str], list[str], list[str]]:
+    """闸⑲-a：这一镜画面上**真有一个铺得开的主体**吗。→ (打回, 提醒, 未判)。
+
+    这一道判的是**几何**，读的是母版在探针帧上量的两个原始读数（闸⑧ 那条回读通道
+    顺路带回来的）：``subject_share``（主体件并集外接盒 ∩ 画面带 ÷ 带面积）与
+    ``text_share``（文字盒同理）。判据在**产物上**——代码里写了 `rough.generator(...)`
+    与画面上真有一片占了 18% 的图形，是两件事（画到带外、尺寸算成 0、被裁光都算）。
+
+    **为什么元素那一半不在这里重数一遍**：`shot_used_channels` 已经要求「import 了还得
+    真用得上」，⑦ 与 ⑯ 因此早把「代码里一个 roughjs 都没有」这一档拦在烧像素之前了；
+    在这里再数一遍等于把一个已有判据抄成第二个（本仓踩过三次的清单漂移）。
+    ⑲-a 只补**没人管的那一格**：屏幕上那个东西到底铺开了多大一片。
+
+    两条硬判据（都是**联合**判，单条都会误伤合法片子）：
+
+    1. 主体件占比 < :data:`SUBJECT_MIN_BBOX` **且** 文字占比 > :data:`TEXT_DOMINANT_SHARE`
+       → 「卡片+文字」。这是 ⑳(a) 那条退化形态，判据只此一处（⑳ 的账读它的结果）。
+    2. 申报了 `subject_channel`（即模型说这镜画了图形主体）而屏幕上 ``subjects == 0``
+       → 主体是**空壳**：代码写了、画面上没有。⑯ 查代码、⑲-b 查认不认得出，这一格
+       是它们之间的缝。
+
+    只踩第一条一半的（主体小、文字也不多）落**提醒**：那是「构图小气」，归 ④ 的
+    `fill_span` 与技能正文的目标值，不由这里打回。
+
+    读数取不到（母版没回读、或这一镜没扫）→ **未判**（第三个出口）。这条尤其重要：
+    把「没量到」写成「量到了、很小」会让这条闸恰好在它该响的时候闭嘴。
+    """
+    errors: list[str] = []
+    warns: list[str] = []
+    undetermined: list[str] = []
+    readings = scanned or {}
+    for i, s in enumerate(shots):
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        head = f"闸⑲-a 主体在场：{sid}："
+        got = readings.get(sid) if isinstance(readings, Mapping) else None
+        got = got if isinstance(got, Mapping) else None
+        declared = str(s.get("subject_channel") or "").strip().lower()
+        if got is None or got.get("status") != "scanned":
+            undetermined.append(
+                f"{head}这一镜的版面没回读到（闸⑧ 那一趟没扫成），⑲-a 的几何读数"
+                f"因此**没有量过**——未判不是通过")
+            continue
+        sc = got.get("scanned") if isinstance(got.get("scanned"), Mapping) else {}
+        subj = _as_float(sc.get("subject_share"))
+        text = _as_float(sc.get("text_share"))
+        count = sc.get("subjects")
+        if subj is None or text is None:
+            undetermined.append(
+                f"{head}母版这一趟没带 ⑲-a 的两个读数（镜像里的母版比这条链旧），"
+                f"这一格**没量过**——未判不是通过")
+            continue
+        if isinstance(count, int) and count == 0 and declared:
+            _err(errors, f"{head}这一镜申报了 subject_channel={declared}，而**画面上**"
+                         f"一个主体件都没有（母版数出来的图元数=0）——代码写了不等于画出来了，"
+                         f"主体是空壳。把它画到 `useBody()` 报回来的那条带子里、给它一个"
+                         f"能读出的尺寸，或者这一镜本来就没画图形，就把 subject_channel 去掉")
+            continue
+        if subj < SUBJECT_MIN_BBOX and text > TEXT_DOMINANT_SHARE:
+            _err(errors, f"{head}画面主体只占了带的 {subj * 100:.0f}%（线 "
+                         f"{SUBJECT_MIN_BBOX * 100:.0f}%），文字却铺了 {text * 100:.0f}%"
+                         f"（线 {TEXT_DOMINANT_SHARE * 100:.0f}%）——这就是「卡片+文字」："
+                         f"图元数 {count}，但画面上真正占地方的是字。把主体放大到撑起画面"
+                         f"（技能正文「画面丰富度合同」给的目标是短边的六成，"
+                         f"那个数在 `code_render.FILL_TARGET` 一处），"
+                         f"或者把这一镜的分工改成「画图为主、字为辅」")
+            continue
+        if subj < SUBJECT_MIN_BBOX:
+            warns.append(
+                f"{head}主体件只占了带的 {subj * 100:.0f}%（目标 "
+                f"{SUBJECT_MIN_BBOX * 100:.0f}% 以上），文字 {text * 100:.0f}%——"
+                f"还没到「卡片+文字」那一档，但主体偏小，看一眼构图")
+    return errors, warns, undetermined
+
+
+def _as_float(value: Any) -> float | None:
+    """读数只认真数：``None``/字符串/``bool`` 一律算「没量到」（``bool`` 是 ``int`` 子类，
+    真值会悄悄变成 1.0——那正是「没量到被写成量到了」的一种）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 #: 抽象词那条打回理由里给的改写示范——**刻意给一个器物**，因为真机上模型被拦之后
 #: 最常见的反应是把抽象词换个近义词（「理念」→「观念」），而不是去画一个东西。
 _SUBJECT_HINT = "活字盘"

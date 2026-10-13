@@ -118,6 +118,32 @@ const CASES = [
     code: shot(`        <Box x={760} y={300} w={300} h={90}>被切掉的长标签文字</Box>`),
     expect: { kinds: ['clipped'], side: 'right', pxMin: 100, pxMax: 140 },
   },
+  // ---- R8-T30：⑲-a 的两个读数必须是真的（判据在 Python，这里只验读数）----
+  {
+    name: '主体件铺开（⑲-a 读数必须大）',
+    // 一个半径 300 的圆落在带中央：并集外接盒 600×600 = 360000，带 936×1524 = 1426464
+    // → ≈0.25，过 0.18 那条线。判的是「母版真把 SVG 形状量进去了」。
+    code: shot(`        <svg width={body.w} height={body.h}
+                             style={{ position: 'absolute', left: 0, top: 0 }}>
+          <circle cx={468} cy={762} r={300} fill="none" stroke={TOKENS.ink} strokeWidth={6} />
+        </svg>`),
+    expect: { kinds: [], subjectMin: 0.18 },
+  },
+  {
+    name: '卡片+文字（⑲-a 读数必须小：div 不算主体）',
+    // 一整块渐变底板 + 四处文字，**一个 SVG 形状都没有**。读数必须是小的那一档——
+    // 把涂了底色的 div 算进主体，这一支就会报出接近 1 的占比，「卡片+文字」从此绿得非常稳。
+    code: shot(`        <div style={{ position: 'absolute', left: 60, top: 60, width: 816,
+                      height: 1404,
+                      background: 'linear-gradient(180deg, rgba(20,20,24,0.9), rgba(20,20,24,0.9))' }} />
+        <Box x={140} y={140} w={640} h={140}>第一步：先说清结论</Box>
+        <Box x={140} y={520} w={640} h={140}>第二步：再给一个数</Box>
+        <Box x={140} y={900} w={640} h={140}>第三步：最后收一句</Box>
+        <Box x={140} y={1280} w={640} h={150}>这几行字就是全部画面</Box>`),
+    // 两个读数要落在**被判据拒掉的那一格**上：主体 0（<0.18）且文字 >0.45。
+    // 构造得刚刚好只说明夹具会写数，落在那一格才说明这道闸真有东西可判。
+    expect: { kinds: [], minTexts: 4, subjectMax: 0.17, textMin: 0.45 },
+  },
 ];
 
 const post = async (p, payload) => {
@@ -195,6 +221,25 @@ for (const c of CASES) {
   if (c.expect.minDrawn != null) {
     say(lay.scanned.drawn >= c.expect.minDrawn,
         `扫到 ≥${c.expect.minDrawn} 个画得出的图元（实得 ${lay.scanned.drawn}）`);
+  }
+  // 闸⑲-a / ⑳(a) 的两个读数（R8-T30）：这里钉的是**读数本身是真的**——
+  // 判据在 Python（阈值在 code_spec），母版这一侧只负责量。读数为 undefined
+  // 就是「母版没带这一栏」，与「量出来是 0」必须分开报，所以下面两句都用
+  // `Number.isFinite` 而不是 `!= null`。
+  if (c.expect.subjectMin != null) {
+    const s = lay.scanned.subject_share;
+    say(Number.isFinite(s) && s >= c.expect.subjectMin,
+        `主体件占带 ≥${c.expect.subjectMin}（实得 ${s}，图元数 ${lay.scanned.subjects}）`);
+  }
+  if (c.expect.subjectMax != null) {
+    const s = lay.scanned.subject_share;
+    say(Number.isFinite(s) && s <= c.expect.subjectMax,
+        `主体件占带 ≤${c.expect.subjectMax}（实得 ${s}，图元数 ${lay.scanned.subjects}）`);
+  }
+  if (c.expect.textMin != null) {
+    const t = lay.scanned.text_share;
+    say(Number.isFinite(t) && t >= c.expect.textMin,
+        `文字占带 ≥${c.expect.textMin}（实得 ${t}）`);
   }
   // 悬空那条必须落在**带内坐标**：末端 (800,1300) 与变换组那条 (≈800,≈1300)
   const d = (lay.findings || []).find((f) => f.kind === 'dangling');
