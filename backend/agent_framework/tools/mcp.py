@@ -9,20 +9,36 @@
 链路：  MCPConfig(文件) → MCPClient(transport) → tools/list → 逐个包成 MCPTool 注册进 Registry
                                                                  tools/call → 结果回填 LLM
 
-可测试 / 可换后端：MCPClient 只依赖注入的 transport（JSON-RPC 一问一答），验证脚本
-用 FakeTransport 即可跑通，不需要真实 Server；生产用 stdio / streamableHttp transport。
-零第三方依赖：JSON-RPC 用标准库手写；YAML 只实现配置所需的最小子集并做 ${ENV} 展开。
+可测试 / 可换后端：MCPClient 只依赖注入的 transport（**操作级**接缝：open / list_tools /
+call_tool / reset / close），验证脚本用假会话即可跑通，不需要真实 Server；生产的三种
+transport（stdio / streamableHttp / sse）都是官方 `mcp` 包的薄适配（R10-T44）。
+
+本仓仍然自持的只剩**配置**那一侧：YAML 最小子集与 ${ENV} 展开（它为什么不换库、金样在哪，
+见 §3.6 与 tests/test_handrolled_goldens.py）。**协议侧不再手写**——JSON-RPC 报文、
+SSE 的 `data:` 行、mcp-session-id 的来回传递，全部交给官方客户端（R10-T44 之前它们都
+是本仓的代码，这也正是 P30 记的那笔账）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, AsyncIterator, Mapping, Protocol, Sequence
+
+# 官方 MCP 客户端（R10-T44）。**这三个传输入口就是「协议侧不再手写」的全部依据**：
+# 报文、SSE 解析、会话头都在它们肚子里。
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.sse import sse_client
+from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamablehttp_client
+from mcp.shared.exceptions import McpError
+from mcp.types import Implementation
 
 from ..editing_contract import EditingContract, NodeContract
 from ..identity import current_identity
@@ -227,163 +243,45 @@ def _split_flow(inner: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
-# 传输层：JSON-RPC 一问一答的抽象 + 具体实现
+# 传输层：官方 mcp 包的薄适配（R10-T44）
 # --------------------------------------------------------------------------
+#
+# 迁移之前，这一节是本仓**手写**的 JSON-RPC：自己拼 initialize / tools/list /
+# tools/call 的报文、自己扫 SSE 的 `data:` 行、自己把 mcp-session-id 传回去。
+# 这类手写件会与官方实现各自演进（P30 记的就是这笔账），所以改成官方 `mcp` 包
+# 客户端那一半的薄适配层。
+#
+# **换掉的是接缝底下的实现，不是接缝上面那三件。** 下面这个 Protocol 从「JSON-RPC
+# 报文级」改成「操作级」——报文既然交给官方库去拼，接缝上就没法再谈报文了。而
+# MCPTool 拿到的工具定义、execute 的身份覆写、enabled_tools 白名单，全都在上面那一层，
+# 一行未动：适配层把 SDK 的 pydantic 对象 dump 回**与迁移前逐键相同**的 dict。
+#
+# 一条硬约束写在最前面（探针量出来的，不是设计偏好）：SDK 的 client 上下文管理器是
+# anyio 取消作用域，**在哪个任务进就得在哪个任务出**——跨任务退出会当场
+#   RuntimeError: Attempted to exit cancel scope in a different task than it was entered in
+# 而本仓的连接发生在**装配任务**、工具调用发生在 **agent run 任务**，两者不是同一个。
+# 跨任务**调用** session.* 本身是安全的（探针：六问并发无串台；外层 wait_for 掐断一次
+# 之后会话仍然可用）。于是形状只剩一种：
+#
+#     一个长驻任务自持 SDK 上下文（自己进、自己出），别的任务只调 session.*。
+#
+# 这不是为了好看——它是唯一能同时满足「用官方库」和「本仓连接/调用跨任务」的形状。
 
-class MCPTransport(Protocol):
-    """把一条 JSON-RPC 请求发往 Server 并取回响应 dict。"""
+#: 建连 + 握手（``open``）的默认上限（秒）。
+CONNECT_TIMEOUT = 30.0
 
-    async def request(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]: ...
+#: 交给 SDK 的「流上多久没有新事件算断」阈值。刻意拉到远大于任何 ``tool_timeout``：
+#: **超时的唯一裁判是本层的 ``asyncio.wait_for``**（它认得出超时、且认出来就不重发，
+#: 见 ``_is_timeout``）。底下再挂一个看不见的定时器，只会多出一种措辞不同的超时错误。
+STREAM_READ_TIMEOUT = 3600.0
 
-    async def notify(self, payload: dict[str, Any]) -> None: ...
+#: 收尾时等长驻任务自己退出的上限；超了就取消它。
+_CLOSE_TIMEOUT = 5.0
 
-    async def close(self) -> None: ...
-
-
-class StdioTransport:
-    """stdio：拉起本地 Server 子进程，按行分隔的 JSON-RPC 经 stdin/stdout 通信。"""
-
-    def __init__(self, command: str, args: list[str], env: dict[str, str] | None = None) -> None:
-        self._argv = [command, *args]
-        self._env = env
-        self._proc: Any = None
-
-    async def start(self) -> None:
-        full_env = dict(os.environ)
-        if self._env:
-            full_env.update({k: _expand_env(v) for k, v in self._env.items()})
-        self._proc = await asyncio_create_subprocess(
-            self._argv, full_env
-        )
-
-    async def request(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
-        import asyncio
-
-        if self._proc is None:
-            await self.start()
-        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-        self._proc.stdin.write(data)
-        await self._proc.stdin.drain()
-        line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=timeout)
-        if not line:
-            raise RuntimeError("MCP stdio Server 关闭了输出流")
-        return json.loads(line.decode("utf-8"))
-
-    async def notify(self, payload: dict[str, Any]) -> None:
-        if self._proc is None:
-            await self.start()
-        self._proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-        await self._proc.stdin.drain()
-
-    async def close(self) -> None:
-        if self._proc is not None:
-            try:
-                self._proc.stdin.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._proc.terminate()
-            self._proc = None
-
-
-async def asyncio_create_subprocess(argv: list[str], env: dict[str, str]) -> Any:
-    import asyncio
-
-    return await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-        env=env,
-    )
-
-
-# HTTP 传输：可注入一个 async/sync 的 fetcher，默认用标准库 urllib，避免强依赖。
-HttpFetcher = Callable[[str, dict[str, str], dict[str, Any], float], Any]
-
-
-class StreamableHttpTransport:
-    """streamableHttp：向 url POST 一条 JSON-RPC，取回 JSON 响应。
-
-    遵守 MCP Streamable HTTP 规范：Accept 同时声明 json 与 SSE；initialize
-    响应头里的 mcp-session-id 会携带在后续请求/通知中；notification 以无 id
-    POST 投递（202 空响应）。fetcher 可注入：返回 dict 即纯 JSON-RPC 响应
-    （测试替身兼容），返回 (dict, headers) 元组则同时回传响应头。
-    """
-
-    def __init__(self, url: str, headers: dict[str, str] | None = None,
-                 fetcher: HttpFetcher | None = None) -> None:
-        self._url = url
-        self._headers = {"content-type": "application/json",
-                         "accept": "application/json, text/event-stream",
-                         **(headers or {})}
-        self._fetcher = fetcher or _urllib_fetcher
-        self._session_id = ""
-
-    async def request(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
-        import asyncio
-
-        headers = {k: _expand_env(v) for k, v in self._headers.items()}
-        if self._session_id:
-            headers["mcp-session-id"] = self._session_id
-        if asyncio.iscoroutinefunction(self._fetcher):
-            result = await self._fetcher(self._url, headers, payload, timeout)
-        else:
-            result = await asyncio.to_thread(
-                self._fetcher, self._url, headers, payload, timeout)
-        if isinstance(result, tuple):
-            body, resp_headers = result
-            lowered = {str(k).lower(): v for k, v in (resp_headers or {}).items()}
-            if payload.get("method") == "initialize" and lowered.get("mcp-session-id"):
-                self._session_id = lowered["mcp-session-id"]
-            return body or {}
-        return result or {}
-
-    async def notify(self, payload: dict[str, Any]) -> None:
-        # 通知必须真正送达（initialized 通知完成握手）；服务端回 202 空体。
-        await self.request(payload, timeout=15)
-
-    async def close(self) -> None:
-        return None
-
-
-def _parse_rpc_body(raw: str, ctype: str) -> dict[str, Any]:
-    """JSON / SSE(text/event-stream) 双模响应体 → JSON-RPC 响应 dict。"""
-    raw = (raw or "").strip()
-    if not raw:
-        return {}
-    if "text/event-stream" in ctype or raw.startswith(("event:", "data:")):
-        for line in raw.splitlines():
-            if line.startswith("data:"):
-                chunk = line[5:].strip()
-                if chunk and chunk != "[DONE]":
-                    try:
-                        obj = json.loads(chunk)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(obj, dict) and ("result" in obj or "error" in obj):
-                        return obj
-        return {}
-    return json.loads(raw)
-
-
-def _urllib_fetcher(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float) -> Any:
-    import urllib.request
-
-    req = urllib.request.Request(
-        url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers, method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        raw = resp.read().decode("utf-8", "replace")
-        ctype = (resp.headers.get("content-type") or "").lower()
-        return _parse_rpc_body(raw, ctype), dict(resp.headers.items())
-
-
-# --------------------------------------------------------------------------
-# MCP 客户端：initialize / tools/list / tools/call
-# --------------------------------------------------------------------------
-
-PROTOCOL_VERSION = "2024-11-05"
+#: 握手时自报的客户端身份。原先挂在 ``MCPClient(client_name=...)`` 上，即「谁连的」
+#: 记在客户端对象上；现在上线报文由 transport 里的 SDK 会话发，身份就跟着挪到 transport。
+CLIENT_INFO_NAME = "creation-assistant"
+CLIENT_INFO_VERSION = "0.1"
 
 
 class MCPError(RuntimeError):
@@ -395,7 +293,7 @@ def _is_timeout(exc: BaseException) -> bool:
 
     两者必须区别对待：连接断了重建会话重发一次是对的；**超时**重发等于让服务端
     把同一段长活（asr / 画面理解）整段再跑一遍——时间与 API 费用翻倍，
-    用户等更久还拿不到结果。超时只该如实上报。
+    用户等更久还拿不到更早的结果。超时只该如实上报。
     """
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
         return True
@@ -406,54 +304,296 @@ def _is_timeout(exc: BaseException) -> bool:
     return "timed out" in text or "timeout" in text
 
 
+class MCPTransport(Protocol):
+    """一条到 MCP Server 的**操作级**接缝：建会话 / 列工具 / 调工具 / 丢弃 / 关闭。
+
+    为什么是操作级而不是原来的报文级（``request(payload, timeout)``）：报文一旦由官方
+    库来拼，接缝上就没法再谈报文了——留着它只会变成「假报文 → 真报文」的翻译层，比手写
+    那一版还多一层。测试替身也随之从「假服务端」变成「假会话」：它答的是「列出来是哪些
+    工具 / 这次调用返回什么」，而不是「第几条 JSON-RPC 长什么样」。
+    """
+
+    async def open(self, timeout: float) -> dict[str, Any]:
+        """建立会话并握手；已建立则直接返回（幂等）。返回值是握手响应（可为空 dict）。"""
+        ...
+
+    async def list_tools(self, timeout: float) -> list[dict[str, Any]]: ...
+
+    async def call_tool(self, name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]: ...
+
+    async def reset(self) -> None:
+        """丢弃当前会话（下次 ``open`` 重建）。真·断线时由 ``MCPClient`` 调。"""
+        ...
+
+    async def close(self) -> None: ...
+
+
+def _tool_def(tool: Any) -> dict[str, Any]:
+    """SDK 的 ``Tool`` 对象 → 与迁移前**逐键相同**的 dict。
+
+    为什么坚持 dump 回 dict，而不是让下游改读对象：``MCPTool`` 读的是
+    ``tool_def.get("inputSchema")`` 与 ``annotations.readOnlyHint``，``register_mcp_tools``
+    读的是 ``td["name"]``——那几行正是 T44 点名「必须原样保留」的三件。**下游一行不改**，
+    这三件就不可能被这次迁移弄断（而不是「小心一点应该不会断」）。
+    """
+    if isinstance(tool, dict):
+        return tool                      # 测试替身可以直接给 dict
+    return tool.model_dump(by_alias=True, exclude_none=True)
+
+
+def _result_dict(result: Any) -> dict[str, Any]:
+    """``CallToolResult`` → dict：``content`` / ``isError`` 两个键与迁移前一致。"""
+    if isinstance(result, dict):
+        return result
+    return result.model_dump(by_alias=True, exclude_none=True)
+
+
+class _SDKTransport:
+    """三种 type 共用的骨架：一个长驻任务自持 SDK 会话，外面只调 ``session.*``。
+
+    子类唯一要做的事是 ``_connector()``——把配置变成一个产出 SDK ``(read, write)`` 的
+    ``@asynccontextmanager``。进和出都发生在 ``_owner`` 这一个任务里，因此天然满足
+    anyio 的「谁进谁出」。这是整节存在的理由，不是包装癖：见模块上方那段硬约束。
+    """
+
+    #: 出错措辞里的可读标签，子类覆盖成 ``stdio:cmd`` / ``http:url`` 这类。
+    label = "mcp"
+
+    def __init__(self, *, client_name: str = CLIENT_INFO_NAME) -> None:
+        self._client_name = client_name
+        self._session: ClientSession | None = None
+        self._info: dict[str, Any] = {}
+        self._task: asyncio.Task | None = None
+        self._ready: asyncio.Event | None = None
+        self._stop: asyncio.Event | None = None
+        self._error: BaseException | None = None
+
+    # ---- 子类实现 ----
+
+    def _connector(self) -> Any:
+        raise NotImplementedError
+
+    def _header_map(self) -> dict[str, str]:
+        """配置里的请求头在**用时**才做 ``${ENV}`` 展开。
+
+        为什么不能省：YAML 那条路 `parse_simple_yaml` 已经展开过一遍，但 **JSON 配置走
+        `json.loads`，压根没有展开这一步**——迁移前的手写实现正是在这里补上的。
+        """
+        raw = getattr(self, "_headers", None) or {}
+        return {str(k): _expand_env(str(v)) for k, v in raw.items()}
+
+    # ---- 长驻任务：整个生命周期里唯一的进/出点 ----
+
+    async def _owner(self) -> None:
+        try:
+            async with AsyncExitStack() as stack:
+                read, write = await stack.enter_async_context(self._connector())
+                session = await stack.enter_async_context(ClientSession(
+                    read, write,
+                    client_info=Implementation(name=self._client_name,
+                                               version=CLIENT_INFO_VERSION),
+                ))
+                init = await session.initialize()
+                self._info = init.model_dump(by_alias=True, exclude_none=True)
+                self._session = session
+                self._ready.set()
+                await self._stop.wait()      # 会话在这里活着，直到 reset/close 叫停
+        except asyncio.CancelledError:
+            raise                            # 取消不是「连不上」，照实往上抛
+        except BaseException as exc:         # noqa: BLE001 - 连不上/握手失败要交回调用方
+            self._error = exc
+        finally:
+            self._session = None
+            if self._ready is not None:
+                self._ready.set()            # 别让 open() 一直在那儿等一个不会来的信号
+
+    async def open(self, timeout: float = CONNECT_TIMEOUT) -> dict[str, Any]:
+        if self._session is not None:
+            return self._info
+        if self._task is None or self._task.done():
+            self._ready = asyncio.Event()
+            self._stop = asyncio.Event()
+            self._error = None
+            self._info = {}
+            self._task = asyncio.create_task(self._owner(), name=f"mcp-{self.label}")
+        ready = self._ready
+        if ready is None:                    # 只有上面那段被改坏才到得了这里
+            raise MCPError(f"{self.label} 传输状态损坏：ready 事件缺失")
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=timeout)
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            await self.reset()
+            raise MCPError(f"连接 {self.label} 超时（{timeout:g}s）") from exc
+        if self._error is not None:
+            err = self._error
+            await self.reset()
+            raise MCPError(f"连接 {self.label} 失败：{err}") from err
+        if self._session is None:
+            raise MCPError(f"连接 {self.label} 失败：会话未建立就退出了")
+        return self._info
+
+    async def reset(self) -> None:
+        """丢掉会话。**必须由长驻任务自己收尾**，所以这里是「叫停 + 等它回来」。"""
+        task, stop = self._task, self._stop
+        self._task = None
+        self._stop = None
+        self._ready = None
+        self._session = None
+        self._error = None
+        self._info = {}
+        if stop is not None:
+            stop.set()
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=_CLOSE_TIMEOUT)
+            except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
+                # wait_for 超时会顺手取消它；这里把取消收干净，别把异常漏给收尾方
+                with contextlib.suppress(BaseException):
+                    await task
+            except BaseException:            # noqa: BLE001 - 收尾失败不该盖住原本的错误
+                pass
+
+    async def close(self) -> None:
+        await self.reset()
+
+    # ---- 操作 ----
+
+    async def _use(self, timeout: float) -> ClientSession:
+        if self._session is None:
+            await self.open(timeout)
+        session = self._session
+        if session is None:
+            raise MCPError(f"{self.label} 会话不可用")
+        return session
+
+    async def list_tools(self, timeout: float = CONNECT_TIMEOUT) -> list[dict[str, Any]]:
+        session = await self._use(timeout)
+        try:
+            result = await asyncio.wait_for(session.list_tools(), timeout=timeout)
+        except McpError as exc:
+            raise MCPError(f"{self.label} 列工具被服务端回绝：{exc.error}") from exc
+        return [_tool_def(t) for t in result.tools]
+
+    async def call_tool(self, name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
+        session = await self._use(timeout)
+        try:
+            result = await asyncio.wait_for(
+                session.call_tool(name, arguments), timeout=timeout)
+        except McpError as exc:
+            # 服务端以 JSON-RPC error 明确回绝（不是工具自己报的 isError）→ 如实上报，
+            # 别当断线去重连重发。``McpError`` 是 SDK 的协议级异常类型。
+            raise MCPError(f"调用 {name} 被服务端回绝：{exc.error}") from exc
+        # 超时（TimeoutError）与其它异常**原样放行**：MCPClient 靠这个区别决定
+        # 「重连重试一次」还是「如实上报」。在这里提前翻译会把那个区别抹掉。
+        return _result_dict(result)
+
+
+class StdioTransport(_SDKTransport):
+    """stdio：由官方 ``stdio_client`` 负责拉起子进程与逐行 JSON-RPC。"""
+
+    def __init__(self, command: str, args: list[str], env: dict[str, str] | None = None,
+                 *, client_name: str = CLIENT_INFO_NAME) -> None:
+        super().__init__(client_name=client_name)
+        self._command = command
+        self._args = list(args)
+        self._env = dict(env or {})
+        self.label = f"stdio:{command}"
+
+    @contextlib.asynccontextmanager
+    async def _connector(self) -> AsyncIterator[Any]:
+        # env **显式给全量**（父进程环境 + 配置里展开后的覆盖项），不吃 SDK 的默认值：
+        # ``StdioServerParameters(env=None)`` 会让 SDK 换成 ``get_default_environment()``
+        # ——那是刻意收窄过的一份安全子集（POSIX 上只有 HOME/LOGNAME/PATH/SHELL/TERM/USER），
+        # 而迁移前的手写实现传的是 ``dict(os.environ)``。换库不该顺手改这件事：收窄是有
+        # 价值的动作，但它会让依赖父环境变量的 server 直接连不上，得单独定价、单独上线。
+        env = dict(os.environ)
+        env.update({k: _expand_env(v) for k, v in self._env.items()})
+        params = StdioServerParameters(command=self._command, args=list(self._args), env=env)
+        async with stdio_client(params) as (read, write):
+            yield read, write
+
+
+class StreamableHttpTransport(_SDKTransport):
+    """streamableHttp：由官方 ``streamablehttp_client`` 管双模响应与会话头。"""
+
+    def __init__(self, url: str, headers: dict[str, str] | None = None,
+                 *, timeout: float = CONNECT_TIMEOUT,
+                 client_name: str = CLIENT_INFO_NAME) -> None:
+        super().__init__(client_name=client_name)
+        self._url = url
+        self._headers = dict(headers or {})
+        self._timeout = timeout
+        self.label = f"http:{url}"
+
+    @contextlib.asynccontextmanager
+    async def _connector(self) -> AsyncIterator[Any]:
+        async with streamablehttp_client(
+            self._url, headers=self._header_map(),
+            timeout=self._timeout, sse_read_timeout=STREAM_READ_TIMEOUT,
+        ) as (read, write, _get_session_id):
+            # 第三个回值才是取 mcp-session-id 的函数。迁移前我们自己存这个 id、每个请求
+            # 带回去，还额外留了一句 `transport._session_id = ""` 的越权清空；现在它由
+            # SDK 维护，我们不再需要那个字段（`MCPClient` 也不再伸手去改传输的内部状态）。
+            yield read, write
+
+
+class SseTransport(_SDKTransport):
+    """sse：由官方 ``sse_client`` 负责。
+
+    迁移前 ``MCPServerConfig.type`` 里写着 ``sse`` 这个取值，但 ``_default_transport``
+    会把它当 streamableHttp 用——一个静默的谎。现在三种取值都是**真的**。
+    """
+
+    def __init__(self, url: str, headers: dict[str, str] | None = None,
+                 *, timeout: float = CONNECT_TIMEOUT,
+                 client_name: str = CLIENT_INFO_NAME) -> None:
+        super().__init__(client_name=client_name)
+        self._url = url
+        self._headers = dict(headers or {})
+        self._timeout = timeout
+        self.label = f"sse:{url}"
+
+    @contextlib.asynccontextmanager
+    async def _connector(self) -> AsyncIterator[Any]:
+        async with sse_client(self._url, headers=self._header_map(),
+                              timeout=self._timeout,
+                              sse_read_timeout=STREAM_READ_TIMEOUT) as (read, write):
+            yield read, write
+
+
+# --------------------------------------------------------------------------
+# MCP 客户端：initialize / tools/list / tools/call
+# --------------------------------------------------------------------------
 
 class MCPClient:
-    """对一个 MCP Server 的轻量客户端，只依赖注入的 transport。"""
+    """对一个 MCP Server 的轻量客户端，只依赖注入的 transport。
 
-    def __init__(self, server: str, transport: MCPTransport, *, client_name: str = "creation-assistant") -> None:
+    T44 之后这一层**更薄**了：握手、会话头、SSE 解析都沉到了 transport 底下的官方客户端。
+    留在这儿的只剩两条**本仓的业务语义**，它们与用哪个库无关：
+      1. **超时不重发**（``_is_timeout``）——见 ``call_tool`` 里的长注释；
+      2. 只有真·断线才重建会话重试一次。
+    """
+
+    def __init__(self, server: str, transport: MCPTransport) -> None:
         self.server = server
         self._transport = transport
-        self._client_name = client_name
-        self._id = 0
         self._initialized = False
 
-    def _next_id(self) -> int:
-        self._id += 1
-        return self._id
-
-    async def _rpc(self, method: str, params: dict[str, Any], timeout: float) -> Any:
-        payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params}
-        resp = await self._transport.request(payload, timeout=timeout)
-        if isinstance(resp, dict) and resp.get("error"):
-            err = resp["error"]
-            raise MCPError(f"{method} 失败: {err.get('message', err)}")
-        return resp.get("result") if isinstance(resp, dict) else None
-
-    async def initialize(self, timeout: float = 30.0) -> dict[str, Any]:
+    async def initialize(self, timeout: float = CONNECT_TIMEOUT) -> dict[str, Any]:
         if self._initialized:
             return {}
-        result = await self._rpc(
-            "initialize",
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": self._client_name, "version": "0.1"},
-            },
-            timeout,
-        )
-        await self._transport.notify({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        info = await self._transport.open(timeout)
         self._initialized = True
-        return result or {}
+        return info or {}
 
-    async def list_tools(self, timeout: float = 30.0) -> list[dict[str, Any]]:
+    async def list_tools(self, timeout: float = CONNECT_TIMEOUT) -> list[dict[str, Any]]:
         await self.initialize(timeout)
-        result = await self._rpc("tools/list", {}, timeout)
-        return (result or {}).get("tools", [])
+        return await self._transport.list_tools(timeout)
 
     async def call_tool(self, name: str, arguments: dict[str, Any], timeout: float) -> Any:
         await self.initialize(timeout)
         try:
-            return await self._rpc("tools/call", {"name": name, "arguments": arguments}, timeout)
+            return await self._transport.call_tool(name, arguments, timeout)
         except MCPError:
             raise
         except BaseException as exc:
@@ -467,11 +607,12 @@ class MCPClient:
                     f"{name} 调用超时（{timeout:g}s）：服务端仍在处理，"
                     f"不重发以免整段重跑。可改用更小的输入或稍后重试。") from exc
             # 真·传输异常：连接可能坏了，重建会话后重试一次。
+            # 迁移前这里伸手改传输的内部状态（`transport._session_id = ""`）；现在
+            # `reset()` 是协议上的一个动作，不再需要谁去偷看别人的私有字段。
+            await self._transport.reset()
             self._initialized = False
-            if hasattr(self._transport, "_session_id"):
-                self._transport._session_id = ""
             await self.initialize(timeout)
-            return await self._rpc("tools/call", {"name": name, "arguments": arguments}, timeout)
+            return await self._transport.call_tool(name, arguments, timeout)
 
     async def close(self) -> None:
         await self._transport.close()
@@ -677,9 +818,27 @@ async def connect_server(config: MCPServerConfig, transport: MCPTransport | None
 
 
 def _default_transport(config: MCPServerConfig) -> MCPTransport:
-    if config.type == "stdio" or (config.command and not config.url):
+    """按 ``type`` 选传输。三种取值（stdio / streamableHttp / sse）现在**都是真的**。
+
+    认不出的 ``type`` 从「静默当 streamableHttp 用」改成**明确报错**：原先写错一个
+    取值不会有任何提示，只会在连接时表现成「这台 server 怎么连不上」。报错之后
+    ``McpManager.connect_enabled`` 会记一条告警跳过它，那才是能查的样子。
+    """
+    kind = (config.type or "").strip().lower()
+    if kind == "stdio" or (not kind and config.command and not config.url):
         return StdioTransport(config.command, config.args, config.env)
-    return StreamableHttpTransport(config.url, config.headers)
+    if not config.url:
+        raise MCPError(
+            f"MCP server「{config.name}」的 type={config.type!r} 缺少 url"
+            f"（stdio 要 command，streamableHttp / sse 要 url）")
+    timeout = float(config.tool_timeout)
+    if kind == "sse":
+        return SseTransport(config.url, config.headers, timeout=timeout)
+    if kind in ("", "streamablehttp", "http"):
+        return StreamableHttpTransport(config.url, config.headers, timeout=timeout)
+    raise MCPError(
+        f"MCP server「{config.name}」的 type={config.type!r} 不认识："
+        f"只支持 stdio / streamableHttp / sse")
 
 
 async def register_mcp_tools(
