@@ -136,10 +136,19 @@ class Checkpoint:
 
 
 def rebuild(entries: list[dict[str, Any]]) -> list[Message]:
-    """一致点链 → 完整消息列表。遇到 full 基准就重新起算，delta 往后追加。"""
+    """一致点链 → 完整消息列表。遇到 full 基准就重新起算，delta 往后追加。
+
+    ``kind='summary'`` 那类行（R10-T47 的压缩摘要，payload 是对象不是消息数组）
+    **一律跳过**：它住在合成 run_id 下面，按 run_id 取链的正常路径根本取不到它，
+    所以这一跳在今天是死代码——留着是因为反过来写（``list(payload)`` 打在 dict 上
+    会展开成键名列表）会把它变成一个「只有真出问题那天才发作」的坑，
+    而那条路径是**崩溃恢复**，最不该在那种时候才发现 payload 形状不对。
+    """
     msgs: list[Message] = []
     for e in entries:
-        payload = list(e.get("payload") or [])
+        payload = e.get("payload")
+        if not isinstance(payload, list):
+            continue
         msgs = payload if e.get("kind") == "full" else [*msgs, *payload]
     return msgs
 

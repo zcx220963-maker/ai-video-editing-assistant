@@ -108,3 +108,13 @@ CREATE INDEX IF NOT EXISTS asset_role_idx ON asset_library(asset_role, enabled);
 -- 而 T54 的清单（哪些件要补）正是从这一格里数出来的。
 ALTER TABLE asset_library ADD COLUMN IF NOT EXISTS scale_safe boolean;
 ALTER TABLE asset_library ADD COLUMN IF NOT EXISTS scale_facts jsonb NOT NULL DEFAULT '{}';
+
+-- R10-T47：压缩摘要复用 checkpoint_entries 落行（合成 run_id="summary:<会话指纹>"，
+-- kind='summary'）。约束在这里 DROP+ADD 的写法与 schema.sql 的建表期 CHECK **逐项相等**
+-- （与 asset_library.asset_role 那条同规）：本文件是唯一执行口，新建库走 schema.sql、
+-- 老库走这里，两边必须落成同一形状，否则「新建库能写摘要、老库写不进去」会变成
+-- 一个只在老部署上复现的 bug。
+-- 约束名按 PG 对列级 CHECK 的自动命名规则写（<表>_<列>_check）。
+ALTER TABLE checkpoint_entries DROP CONSTRAINT IF EXISTS checkpoint_entries_kind_check;
+ALTER TABLE checkpoint_entries ADD CONSTRAINT checkpoint_entries_kind_check
+  CHECK (kind IN ('delta','full','summary'));

@@ -195,11 +195,15 @@ CREATE INDEX IF NOT EXISTS ck_lease_idx  ON checkpoints(status, lease_expires_at
 -- 一致点增量链：原来每轮把整条 messages 全量 upsert 回一行（几十 KB 写放大），
 -- 现在每行只存自上一致点新增的消息；上下文压缩改写了旧消息时那一条退化成 full 基准。
 -- 归属随 checkpoints 指针行（按 run_id 取链），本表不重复挂会话列。
+--
+-- kind='summary'（R10-T47）是**压缩摘要**那一类行：run_id 是合成 id（"summary:<指纹>"，
+-- 见 summary_store.py），payload 是对象不是消息数组，也没有 checkpoints 指针行。
+-- 它借的是这张表的定序、索引与随会话回收，不是这张表的「一致点」语义。
 CREATE TABLE IF NOT EXISTS checkpoint_entries (
   run_id        text NOT NULL,
   seq           integer NOT NULL,
   parent_seq    integer,
-  kind          text NOT NULL DEFAULT 'delta' CHECK (kind IN ('delta','full')),
+  kind          text NOT NULL DEFAULT 'delta' CHECK (kind IN ('delta','full','summary')),
   payload       jsonb NOT NULL,
   iteration     integer NOT NULL DEFAULT 0,
   created_at_ms bigint NOT NULL,

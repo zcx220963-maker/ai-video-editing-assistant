@@ -25,6 +25,7 @@ from .identity import parse_session, session_forms, storyline_session_id
 from .ingest import safe_segment
 from .orchestration import _safe
 from .storage import Cond
+from .summary_store import summary_run_id
 
 #: 只认 session_id 的账本表（删对话要一并清掉的行）
 SESSION_TABLES = ("artifacts", "render_jobs", "checkpoints", "token_usage")
@@ -107,6 +108,11 @@ async def purge_session(storage: Any, session_id: str, *,
         return out
 
     runs = await _run_ids_of(storage, forms)
+    # 压缩摘要（R10-T47）住在 checkpoint_entries 下、带**合成** run_id，所以它既不在
+    # ``checkpoints`` 表里（``_run_ids_of`` 看不到它），也不会被 FOREIGN KEY 级联带走
+    # （本表根本没有外键）。会话没了，它引的旧历史就没了，摘要留着就是一段谁也读不到
+    # 的正文——两种会话拼法各算一次指纹，两种都清。
+    runs += [summary_run_id(form) for form in forms]
     for table in SESSION_TABLES:
         out["rows"][table] = await storage.db.delete(
             table, where=[Cond("session_id", "in", forms)])

@@ -25,7 +25,7 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Protocol,
                     Sequence, runtime_checkable)
 
 from .messages import Message, user
-from .session import Session
+from .session import HISTORY_WINDOW_BYTES, Session, render_history
 
 if TYPE_CHECKING:  # 只在类型检查时导入，避免 context ↔ prompts 的循环
     from .prompts import PromptLibrary
@@ -262,6 +262,18 @@ SECTION_BUDGET_BYTES: dict[str, int] = {
     # 能力面，53 KB 上下是它的正常尺寸——拿这条线去判它们等于让闲聊轮全死，
     # 那正是 §9-Q100 ③ 当初不敢设这个数的原因。未裁那一档的账与取舍登记在 §9-Q105。
     "tools": 40960,
+    # **`history` 刻意不在这张表里**（T48 记完账当场改的，理由值得留着）：
+    #
+    # 它一度在这里（值取 `session.HISTORY_WINDOW_BYTES`）。进了这张表就等于进了 ㉓ 的
+    # 硬闸——`_ledger` 把每一行的字节与 `section_budget(name)` 比，超了就
+    # `ContextBudgetError`，**这次请求不发出**。而历史窗口是**推出去**的对话，
+    # 在压缩链的**上游**：第 629 行按 `session.messages` 记它的账，压缩要到那之后才跑。
+    # 于是长对话会先在闸上硬失败，压缩根本没机会救它——把「该压缩」写成了「不许发」。
+    #
+    # 管历史大小的是压缩链自己（`DEFAULT_MAX_CONTEXT_TOKENS`，同一把尺 1 B ≤ 1 token），
+    # 不是 §5.4 的断值表。所以今天只**记账**（`sections` 里有一行 `history` + 一条
+    # 独立回执，见 `ledger["history"]`），**不设断值**；那一行在 §5.4 表里也照此写明，
+    # 免得下一个人看它「没预算」又补上去。
 }
 
 # §5.4 的「目标」列：R9 要把这几块瘦到哪。**与上面那张断值表是两件事**——
@@ -363,6 +375,25 @@ def section_name(text: str) -> str:
     tag = m.group(1)
     attr = _NAME_ATTR_RE.search(m.group(2) or "")
     return f"{tag}:{attr.group(1)}" if attr else tag
+
+
+def wrap_source(name: str, body: str) -> str:
+    """按源名给正文包一层标签——**只在它自己没带标签时**（T43/Q70 的单一包装规则）。
+
+    为什么必须按「有没有标签」而不是按「是哪个源」判：`SkillManifestContextSource.render`
+    返回的**不是**一段裸正文，而是一个多标签块——一个 `<skills>` 清单后面跟着 N 个
+    `<skill_instructions name="…">` 正文（`skill.py:392-403`）。出口再按 `source.name`
+    包一次，得到的是 `<skills><skills>…</skills>＋<skill_instructions>…</skill_instructions></skills>`：
+    标签重复只是表象，真正的错是**本应与 `<skills>` 同级的正文块被吞成了它的子节点**——
+    模型会把「清单」（有哪些技能）与「正文」（这个技能怎么写）读成父子关系，而
+    §5.4 的 `<skills>` 那一栏字节也因此虚增（同一个东西数了两遍）。
+    改源不改出口（让源别拼标签）要把它拆成 N 个 context source：一处清楚变两处，
+    所以 Q70 选这一侧。判据只看首字符，不解析结构——认不出标签的段照样包。
+    """
+    stripped = body.strip()
+    if stripped.startswith("<"):
+        return stripped
+    return f"<{name}>\n{stripped}\n</{name}>"
 
 
 @dataclass(frozen=True)
@@ -572,7 +603,7 @@ class ContextBuilder:
                 # 装配侧不认识「记忆」或「技能」是什么，只认它自报的身份与消费者。
                 _add(Section(
                     name=str(source.name),
-                    text=f"<{source.name}>\n{body.strip()}\n</{source.name}>",
+                    text=wrap_source(str(source.name), body),
                     kind=str(getattr(source, "ledger_kind", "always")),
                     condition_key=getattr(source, "ledger_condition_key", None),
                     referenced_by=tuple(getattr(source, "ledger_referenced_by", ()) or ()),
@@ -592,7 +623,30 @@ class ContextBuilder:
 
         system_content = "\n\n".join(s.text for s in sections)
 
-        ledger = self._ledger(sections)
+        # 会话历史那一段**不是** Section：它以 messages 的形态发出去，不拼进
+        # system_content。但 §5.4 的账面上必须有它一行（T48：「这一块从未在任何
+        # 预算表里出现过」正是它要治的病），所以单独造一行塞进账面。
+        history_row = None
+        if session.messages:
+            history_row = self._ledger_row("history", render_history(session.messages),
+                                           "conditional", "session_history", ASSEMBLY_REF)
+
+        ledger = self._ledger(sections, extra_rows=(history_row,) if history_row else ())
+        # 历史窗口的回执（T48 ③）：截了多少条、前缀摘要多大、这一栏的尺在哪。
+        # 有它才能回答「这段上下文为什么突然短了」——没有回执的瘦身与静默丢内容
+        # 从外面看是同一件事。
+        #
+        # 注意这一栏**只有 `compress_at`，没有 `budget`**：历史不进 `SECTION_BUDGET_BYTES`，
+        # 也就没有断值（理由见那张表上面的长注释）。`compress_at` 是**参考**线——
+        # 越过它该干的事是压缩链瘦身，不是 ㉓ 拒发；字段名刻意避开 `budget`，
+        # 免得读回执的人以为它是断值。`bytes` 记的是本轮回执里那一行历史渲染出来的体积。
+        ledger["history"] = {
+            "window": session.history_window,
+            "dropped": session.history_dropped,
+            "prefix_bytes": section_bytes(session.history_prefix),
+            "bytes": history_row["bytes"] if history_row else 0,
+            "compress_at": HISTORY_WINDOW_BYTES,
+        }
         self.last_ledger = ledger
         if ledger["over_budget"]:
             raise ContextBudgetError(self._over_budget_message(ledger))
@@ -604,13 +658,25 @@ class ContextBuilder:
         ]
 
         if self.compressor:
+            # 告诉压缩器「这一轮在哪个会话里」，它的摘要缓存才敢用（T47）。
+            # 鸭子类型：自定义压缩器没有这个钩子就跳过，签名（messages, query）不动。
+            binder = getattr(self.compressor, "bind_scope", None)
+            if callable(binder):
+                binder(session.session_id)
             messages = await self.compressor(messages, current_input)
         return messages
 
     # ---- 账面 ----
 
-    def _ledger(self, sections: Sequence[Section]) -> dict[str, Any]:
-        """§5.7 第①条的账面格式。四个键的字段名与含义**冻结**，别在别处记账。"""
+    def _ledger(self, sections: Sequence[Section],
+                extra_rows: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
+        """§5.7 第①条的账面格式。四个键的字段名与含义**冻结**，别在别处记账。
+
+        ``extra_rows`` 是**不在 ``sections`` 里、但真发出去了**的块（现在只有
+        `<history>`）：它不进 ``system_content``，因此第②条那种「按 ``\\n\\n``
+        切开逐段比字节」的对账到它这里为止——这是**一处写明了的例外**，
+        不是漏账。
+        """
         rows: list[dict[str, Any]] = []
         for sec in sections:
             rows.append(self._ledger_row(sec.name, sec.text, sec.kind,
@@ -621,6 +687,7 @@ class ContextBuilder:
                     # 而那个守卫名只有产出方知道（现在由产出方写进父段的 condition_key）。
                     rows.append(self._ledger_row(sub_name, sub_text, sec.kind,
                                                  sec.condition_key, sec.referenced_by))
+        rows.extend(dict(r) for r in extra_rows)
         over = sorted({r["name"] for r in rows
                        if (b := section_budget(r["name"])) is not None and r["bytes"] > b})
         # 「超目标」与「超断值」分开记，因为它们是两件事：前者是 R9 还在还的账

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
@@ -234,11 +235,23 @@ class MessagesRepo(_Repo):
             f"消息 seq 连续 5 次撞号（会话 {conv_id}）：{last_err}")
 
     async def history(self, user_id: str, conv_id: str,
-                      limit: int | None = None) -> list[dict[str, Any]]:
+                      limit: int | None = None, *,
+                      tail: bool = False) -> list[dict[str, Any]]:
+        """按 seq 升序取这个会话的消息行；``limit`` 给定时只取一部分。
+
+        ``tail=True`` 取的是**最后** ``limit`` 条（R10-T48 的历史窗口），
+        但返回值**仍然是升序**——调用方拿到的永远是一条从头到尾的时间线，
+        「取的是头部还是尾部」只影响丢掉了哪一端，不影响它怎么读。
+        倒序下推给后端再翻回来，比「全量拉回来在 Python 里切尾」少搬一次整段历史。
+        """
         if await self._owner(conv_id) != user_id:
             return []
-        return await self.db.select(self.table, where={"conv_id": conv_id},
-                                    order_by=["seq"], limit=limit)
+        if not tail:
+            return await self.db.select(self.table, where={"conv_id": conv_id},
+                                        order_by=["seq"], limit=limit)
+        rows = await self.db.select(self.table, where={"conv_id": conv_id},
+                                    order_by=["-seq"], limit=limit)
+        return list(reversed(rows))
 
     async def set_qa(self, message_id: int, qa: Mapping[str, Any]) -> None:
         await self.db.update(self.table, {"qa": dict(qa)}, where={"id": message_id})
@@ -812,6 +825,18 @@ class CheckpointsRepo(_Repo):
         return await self.db.delete(self.entry_table,
                                     where=[Cond("run_id", "eq", run_id),
                                            Cond("seq", "gt", seq)])
+
+    async def drop_entries_before(self, run_id: str, seq: int) -> int:
+        """砍掉某个 seq **之前**的链。
+
+        与 ``drop_entries_after`` 相对，只有摘要那条通道用它：
+        ``SummaryStore`` 在同一会话名下按序留最新几份摘要（``summary_store.py``
+        的 ``KEEP_PER_SCOPE``），更新的那份覆盖的范围包含更旧的，所以旧行是纯残留。
+        真 run 的链**永远不许**这么删——那里每一条一致点都是可回退的历史。
+        """
+        return await self.db.delete(self.entry_table,
+                                    where=[Cond("run_id", "eq", run_id),
+                                           Cond("seq", "lt", seq)])
 
     async def prune(self, keep: int = 200) -> int:
         """已收尾（成功/失败/让位）的旧 run 按量截断——替掉原来「永不删除、只增不减」的毛病。

@@ -19,6 +19,7 @@ from typing import Any, Awaitable, Callable, Iterable
 
 from .llm import LLMClient
 from .messages import Message
+from .summary_store import SummaryStore, summary_key
 
 # token 计数器：Message -> int
 TokenCounter = Callable[[Message], int]
@@ -102,12 +103,33 @@ class ContextCompressor:
         fold_preview: int = 60,
         token_counter: TokenCounter | None = None,
         summarizer: Summarizer | None = None,
+        summaries: SummaryStore | None = None,
     ) -> None:
         self.max_tokens = max_tokens
         self.keep_recent_tool_results = keep_recent_tool_results
         self.fold_preview = fold_preview
         self.count = token_counter or default_token_counter
         self.summarizer = summarizer or default_summarizer
+        # 摘要的持久化口（R10-T47）。传 None = 今天的行为：每轮重算、不落库。
+        # 它**不影响压缩结果**，只影响「同一段前缀第二次要不要再花一次模型调用」，
+        # 所以没有存储的调用方（单测、离线脚本）什么都不用改。
+        self.summaries = summaries
+        # 当前所在的会话作用域，由装配方在调用前 bind 进来。空串 = 未知，
+        # 于是不查缓存也不落库——宁可多花一次模型调用，也不要把 A 会话的摘要
+        # 喂给 B 会话（那是串话，比多花钱坏得多）。
+        self._scope = ""
+
+    # ---- 作用域绑定（Q64：不改压缩器签名，靠一个鸭子类型的钩子）----
+
+    def bind_scope(self, scope: str, **_: object) -> None:
+        """告诉压缩器「这一轮在哪个会话里」。
+
+        为什么不把 scope 加进 ``__call__`` 的形参：``ContextCompressor`` 协议的签名
+        （``(messages, query)``）是冻结的，装配侧、Agent 侧与测试都按它写；多一个形参
+        就是三处跟着改。装配方在调用前 duck-typing 地看一眼有没有这个钩子，
+        有就绑、没有就算了（自定义压缩器不必实现它）。
+        """
+        self._scope = str(scope or "")
 
     # ---- 估算 ----
 
@@ -175,14 +197,35 @@ class ContextCompressor:
         dropped, kept = self._split_to_fit(system, body, reserve)
 
         if dropped:
-            text = self.summarizer(dropped)
-            summary = await text if _is_awaitable(text) else text
+            summary = await self._summarize(dropped)
             summary_msg: Message = {
                 "role": "system",
                 "content": f"<history_summary>\n{summary}\n</history_summary>",
             }
             return _repair_orphans(system + [summary_msg] + kept)
         return _repair_orphans(system + kept)
+
+    async def _summarize(self, dropped: list[Message]) -> str:
+        """被淘汰那一段 → 摘要文本。**同一段前缀只总结一次**（R10-T47/Q64）。
+
+        判据落在被淘汰那一段的**内容指纹**上，不是「第几轮」：压缩器拿不到
+        ``head_seq``（见 ``__call__`` 的签名），而且「同一段历史」本来就是它唯一
+        该关心的东西——前缀多淘汰了一条，指纹就变、重算一次也是对的（更长的一段
+        该有覆盖它的新摘要）。
+
+        命中时**一次模型调用都不发**，这正是这条通道存在的理由：每轮重算一次摘要，
+        省下的是真钱。
+        """
+        key = summary_key(dropped)
+        if self.summaries is not None and self._scope:
+            cached = await self.summaries.get(self._scope, key)
+            if cached:
+                return cached
+        text = self.summarizer(dropped)
+        summary = await text if _is_awaitable(text) else str(text or "")
+        if self.summaries is not None and self._scope and summary.strip():
+            await self.summaries.put(self._scope, key, summary, covered=len(dropped))
+        return summary
 
 
 def _repair_orphans(messages: list[Message],
