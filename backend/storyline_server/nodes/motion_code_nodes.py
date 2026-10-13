@@ -197,6 +197,7 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                 spec_for_render,
                 providers=self.providers, work=work, bgm=bgm_path,
                 client=self._client(),
+                storage=self.storage,
                 progress=on_event, cache=_ObjectShotCache(self.storage.workspace, sess))
             await probe.drain()           # 迟到进度不能盖掉后面的终态
             frames, frame_reason = await self._spotcheck(state, out)

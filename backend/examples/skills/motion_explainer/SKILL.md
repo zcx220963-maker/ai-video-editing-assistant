@@ -130,6 +130,19 @@ import { fitText as remFitText } from "@remotion/layout-utils";
 
 科普视频推荐主题：`deep-ocean`（科技感）、`midnight`（数据感）、`obsidian-violet`（概念感）。
 
+## 3 档风格组合
+
+`remotion/src/themes/styles.json` 定义三档**固定组合**（色板 + 质感 + 字幕档 + 主体来源 + 素材源白名单）。
+模型只选档，不自由搭配——这是"多风格"与"风格漂移"的分界。
+
+| 档 | 色板 | texture | 字幕档 | 主体来源 | 适用选题 |
+|----|------|---------|--------|----------|----------|
+| `ink-archive` | `vintage-kraft` / `modern-light` | `film` 或 `bleach` | `torn_highlight` | 位图优先：老照片、纸纹、手绘 | 历史、器物、人物传记 |
+| `tech-data` | `modern-light` / `color-play` | `none` | `full` | 代码优先：矢量图、公式、数据卡、图标 | 概念解释、数据对比、流程 |
+| `night-concept` | `deep-ocean` / `midnight` / `obsidian-violet` | `glow` | `torn_highlight` | 3D/光优先：三维、光效、人物剪影 | 科学、宇宙、抽象概念 |
+
+选档时把 `palette`/`texture`/`subtitle_mode` 写进 spec 顶层，`asset_sources` 限定本片只能从素材库的这几个来源检索。
+
 ## 代码模板
 
 ```tsx
@@ -341,9 +354,11 @@ lint 白名单 36 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 ## assets 栏
 
 每镜可声明 `assets` 数组，每项含：
-- `relpath`：相对于 `public/` 的路径（如 `stage/<cache_key>/<filename>`）
-- `sha256`：字节身份校验
-- `bytes`：文件大小
+- `name`：文件名（代码里 `staticFile("<name>")` 引用，也是渲染容器 `public/` 下的相对路径）
+- `sha256`：完整 64 位十六进制 sha256——渲染前按它从 `asset_library` 表取字节、投到渲染容器
+- `ext`：扩展名（如 `png`、`svg`）
+
+可选字段：`source`（来源信息对象）、`alpha`（是否有 alpha 通道）、`layer`（`fg`/`bg`/`cutout`）。
 
 ## staticFile 对账
 
@@ -358,7 +373,8 @@ lint 规则 `dg/staticfile-asset-check` 双向对账：
 
 ## 资产入库
 
-资产通过 `POST /stage-assets` 端点入库（sha256 校验 + 幂等），存到 `public/` 下。
+渲染前，执行层按每镜 `assets` 栏的 `sha256` 从 `asset_library` 表查到 `object_key`，
+从对象存储取字节，经 `POST /stage-assets` 投到渲染容器 `public/<name>`（sha256 前 16 位校验 + 幂等）。
 `materials.origin` 支持 `'art'`（代码生成的素材）。全局素材库 `asset_library` 表不属任何用户。
 
 # 字体白名单

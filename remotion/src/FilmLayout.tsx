@@ -5,6 +5,7 @@ import {
   useCurrentFrame,
   useVideoConfig,
 } from 'remotion';
+import { fitText as remotionFitText } from '@remotion/layout-utils';
 import {
   ASPECTS,
   ASSET_LOG_MARKER,
@@ -627,7 +628,27 @@ const Caption: React.FC<{
   geo: (typeof FILM_GEOMETRY)[Aspect];
 }> = ({ text, highlight, words, mode, opacity, geo }) => {
   const frame = useCurrentFrame();
+  const { width } = useVideoConfig();
   const cap = geo.caption;
+
+  // fitText：用 Noto CJK 实测字宽，按可用宽度自适应字号。
+  // 母版原来用固定 cap.fontSize，长文案撑破字幕盒、短文案字偏小——闸⑧ 叠字的根因。
+  const availW = width - 2 * cap.side - 2 * cap.padX;
+  let fontSize = cap.fontSize;
+  try {
+    const ft = remotionFitText({
+      text,
+      maxWidth: availW,
+      fontFamily: '"Noto Sans CJK SC", sans-serif',
+      fontWeight: 400,
+      maxLines: 2,
+      maxFontSize: cap.fontSize,
+      minFontSize: Math.round(cap.fontSize * 0.6),
+    });
+    fontSize = ft.fontSize;
+  } catch {
+    // lint / 构建期没有浏览器环境，退回固定字号
+  }
 
   const lit = (piece: string) => {
     const hit = highlight.find((h) => h && piece.includes(h));
@@ -660,7 +681,7 @@ const Caption: React.FC<{
           background: TOKENS.paper,
           borderRadius: cap.radius,
           color: TOKENS.ink,
-          fontSize: cap.fontSize,
+          fontSize: fontSize,
           lineHeight: 1.35,
           textAlign: 'center',
         }}
@@ -682,7 +703,7 @@ const Caption: React.FC<{
                 // 粗细跟字号走，三种画幅下才是同一条线。
                 borderBottom:
                   on && mode === 'torn_highlight'
-                    ? `${Math.max(2, Math.round(cap.fontSize / 26))}px solid ${TOKENS.accent}`
+                    ? `${Math.max(2, Math.round(fontSize / 26))}px solid ${TOKENS.accent}`
                     : 'none',
               }}
             >

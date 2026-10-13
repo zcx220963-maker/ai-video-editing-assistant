@@ -39,6 +39,7 @@ BGM 闪避。本文件只管代码镜这一段：
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
@@ -639,10 +640,50 @@ async def _shot_texture(clip: Path, dst_dir: Path, *, shot: Mapping[str, Any],
     return out_clip, kind, chain, out_frame
 
 
+async def _stage_shot_assets(shot: Mapping[str, Any], *, sid: str,
+                             storage: Any, client: dict[str, Any]) -> None:
+    """渲染前把本镜 assets 的字节投到渲染容器 public/ 下。
+
+    链路：shot.assets[].sha256 → asset_library 表查 object_key → MinIO 取字节 →
+    POST /stage-assets（sha16=sha256[:16] 校验 + 幂等落盘）。
+
+    没声明 assets 的镜头直接过。asset_library 里查不到的 sha256 抛错——
+    模型填了一个素材库里没有的 sha256，渲出来就是空白，不如在这里就红。
+    """
+    assets = shot.get("assets") or []
+    if not assets:
+        return
+    stage = client.get("stage_asset")
+    if stage is None:
+        raise MediaError(f"{sid}：声明了 {len(assets)} 个素材但渲染客户端没有 stage_asset 口")
+    for a in assets:
+        sha256 = str(a.get("sha256") or "").strip().lower()
+        name = str(a.get("name") or "").strip()
+        if not sha256 or not name:
+            continue          # _norm_shot 已经报过错了，这里不重复报
+        row = await storage.assets.get_by_sha(sha256)
+        if row is None:
+            raise MediaError(
+                f"{sid}：素材 sha256={sha256[:16]}… 在 asset_library 里查不到——"
+                "模型填了一个素材库里没有的素材，请先入库或去掉这条 asset 声明")
+        object_key = str(row.get("object_key") or "")
+        if not object_key:
+            raise MediaError(f"{sid}：素材 {name} 的 asset_library 行没有 object_key")
+        chunks = storage.objects.get_stream(object_key)
+        buf = bytearray()
+        async for chunk in chunks:
+            buf.extend(chunk)
+        raw_bytes = bytes(buf)
+        sha16 = sha256[:16]
+        bytes_b64 = base64.b64encode(raw_bytes).decode("ascii")
+        await asyncio.to_thread(stage, name, sha16, bytes_b64)
+
+
 async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
                            providers: Providers, work: Path, index: int,
                            frames_used: int, identities: Mapping[str, str],
                            client: dict[str, Any],
+                           storage: Any = None,
                            cache: "rpipe.ShotCache | None" = None,
                            progress: Progress | None = None) -> dict[str, Any]:
     """一镜（代码）→ 带声切片 + 记账。八道闸里属于这一镜的那几道都在这条路上。
@@ -694,10 +735,13 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
 
     props = shot_input_props(shot, spec, frames=frames,
                              frame_words=_to_frame_words(narr["timed"], fps))
+    if storage is not None:
+        await _stage_shot_assets(shot, sid=sid, storage=storage, client=client)
     resp = await _await_heartbeat(
         progress, sid=sid, index=index, total=len(spec.get("shots") or []),
         awaitable=asyncio.to_thread(
-            client["render"], str(shot.get("code") or ""), key, props))
+            client["render"], str(shot.get("code") or ""), key, props,
+            None, shot.get("assets") or []))
     await _emit(progress, {"stage": "rendered", "shot": sid, "done": index + 1,
                            "total": len(spec.get("shots") or []),
                            "cache_key": key, "frames": frames})
@@ -837,6 +881,7 @@ def _shot_table(sid: str, index: int, size: tuple[int, int], *,
 
 async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work: Path,
                              client: dict[str, Any] | None = None,
+                             storage: Any = None,
                              bgm: Path | None = None,
                              progress: Progress | None = None,
                              cache: "rpipe.ShotCache | None" = None) -> dict[str, Any]:
@@ -871,6 +916,7 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
         rec = await render_code_shot(shot, spec=spec, providers=providers, work=work,
                                      index=i, frames_used=frames_used,
                                      identities=identities, client=client,
+                                     storage=storage,
                                      cache=cache, progress=progress)
         hitmaps[rec["id"]] = rec.pop("hits", None) or {}
         files[rec["id"]] = {"clip": rec["clip"], "frame": rec["frame"]}

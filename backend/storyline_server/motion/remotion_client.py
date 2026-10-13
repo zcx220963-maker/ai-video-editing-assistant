@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """creation-remotion 容器的 HTTP 客户端——图形科普片「代码镜」这条链的唯一外呼口。
 
-契约真源是 `remotion/server.mjs`，这四个口之外没有别的接口：
+契约真源是 `remotion/server.mjs`，这五个口之外没有别的接口：
 
     GET  /healthz       → {ok, node, remotion, chromium, gl, master_hash, lockfile_hash}
     POST /lint          → {ok, errors:[{rule,line,column,msg}], declared}   恒 200
     POST /render-shot   → {ok, cache_key, artifact, bytes, composition,
                             probed, timings, tokens, fields_used, layout_used, warnings}
     GET  /artifact/{k}  → video/mp4 字节
+    POST /stage-assets  → {ok, relpath, sha16, bytes} | {ok, relpath, sha16, idempotent}
 
 三条写代码时必须记住的事：
 
@@ -100,15 +101,19 @@ def lint(code: str, *, declared_fields: list[str] | None = None,
 
 def render_shot(*, code: str, cache_key: str, input_props: dict[str, Any],
                 declared_fields: list[str] | None = None,
+                assets: list[dict[str, Any]] | None = None,
                 base: str | None = None, timeout: int = 900) -> dict[str, Any]:
     """渲一镜。服务端会自己再 lint 一遍，返回的 `errors` 就是拒绝理由。
 
     抛错时 `lint_errors` 非空 = 闸①拒绝（重交代码可修），为空 = 渲染/超预算类失败。
+    `assets` 是本镜声明的素材列表（传给服务端做 staticFile 双向对账）。
     """
     payload: dict[str, Any] = {"code": code, "cache_key": cache_key,
                                "input_props": input_props}
     if declared_fields is not None:
         payload["declared_fields"] = list(declared_fields)
+    if assets is not None:
+        payload["assets"] = list(assets)
     status, j = _request("POST", "/render-shot", base=base, payload=payload,
                          timeout=timeout)
     if status != 200 or not j.get("ok"):
@@ -139,22 +144,45 @@ def fetch_artifact(artifact: str, dest: Path, *, base: str | None = None,
     return len(data)
 
 
+def stage_asset(*, relpath: str, sha16: str, bytes_b64: str,
+                base: str | None = None, timeout: int = 120) -> dict[str, Any]:
+    """把一个素材文件投到渲染容器 public/ 下（/stage-assets 端点）。
+
+    `relpath` 是相对于 public/ 的路径（即 assets 栏的 `name`）；
+    `sha16` 是 sha256 前 16 位，服务端按它对账——声明与实算不符直接 400；
+    `bytes_b64` 是文件字节的 base64 编码。
+
+    幂等：同一 relpath + sha16 已存在时服务端返回 `{idempotent: true}`，不重写。
+    """
+    _, j = _request("POST", "/stage-assets", base=base,
+                    payload={"relpath": relpath, "sha16": sha16, "bytes_b64": bytes_b64},
+                    timeout=timeout)
+    if not j.get("ok"):
+        raise RemotionError(f"素材投递失败（{relpath}）：{j.get('error') or j}")
+    return j
+
+
 def endpoints(*, base: str | None = None, health_timeout: int = 10,
               lint_timeout: int = 60, render_timeout: int = 900,
-              fetch_timeout: int = 300) -> dict[str, Any]:
-    """四个口绑成一组普通可调用对象：``{health, lint, render, fetch}``。
+              fetch_timeout: int = 300, stage_timeout: int = 120) -> dict[str, Any]:
+    """五个口绑成一组普通可调用对象：``{health, lint, render, fetch, stage_asset}``。
 
     执行层拿这一组而不是直接 import 本模块的函数，为的是**依赖注入不用 monkeypatch**：
     离线用例塞一个假服务就是一段 dict，而改模块函数会把别的用例一起带跑。
-    位置参数口径固定：``render(code, cache_key, input_props)``、``fetch(artifact, dest)``。
+    位置参数口径固定：``render(code, cache_key, input_props)``、``fetch(artifact, dest)``、
+    ``stage_asset(relpath, sha16, bytes_b64)``。
     """
     return {
         "health": lambda: health(base=base, timeout=health_timeout),
         "lint": lambda code, declared_fields=None: lint(
             code, declared_fields=declared_fields, base=base, timeout=lint_timeout),
-        "render": lambda code, cache_key, input_props, declared_fields=None: render_shot(
+        "render": lambda code, cache_key, input_props, declared_fields=None, assets=None: render_shot(
             code=code, cache_key=cache_key, input_props=input_props,
-            declared_fields=declared_fields, base=base, timeout=render_timeout),
+            declared_fields=declared_fields, assets=assets, base=base,
+            timeout=render_timeout),
         "fetch": lambda artifact, dest: fetch_artifact(artifact, dest, base=base,
                                                        timeout=fetch_timeout),
+        "stage_asset": lambda relpath, sha16, bytes_b64: stage_asset(
+            relpath=relpath, sha16=sha16, bytes_b64=bytes_b64, base=base,
+            timeout=stage_timeout),
     }

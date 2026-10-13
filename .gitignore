@@ -67,6 +67,13 @@ backend/scripts/
 backend/.smoke/
 # 仓库根那一份同样是取证残渣（真渲样片 mp4 + 一次性探针脚本），不是源码
 .smoke/
+# 仓库根的临时截图与渲染产物（不入库）
+tmp_*.jpg
+tmp_*.png
+motion_final.mp4
+# remotion 下的临时标定脚本与归档重复夹具
+remotion/.tmp_*
+remotion/_archive/
 backend/pytest.ini
 backend/start.bat
 

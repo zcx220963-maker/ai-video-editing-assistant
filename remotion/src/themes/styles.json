@@ -1,0 +1,32 @@
+{
+  "ink-archive": {
+    "description": "纸纹档案——历史、器物、人物传记",
+    "palettes": ["vintage-kraft", "modern-light"],
+    "texture": "film",
+    "texture_alt": "bleach",
+    "subtitle_mode": "torn_highlight",
+    "subject_preference": "位图优先：老照片、纸纹、手绘插画",
+    "asset_sources": ["wikimedia", "ambientcg", "openpeeps"],
+    "motif_families": ["photo", "paper", "clipcard", "pagecam"]
+  },
+  "tech-data": {
+    "description": "亮底数据——概念解释、数据对比、流程",
+    "palettes": ["modern-light", "color-play"],
+    "texture": "none",
+    "texture_alt": null,
+    "subtitle_mode": "full",
+    "subject_preference": "代码优先：矢量图、公式、数据卡、图标",
+    "asset_sources": ["iconify"],
+    "motif_families": ["vector", "katex", "chart", "gauge", "icon"]
+  },
+  "night-concept": {
+    "description": "暗底概念——科学、宇宙、抽象概念",
+    "palettes": ["deep-ocean", "midnight", "obsidian-violet"],
+    "texture": "glow",
+    "texture_alt": null,
+    "subtitle_mode": "torn_highlight",
+    "subject_preference": "3D/光优先：三维场景、光效、人物剪影",
+    "asset_sources": ["openpeeps", "polyhaven", "wikimedia"],
+    "motif_families": ["three", "aurora", "spotlight", "fracture", "silhouette"]
+  }
+}

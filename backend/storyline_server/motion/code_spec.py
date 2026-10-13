@@ -375,6 +375,40 @@ def _err(errors: list[str], msg: str) -> None:
     errors.append(msg)
 
 
+def _norm_assets(raw: Any, sid: str, errors: list[str]) -> list[dict[str, Any]]:
+    """归一化 assets 栏。每项必须有 name/sha256/ext，sha256 是完整 64 位十六进制。"""
+    if not raw:
+        return []
+    if not isinstance(raw, list):
+        _err(errors, f"{sid}：assets 不是数组")
+        return []
+    out: list[dict[str, Any]] = []
+    for j, a in enumerate(raw):
+        if not isinstance(a, dict):
+            _err(errors, f"{sid}：assets[{j}] 不是对象")
+            continue
+        name = str(a.get("name") or "").strip()
+        sha256 = str(a.get("sha256") or "").strip().lower()
+        ext = str(a.get("ext") or "").strip().lstrip(".")
+        if not name:
+            _err(errors, f"{sid}：assets[{j}].name 为空——代码里 staticFile(\"<name>\") 引用需要文件名")
+        if len(sha256) != 64 or not all(c in "0123456789abcdef" for c in sha256):
+            _err(errors, f"{sid}：assets[{j}].sha256={sha256!r} 不是完整 64 位十六进制")
+            sha256 = ""
+        if not ext:
+            _err(errors, f"{sid}：assets[{j}].ext 为空——渲染容器要按扩展名落盘")
+        item: dict[str, Any] = {"name": name, "sha256": sha256, "ext": ext}
+        if isinstance(a.get("source"), dict):
+            item["source"] = a["source"]
+        if isinstance(a.get("alpha"), bool):
+            item["alpha"] = a["alpha"]
+        layer = str(a.get("layer") or "").strip()
+        if layer in ("fg", "bg", "cutout"):
+            item["layer"] = layer
+        out.append(item)
+    return out
+
+
 def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int) -> dict[str, Any]:
     sid = str(raw.get("id") or f"s{i + 1:02d}")
 
@@ -454,7 +488,7 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         "source": {str(k): str(v) for k, v in src.items()},
         "card": card,
         "derived_from": derived_from,
-        "assets": raw.get("assets") or [],
+        "assets": _norm_assets(raw.get("assets"), sid, errors),
     }
 
 
@@ -529,7 +563,8 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     # 这里：三个调用点——plan_motion 入库前、render_motion_code 烧像素前、
     # patch_motion_code 落盘前——调的都是这一个函数，规则因此不可能只在一路上生效。
     # 提醒那一份从这里单独取（见 style_facts）。
-    for checker in (check_style_quota, check_shot_structure, check_ink_contrast):
+    for checker in (check_style_quota, check_derived_similarity,
+                    check_shot_structure, check_ink_contrast):
         errors.extend(checker(shots)[0])
 
     bgm = raw.get("bgm") if isinstance(raw.get("bgm"), dict) else {}
@@ -578,7 +613,7 @@ def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
     assets_hash = ""
     if assets:
         asset_pairs = sorted(
-            f"{a.get('sha16','')}/{a.get('name','')}"
+            f"{a.get('sha256','')}/{a.get('name','')}"
             for a in assets if isinstance(a, dict)
         )
         assets_hash = hashlib.sha256(
@@ -910,6 +945,58 @@ def shape_similarity(a: tuple[str, ...], b: tuple[str, ...]) -> float:
     ca, cb = Counter(a), Counter(b)
     union = sum((ca | cb).values())
     return sum((ca & cb).values()) / union if union else 0.0
+
+
+@lru_cache(maxsize=256)
+def _demo_shape(relpath: str) -> tuple[str, ...] | None:
+    """读一份 demo 代码并算骨架。读不到返回 None（文件不在或读失败）。"""
+    f = _SKILL_DIR / "demos" / relpath
+    if not f.is_file():
+        return None
+    try:
+        return canonical_shape(f.read_text("utf-8"))
+    except Exception:
+        return None
+
+
+def check_derived_similarity(shots: list[dict[str, Any]]
+                             ) -> tuple[list[str], list[str]]:
+    """闸（derived_from）：本镜代码与声明的 demo 源文件骨架相似度 ≥ DERIVED_MIN_SIM。
+
+    模型声明 ``derived_from: ["demos/opening/fracture/Fracture.tsx"]`` 但代码与该 demo
+    的骨架相似度低于阈值 → 声明是假的，打回。阈值 0.61 是标定值（见 calibrate_derived_sim.py）：
+    正样本（卡→自己 demo）全 =1.0，负样本（卡→异类 demo）最高 0.603。
+
+    只出打回不出提醒：这一条的性质是「声明造假」，没有「可疑」档。
+    """
+    errors: list[str] = []
+    warns: list[str] = []
+    for shot in shots:
+        sid = str(shot.get("id") or "")
+        code = str(shot.get("code") or "")
+        derived = shot.get("derived_from") or []
+        if not code or not derived:
+            continue
+        shot_shape = canonical_shape(code)
+        if len(shot_shape) < _SHAPE_MIN_TOKENS:
+            continue
+        best = 0.0
+        best_rel = ""
+        for rel in derived:
+            ds = _demo_shape(str(rel))
+            if ds is None or len(ds) < _SHAPE_MIN_TOKENS:
+                continue
+            sim = shape_similarity(shot_shape, ds)
+            if sim > best:
+                best = sim
+                best_rel = str(rel)
+        if best < DERIVED_MIN_SIM:
+            errors.append(
+                f"闸（derived_from）{sid}：代码与声明的 demo 源文件骨架相似度 "
+                f"最高 {best:.3f}（{best_rel or '全部读不到'}）< {DERIVED_MIN_SIM}。"
+                "声明 derived_from 但代码与该 demo 无结构关联——要么改代码让它真正"
+                "从该 demo 演化而来，要么改 derived_from 指向真正来源的 demo")
+    return errors, warns
 
 
 def structure_pairs(codes: list[str]) -> list[tuple[int, int, float]]:
@@ -1465,14 +1552,16 @@ def spec_schema() -> dict[str, Any]:
                                                         "如 [\"demos/opening/fracture/Fracture.tsx\"]。"
                                                         "每个都必须命中 demos/MANIFEST.json 白名单"},
                         "assets": {"type": "array",
-                                   "description": "本镜引用的素材资产。每个声明 name/sha16/ext/source/alpha/layer。"
-                                                  "代码里用 staticFile(\"<name>\") 引用，lint 做双向对账",
+                                   "description": "本镜引用的素材资产。每个声明 name/sha256/ext/source/alpha/layer。"
+                                                  "代码里用 staticFile(\"<name>\") 引用，lint 做双向对账。"
+                                                  "sha256 是全 64 位十六进制——渲染前按 sha256 从 asset_library 取字节、"
+                                                  "投到渲染容器 public/<name>",
                                    "items": {"type": "object",
-                                             "required": ["name", "sha16", "ext"],
+                                             "required": ["name", "sha256", "ext"],
                                              "properties": {
                                                  "name": {"type": "string"},
-                                                 "sha16": {"type": "string",
-                                                           "description": "sha256 前 16 位"},
+                                                 "sha256": {"type": "string",
+                                                            "description": "完整 sha256（64 位十六进制）"},
                                                  "ext": {"type": "string"},
                                                  "source": {"type": "object"},
                                                  "alpha": {"type": "boolean"},
