@@ -1,10 +1,15 @@
-"""SubAgent 设计：主 Agent 通过 SpawnTool 异步派生子 Agent 执行子任务。
+"""SubAgent 设计：主 Agent 通过 SpawnTool 派生一个子 Agent 执行子任务。
 
 对应设计文档「SubAgent 设计」：
-  主 Agent → SpawnTool → 异步启动 SubAgent → 独立执行 → 结果回传主 Agent → 主 Agent 继续
+  主 Agent → SpawnTool → 启动 SubAgent → 独立执行 → 结果回传主 Agent → 主 Agent 继续
 - 主 / 子共用同一套 AgentOnceRun（ReAct 循环）。
 - 关键约束：SubAgent 不能再派生 SubAgent —— 子 Agent 的工具注册表里【不含 SpawnTool】，
-  从结构上杜绝无限递归。
+  从结构上杜绝无限递归。这条今天由 ``tests/test_team_wiring.py`` 的断言守着
+  （原来只有 ``_build_child_registry`` 上面那句注释在守，注释不构成判据）。
+- **本工具是同步等待**（Q65）：``SpawnTool.execute`` 直接 await 子 Agent 跑完，
+  子结论作为本次工具回执进入本轮消息序列，父计划在它回来之前不许收尾。
+  骨架说「异步派生」，本仓在这一点上**不同但更强**（回调语义因此成立）；
+  真正要「派出去就不等」的活，走 ``subagent_manager.py`` 的常驻 WORK/IDLE 腿。
 """
 
 from __future__ import annotations
@@ -118,9 +123,16 @@ class SpawnTool(Tool):
 
     @property
     def description(self) -> str:
+        # 描述必须与行为一致（T49/Q65）：本工具是**同步等待**，不是「派出去就不管」。
+        # 回调语义（子结论作为工具回执直接进入本轮消息序列、父计划在它回来前不许收尾）
+        # 正是这么保证的，所以这里如实写「等它结束」，并点明「要并行就同一批里发起」——
+        # 否则模型会以为「派生」= 立刻返回，把本该同时发出去的几件活拆成串行。
         return (
-            "派生一个子 Agent 异步完成一个可独立处理的子任务，并把子 Agent 的最终结论作为工具结果返回。"
-            "适合把大任务拆成子步骤（如检索+汇总、分文件处理）。子 Agent 不能再派生孙 Agent。"
+            "派生一个子 Agent 去完成一个可独立处理的子任务，并**同步等待它结束**，"
+            "把子 Agent 的最终结论作为本次工具调用的结果返回。"
+            "适合把大任务拆成子步骤（如检索+汇总、分文件处理）。"
+            "要多路子任务同时跑，就在同一次回复里一起调用本工具（系统会并发执行）。"
+            "子 Agent 不能再派生孙 Agent。"
         )
 
     @property

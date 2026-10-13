@@ -10,7 +10,10 @@ fastapi>=0.136        # agent_framework/server.py：/chat /upload /history /ws
 uvicorn>=0.47         # ASGI 服务器
 pydantic>=2.13        # 请求体模型
 websockets>=15.0      # WebSocket 回投（Connection Manager）
-aiohttp>=3.13         # 出站 HTTP（WebTool / MQ 消费端）
+# 出站 HTTP 一律走标准库 urllib（media_fetch / image_backend / tools/mcp.py 都是这套）。
+# 原先这里声明过 aiohttp —— **装了没人 import**，R10-T49 的依赖卫生闸把它照出来了
+# （详见 tests/test_requirements_hygiene.py 的 ①；image_backend.py 的注释里也写着
+# 「这仓没有 aiohttp 依赖」）。要用异步出站 HTTP 时再加回来，别留着占位。
 
 # --- 上线存储层（spec 2026-09-20-pg-minio-storage-design）---
 # 元数据全进 PostgreSQL、媒体字节全进 MinIO；两者配置只从环境变量读。
