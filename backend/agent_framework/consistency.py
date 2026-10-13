@@ -88,6 +88,47 @@ _SKILL_NOT_TOOL_PATTERNS = (
 )
 
 
+def props_schema_names(props: Mapping[str, Any] | None) -> set[str]:
+    """一份**裸的 properties 表**（`{键: 声明}`）里出现过的键名与取值，含嵌套层。
+
+    与 :func:`schema_property_names` 共用同一把 `walk`，只是入口不同：那边的入口是
+    「工具对象」（``tool.parameters`` 是一份完整 schema），这里的入口是**契约参数**
+    ——``plan_vocab.props_for(node)`` 那一份 `{键: 声明}`。两条路的形状不一样
+    （一份是完整 schema、一份是 properties 表），而来源必须**同一个** walk：
+    否则又是一次「两处各算各的」。
+    """
+    out: set[str] = set()
+    _walk_schema({"type": "object", "properties": props or {}}, out)
+    return out
+
+
+def _walk_schema(node: Any, out: set[str], depth: int = 0) -> None:
+    """把一份 JSON Schema 里「像字段名/取值的东西」收进 ``out``（递归，深度上限 8）。"""
+    if depth > 8 or not isinstance(node, Mapping):
+        return
+    enum = node.get("enum")
+    if isinstance(enum, (list, tuple)):
+        # 脏 schema 可能把 enum 写成字符串：逐字符遍历会往豁免集里塞单字母
+        for value in enum:
+            if isinstance(value, str) and value:
+                out.add(value)
+    const = node.get("const")
+    if isinstance(const, str) and const:
+        out.add(const)
+    props = node.get("properties")
+    if isinstance(props, Mapping):
+        for key, sub in props.items():
+            out.add(str(key))
+            _walk_schema(sub, out, depth + 1)
+    for key in ("items", "additionalProperties", "oneOf", "anyOf", "allOf"):
+        sub = node.get(key)
+        if isinstance(sub, Mapping):
+            _walk_schema(sub, out, depth + 1)
+        elif isinstance(sub, (list, tuple)):
+            for item in sub:
+                _walk_schema(item, out, depth + 1)
+
+
 def schema_property_names(tools: Iterable[Any]) -> set[str]:
     """把所有工具 JSON Schema 里出现过的 **properties 键名**与**声明过的取值**全收出来（含嵌套层）。
 
@@ -105,39 +146,14 @@ def schema_property_names(tools: Iterable[Any]) -> set[str]:
     只放宽文案检查，不影响任何执行判定。
     """
     out: set[str] = set()
-
-    def walk(node: Any, depth: int = 0) -> None:
-        if depth > 8 or not isinstance(node, Mapping):
-            return
-        enum = node.get("enum")
-        if isinstance(enum, (list, tuple)):
-            # 脏 schema 可能把 enum 写成字符串：逐字符遍历会往豁免集里塞单字母
-            for value in enum:
-                if isinstance(value, str) and value:
-                    out.add(value)
-        const = node.get("const")
-        if isinstance(const, str) and const:
-            out.add(const)
-        props = node.get("properties")
-        if isinstance(props, Mapping):
-            for key, sub in props.items():
-                out.add(str(key))
-                walk(sub, depth + 1)
-        for key in ("items", "additionalProperties", "oneOf", "anyOf", "allOf"):
-            sub = node.get(key)
-            if isinstance(sub, Mapping):
-                walk(sub, depth + 1)
-            elif isinstance(sub, (list, tuple)):
-                for item in sub:
-                    walk(item, depth + 1)
-
     for tool in tools or ():
         schema = getattr(tool, "parameters", None)
-        walk(schema if isinstance(schema, Mapping) else {})
+        _walk_schema(schema if isinstance(schema, Mapping) else {}, out)
     return out
 
 
 def skill_field_names(*, node_param_keys: Iterable[str] = (),
+                      node_props: Iterable[Mapping[str, Any]] = (),
                       tools: Iterable[Iterable[Any]] = ()) -> set[str]:
     """技能正文里可能出现的**字段名**总集（这些都不是工具名，不能报成臆造工具）。
 
@@ -148,7 +164,8 @@ def skill_field_names(*, node_param_keys: Iterable[str] = (),
     来源少一个就会在测试里红。
 
     ``tools`` 是「一批批工具对象」（每批一个可迭代的 Tool），不是工具名的可迭代——
-    所以调用方传列表，别传生成器。
+    所以调用方传列表，别传生成器。``node_props`` 是**裸的 properties 表**那一路
+    （``plan_vocab.props_for(node)`` 的返回值，含嵌套字段），见下面那条注释。
     """
     out = {str(k) for k in node_param_keys}
     # 节点**产出**的字段名单源在计划门那一层（``plan.support.OUTPUT_FIELD_NAMES``）：
@@ -156,6 +173,13 @@ def skill_field_names(*, node_param_keys: Iterable[str] = (),
     # 而它们不是任何工具的入参键，所以 schema 扫不出来。不收这一份就会挂假告警
     # ——这台检查最怕的就是假告警。
     out |= set(OUTPUT_FIELD_NAMES)
+    # 契约参数那一份**必须单独收**：技能正文讲的是「`shots[]` 里的 `derived_from`
+    # 怎么填」这类**嵌套**字段，而 `PlanGate.param_keys()` 按自己的契约只收顶层键名
+    # （改它会动到计划卡反查的口径）。2026-10-13 真机启动日志上挂的那条假告警
+    # （「点名了不存在的工具：derived_from」）就是这么来的：离线用例把节点 schema
+    # 整批传进了 `tools`，装配处只传了主注册表 —— 又是「测试与生产各算各的来源」。
+    for props in node_props or ():
+        out |= props_schema_names(props)
     for batch in tools:
         out |= schema_property_names(batch)
     return out

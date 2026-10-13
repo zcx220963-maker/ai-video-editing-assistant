@@ -684,8 +684,20 @@ def build_runtime(
                 # （画幅 landscape、版式 dict_entry、字幕形态 torn_highlight），它们
                 # 长得像工具名（小写下划线）却不是可调用的东西——只收键名就挂假告警。
                 node_keys = plan_gate.param_keys() | plan_gate.enum_values()
+                # 规划轮节点的**嵌套**字段（`shots[].derived_from`、
+                # `fields.<name>`）只在契约参数那一份里：MCP 声明给的是顶层类型
+                # （`_signature_for` 翻签名时别的带不过来），而 `param_keys()` 按
+                # 自己的契约只收顶层键名（改它会动到计划卡反查的口径）。不收这一份，
+                # 技能正文里正确写下的 `derived_from` 就会被判成「点名了不存在的
+                # 工具」——2026-10-13 真机启动日志上挂着的那条假告警正是它。
+                # 离线用例 `tests/test_motion_channel.py` ⑦ 早就把节点 schema 整批
+                # 传进 `tools` 了，于是**测试全绿而真机挂告警**：又是「测试与生产
+                # 各算各的来源」那个形状（§9-Q91）。
+                node_props = [plan_gate.vocab.props_for(n)
+                              for n in sorted(plan_gate.whitelist())]
                 param_keys = _cons.skill_field_names(
                     node_param_keys=node_keys,
+                    node_props=node_props,
                     tools=[registry.all_tools(),
                            [SubmitPlanTool(plan_gate), ConfirmPlanTool()]])
             except Exception as exc:  # noqa: BLE001 - 取不到就按原样检查
