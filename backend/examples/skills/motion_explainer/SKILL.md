@@ -2,6 +2,7 @@
 name: motion_explainer_skill
 display: 图文科普片（零素材出片）
 description: 【WORKFLOW SKILL】没有视频素材、用户只给一个选题时的出片流程：自己查资料 → 写每镜文案 → 每镜选一张shot配方卡+填参数（不写渲染代码）→ 人声旁白配逐词字幕 → 一条成片。适用于科普、历史、概念解释类短片，或用户明确说「我没有素材，你自己找内容做一条」。A zero-material workflow: research, write per-shot copy, select shot recipe cards and fill params, narrate and render.
+sections: film-knobs, patch-motion, sound-design, image-channel, asset-motion, subject-naming, motion-anchors, text-only-quota
 ---
 
 # 何时用这条通道（与常规剪辑的分界）
@@ -265,6 +266,8 @@ export default Shot;
 - 查不到就说查不到，不要编。`source` 留空比编一个强。
 - 出处不进画面（除非用户要求），但进分镜卡和逐镜账。
 
+<!-- section: film-knobs -->
+
 # 画面质感档 texture
 
 每镜可选 `texture`（省略=跟整片默认），5 档：
@@ -317,6 +320,8 @@ export default Shot;
 **进出场则要进缓存键**，因为它由母版逐帧画进每一镜的切片里，改一次就是整片重烧。
 所以「先定进出场、再调转场」比反过来便宜得多。
 
+<!-- section: patch-motion -->
+
 # 局部改
 
 出片后要改几个字或几镜，**不要重跑整条流程**：
@@ -324,6 +329,8 @@ export default Shot;
 1. **改文案/高亮词** → patch_motion_code（只改指定镜的 text/highlight，不重渲结构）
 2. **改一镜的画面** → 重新选卡/适配那一段代码 → patch_motion_code
 3. **改整体风格** → 换主题色板 → patch_motion_code（改 palette 引用）
+
+<!-- /section -->
 
 # 十一道闸
 
@@ -439,6 +446,8 @@ lint 白名单 44 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 - 横屏 landscape：1800×732
 - 方屏 square：952×764
 
+<!-- section: image-channel -->
+
 # 资产与图像通道
 
 本链支持图像资产——用 `staticFile` 引本镜 `assets` 声明过的本地文件。
@@ -484,6 +493,8 @@ lint 规则 `dg/staticfile-asset-check` 双向对账：
 `public/<name>`（按 sha256 前 16 位对账 + 幂等落盘）。素材必须先入全局素材库；填一个库里没有的
 sha256，渲染前一帧都不烧就会红。素材来源分类 `materials.origin` 支持 `'art'`（代码生成的素材）。
 
+<!-- /section -->
+
 # 字体白名单
 
 字族只许从这两类里取，写别的**逐镜打回**（lint 规则 `dg/font-family-whitelist`，
@@ -506,6 +517,8 @@ sha256，渲染前一帧都不烧就会红。素材来源分类 `materials.origi
 浏览器**不报错**、直接回落成默认字族——代码里写的和画面上出现的不是一回事（闸① 的
 `dg/font-load-check` 就是为这条：`loadFont` 指的字节必须在 `public/fonts/` 里真存在）。
 
+<!-- section: asset-motion -->
+
 # 闸⑪：资产动效
 
 闸 ⑪ 判**资产是否参与了动效**——静态摆图不算"用了资产"。
@@ -525,3 +538,66 @@ sha256，渲染前一帧都不烧就会红。素材来源分类 `materials.origi
 母版 `FilmLayout` 在 `probeFrame - 2`（首帧附近）和 `probeFrame`（末帧附近）两个时点
 扫一遍 `<img>`/`<video>`，记录 tag/src/box/transform/opacity。
 `server.mjs` 比对两帧快照，按 src 匹配，比较盒/transform/opacity 是否变化。
+<!-- /section -->
+
+<!-- section: subject-naming -->
+# 主体具名（闸⑯）：每一镜的那个「能被认出的东西」怎么写
+
+- `subject` **每镜必填**，2~24 字，写**画面上那个东西**的名词短语（`活字盘`、`三条等高线`、
+  `一张 1900 年的地图`），不要写主题词（`印刷术`）。`理念`/`趋势`/`文化` 这类抽象词在
+  拒绝名单里，闸⑯ 见一个退一个——它们既画不出来也认不出来。
+- `subject_channel` **有图形主体的镜必填**，五选一：`rough` / `three` / `katex` /
+  `vector` / `image`。它必须是**这一镜代码里真用上的那条**（import 了还得真调用），
+  闸⑯ 拿代码逐镜核你申报的那条；写着 `rough` 而代码里一个 `roughjs` 都没用，等于自报。
+- **纯文字/纯色块镜不许填 `subject_channel`**（那一档由闸⑦ 的纯文字配额管）：这类镜
+  一条画法通道都没有，填了就是无证据的申报，闸⑯ 两向都判。`subject` 照样要写——
+  「「毕昇」两个字」也是个能被认出的主体。
+- `subject_terms`（⑲-b 盲描述用的词族）**今天的 schema 里还没有这一栏**：合同里写的是
+  它，实现只落了 `subject` / `subject_channel` 两格。**别写它**，写了会被 schema 退回来。
+<!-- /section -->
+
+<!-- section: motion-anchors -->
+# 动效锚定（闸㉑）：每一条动效为**哪个数据**动
+
+镜级 `motion` 是一张清单，每条 `{kind, anchors}`：
+
+- `kind` 必填且非空（说不出是什么动效，就没法说它服务谁）。
+- `anchors` **必填、不能空、最多 3 个**。空锚＝这条动效不为任何数据服务（历史上被驳回过的
+  形态）；挂超过 3 个上限就退——判据是「**每一个**锚都得落在窗口内」，挂满了等于没锚。
+- 只认三种写法（**白名单**，写错一个字符当场退）：`fields.<本镜声明过的字段名>`、
+  `subtitle:<本镜第几个词>`、`beat:<第几个节拍>`。序号从 **1** 起，不写零、不写小数。
+  锚到这一镜没声明过的字段，与没锚是同一件事。
+- **窗口**：这条动效的触发帧要落在它锚的数据「首次可读」的 ±k 帧内，k = fps ÷ 3
+  （30fps 就是 10 帧 ≈ 0.33 秒）——人对齐的精度是按时间走的，所以容差跟着帧率走。
+- **今天真判得动的只有 `subtitle:` 那一档**：`fields.` 锚落「未判」（「这个字段什么时候
+  在画面上变得可读」要人判，不是这一层能反推的），`beat:` 锚也落「未判」（这条链没做
+  节拍检测，节拍表不存在）。**未判不是通过**——别把「挂到必然存在的字段上」当成过闸的
+  写法；该申报就如实申报，⑲-b 那条盲测通道上线后这两档才会真有读数。
+<!-- /section -->
+
+<!-- section: text-only-quota -->
+# 纯文字镜的配额（闸⑦ 第三档）：中间镜最多三分之一
+
+- 判据只数**中间镜**：**首尾两镜不计入分子也不计入分母**。开场与收尾用纯文字/纯色块
+  是允许的（那两镜本来就常常是标题与落款）。
+- 中间镜里，纯文字/纯色块镜超过 **1/3** 就打回，回执点名是哪几镜——补画面主体，
+  别把整片做成「卡片 + 文字」。
+- 这条只在 **≥6 镜**时判（更短的片子不判通道配额）。
+- 与本条同族的还有「画法通道种数」（≥6 镜要 3 种、≥10 镜要 4 种，见「通道表（闸⑦）」）。
+- 「纯文字镜**不得连续 3 镜**」这句**今天没有判据**：连续与否没有任何闸在读，全靠这条
+  配额。按配额写就够，别指望有人替你数字号。
+<!-- /section -->
+
+<!-- section: sound-design -->
+# 声音：旁白与配乐
+
+- **配乐只从曲库选**：`select_BGM` 挑一条填进 `render_motion_code` 的 `bgm`。曲库里没有
+  合适的就**问用户**——绝不去网上下载（`fetch_media` / `web_search` / `fetch_url` 都不许
+  用来找音乐）。
+- **有旁白**（`narration=true`）：人声与逐词字幕由母版合成，**不要写每镜时长**（镜头长度
+  归真实语音时长）。第几个词可用 `subtitle:<i>` 锚动效——那是今天唯一真判得动的一档锚。
+- **没旁白**（`narration=false`）：没有语音时长可依，**每镜必须给 `min_duration_sec`**
+  （5~15 秒，给观众读字幕的时间），全片总长就是各镜 `min_duration_sec` 之和。
+- **声音设计的细节不在这份正文里**（响度、BGM 压低、停顿、语气）：要动它们就
+  `load_skill(name="motion_explainer_skill", path="sound-design.md")` 取附件全文再动手。
+<!-- /section -->

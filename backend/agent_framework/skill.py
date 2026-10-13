@@ -18,12 +18,13 @@ import io
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Iterable
 
 from .storage import StorageUnavailable
 from .tool import Tool
@@ -61,6 +62,27 @@ class Skill:
     available: bool = True
     unavailable_reason: str = ""
     display: str = ""             # frontmatter display：面向用户的中文名
+    declared_sections: list[str] = field(default_factory=list)  # frontmatter sections：
+
+    # ---- 分段键（T42，§5.7 第②条）----
+
+    @property
+    def section_names(self) -> list[str]:
+        """正文里**真出现**的分段名（按出现顺序；无标记就是空表）。
+
+        与 ``declared_sections`` 是两件事：declared 是 frontmatter 里那份声明，
+        这里是正文里真切的块。两者不一致说明有人加/删了块没改声明（或反过来）——
+        对账靠 `tests/test_skill.py`，这里只如实报。
+        """
+        return list(split_sections(self.body)[1])
+
+    def assemble(self, sections: Iterable[str] = ()) -> str:
+        """按需拼正文：**标记之外的正文 + 这次点名要的那几块**（T42）。
+
+        没有分段标记的技能（今天绝大多数）原样返回 ``body``——这一层是**纯增益**，
+        不改变任何既有技能的内容。
+        """
+        return assemble_sections(self.body, sections)
 
     def manifest_lines(self) -> str:
         attr = "true" if self.available else "false"
@@ -110,6 +132,82 @@ def _is_true(value: Any) -> bool:
     return str(value).strip().lower() in ("true", "1", "yes")
 
 
+def _parse_sections(raw: Any) -> list[str]:
+    """解析 frontmatter 的 ``sections:``：``image-channel, sound-design`` 这种一行清单。
+
+    为什么沿用 ``_parse_requires`` 那种「一行逗号分隔」而不是 YAML 列表：frontmatter
+    解析器是**极简的** ``key: value``（多行列表它读不了，读不了就会静默丢掉后半段）。
+    要写多行列表就得先把解析器换成 YAML 库，而那会把「改一行 frontmatter」的代价从
+    评审换到「依赖 + 换行缩进的坑」上——为六个名字不值这个价。
+    """
+    raw = str(raw or "").strip().strip("[]")
+    return [tok.strip().strip("\"'") for tok in raw.split(",") if tok.strip()]
+
+
+# --------------------------------------------------------------------------
+# 分段键（T42，§5.7 第②条）：正文里单独成行的 `<!-- section: <name> -->` 起一块，
+# 块到下一个标记、`<!-- /section -->` 或文末为止。**标记之外的正文 = 默认注入集**。
+#
+# 为什么默认集是「标记之外」而不是「标了 default 的那些」：加一节说明是**增**动作，
+# 而「默认发什么」是**既有行为**。按这个方向定，新写的一节天生不进默认集（T36 那三节
+# 就是这么加的），既有技能一个字都不用标、行为逐字不变（没有标记 → 整份正文照发）
+# ——反过来定的话，每加一节都要回头去数「默认集里原来有哪些」，那才是漂移的入口。
+#
+# 为什么有收尾标记 `<!-- /section -->`：没有它，块只能一路排到文末，于是「中间抽掉一段、
+# 后面接着回默认集」这件事写不出来（`motion_explainer` 要抽的三段就散在正文中段：
+# 整片开关、资产与图像通道、闸⑪）。收尾标记之后的行重新算默认集，**不写它就等于
+# 「一直到下一个标记」**——两种写法都存在，是刻意的：末尾的块不必再多写一个收尾标记。
+#
+# 为什么标记用注释形而不是 `# 标题`：标题是**给人看的排版**，注释是**给机器看的身份**。
+# 拿 `# 一镜只有七栏` 这种标题当分段键，等于把「改标题措辞」变成「改注入行为」——
+# 技能正文的措辞本来就是最常改的东西。
+_SECTION_MARK = re.compile(r"^<!--\s*section:\s*([A-Za-z0-9_.\-]+)\s*-->\s*$")
+_SECTION_END = re.compile(r"^<!--\s*/section\s*-->\s*$")
+
+
+def _section_pieces(body: str) -> list[tuple[str | None, str]]:
+    """正文 → ``[(段名或 None, 文本)]``（按出现顺序；``None`` = 标记之外的默认集）。"""
+    pieces: list[tuple[str | None, list[str]]] = [(None, [])]
+    for line in (body or "").splitlines():
+        m = _SECTION_MARK.match(line.strip())
+        if m:
+            pieces.append((m.group(1), []))
+            continue
+        if _SECTION_END.match(line.strip()):
+            pieces.append((None, []))
+            continue
+        pieces[-1][1].append(line)
+    return [(name, "\n".join(lines).strip()) for name, lines in pieces]
+
+
+def split_sections(body: str) -> tuple[str, list[str]]:
+    """正文 → ``(默认集文本, 分段名清单)``。没有标记时分段名清单为空。"""
+    base: list[str] = []
+    names: list[str] = []
+    for name, text in _section_pieces(body):
+        if name is None:
+            base.append(text)
+        else:
+            names.append(name)
+    return "\n\n".join(t for t in base if t), names
+
+
+def assemble_sections(body: str, sections: Iterable[str] = ()) -> str:
+    """默认集 + 这次点名要的那几块（保正文原序）；**没有分段标记时原样返回**。
+
+    要一个本技能没有的段名时**静默跳过**，不报错：段名是「通道/特性键」（计划里用了
+    图像通道 → 要 ``image-channel``），同一个键在不同技能里写不写那一段是各技能的
+    自由——十二份技能各自只认自己有的那几块，调用方不必先问清单。
+    """
+    want = {str(s).strip() for s in (sections or ()) if str(s).strip()}
+    pieces = _section_pieces(body)
+    if not any(name for name, _ in pieces):
+        return body
+    out = [text for name, text in pieces
+           if text and (name is None or name in want)]
+    return "\n\n".join(out)
+
+
 async def _one_chunk(data: bytes) -> AsyncIterator[bytes]:
     yield data
 
@@ -142,6 +240,11 @@ class SkillLoader:
             available=available,
             unavailable_reason=reason,
             display=str(fm.get("display", "") or ""),
+            # frontmatter 的 `sections:` 是**声明**（一行逗号分隔的名字），正文里那几个
+            # `<!-- section: … -->` 块是**事实**。两份都要有：声明让人一眼看得出这个技能
+            # 分了哪几块，事实保证块真的存在——对账（声明 ⊆ 事实、事实 ⊆ 声明）由
+            # `tests/test_skill.py` 判红，不许只写一头。
+            declared_sections=_parse_sections(fm.get("sections", "")),
         )
 
     async def discover(self, user_id: str | None = None) -> list[Skill]:

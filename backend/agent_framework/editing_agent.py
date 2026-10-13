@@ -27,6 +27,7 @@ from .context import ContextBuilder
 from .hooks import AgentHook, CompositeHook, LoggingHook, MetricsHook
 from .memory import MemoryContextSource, MemoryStore, register_memory_tools
 from .orchestration import NodeRegistry, NodeState
+from .prompts import PromptLibrary, build_prompt_library
 from .skill import SkillLoader, SkillManifestContextSource, register_skill_tools
 from .task_manager import TaskManager, topo_order
 from .video_editing import build_agent_registry, build_node_registry
@@ -34,18 +35,36 @@ from .video_editing import build_agent_registry, build_node_registry
 
 from .context import prompt_fingerprint
 
-# WORKFLOW 技能正文作为剪辑 Agent 的系统提示内核（LLM 据此决定剪辑路径）。
+# 剪辑副链的系统提示内核的**内联回落副本**（LLM 据此决定剪辑路径）。
+#
+# T42 起这份文案的**真相源是磁盘**：`prompts/editing_round.md`，经 ``PromptLibrary.text``
+# 读出（`build_editing_agent` 里那一行），这里这份只在「目录没拷过去 / 文件缺失」时兜底。
+# 为什么必须两处都有、而且必须逐字一致：主链早就走 ``prompt_library``（`prompts/*.md` +
+# 内联回落），副链此前是**写死的一整段**——同一条纪律（「配乐只能从曲库选」）改一处不改
+# 另一处，两条链就会对同一件事说两句话（§1.9 那类「两份真相」污染的同一个形状）。
+# 一致性由 `tests/test_prompt_library.py` 的既有对账清单守（T42 起把
+# `editing_round.md` ↔ 本常量也纳入），单改一侧即红。
+# 指纹（``EDITING_PROMPT_FINGERPRINT``）算的是**这份内联文本**，不随文件改动漂——
+# 它标的是「代码里那份合同的版本」，与磁盘热替换是两件事（同 `context.prompt_fingerprint`
+# 对主链的口径）。
 EDITING_SYSTEM_PROMPT = (
     "你是视频剪辑 Agent。无论任何情况，你必须始终用简体中文思考和回复。"
     "你在调用工具前对步骤的任何说明文字，也必须是简体中文，绝不允许输出英文句子——"
     "即使工具返回的是英文内容也不允许改变语言。"
+    "\n\n"
     "工具失败处理：同一工具连续失败 2 次后，必须停止重试，向用户说明失败原因并询问如何处理"
     "（换素材、换参数、跳过这步或换方案），不要盲目改参数反复重试同一工具；"
     "素材或资源找不到时直接问用户要不要换一个。"
+    "\n\n"
     "剪辑工具的前置依赖会由拦截器自动补齐，你不需要手动补调依赖节点。"
     "终止点不固定——用户只要分组或只要文案时，走到 group_clips / generate_script 即可，不必渲染成片。"
+    "\n\n"
     "⚠️ 禁止用 fetch_media、web_search、fetch_url 去网上搜索或下载配乐——"
     "配乐只能通过 select_BGM 从曲库选取，曲库里没有就问用户，绝不去网上下载。"
+    "\n\n"
+    # 段间换行与 `prompts/editing_round.md` 逐字对齐：那个文件是给人读的（要分段），
+    # 这里是回落副本——两边的空白也必须一致，否则 `test_prompt_library.py` 那支
+    # 对账会把「只差一个空格」判成漂移（T42 落地时就是先红在这里）。
     "需要了解画面内容（谁出镜、什么场景、什么氛围）时，用 read_node_history 读 understand_clips——"
     "它有每个镜头的视觉描述（caption），包括画面里是谁、在做什么。"
     "不要凭空猜画面内容，也不要让用户人工标注时间点——画面信息在 understand_clips 里，读它。"
@@ -89,6 +108,7 @@ def build_editing_agent(
     state: NodeState | None = None,
     max_iterations: int = 40,
     observability: bool = True,
+    prompt_library: PromptLibrary | None = None,
 ) -> dict[str, Any]:
     """装配一个剪辑 AgentOnceRun，并返回其关键部件供调用/测试观测。
 
@@ -96,6 +116,10 @@ def build_editing_agent(
     memories 两张表。
     返回字段：agent, state, interceptor, registry, skill_loader, memory_store,
     checkpoint, context_builder, metrics。
+
+    ``prompt_library``（T42）：副链与主链**共用同一个提示词库**。不传就是按默认目录现建
+    一个（`build_prompt_library(None)`：仓库自带目录在就用它），传进来则连热替换一起共享
+    ——两条链从此读同一批 ``prompts/*.md``，「改一句文案要动两处代码」这件事到此为止。
     """
     node_registry = node_registry or build_node_registry()
     state = state or NodeState(session_id="edit:default", artifact_id="")
@@ -114,7 +138,13 @@ def build_editing_agent(
         register_memory_tools(registry, memory_store)
         context_sources.append(MemoryContextSource(memory_store))
 
-    context_builder = ContextBuilder(EDITING_SYSTEM_PROMPT, context_sources=context_sources)
+    # 系统提示内核从**磁盘**读（`prompts/editing_round.md`），读不到才用内联副本回落。
+    # 显式传字符串给 ContextBuilder 是刻意的：它的 ``system_prompt=None`` 那条默认路径
+    # 读的是 ``system_prompt.md``（主链那份），而副链要的是自己这一份。
+    library = prompt_library or build_prompt_library(None)
+    context_builder = ContextBuilder(
+        library.text("editing_round.md", EDITING_SYSTEM_PROMPT),
+        context_sources=context_sources, prompt_library=library)
 
     hooks: AgentHook | None = None
     metrics: MetricsHook | None = None

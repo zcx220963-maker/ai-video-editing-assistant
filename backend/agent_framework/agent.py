@@ -37,6 +37,7 @@ from .messages import ToolCall, assistant, system, tool_result, user
 from .plan import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_step_executed,
                         pending_continuation, planning_section_blocks,
                         preload_skills, reconcile, render_injections,
+                        sections_for_plan,
                         ROUND_FILTER, SCOPE_CONDITION_KEY, SCOPE_SECTION,
                         plan_nodes, registry_for_round, scope_lines, trimmed_nodes)
 from .plan_retro import (PlanRetrospective, plan_card_lines, rework_line,
@@ -2289,7 +2290,12 @@ class Agent:
                                user_id, conversation_id))],
             user_id=user_id, conversation_id=conversation_id)
         sections = list(render_injections(compiled))
-        sections += await preload_skills(self.skill_loader, compiled.get("skills_hint") or ())
+        # 技能正文**按本片计划取块**（T42/§5.7②）：默认集 + 本轮点名要的那几块。
+        # 卡面一并传进去，只为一件事——读 `param_options[].default` 判「整片开关动没动过」
+        # （编译结果看不出用户勾没勾）；拿不到卡面时按「动过」算（见 plan.skills 的注释）。
+        sections += await preload_skills(
+            self.skill_loader, compiled.get("skills_hint") or (),
+            sections=sections_for_plan(compiled, plan))
         # 工具面按这张计划裁（T41）：只发计划用得到的剪辑节点 + 通用件，被裁的节点名
         # 进「如何请求扩面」那一小节（裁的是 schema 字节，不是可发现性，Q56）。
         steps = compiled.get("steps") or []

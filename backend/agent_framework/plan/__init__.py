@@ -31,7 +31,7 @@ from .reconcile import (NON_STEP_TOOLS, PlanCardHook, PlanReconcileHook,
 from .resume import pending_continuation
 from .round import (ROUND_FILTER, SCOPE_CONDITION_KEY, SCOPE_SECTION, plan_nodes,
                     registry_for_round, scope_lines, trimmed_nodes)
-from .skills import preload_skills
+from .skills import changed_film_knobs, preload_skills, sections_for_plan
 from .support import (CUSTOM_MAX_CHARS, CUSTOM_MAX_ITEMS, PLAN_MAX_CANDIDATES,
                       PlanIssues, neutralize)
 from .tools import ConfirmPlanTool, SubmitPlanTool
@@ -44,6 +44,8 @@ __all__ = [
     "PlanGate", "PlanVocabulary", "PlanValidator", "PlanCompiler",
     "SubmitPlanTool", "ConfirmPlanTool", "PlanIssues", "neutralize",
     "render_injections", "reconcile", "preload_skills", "planning_section",
+    # T42：技能正文按本片计划取块（判据 + 装配，与 skill.py 的分段标记成对）
+    "sections_for_plan", "changed_film_knobs",
     "planning_section_blocks",
     "pending_continuation", "claims_plan_card", "claims_step_executed",
     # T41：执行轮工具面的按链装配（表 + 「如何请求扩面」那段说明，成对出现）
