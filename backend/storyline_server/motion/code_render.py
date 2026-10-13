@@ -107,7 +107,12 @@ FILL_TARGET = 0.60
 META_FIELDS = ("sec", "speech_sec", "planned_frames", "frames", "words", "degraded",
                "measured_sec", "width", "height", "fps", "empty_ratio", "fill_span",
                "tokens", "field_checks", "render_timings", "cache_key", "layout",
-               "asset_motion", "assets", "motion")
+               "asset_motion", "assets", "motion",
+               # 闸㉑（T33）要的那两栏。`motion_anchors` 是**读数**（提醒/未判两个出口），
+               # `motion_anchor_frames` 是它算不出来的那个输入：旁白逐词的帧刻度。
+               # 后者必须进缓存还原——命中缓存的那一镜不会重跑 TTS，没有它就只能把
+               # 字幕锚全记成「未判」，而那是拿一个假未判冒充真判过。
+               "motion_anchors", "motion_anchor_frames")
 
 #: 母版回读字段盒的探针帧尾偏移（`durationInFrames - 本值`）。**必须与
 #: `remotion/src/tokens.ts` 的 `FIELD_PROBE_TAIL` 同值，两处一起改**：闸⑥ 比的是那一刻
@@ -995,6 +1000,22 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
                 cached_reject = motion_error(sid, rec.get("motion"))
                 if cached_reject:
                     raise MediaError(f"{cached_reject}（这一镜来自缓存，按当前判据重判不过）")
+                # 闸㉑ 同理，而且理由更硬：**申报（`shot["motion"]`）压根不进缓存键**
+                # ——它不改变任何像素，改它不该重烧。但判据读的正是申报，于是命中缓存的
+                # 那一镜必须拿**当前的**申报重判一次，否则回执上会挂着一份按旧申报算出来
+                # 的读数，而那是账上写一套、画面对着一套里最坏的一种。重判要的两个输入
+                # 都在缓存里：⑭ 的像素段（`rec["motion"]`）与旁白词表（`motion_anchor_frames`）。
+                cached_anchor_errs, cached_anchor_warns, cached_anchor_undet = \
+                    cspec.check_motion_windows(
+                        shot, events=(rec.get("motion") or {}).get("events") or [],
+                        word_frames=rec.get("motion_anchor_frames") or [], fps=fps,
+                        beats=None)
+                if cached_anchor_errs:
+                    raise MediaError("\n".join(
+                        f"{e}（这一镜来自缓存，按当前申报重判不过）"
+                        for e in cached_anchor_errs))
+                rec["motion_anchors"] = {"warnings": cached_anchor_warns,
+                                         "undetermined": cached_anchor_undet}
                 # 命中缓存**不等于**这一镜可以跳过滤镜：缓存里的那一镜是没加质感的像素，
                 # 质感在缓存之后按镜补。跳过它就成了「整片加了质感、命中缓存的那几镜是
                 # 原片」，而同一版片子里两种像素并存是没人看得见的错（闸⑤ 只管数值一致）。
@@ -1016,8 +1037,11 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
             f"{frame_budget}。降 fps（{fps}→10）或缩短片子再来——"
             "不静默砍镜，也不静默截帧")
 
-    props = shot_input_props(shot, spec, frames=frames,
-                             frame_words=_to_frame_words(narr["timed"], fps))
+    # 词表算一次、两处用：注入给母版的那份 props，与闸㉑ 判「字幕锚的首次可读帧」用的
+    # 那份。各算一遍就会出现「母版按 A 表点亮、判据按 B 表对窗口」这种只在真机上
+    # 看得见的分歧（与 `shot_input_props` 里 fields 那条同规）。
+    frame_words = _to_frame_words(narr["timed"], fps)
+    props = shot_input_props(shot, spec, frames=frames, frame_words=frame_words)
     if storage is not None:
         await _stage_shot_assets(shot, sid=sid, storage=storage, client=client)
     resp = await _await_heartbeat(
@@ -1050,6 +1074,15 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
     motion_err = motion_error(sid, motion)
     if motion_err:
         raise MediaError(motion_err)
+    # 闸㉑ 的后半段（T33）紧挨着闸⑭：它读的就是 ⑭ 刚数出来的那几段（触发帧），
+    # 与这份词表。**同样排在切片进缓存之前**——理由与 ⑭ 一字不差：退回去的一镜
+    # 不许在缓存里留一份「锚不上任何数据」的切片。
+    anchor_errors, anchor_warns, anchor_undet = cspec.check_motion_windows(
+        shot, events=motion.get("events") or [],
+        word_frames=[int(w["startFrame"]) for w in frame_words],
+        fps=fps, beats=None)
+    if anchor_errors:
+        raise MediaError("\n".join(anchor_errors))
     tokens = resp.get("tokens") or None
     fill = await _empty_check(sid, raw, bg_hex=_bg_of(tokens),
                               size=size, duration=float(info["duration"]),
@@ -1092,6 +1125,12 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
         # 闸⑭ 动效事件密度：上面那一刀只拦 rejected；能走到这里的是 ok 或 undetermined，
         # 后者的意思是「这一镜的动效没人判过」，必须原样留档（未判不许折成通过）。
         "motion": motion,
+        # 闸㉑ 的读数（T33）：只留**两个出口**（提醒/未判）+ 判它用的那份词表。
+        # 打回那一档在渲染口就抛了、走不到这里，所以账上要能看出的是「拿什么判的、
+        # 哪几条没判完」。词表进缓存是必须的：命中缓存的那一镜不重跑 TTS，
+        # 少了它字幕锚只能记成未判（见 META_FIELDS 那条注释）。
+        "motion_anchors": {"warnings": anchor_warns, "undetermined": anchor_undet},
+        "motion_anchor_frames": [int(w["startFrame"]) for w in frame_words],
         "render_timings": resp.get("timings") or {}, "cache_key": key,
         "chain": "remotion",
         "lint_warnings": [str(w)[:200] for w in (resp.get("warnings") or [])][:8],

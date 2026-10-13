@@ -74,6 +74,14 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 技能正文教模型「被判据拒的镜要说清是哪一镜、差在哪，未判的镜要如实说没判过」，
     # 这两个键只活在回执里，schema 扫不出来，不收就是假告警。
     "motion_warnings", "motion_unjudged",
+    # 闸㉑（动效锚定，R8-T33）的产物键，**必须与上面那两栏分开收**：⑭ 判的是「画面上
+    # 有没有先后变化」，㉑ 判的是「这些变化为哪条数据服务」——一镜可能 ⑭ 过了而 ㉑ 未判
+    # （动效有先后、锚在 `fields.` 上而窗口反推不出来）。技能正文要教模型「锚到本镜声明过的
+    # 字段 / 旁白第几个词 / BGM 第几个节拍，每一条动效都得说清为谁动」，所以 `motion` /
+    # `anchors` / `kind` 这三个**分镜 schema 的嵌套键**也在这里收下（与 `subject_channel`
+    # 同一形状：`vocab.props_for` 只扫顶层，嵌套键扫不出来，不收就是假告警）。
+    "motion_anchor_warnings", "motion_anchor_unjudged",
+    "motion", "anchors", "kind",
     # 闸⑮（版式族配额）与闸⑯（主体具名）的产物键：技能正文要教模型「每镜写清 subject
     # 与 subject_channel」，卡面的逐镜账里这两栏与 style（代码里认得的通道）并排摆着。
     # `subject`/`subject_channel` **在 plan_motion 的 schema 里**（不是臆造名），但

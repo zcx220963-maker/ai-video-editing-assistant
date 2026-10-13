@@ -190,6 +190,30 @@ SHOT_MOTION_STYLES = ("none", "fade", "rise", "drop", "zoom")
 SHOT_MOTION_MAX_SHARE = 0.10
 SHOT_MOTION_MAX_FRAMES = 15
 
+# ---------------------------------------------------------------------------
+# ㉑ 动效锚定（R8-T33）：「每个动效事件必须说清它为哪条数据服务」
+# ---------------------------------------------------------------------------
+# 「动效有没有意义」这句话没法判——谁也写不出一条能报红的规则。这一道把它换成可测的
+# 另一句：**这个事件为哪条数据服务**（一个字段 / 一个字幕词 / 一个音乐节拍），而判据只
+# 取机器判得动的那一半：**事件触发的那一帧，被锚的那条数据是不是正好可以读了**。
+# 「这个数据值不值得动」仍然归人眼——见 §10 的措辞表，不许把这一道说成「动效已被理解」。
+
+#: 一个动效事件最多挂几个锚。上限不为省字节，为**堵住一条绕法**：锚是「所有锚都必须在
+#: 窗口内」才算数（见 :func:`check_motion_windows`），把整句话二十个词全锚上就等于
+#: 「总有一个词在附近」，紧跟着的上限让这条绕法在字数上先走不通。
+MOTION_MAX_ANCHORS = 3
+
+#: 锚的三种写法。**这不是给人看的语法介绍，是白名单**——认不出的写法一律打回，
+#: 因为一个写错的锚（比如 `field.x` 少了个 s）在回执上看起来和真锚一模一样。
+MOTION_ANCHOR_FORMS = ("fields.", "subtitle:", "beat:")
+
+#: 窗口容差 k = fps // 这个数（@30fps 是 10 帧 ≈ 0.33 秒）。
+#: **为什么是 fps 的函数而不是一个帧数**：这条容差量的是「人对齐得准不准」，而人对齐的
+#: 精度是按**时间**走的（三百毫秒左右），把帧数写死会让 15fps 的片子容差翻倍、60fps 的
+#: 片子容差减半。附录 B 要求这个数由真渲分布标定（取 95 分位），**标定脚本还不存在**——
+#: 这一点记在 §9-Q98，不许把「3」当成标定结果。
+MOTION_ANCHOR_TOLERANCE_DIV = 3
+
 #: 母版 `<FilmLayout>` 真认的字幕形态。旧链那四档（torn/bottom…）随模板一起消失：
 #: 新链的字幕带只画在母版里，母版没实现的形态就不该出现在可选项里。
 SUBTITLE_MODES = ("full", "torn_highlight", "none")
@@ -635,6 +659,15 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         # 「填没填、有没有证据」是那一层的事，因为它要读**代码**算通道。
         "subject": str(raw.get("subject") or "").strip(),
         "subject_channel": str(raw.get("subject_channel") or "").strip().lower(),
+        # ㉑ 的申报（R8-T33）。**这一栏刻意不在这里归一**，与上面那两栏反着来：
+        # `check_motion_anchors` 是它形状的唯一主人，而它要判的正是「写法对不对」——
+        # 在这里顺手把非字符串的锚丢掉、把认不出的写法清成空表，都会把「写了但认不出」
+        # 悄悄修成「没写」，也就是把 ㉑ 的红样②（空锚打回）变成一条永远不响的路。
+        # 所以原样带着走，连大小写与空白都不动：回执上要能拿着锚串逐字核对。
+        # 它**不进缓存键**（`SHOT_KNOBS` 里没有它，刻意）：改申报不改变任何像素，
+        # 改了就该重烧一次是浪费——代价是命中缓存的镜必须按**当前**申报重判，见
+        # `code_render` 缓存路径上那一段。
+        "motion": raw.get("motion"),
     }
 
 
@@ -752,6 +785,10 @@ def validate_code_spec(raw: dict[str, Any], *,
     # 提醒那一份从这里单独取（见 style_facts）。
     for checker in WHOLE_FILM_GATES:
         errors.extend(checker(shots)[0])
+    # 闸㉑ 的**闸前**那一半（R8-T33）：动效事件的锚是纯契约，判它一次 ffmpeg 都不用开，
+    # 所以它跟上面那批整片闸并排放在这里，三个调用点（plan 入库前 / 烧像素前 / 落盘前）
+    # 一起生效。「事件触发帧在不在窗口里」那一半要像素，在 code_render 逐镜那一段。
+    errors.extend(check_motion_anchors(shots))
     # 闸⑱：投递腿存在性。只有调用方**知道**客户端能力时才判（None = 不判）——
     # plan_motion 那一侧还没有客户端，硬塞一个 None 当 False 会把「没接腿」误判成「缺腿」。
     if has_stage_leg is not None:
@@ -1379,6 +1416,228 @@ def _as_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def parse_motion_anchor(raw: Any) -> tuple[str, str] | None:
+    """一个锚串 → ``("fields"|"subtitle"|"beat", 参数)``；认不出返回 ``None``。
+
+    三种写法各只认**一种**拼法，因为这条通道的两头是两台机器：
+
+    * ``fields.<key>``    —— 参数是**这一镜自己声明的**字段名（⑥ 的口径，闸前对账）。
+    * ``subtitle:<i>``    —— 参数是**本镜旁白的第 i 个词**（1 起）。合同里写的「字幕窗」
+      落成词的首次可读帧：这一镜只有一行字幕，整行都在窗口里，那等于「怎么锚都算对」。
+    * ``beat:<n>``        —— 参数是 BGM 的第 n 个节拍（1 起）。
+
+    ``int(...)`` 那几个分支**只认十进制整数串**（含 ``+1`` 那种写法一律不认）：
+    ``"subtitle:1.0"`` 与 ``"subtitle: 1"`` 是两种写法，放进白名单就等于同一件事有
+    两个名字——而这条闸的回执要能被人拿着锚串逐字核对。
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if text.startswith("fields."):
+        key = text[len("fields."):]
+        return ("fields", key) if FIELD_NAME_RE.match(key) else None
+    for prefix, form in (("subtitle:", "subtitle"), ("beat:", "beat")):
+        if text.startswith(prefix):
+            tail = text[len(prefix):]
+            if not tail.isdigit() or (len(tail) > 1 and tail.startswith("0")):
+                return None                  # 前导零/符号/小数一律不认：一个名字一种写法
+            idx = int(tail)
+            return (form, str(idx)) if idx >= 1 else None
+    return None
+
+
+def check_motion_anchors(shots: list[dict[str, Any]]) -> list[str]:
+    """㉑ **闸前**：申报了的每个动效事件都必须挂上能解析的锚。→ 打回清单。
+
+    这一半**不用烧像素**，所以它排在三处调用点（`validate_code_spec`）上：
+    「写了动效却没说为谁动」这一次请求根本不该发出去。
+
+    判四件事：
+
+    1. ``motion`` 每一条都得是对象、且有非空的 ``kind``（说不出是什么动效）；
+    2. ``anchors`` 非空——**空数组就是打回**（§8.3 第 7 支反例的正面：动效有先后、
+       但不为任何数据服务）；
+    3. 每个锚能解析成 :data:`MOTION_ANCHOR_FORMS` 三种之一；
+    4. ``fields.<key>`` 的 key 必须是**这一镜自己声明过的**字段（⑥ 的白名单）——
+       锚到一个不存在的字段，在这条闸眼里与「没锚」是同一件事。
+
+    ``subtitle:<i>`` / ``beat:<n>`` 只在这里做**形式**检查：词表的长度要等 TTS 实测
+    （`narration_for`）才知道，节拍表今天压根没有——那两件事的可用性在闸后那一半
+    （:func:`check_motion_windows`）才算得出来，这里越界也判不了，不假装判过。
+    """
+    errors: list[str] = []
+    for i, s in enumerate(shots):
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        head = f"闸㉑ 动效锚定：{sid}："
+        declared = s.get("motion")
+        if declared is None:
+            continue                     # 一条都没申报：那一格由闸后按像素数出来的段判
+        if not isinstance(declared, (list, tuple)):
+            _err(errors, f"{head}motion 不是清单（实得 {type(declared).__name__}）——"
+                         f"每一条要写 {{kind, anchors}}")
+            continue
+        names = {str(f.get("name")) for f in (s.get("fields") or [])
+                 if isinstance(f, Mapping)}
+        for j, ev in enumerate(declared, 1):
+            if not isinstance(ev, Mapping):
+                _err(errors, f"{head}第 {j} 条动效不是对象")
+                continue
+            kind = str(ev.get("kind") or "").strip()
+            if not kind:
+                _err(errors, f"{head}第 {j} 条动效没写 kind——说不出是什么动效，"
+                             f"就没法说它服务谁")
+            raw_anchors = ev.get("anchors")
+            if isinstance(raw_anchors, str) or not isinstance(raw_anchors, (list, tuple)):
+                _err(errors, f"{head}第 {j} 条（{kind or '?'}）的 anchors 不是清单")
+                continue
+            if not raw_anchors:
+                _err(errors, f"{head}第 {j} 条（{kind or '?'}）**没有锚**——"
+                             f"这一条动效在说它不为任何数据服务，而那是 §8.3 里被驳回过的"
+                             f"形态。挂上它为谁动：`fields.<本镜字段名>`（这一镜声明过的）、"
+                             f"`subtitle:<本镜第几个词>`、或 `beat:<第几个节拍>`")
+                continue
+            if len(raw_anchors) > MOTION_MAX_ANCHORS:
+                _err(errors, f"{head}第 {j} 条（{kind or '?'}）挂了 {len(raw_anchors)} 个锚，"
+                             f"上限 {MOTION_MAX_ANCHORS}——锚是「**每一个**都必须在窗口内」"
+                             f"才算数，挂满了等于没锚")
+            for raw in raw_anchors:
+                got = parse_motion_anchor(raw)
+                if got is None:
+                    _err(errors, f"{head}第 {j} 条（{kind or '?'}）的锚 {raw!r} 认不出——"
+                                 f"只认三种写法：`fields.<字段名>` / `subtitle:<第几个词>`"
+                                 f" / `beat:<第几个节拍>`（都从 1 起，不写零、不写小数）")
+                    continue
+                if got[0] == "fields" and got[1] not in names:
+                    _err(errors, f"{head}第 {j} 条（{kind or '?'}）锚在 fields.{got[1]} 上，"
+                                 f"而这一镜没声明过这个字段"
+                                 + (f"（声明的是：{'、'.join(sorted(names))}）" if names
+                                    else "（这一镜一个字段都没声明）")
+                                 + "——锚到一个不存在的字段，与没锚是同一件事")
+    return errors
+
+
+def check_motion_windows(shot: Mapping[str, Any], *, events: Sequence[Mapping[str, Any]],
+                         word_frames: Sequence[int], fps: int, beats: Sequence[int] | None = None
+                         ) -> tuple[list[str], list[str], list[str]]:
+    """㉑ **闸后**：每个事件的触发帧，落在它锚的那条数据「首次可读」的 ±k 帧内吗。
+
+    → (打回, 提醒, 未判)。`events` 是闸⑭ 从像素上量出来的那几段（`start_frame` 是
+    触发帧）；`word_frames` 是本镜旁白逐词的帧刻度（= 母版 `props.words[].startFrame`
+    的同一份，见 `code_render._to_frame_words`）。
+
+    **对齐方式：按顺序一一对应**。申报的第 j 条 ↔ 数出来的第 j 段。这么对齐是因为两头
+    都没有第二个身份可用（像素段没有名字，申报也没有帧号——**让模型自己报触发帧就是
+    自报，不是证据**，与 §9-Q80 同一条理由）。所以：
+
+    * 条数与段数不等 → **未判**，并说清两边各几条。不判成红：段数少一条完全可能是
+      一次动画被像素切成了两段（反之亦然），那是读数的粒度问题，不是内容的错。
+      **这条本身就是一条已知绕法**（把条数写错就永远不进窗口判），记在 §9-Q98。
+    * 每个锚的「首次可读帧」：
+        - `subtitle:<i>` → 第 i 个词的 `startFrame`（词表拿不到 / i 越界 → 未判）；
+        - `beat:<n>`     → 节拍表今天**不存在**（这条链没做节拍检测）→ 未判；
+        - `fields.<key>` → 字段的值从第 0 帧就注进去了，「它什么时候在画面上变得可读」
+          不是这一层能反推的（反推它就是在做 ⑲-b 要模型做的那件事）→ 未判。
+    * 全部锚都算得出窗口时：**每一个锚都必须落在 ±k 内**，有一个不在就打回
+      （「每一个」而不是「其中一个」，见 :data:`MOTION_MAX_ANCHORS`：否则把所有词锚上
+      就是必胜）。一个锚都算不出 → 未判。
+
+    **提醒栏今天只有一条**：同一事件里挂了重复的锚（`["subtitle:3","subtitle:3"]`）——
+    「每个锚都在窗口内」这句话的份量得按**不同数据**算，重复项在这句话上是零信息。它不拦
+    是因为它没有错，只是这份申报比看上去薄。
+
+    **未判不是通过**（D-未判不绿）：`fields.` 锚今天必然落进未判这一档，所以「把动效锚到
+    必然存在的字段上」这条绕法今天只被**闸前那一半**挡着（该字段必须真在 fields 里），
+    窗口那一半挡不住——§9-Q98 记了这一条，不许在交付语里被抹成「㉑ 已完全挡住」。
+    """
+    errors: list[str] = []
+    warns: list[str] = []
+    undetermined: list[str] = []
+    sid = str(shot.get("id") or "")
+    head = f"闸㉑ 动效锚定：{sid}："
+    declared = shot.get("motion")
+    declared = [e for e in declared if isinstance(e, Mapping)] \
+        if isinstance(declared, (list, tuple)) else []
+    fired = [e for e in events if isinstance(e.get("start_frame"), int)]
+    if not declared:
+        # 闸⑭ 保证了走到这里的片子每一镜都数得出 ≥2 段先后变化（数不出来的那几镜已经
+        # 在 ⑭ 那里退回），所以「一条都没申报」到这里不再是「这一镜没有动效」，而是
+        # 「有动效、一条都没说是为谁动的」——这正是 §8.3 第 7 支反例。
+        if len(fired) >= 2:
+            _err(errors, f"{head}像素上数得出 {len(fired)} 段先后变化，而这一镜"
+                         f"**一条动效都没申报**——每一段都得说清它为哪条数据动"
+                         f"（`fields.<字段名>` / `subtitle:<第几个词>` / `beat:<第几个节拍>`）")
+        elif fired:
+            undetermined.append(f"{head}没申报动效，像素也只数到 {len(fired)} 段——"
+                                f"对应关系说不清，这一镜的锚定没判过")
+        return errors, warns, undetermined
+    if len(declared) != len(fired):
+        undetermined.append(
+            f"{head}申报了 {len(declared)} 条动效、像素上数到 {len(fired)} 段先后变化，"
+            f"两边对不上——对不上就说不清哪一条对应哪一段，这一镜的窗口**没判过**"
+            f"（未判不是通过）。把申报的条数改成与画面上真的动了几处一致")
+        return errors, warns, undetermined
+
+    tol = max(1, int(fps) // MOTION_ANCHOR_TOLERANCE_DIV)
+    for j, (ev, seg) in enumerate(zip(declared, fired), 1):
+        kind = str(ev.get("kind") or "?").strip() or "?"
+        frame = int(seg["start_frame"])
+        raw_anchors = ev.get("anchors")
+        raws = [a for a in raw_anchors if isinstance(a, str)] \
+            if isinstance(raw_anchors, (list, tuple)) else []
+        # 重复的锚**只提醒不拦**，但必须出声：判据是「**每一个**锚都得落在窗口内」，
+        # 于是 `["subtitle:3","subtitle:3","subtitle:3"]` 在回执上看起来是「三个锚都在
+        # 窗口里」，实际只锚了一个数据——那是 :data:`MOTION_MAX_ANCHORS` 那条上限要堵的
+        # 绕法的退化版。不拦是因为它没有错，只是这份申报比看上去薄。
+        if len(set(raws)) != len(raws):
+            warns.append(f"{head}第 {j} 条（{kind}）的锚里有重复项"
+                         f"（{len(raws)} 个锚、{len(set(raws))} 个不同的数据）——"
+                         f"重复不算多锚一个，「每个锚都在窗口内」这句话的份量按不同数据算")
+        hits: list[tuple[str, int]] = []       # 算得出窗口的锚：(原文, 首次可读帧)
+        blind: list[str] = []                  # 窗口算不出来的锚（连同理由）
+        for raw in raws:
+            got = parse_motion_anchor(raw)
+            if got is None:
+                blind.append(f"{raw!r}（写法认不出）")
+                continue
+            form, arg = got
+            if form == "subtitle":
+                idx = int(arg)
+                if idx > len(word_frames):
+                    blind.append(f"{raw}（这一镜旁白只有 {len(word_frames)} 个词）")
+                    continue
+                hits.append((raw, int(word_frames[idx - 1])))
+            elif form == "beat":
+                if not beats:
+                    blind.append(f"{raw}（这条链没有节拍表，量不了）")
+                    continue
+                n = int(arg)
+                if n > len(beats):
+                    blind.append(f"{raw}（BGM 只量到 {len(beats)} 个节拍）")
+                    continue
+                hits.append((raw, int(beats[n - 1])))
+            else:                                   # fields.<key>
+                blind.append(f"{raw}（字段从第 0 帧就注进去了，「画面上的首次可读」"
+                             f"这一层反推不出来）")
+        if not hits:
+            undetermined.append(
+                f"{head}第 {j} 条（{kind}）的锚都没法算出「首次可读帧」——"
+                + "；".join(blind) +
+                f"。这一条**没判过**（未判不是通过）")
+            continue
+        off = [f"{raw}（差 {frame - at:+d} 帧，容差 ±{tol}）"
+               for raw, at in hits if abs(frame - at) > tol]
+        if off:
+            _err(errors, f"{head}第 {j} 条（{kind}）触发的第 {frame} 帧，离它服务的"
+                         f"数据**首次可读**那一帧太远：" + "；".join(off) +
+                         f"。要么把这条动效挪到它所锚的那条数据真出现的那一刻，"
+                         f"要么把它锚到那一刻真在的那条数据上")
+        if blind:
+            undetermined.append(
+                f"{head}第 {j} 条（{kind}）有一部分锚算不出窗口：" + "；".join(blind) +
+                "——那几条没判过")
+    return errors, warns, undetermined
 
 
 def check_degenerate_forms(shots: list[dict[str, Any]], *,
@@ -2691,6 +2950,39 @@ def spec_schema() -> dict[str, Any]:
                                       "maxItems": MAX_HIGHLIGHTS_PER_SHOT,
                                       "description": "逐词点亮的词，每个都必须是 text 的子串，"
                                                      "每镜 ≤4 个；差一个字画面上永远不亮"},
+                        # 闸㉑（R8-T33）。**不进 required**：这一格描述的是「你已经写好的
+                        # 动效各为谁动」，而 schema 的 required 是「这条请求缺了就不合法」
+                        # ——把没写当不合法，会把「这一镜压根没有动效」与「有动效却不说为
+                        # 谁动」压成同一个错（前者由闸⑭ 按像素判、后者由 ㉑ 判，两句话）。
+                        # 所以缺了这一栏时 ㉑ 走闸后：像素数得出 ≥2 段而一条都没申报 → 打回。
+                        "motion": {
+                            "type": "array", "maxItems": MAX_FIELDS_PER_SHOT,
+                            "description": "这一镜的逐个动效事件，按发生顺序。每条说清"
+                                           "**它服务哪条数据**——「有没有意义」判不了，"
+                                           "「为哪条数据动」判得了：闸㉑ 会拿它和像素上"
+                                           "数出来的那几段一一对上，再看触发帧在不在"
+                                           "所锚数据**首次可读**的 ±"
+                                           f"{MOTION_ANCHOR_TOLERANCE_DIV} 分之一个"
+                                           "秒内。anchors 三种写法（都从 1 起）："
+                                           "`fields.<本镜声明过的字段名>` / "
+                                           "`subtitle:<本镜旁白的第几个词>` / "
+                                           "`beat:<第几个节拍>`。**空数组等于这条动效"
+                                           "不为任何数据服务**，闸前直接打回",
+                            "items": {
+                                "type": "object", "required": ["kind", "anchors"],
+                                "properties": {
+                                    "kind": {"type": "string",
+                                             "description": "这是什么动效，如 标题浮入 / "
+                                                            "数字滚动 / 光标指向"},
+                                    "anchors": {
+                                        "type": "array", "minItems": 1,
+                                        "maxItems": MOTION_MAX_ANCHORS,
+                                        "items": {"type": "string"},
+                                        "description": "它服务的数据，每条动效都必须有；"
+                                                       "每一个锚都得在触发帧的窗口内，"
+                                                       "所以别把整句话的词都挂上来"},
+                                }}},
+
                         "fields": {
                             "type": "array", "maxItems": MAX_FIELDS_PER_SHOT,
                             "description": "这一镜**交出去给用户改的旋钮**（≤12 个）：把将来"

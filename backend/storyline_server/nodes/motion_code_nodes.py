@@ -411,6 +411,27 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         motion_tight = [r["motion"].get("min_gap_frames") for r in motion_shot
                         if isinstance(r["motion"].get("min_gap_frames"), int)]
         motion_segs = [len(r["motion"].get("events") or []) for r in motion_shot]
+        # 闸㉑ 的整片账（T33）：读数与措辞都由渲染层带回来（`code_spec.check_motion_windows`
+        # 单源），报告层只**摊开**不重算——这一道红了根本出不了片（渲染口就 raise 了），
+        # 所以走到这里「打回」那一栏必然是空的，回执要说清的是**拿什么判的、哪几镜没判完**。
+        # 「申报了锚」与「锚判完了」是两件事：申报了但窗口算不出来的镜（`fields.` 那一路、
+        # `beat:` 那一路）必须落在未判栏里点名，否则回执会把「没判过」读成「判过了」。
+        # **「申报了」读的是 spec 里那一栏**，不是账里的 `r["motion"]`——后者是 ⑭ 从像素上
+        # 数出来的那一份读数（每一镜都有），拿它当「申报」会让这一行把「这一镜有动效」
+        # 说成「这一镜申报了锚」，而那正是 ㉑ 要分开的两件事。
+        anchor_declared = [str(s.get("id")) for s in spec["shots"] if s.get("motion")]
+        anchor_undet = [u for r in ledger
+                        for u in ((r.get("motion_anchors") or {}).get("undetermined") or [])]
+        anchor_warns = [w for r in ledger
+                        for w in ((r.get("motion_anchors") or {}).get("warnings") or [])]
+        anchor_clear = [str(r.get("id")) for r in ledger
+                        if r.get("motion_anchors") is not None
+                        and not ((r.get("motion_anchors") or {}).get("undetermined") or [])]
+        # 未判的**镜号**单独取一遍（不从上面那串话里切字符串——措辞改一次这里就碎）
+        anchor_undet_shots = sorted(
+            str(r.get("id")) for r in ledger
+            if (r.get("motion_anchors") or {}).get("undetermined"))
+        anchor_tol = max(1, int(out["fps"]) // cspec.MOTION_ANCHOR_TOLERANCE_DIV)
         # 闸⑰ 的整片账（T23）：这一道判在拼接之前（红了根本出不了片），所以它的读数由
         # 渲染层带回来（`code_render` 的 `av_accounting`），报告层只**摊开**不重算——
         # 重算就会出现「判的时候 0.97、报的时候 0.99」这种两把尺。
@@ -541,6 +562,28 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                       "（相邻 <0.4 s 的两段在画面上读不出先后）。代码里声明了 `card.motion` "
                       "而画面上从第 0 帧就在终态的镜，在这一档按「静帧」退回——"
                       "自报不是证据，像素才是"
+                if ledger else "这份分镜没有镜头"),
+            _ev(f"闸㉑ 动效锚定（每一个动效说清为哪条数据服务）："
+                f"{len(anchor_declared)}/{len(ledger)} 镜申报了锚，其中 "
+                f"{len(anchor_clear)} 镜在 ±{anchor_tol} 帧的窗口里判完了"
+                + (f"；**未判**的镜：{'、'.join(anchor_undet_shots)}"
+                   f"（未判 ≠ 通过——申报了锚但窗口今天算不出来的都落这一档）"
+                   if anchor_undet_shots else "")
+                + (f"；提醒：{'；'.join(anchor_warns)}" if anchor_warns else ""),
+                "machine",
+                verified=(bool(ledger) and len(anchor_declared) == len(ledger)
+                          and not anchor_undet),
+                proof="判的是「这一条动效为哪条数据服务」——「有没有叙事意义」仍然归人眼"
+                      f"（只以 10% 抽检的成本存在）。闸前（不烧像素）：每个申报的动效必须"
+                      f"带非空 kind 与至少一个能解析的锚，锚到本镜没声明过的字段与没锚同罪；"
+                      f"闸后：把 ⑭ 从**像素**上数出来的触发帧，与锚那条数据的「首次可读帧」"
+                      f"对齐（`subtitle:<i>` → 第 i 个词的首帧，容差 ±"
+                      f"{cspec.MOTION_ANCHOR_TOLERANCE_DIV} 分之一秒折成 {anchor_tol} 帧），"
+                      f"**每一个锚都要在窗口内**才算过。两处今天判不了、如实落未判："
+                      f"`fields.<key>` 的「画面上首次可读」这一层反推不出来（字段从第 0 帧"
+                      f"就注进去了）、`beat:<n>` 这条链没有节拍表；申报条数与像素段数不等也"
+                      f"落未判（对不齐就说不清哪条对哪段）。**所以「锚到必然存在字段上」这条"
+                      f"绕法今天只被闸前那一半挡着**，见 §9-Q98，不许被说成「㉑ 已完全挡住」"
                 if ledger else "这份分镜没有镜头"),
             _ev(f"闸⑰ 音画数据对账："
                 + (f"BGM {av['bgm_sec']}s / 成片 {av['film_sec_planned']}s"
@@ -849,6 +892,12 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             # 理由与上面两栏一样：「没判」和「判过且没问题」在回执上必须是两句话。
             "motion_warnings": motion_warns,
             "motion_unjudged": motion_undet,
+            # 闸㉑（T33）同规，而且这里**必须**另起两栏、不许并进上面那两栏：⑭ 判的是
+            # 「画面上有没有先后变化」，㉑ 判的是「这些变化为哪条数据服务」——一镜可能
+            # ⑭ 过、㉑ 未判（动效有先后、锚在 `fields.` 上而窗口反推不出来）。并栏就等于
+            # 把「动效密度过了」当成「动效锚定过了」，那正是未判不许绿的那条口径要防的。
+            "motion_anchor_warnings": anchor_warns,
+            "motion_anchor_unjudged": anchor_undet,
             "master_hash": out["master_hash"],
             "lockfile_hash": out["lockfile_hash"],
             "gl": out["gl"],
