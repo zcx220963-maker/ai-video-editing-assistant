@@ -37,6 +37,11 @@ from .memory import (
     ReadMemoryTool,
     register_memory_tools,
 )
+from .memory_compact import (
+    CompactReport,
+    MemoryCompactor,
+    compact_content,
+)
 from .subagent import SubAgentRunner, SpawnTool, make_spawn_tool
 from .orchestration import (
     Store,
@@ -211,6 +216,9 @@ __all__ = [
     "UpdateMemoryTool",
     "ReadMemoryTool",
     "register_memory_tools",
+    "CompactReport",
+    "MemoryCompactor",
+    "compact_content",
     "SubAgentRunner",
     "SpawnTool",
     "make_spawn_tool",

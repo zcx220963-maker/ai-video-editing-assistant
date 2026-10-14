@@ -65,7 +65,8 @@ from .consumer import CHAT_TOPIC, SessionConsumer, session_key
 from .heartbeat import Heartbeat
 from .ingest import IngestRejected, ingest_bytes
 from .library_pick import pick_library_asset
-from .memory import CATEGORIES, MemoryContextSource
+from .memory import CATEGORIES, MemoryContextSource, MemoryStore
+from .memory_compact import MemoryCompactor
 from .prompts import (DEFAULT_PROMPTS_DIR, PHASES, load_manifest, placeholders_in,
                       validate_manifest)
 from .identity import storyline_session_id
@@ -723,7 +724,16 @@ class MemoryWriteRequest(BaseModel):
 #: 单类记忆的落库上限（字节）。定在 8 KB 是「远大于正常偏好、又小于会被静默截掉」之间：
 #: 注入侧 memory.py 每类 700 B、合计 1,400 B，超出的部分模型根本读不到。拦在这里，
 #: 是为了不让用户存进一坨模型看不见的文本还以为它生效了。
+#:
+#: 与下面压缩器那三个数的关系是**故意错开**的：拦截线 8 KB 是「人手动存」的上限，
+#: 硬顶 12 KB 是「机器整理」的上限。硬顶必须大于拦截线，否则人工存到上限的那块内容
+#: 会在下一次追加时被机器顶掉一截——那等于「你刚存的、系统刚删的」，是最难查的一类。
 _MEMORY_MAX_BYTES = 8192
+
+#: 记忆压缩器的**默认那一台**：视图与整理接口都用它，好让「触发线」在面板上只有一个说法。
+#: 装配点给 MemoryStore 换阈值时这里不会跟着变——面板显示的仍是默认线（文档化的口径），
+#: 而不是某台机器上临时改过的线。
+_MEMORY_COMPACTOR = MemoryCompactor()
 
 
 #: 提示词清单里 phase / kind 的中文名，给设置页「提示词」区块用。
@@ -2065,6 +2075,9 @@ def create_app(
         """
         entries = await storage.memories.entries(user_id)
         stamps = await storage.memories.stamps(user_id)
+        # 触发线取一台默认压缩器：它上面每一个数就是「过线自动整理」的那条线本身，
+        # 面板要能回答「这类到底离整理还有多远」——不显示它，用户只会看到记忆莫名变短。
+        compactor = _MEMORY_COMPACTOR
         rows = []
         for cat, label in CATEGORIES.items():
             content = str(entries.get(cat) or "")
@@ -2075,6 +2088,9 @@ def create_app(
                 "lines": len([ln for ln in content.splitlines() if ln.strip()]),
                 "bytes": len(content.encode("utf-8")),
                 "updated_at": stamps.get(cat),
+                # 过线原因（空 = 没过线）。与写侧判据同源：两边各算一次就会出现
+                # 「面板说没过线、写的时候却整理了」这种自相矛盾。
+                "over_limit": compactor.over_limit(content),
             })
         return {
             "categories": rows,
@@ -2084,6 +2100,9 @@ def create_app(
             # 改了一处漏一处时面板会给出一个「说没超、其实超了」的错判。
             "inject_budget_bytes": MemoryContextSource.total_bytes,
             "inject_per_category_bytes": MemoryContextSource.per_category_bytes,
+            "compact_at_bytes": compactor.compact_at_bytes,
+            "compact_at_entries": compactor.compact_at_entries,
+            "max_entries": compactor.max_entries,
             "kind": "memories",
         }
 
@@ -2303,6 +2322,47 @@ def create_app(
         view = await _memory_view(user_id)
         view["status"] = "deleted"
         view["removed"] = int(removed or 0)
+        return view
+
+    @app.post("/memories/compact")
+    async def memories_compact(category: str | None = None,
+                               user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """整理当前身份的记忆（去重 / 合并近重复 / 清低质 / 超上限丢最早）。
+
+        为什么要有这一只：写侧过线时会自动整理（``MemoryStore.append``），但设置页上
+        那块是人手编辑的——**人手编辑不走自动整理**（人工写进去的每一个字都算数，
+        机器不该在它下一次落库时替它删行）。所以「存了 8 KB、想让它收一下」这件事
+        必须有一个显式入口，而不是逼用户去制造一次追加来触发放线。
+
+        ``force=True``：显式要求就是不过线也整理一遍。没可整理的就如实回「无可整理」，
+        不假装动过手（面板要靠 ``changed`` 决定说不说这句话）。
+        """
+        if category and category not in CATEGORIES:
+            raise HTTPException(400, f"未知记忆分类 {category!r}，仅支持 {sorted(CATEGORIES)}")
+        store = MemoryStore(storage, user_id=user_id, compactor=_MEMORY_COMPACTOR)
+        reports = await store.compact([category] if category else None, force=True)
+        view = await _memory_view(user_id)
+        view["status"] = "compacted"
+        view["reports"] = [
+            {
+                "category": cat,
+                "summary": rep.summary(),
+                "detail": rep.detail(),
+                "changed": rep.changed,
+                "skipped": rep.skipped,
+                "before_lines": rep.before_lines,
+                "after_lines": rep.after_lines,
+                "before_bytes": rep.before_bytes,
+                "after_bytes": rep.after_bytes,
+                # 丢了什么要逐条给出来：这是「可核对」的全部意义——
+                # 只给个数字的整理结果，用户只能选择相信或不信。
+                "dropped": [{"reason": r, "text": t} for r, t in rep.dropped],
+                "merged": rep.merged,
+                "truncated": rep.truncated,
+                "kept_for_safety": rep.kept_for_safety,
+            }
+            for cat, rep in reports.items()
+        ]
         return view
 
     # ---- 提示词（只读一览 / 看全量正文）----

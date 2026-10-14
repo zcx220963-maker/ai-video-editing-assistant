@@ -3020,6 +3020,8 @@ const memories = ref(null);
 const memoryDraft = ref({});
 const memorySaving = ref("");
 const memoryMsg = ref("");
+const memoryCompacting = ref("");   // 正在整理哪个分类（"*" = 全部）
+const memoryReport = ref(null);     // 最近一次整理的判决（null = 还没整理过）
 
 async function loadSettings() {
   await ensureIdentity();
@@ -3081,18 +3083,23 @@ async function toggleSettings() {
 
 // ---- 记忆：查看 / 编辑 / 删除（后端 /memories，与 Agent 的 update_memory 同一张表）----
 
+// 视图回写：正文与草稿一起换。草稿初值 = 库里的现值——用户改了草稿、没保存就刷新时，
+// 以库里为准，这正是「保存」这个动作的意义。读/存/删/整理四处都走它，
+// 少走一处就会出现「库变了、输入框还是旧的」那种最难发现的假象。
+function applyMemoryView(j) {
+  memories.value = j;
+  const draft = {};
+  for (const row of j.categories || []) draft[row.category] = row.content || "";
+  memoryDraft.value = draft;
+}
+
 async function loadMemories() {
   try {
     await ensureIdentity();
     const r = await fetch("/memories", { headers: authHeaders() });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
-    memories.value = j;
-    // 草稿初值 = 库里的现值。之后用户改了草稿、没保存就刷新时，会以库里为准——
-    // 这正是「保存」这个动作的意义：页面上看到的以库为准，不以未提交的编辑为准。
-    const draft = {};
-    for (const row of j.categories || []) draft[row.category] = row.content || "";
-    memoryDraft.value = draft;
+    applyMemoryView(j);
   } catch (e) {
     memoryMsg.value = "读不到记忆：" + e.message;
   }
@@ -3111,10 +3118,7 @@ async function saveMemory(category) {
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
-    memories.value = j;
-    const draft = {};
-    for (const row of j.categories || []) draft[row.category] = row.content || "";
-    memoryDraft.value = draft;
+    applyMemoryView(j);
     memoryMsg.value = j.status === "cleared" ? "已清空这一类。" : "已保存。";
   } catch (e) {
     memoryMsg.value = "保存失败：" + e.message;
@@ -3134,15 +3138,42 @@ async function deleteMemory(category) {
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
-    memories.value = j;
-    const draft = {};
-    for (const row of j.categories || []) draft[row.category] = row.content || "";
-    memoryDraft.value = draft;
+    applyMemoryView(j);
     memoryMsg.value = "已删除这一类记忆。";
   } catch (e) {
     memoryMsg.value = "删除失败：" + e.message;
   } finally {
     memorySaving.value = "";
+  }
+}
+
+// 整理记忆：去重 / 合并被包含的条目 / 清掉低质行 / 超上限丢最早。
+// 为什么要有这个按钮：写侧过线时会**自动**整理（追加时触发），但设置页上这块是人手
+// 编辑的，人手编辑不走自动整理——用户存到很大时得有一个显式入口，而不是靠制造一次
+// 追加去触发放线。后端把「丢了哪几条、原文是什么」逐条回给这里，页面照原样念出来。
+async function compactMemory(category) {
+  if (memoryCompacting.value) return;
+  memoryCompacting.value = category || "*";
+  memoryMsg.value = "";
+  memoryReport.value = null;
+  try {
+    await ensureIdentity();
+    const q = category ? "?category=" + encodeURIComponent(category) : "";
+    const r = await fetch("/memories/compact" + q, {
+      method: "POST", headers: authHeaders(),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    applyMemoryView(j);
+    memoryReport.value = j.reports || null;
+    const touched = (j.reports || []).filter((x) => x.changed);
+    memoryMsg.value = touched.length
+      ? "已整理 " + touched.length + " 类记忆。"
+      : "查过一遍，没有可整理的内容。";
+  } catch (e) {
+    memoryMsg.value = "整理失败：" + e.message;
+  } finally {
+    memoryCompacting.value = "";
   }
 }
 
@@ -4817,6 +4848,10 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <span v-if="memories" class="set-note">
             共 {{ memories.total_lines }} 条 · {{ memories.total_bytes }} 字节
           </span>
+          <button class="clip ghost" :disabled="!memories || !!memoryCompacting"
+                  @click="compactMemory('')">
+            {{ memoryCompacting === "*" ? "整理中…" : "整理全部" }}
+          </button>
         </div>
         <template v-if="memories && memories.categories">
           <div v-for="row in memories.categories" :key="row.category" class="mem-block">
@@ -4831,6 +4866,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <b v-if="memories && row.bytes > memories.inject_per_category_bytes" class="bad">
                 · 已超单类预算 {{ memories.inject_per_category_bytes }} 字节，本轮可能不被注入
               </b>
+              <!-- 触发线：写侧追加时过这条线就自动整理一次。不显示它，用户只会看到
+                   「记忆自己变短了」而不知道是谁动的、什么时候动的。 -->
+              <span v-if="memories && row.over_limit" class="mem-over">
+                · 已过整理线（{{ row.over_limit }}），下次追加会自动整理
+              </span>
             </div>
             <textarea v-model="memoryDraft[row.category]" rows="4" spellcheck="false"
                       class="mem-area"
@@ -4845,15 +4885,53 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               </button>
               <button class="clip ghost" :disabled="memorySaving === row.category || !row.lines"
                       @click="deleteMemory(row.category)">删除这一类</button>
+              <button class="clip ghost"
+                      :disabled="!!memoryCompacting || !row.lines"
+                      @click="compactMemory(row.category)">
+                {{ memoryCompacting === row.category ? "整理中…" : "整理这一类" }}
+              </button>
             </div>
           </div>
         </template>
+        <!-- 整理判决：改了哪几条、丢的原文是什么，逐条念出来。
+             只给一个「已整理」的按钮会让用户只能选择相信或不信——而这是**删了东西**
+             的动作，必须能核对。 -->
+        <div v-if="memoryReport" class="mem-report">
+          <div v-for="rep in memoryReport" :key="rep.category" class="mem-report-row">
+            <b class="set-v">{{ rep.category }}</b>
+            <template v-if="rep.changed">
+              ：{{ rep.before_lines }} 条 / {{ rep.before_bytes }} 字节 →
+              {{ rep.after_lines }} 条 / {{ rep.after_bytes }} 字节
+              <div v-if="rep.dropped && rep.dropped.length" class="set-note">
+                丢掉 {{ rep.dropped.length }} 条：
+                <span v-for="(d, i) in rep.dropped.slice(0, 8)" :key="i">
+                  {{ i ? "；" : "" }}{{ d.reason }}「{{ d.text }}」</span>
+                <span v-if="rep.dropped.length > 8">；…另 {{ rep.dropped.length - 8 }} 条</span>
+              </div>
+              <div v-if="rep.merged && rep.merged.length" class="set-note">
+                合并 {{ rep.merged.length }} 处：{{ rep.merged.slice(0, 4).join("；") }}
+              </div>
+            </template>
+            <template v-else>：{{ rep.skipped || "无需整理" }}</template>
+          </div>
+        </div>
         <p class="set-note">
           每行一条。Agent 每轮按相关度召回前几条注入，
           单类约 {{ memories ? memories.inject_per_category_bytes : 700 }} 字节、
           合计约 {{ memories ? memories.inject_budget_bytes : 1400 }} 字节——
           超出的条目本轮不会注入（模型看不到），所以这里存得越精炼越有用。
           清空文本框再保存＝删除这一类。
+        </p>
+        <!-- 阈值全部取自后端（memory_compact.MemoryCompactor），前端一个数都不自己写：
+             两处各写一份，改一处漏一处时这里会给出「说没过线、其实整理了」的错判。 -->
+        <p class="set-note">
+          记忆也会**自己收口**：Agent 每次追加时，这一类过了
+          {{ memories ? memories.compact_at_entries : 24 }} 条 /
+          {{ memories ? memories.compact_at_bytes : 6000 }} 字节就顺手整理一次——
+          完全相同或已被更长那条包含的条目并掉、占位与问句这类空话清掉、
+          仍超过 {{ memories ? memories.max_entries : 40 }} 条时从最早的一条开始丢。
+          这里手动保存的内容**不会**被自动整理（你写的每个字都算数）；
+          要收一次就点「整理这一类」，丢掉了什么上面会逐条列出来。
         </p>
         <!-- 阈值取自后端（memory.MemoryContextSource 的两个类属性），前端不自己写一份：
              两处各写一个数，改一处漏一处时这里会给出「说没超、其实超了」的错判。 -->
@@ -5653,6 +5731,14 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   border: 1px dashed var(--line); border-radius: 4px; outline: none; resize: vertical;
 }
 .mem-area:focus { border-color: var(--vermilion); border-style: solid; }
+/* 整理判决：丢/并了什么的逐条明细。用等宽字体+浅底，读起来像一张回执而不是提示语。 */
+.mem-over { color: var(--ink-soft); }
+.mem-report {
+  display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; margin-top: 4px;
+  font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.6;
+  background: rgba(200, 64, 31, 0.05); border: 1px dotted var(--vermilion); border-radius: 4px;
+}
+.mem-report-row { color: var(--ink); }
 /* 提示词区块：按相（phase）分组，每份一行、点开看正文。只读——不给输入框，
    因为改这里落不进镜像（见 loadPrompts 上方那段注释）。 */
 .pmt-phase { display: flex; flex-direction: column; gap: 2px; padding: 6px 0 2px; }

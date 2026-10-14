@@ -8,16 +8,31 @@
   所有会话共用，记忆必须跟着「这次是谁在跑」走，否则用户之间串味。
 - 演进方向（RAG 召回）由 MemoryContextSource.render(query) 的参数预留，当前全量携带。
 
+**存储侧的压缩**在 ``memory_compact``：写入侧没有任何长度上限、只增不减，而注入侧每类
+只有 700 B，所以「写的时候过线就整理一次」是这一段唯一能收口的位置。整理**不改写侧
+语义**：``append`` 仍然追加、``write`` 仍然全量覆盖（人工在设置页里编辑的内容一根手指
+都不碰），整理只发生在追加之后、且只在过线时。
+
 安全：category 走白名单（PG 端还有 CHECK 兜底），user_id 不取自模型入参。
 """
 
 from __future__ import annotations
 
-import re
+import logging
 from typing import Any
 
 from .identity import current_identity_or
+from .memory_compact import (
+    CompactReport,
+    MemoryCompactor,
+    ascii_words,
+    junk_reason,
+    normalize,
+    terms,
+)
 from .tool import Tool
+
+logger = logging.getLogger(__name__)
 
 # 分类 → 注入 System 时的标题（白名单；PG 侧 memories.category 有同名 CHECK）
 CATEGORIES: dict[str, str] = {
@@ -29,9 +44,12 @@ CATEGORIES: dict[str, str] = {
 class MemoryStore:
     """memories 表的用户侧门面：绑定归属、校验分类、异步读写。"""
 
-    def __init__(self, storage: Any, *, user_id: str | None = None) -> None:
+    def __init__(self, storage: Any, *, user_id: str | None = None,
+                 compactor: MemoryCompactor | None = None) -> None:
         self._mem = storage.memories
         self._fixed_user = user_id
+        #: 存储侧压缩器（阈值 + 判决）。装配点可以按机器换阈值；不换就是默认的那套。
+        self.compactor = compactor or MemoryCompactor()
 
     @property
     def user_id(self) -> str:
@@ -57,9 +75,82 @@ class MemoryStore:
         await self._mem.write(self.user_id, category, content)
 
     async def append(self, category: str, text: str) -> str:
-        """追加一条记忆（换行分隔）；仓储层用比较-交换保证并发下不丢更新。"""
+        """追加一条记忆（换行分隔）；仓储层用比较-交换保证并发下不丢更新。
+
+        追加之后**顺手看一眼过没过整理线**（``memory_compact``）。为什么触发点在这里、
+        而不是读侧或定时任务：写侧是唯一能保证「增长发生的那一刻就被收口」的位置，
+        而追加正是这块正文唯一的增长方式。返回的是这份记忆**此刻**的正文（整理过就是
+        整理后的），调用方拿它当「现在是什么」用——``PlanRetrospective`` 就是这么用的。
+        """
+        merged, _report = await self.append_report(category, text)
+        return merged
+
+    async def append_report(self, category: str, text: str
+                            ) -> tuple[str, CompactReport | None]:
+        """同上，但把「顺手整理了什么」一并交出来。
+
+        为什么要有这一支：``UpdateMemoryTool`` 的回执里得能说「追加成功，另外这一类
+        刚整理了，去重 3 合并 1」——不说，模型就会以为自己刚写的那条成了唯一变动，
+        而一旦它某轮发现记忆变短了，会去重写一遍已经整理好的内容。
+        """
         self._check(category)
-        return await self._mem.append(self.user_id, category, text)
+        merged = await self._mem.append(self.user_id, category, text)
+        after, report = await self._maybe_compact(category)
+        return (after if after is not None else merged), report
+
+    async def compact(self, categories: list[str] | None = None, *,
+                      force: bool = False) -> dict[str, CompactReport]:
+        """整理记忆：分类 → 判决。``force`` 时不看触发线（显式要求整理）。
+
+        逐类独立：一类过了线不会连带去动另一类——两类的写入节奏完全不同
+        （``user`` 是偏好、``tool`` 是教训），互相牵连只会让判决难解释。
+        """
+        cats = categories or list(CATEGORIES)
+        out: dict[str, CompactReport] = {}
+        for cat in cats:
+            self._check(cat)
+            out[cat] = await self._compact_one(cat, force=force)
+        return out
+
+    async def _compact_one(self, category: str, *, force: bool) -> CompactReport:
+        """读 → 判 → 比较-交换写回；输了就重读重判（与 append 同一套 CAS 纪律）。
+
+        为什么必须 CAS：整理是「读整块 → 写整块」，直接覆盖会把期间发生的追加冲掉——
+        那正是 spec 缺陷清单里「记忆 append 丢更新」的同一个形状，只是这次丢的是
+        另一个写者刚追加的那条。
+        """
+        last: CompactReport | None = None
+        for _ in range(self.compactor.retries):
+            before = await self._mem.read(self.user_id, category)
+            after, report = self.compactor.compact(before, category=category, force=force)
+            last = report
+            if not report.changed:
+                return report
+            if await self._mem.replace_if(self.user_id, category, before, after):
+                logger.info("记忆整理 category=%s %s%s", category, report.summary(),
+                            f"｜{report.detail()}" if report.detail() else "")
+                return report
+        # 重试用尽：**如实说没做成**，不写回一份可能已经过期的内容。
+        assert last is not None
+        last.skipped = f"并发争用 {self.compactor.retries} 次未胜出，本轮未整理"
+        last.after_bytes = last.before_bytes
+        last.after_lines = last.before_lines
+        last.dropped.clear()
+        last.merged.clear()
+        last.truncated.clear()
+        logger.warning("记忆整理放弃：category=%s %s", category, last.skipped)
+        return last
+
+    async def _maybe_compact(self, category: str) -> tuple[str | None, CompactReport | None]:
+        """过线才整理；返回 (整理后的正文 或 None, 判决 或 None)。
+
+        「没做事」的两种情形要分开：没过线是**常态**（返回 None 判决，调用方不必解释
+        什么），并发争用输掉是**异常**（判决里带着原因，要如实说出去）。
+        """
+        got = await self._compact_one(category, force=False)
+        if not got.changed:
+            return None, (got if got.skipped.startswith("并发争用") else None)
+        return await self._mem.read(self.user_id, category), got
 
     async def entries(self, categories: list[str] | None = None) -> dict[str, str]:
         """返回非空的分类记忆：category -> content，按白名单顺序。"""
@@ -115,8 +206,11 @@ class MemoryContextSource:
     ledger_kind = "always"
     ledger_referenced_by = ("update_memory", "read_memory")
 
+    # 「重复的不必再写」取代了原先的「重复行 mode=replace 合并」：写侧现在自己会拦
+    # 同骨架的追加（并把已存在的那条原文回给模型），让模型再去 replace 合并一遍
+    # 是白烧一轮。这句常发，改动要跟着 ≤120 B 那条线走。
     USAGE_NOTE = ("用法：偏好→user、教训→tool；新偏好立刻 update_memory，"
-                  "重复行 mode=replace 合并。")
+                  "重复的不必再写。")
 
     def __init__(self, store: MemoryStore, categories: list[str] | None = None,
                  *, per_category_bytes: int | None = None,
@@ -139,20 +233,14 @@ class MemoryContextSource:
 
     @classmethod
     def terms(cls, query: str) -> set[str]:
-        """查询词 → 判据项：ASCII 词（小写，≥2 字）+ CJK 连续段的二元组。
+        """查询词 → 判据项。实现搬到了 ``memory_compact.terms``。
 
-        用二元组而不是分词：没有词典、没有依赖，中文里「文案」这种词本来就会
-        跨词边界（「写文案」「文案风格」），二元组对这类匹配反而更稳。
-        单字 CJK 段（如「跑」）本身就是一个词，直接收。
+        为什么搬：存储侧的判重（``memory_compact`` 的「这两条在说同一件事吗」）
+        与召回侧的判相关用的是**同一件事**——同词。两处各写一份词法，迟早出现
+        「召回觉得不相干的，判重觉得是重复」这种自相矛盾。这里保留这个名字是因为
+        它是公开脸面（用例与调用点都用它），不是第二份实现。
         """
-        text = str(query or "")
-        out = {m.group(0).lower() for m in _ASCII_WORD_RE.finditer(text)}
-        for run in _CJK_RUN_RE.findall(text):
-            if len(run) == 1:
-                out.add(run)
-            else:
-                out.update(run[i:i + 2] for i in range(len(run) - 1))
-        return out
+        return terms(query)
 
     @classmethod
     def _score(cls, entry: str, terms: set[str]) -> int:
@@ -164,7 +252,7 @@ class MemoryContextSource:
         if not terms:
             return 0
         low = entry.lower()
-        words = {m.group(0).lower() for m in _ASCII_WORD_RE.finditer(entry)}
+        words = ascii_words(entry)
         return sum(1 for t in terms if (t in words if t.isascii() else t in low))
 
     async def render(self, query: str, *, user_id: str | None = None) -> str | None:  # noqa: ARG002 (user_id 由 MemoryStore 自身绑定)
@@ -260,16 +348,24 @@ class MemoryContextSource:
                 f"{stamp}；全量见 read_memory）")
 
 
-_ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]{2,}")
-_CJK_RUN_RE = re.compile(r"[一-鿿]+")
-
-
 # --------------------------------------------------------------------------
 # 暴露给 Agent 的记忆读写工具
 # --------------------------------------------------------------------------
 
 class UpdateMemoryTool(Tool):
-    """让 Agent 自主更新记忆；replace 全量覆盖即删除旧记忆。"""
+    """让 Agent 自主更新记忆；replace 全量覆盖即删除旧记忆。
+
+    写侧的两道判断（此前一道都没有，于是「同一句话记十遍」只能靠人去设置页里删）：
+
+    - **重复不追加**：要追加的这条与已有某条同骨架时**不写**，回执里给出已存在的那条
+      原文——模型据此知道「这条已经在了」，不会以为自己又记了一条。
+    - **低质不追加**：占位（「无」「暂无」）、太短、问句这些在事实层面什么都没说，
+      写进去只会占掉注入预算。**不写**，并说清为什么——默默写进去比拒绝更坏
+      （模型以为记住了，而它要么读不到、要么把真偏好挤出去）。
+
+    ``mode='compact'`` 是显式整理：模型发现这一类被自己写乱了（或回执说未注入 N 条）
+    时可以主动收一次口。日常不需要它——过线时 ``append`` 本来就会自动整理。
+    """
 
     def __init__(self, store: MemoryStore) -> None:
         self._store = store
@@ -287,7 +383,8 @@ class UpdateMemoryTool(Tool):
         return (
             "更新当前用户的分类记忆（存 memories 表）。category='user' 存用户偏好，"
             "'tool' 存工具使用反馈。mode='replace' 全量覆盖（用于改写/删除旧记忆），"
-            "'append' 追加一条。"
+            "'append' 追加一条（与已有条目重复或内容空洞时不写，会说明原因），"
+            "'compact' 整理该类（去重、合并近重复、清掉低质行）。"
         )
 
     @property
@@ -296,20 +393,44 @@ class UpdateMemoryTool(Tool):
             "type": "object",
             "properties": {
                 "category": {"type": "string", "enum": list(CATEGORIES), "description": "记忆分类"},
-                "content": {"type": "string", "description": "要写入/追加的记忆内容"},
-                "mode": {"type": "string", "enum": ["replace", "append"], "description": "默认 replace 全量覆盖"},
+                "content": {"type": "string", "description": "要写入/追加的记忆内容（mode=compact 时不用给）"},
+                "mode": {"type": "string", "enum": ["replace", "append", "compact"],
+                         "description": "默认 replace 全量覆盖"},
             },
-            "required": ["category", "content"],
+            "required": ["category"],
         }
 
-    async def execute(self, category: str, content: str, mode: str = "replace") -> str:
+    async def execute(self, category: str, content: str = "",
+                      mode: str = "replace") -> str:
         if category not in CATEGORIES:
             return f"Error: 未知记忆分类 {category!r}，仅支持 {sorted(CATEGORIES)}"
-        if mode == "append":
-            await self._store.append(category, content)
-            return f"已追加到 {category} 记忆（{len(content)} 字符）"
-        await self._store.write(category, content)
-        return f"已全量覆盖 {category} 记忆（{len(content)} 字符）"
+        if mode == "compact":
+            got = (await self._store.compact([category], force=True)).get(category)
+            if got is None:
+                return f"Error: 整理 {category} 记忆没有回执"
+            return f"{category} 记忆整理结果：{got.summary() or '无需整理'}。" + (
+                f"明细：{got.detail()}" if got.detail() else "")
+        if mode != "append":
+            await self._store.write(category, content)
+            return f"已全量覆盖 {category} 记忆（{len(content)} 字符）"
+
+        text = str(content or "").strip()
+        if not text:
+            return f"Error: append 模式必须给 content（要追加的那句话）"
+        why = junk_reason(normalize(text), min_chars=self._store.compactor.min_entry_chars)
+        if why:
+            return (f"Error: 这条不像是能记的事实（{why}），未写入 {category} 记忆。"
+                    f"要记就写一句完整的、带主谓的话；没什么可记就不用调这件工具。")
+        existing = self._store.compactor.duplicate_of(await self._store.read(category), text)
+        if existing:
+            return f"{category} 记忆里已经有这一条了（原文：{existing}），未重复追加。"
+        _content, report = await self._store.append_report(category, text)
+        note = ""
+        if report is not None:
+            note = f"；同时整理了这一类（{report.summary()}）"
+            if report.detail():
+                note += f"，明细：{report.detail()}"
+        return f"已追加到 {category} 记忆（{len(text)} 字符）{note}"
 
 
 class ReadMemoryTool(Tool):

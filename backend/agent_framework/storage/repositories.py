@@ -1148,6 +1148,22 @@ class MemoriesRepo(_Repo):
         raise IntegrityConflict(
             f"memories 追加竞争 {retries} 次未胜出，放弃写入（user_id={user_id}, category={category}）")
 
+    async def replace_if(self, user_id: str, category: str, expect: str,
+                         content: str) -> bool:
+        """条件覆盖：只有当前内容仍是 ``expect`` 时才写入；返回有没有写成功。
+
+        整理（``memory_compact``）是「读整块 → 写整块」，直接覆盖会把期间发生的追加
+        冲掉——那正是 spec 缺陷清单里「记忆 append 丢更新」的同一个形状。所以这里
+        复用 ``append`` 那套条件 UPDATE 的判据：**不是** claim（``FOR UPDATE SKIP
+        LOCKED`` 会把「行被别人锁住」误判成「我输了」，见 append 里那段注释），
+        而是拿到锁后按新快照重算 WHERE，内容真被改过才返回 0 行。
+        """
+        rows = await self.db.update(
+            self.table, {"content": content, "updated_at": _now()},
+            where=[Cond("user_id", "eq", user_id), Cond("category", "eq", category),
+                   Cond("content", "eq", expect)])
+        return bool(rows)
+
     async def entries(self, user_id: str) -> dict[str, str]:
         rows = await self.db.select(self.table, where={"user_id": user_id},
                                     order_by=["category"])
