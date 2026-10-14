@@ -1,11 +1,11 @@
-# shot 卡索引（124 张，按类别）
+# shot 卡索引（128 张，按类别）
 
 每行：`<类别>/<卡名>` [能量] 时长 — 一句话描述 | 适用 | demo 文件 relpath + 字节数
 
 **选卡看这一份就够**：`card` 一栏照抄行首那个 `<类别>/<卡名>`；
 `derived_from` 一栏照抄 demo 栏里的那个 relpath（`demos/` 前缀可有可无，一镜引多份就都写上）。
 **demo 栏给的是盘上真有的文件名，照抄即可——别拿卡名去拼 `<卡名>.tsx`**：
-124 张卡里有 42 张的文件名与卡名对不上，照卡名拼出来的名字会被取材轮当场打回。
+128 张卡里有 42 张的文件名与卡名对不上，照卡名拼出来的名字会被取材轮当场打回。
 不要再逐张打开卡全文——SKILL.md 写明「不要读超过 15 张卡」。
 
 ## camera（10 张）
@@ -95,6 +95,13 @@
 - `rhythm/speed-ramp-freeze` [中高] — 帧号非线性 remap 的节奏手法——定格标注（流动→定格圈注→解冻） | 时长 定格标注全程 158f（≈5.3s，定格段… | 适用 卡片流/长横移中把一个重点"停下给人看"；教学解说、评审语境 | demo `rhythm/speed-ramp-freeze/FreezeAnnotateReal.tsx` 15,887 B
 - `rhythm/trailer-grammar-moves` [A 高] — 预告片语法一式——trailer-bumper 前置速剪钩子：三镜 9f 速剪 + 黑场静默一拍，再开场标题 | 时长 A ~4.7s（140f） | 适用 预告片的开场钩子（cold open）：正片前先塞三个最抓眼的镜头… | demo `rhythm/trailer-grammar-moves/TrailerBumper.tsx` 6,332 B
 
+## science（4 张）
+
+- `science/cross-section-reveal` [中高] — 剖面揭示——一片剖切面自左向右扫过球体，扫到哪层显影哪层（地壳→地幔→外核→内核），标签带引线在该层被扫过 55% 时画入，收尾 30f 真静止 | 时长 150f（5s）；扫过全程 108f + … | 适用 讲"一个东西里面是什么"：地球内部、细胞结构、引擎剖面、地层、脑区… | demo `science/cross-section-reveal/CrossSectionReveal.tsx` 11,360 B
+- `science/map-terrain-build` [中] — 地图地形——等高线自谷底向山顶逐条立起（scale+上移+淡入，顺序=高程），一条河用 dasharray 把自己画出来并带跟随亮点，三个地名… | 时长 158f（5.3s）；等高线 7 条 ×1… | 适用 讲地理/地质/流域/气候：一座山怎么长出来、水往哪走、地形如何决定… | demo `science/map-terrain-build/MapTerrainBuild.tsx` 12,648 B
+- `science/metaphor-bridge` [高] — 比喻桥——把"太阳"换成"一个篮球"再按真实相对比例量出地球：测量线延伸时距离读数真实上跳，走到的位置是一颗针尖大的点（图上放大约 9×，位置… | 时长 168f（5.6s）；篮球入场 16f +… | 适用 讲"这个东西到底有多大/多远/多少"：天体尺度、细胞与细菌、原子与… | demo `science/metaphor-bridge/MetaphorBridge.tsx` 13,619 B
+- `science/process-diagram-flow` [中高] — 流程示意（循环型）——节点先全部落位，箭头按次序逐段用 dasharray 画出来（画的次序=流程次序），一个令牌沿已点亮路径行进并让所在段变… | 时长 176f（5.9s）；4 节点落位 18f… | 适用 讲"这个过程怎么走一圈"：水循环、碳循环、食物链、经济循环、呼吸/… | demo `science/process-diagram-flow/ProcessDiagramFlow.tsx` 14,967 B
+
 ## transition（15 张）
 
 - `transition/bottom-push-stack-wipe` [中] — 底边上推换章——新场景连底色整屏从底边向上推入，把旧场景物理顶出画外，连推数章各配一种饱和底色，内容钉死在各自色底坐标系里随底色走 | 时长 demo 三连推 170f（~5.7s）；… | 适用 多章节产品片的换章骨架（每章一个卖点一种底色）；需要"翻页节奏感"… | demo `transition/bottom-push-stack-wipe/BottomPushStackWipe.tsx` 18,501 B
@@ -162,4 +169,4 @@
 - `ui-entrance/value-stagger-gradient` [中高] — 16 根柱入场时 delay 是时间错峰，同时高度/色相/位移/模糊四个属性各自铺成从首到末的数值梯度；第二拍把错峰原点换成中心，脉冲幅度以中… | 时长 约 5.0s（150f@30fps） | 适用 技法演示与参数化能力的展示镜头；也可直接当数据/频谱/均衡器类界面… | demo `ui-entrance/value-stagger-gradient/ValueStaggerGradient.tsx` 7,981 B
 - `ui-entrance/wall-reveal-moves` [中] — 整墙批量入场两式——bento 逐格点亮、蓝图描线成形，全部原位显形不位移，与 deck-deal-flyin 的飞入位移型互补成品类矩阵 | 时长 单式约 5s（A 150f / B 150… | 适用 功能墙/卡片墙/整页界面的整体亮相；内容已在原位、要"显形"而非"… | demo `ui-entrance/wall-reveal-moves/BentoLightUp.tsx ui-entrance/wall-reveal-moves/WireframeDrawOn.tsx` 19,906 B
 
-总计 demo 字节：2,106,123
+总计 demo 字节：2,158,717

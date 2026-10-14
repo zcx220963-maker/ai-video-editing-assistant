@@ -1,4 +1,4 @@
-# 镜头卡来源与授权说明（2026-08 新增 48 张，2026-10 精简后本批 38 张存活；全库现存 124 张）
+# 镜头卡来源与授权说明（2026-08 新增 48 张，2026-10 精简后本批 38 张存活；2026-11 补科普向 4 张；全库现存 128 张）
 
 本批镜头卡的动效手法研究自公开发布的产品宣传片与开源项目主页。
 **所有实现均为从零重写**（re-implemented from scratch）：仓库不包含任何
@@ -38,6 +38,7 @@
 | 抖音 观机社（dy09） | 抖音账号"观机社"发布的荣耀 AI 概念片剪辑（约 22.6s） | 转载剪辑；底层为品牌向概念内容（涉及荣耀/Honor 品牌元素） | 手法参考，重新实现；品牌字标已替换为中性占位词 |
 | 抖音 江经怜（dy08，个别卡） | 抖音账号"江经怜"公开发布的作品（约 19.4s 竖屏） | 个人作品（公开发布，未获复刻许可） | 手法参考，重新实现；无原素材 |
 | reference/brand-scan | 用户提供的参考图定制 | 内部需求 | 原创实现 |
+| science 科普向补卡（cross-section-reveal / map-terrain-build / process-diagram-flow / metaphor-bridge） | 本项目内部需求：补科普向卡库缺口，脱离产品宣传片语汇 | 原创实现 | 从零撰写，**无任何外部参考片**；不含 ShotcraftMark、功能导航或产品截图 |
 
 > 已知精确度限制：X / 抖音来源当时以账号主页为单位记录，未逐条留存
 > 具体帖子 URL（原片仅在研究期间本地留存，未入库）。表中已尽量补充
@@ -45,7 +46,7 @@
 
 ## 逐卡来源映射
 
-本批 38 张卡与研究批次的对应关系（来自研究期的原片时段映射记录；全库 124 张含其他批次）：
+本批 38 张卡与研究批次的对应关系（来自研究期的原片时段映射记录；全库 128 张含其他批次）：
 
 | 来源 | 卡片 |
 |---|---|
@@ -60,3 +61,4 @@
 | x.com/tvnxty（Firecrawl 宣传片） | `product-card-progressive-assemble`、`research-card-stack-scroll` |
 | 抖音 观机社 | `logo-shrink-wordmark-lockup`、`white-flash-logo-simplify-cut` |
 | 用户参考图定制（brand-scan） | `assemble-then-type-flyin`、`scanline-annotate-focus`、`scanline-assemble-flyin` |
+| 科普向补卡（science，原创实现） | `cross-section-reveal`、`map-terrain-build`、`process-diagram-flow`、`metaphor-bridge` |

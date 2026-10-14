@@ -360,6 +360,22 @@
     "bytes": 6332
   },
   {
+    "relpath": "science/cross-section-reveal/CrossSectionReveal.tsx",
+    "bytes": 11360
+  },
+  {
+    "relpath": "science/map-terrain-build/MapTerrainBuild.tsx",
+    "bytes": 12648
+  },
+  {
+    "relpath": "science/metaphor-bridge/MetaphorBridge.tsx",
+    "bytes": 13619
+  },
+  {
+    "relpath": "science/process-diagram-flow/ProcessDiagramFlow.tsx",
+    "bytes": 14967
+  },
+  {
     "relpath": "transition/bottom-push-stack-wipe/BottomPushStackWipe.tsx",
     "bytes": 18501
   },
