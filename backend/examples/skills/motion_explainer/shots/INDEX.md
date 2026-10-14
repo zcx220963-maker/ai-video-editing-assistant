@@ -1,11 +1,11 @@
-# shot 卡索引（128 张，按类别）
+# shot 卡索引（132 张，按类别）
 
 每行：`<类别>/<卡名>` [能量] 时长 — 一句话描述 | 适用 | demo 文件 relpath + 字节数
 
 **选卡看这一份就够**：`card` 一栏照抄行首那个 `<类别>/<卡名>`；
 `derived_from` 一栏照抄 demo 栏里的那个 relpath（`demos/` 前缀可有可无，一镜引多份就都写上）。
 **demo 栏给的是盘上真有的文件名，照抄即可——别拿卡名去拼 `<卡名>.tsx`**：
-128 张卡里有 42 张的文件名与卡名对不上，照卡名拼出来的名字会被取材轮当场打回。
+132 张卡里有 42 张的文件名与卡名对不上，照卡名拼出来的名字会被取材轮当场打回。
 不要再逐张打开卡全文——SKILL.md 写明「不要读超过 15 张卡」。
 
 ## camera（10 张）
@@ -95,12 +95,16 @@
 - `rhythm/speed-ramp-freeze` [中高] — 帧号非线性 remap 的节奏手法——定格标注（流动→定格圈注→解冻） | 时长 定格标注全程 158f（≈5.3s，定格段… | 适用 卡片流/长横移中把一个重点"停下给人看"；教学解说、评审语境 | demo `rhythm/speed-ramp-freeze/FreezeAnnotateReal.tsx` 15,887 B
 - `rhythm/trailer-grammar-moves` [A 高] — 预告片语法一式——trailer-bumper 前置速剪钩子：三镜 9f 速剪 + 黑场静默一拍，再开场标题 | 时长 A ~4.7s（140f） | 适用 预告片的开场钩子（cold open）：正片前先塞三个最抓眼的镜头… | demo `rhythm/trailer-grammar-moves/TrailerBumper.tsx` 6,332 B
 
-## science（4 张）
+## science（8 张）
 
 - `science/cross-section-reveal` [中高] — 剖面揭示——一片剖切面自左向右扫过球体，扫到哪层显影哪层（地壳→地幔→外核→内核），标签带引线在该层被扫过 55% 时画入，收尾 30f 真静止 | 时长 150f（5s）；扫过全程 108f + … | 适用 讲"一个东西里面是什么"：地球内部、细胞结构、引擎剖面、地层、脑区… | demo `science/cross-section-reveal/CrossSectionReveal.tsx` 11,360 B
 - `science/map-terrain-build` [中] — 地图地形——等高线自谷底向山顶逐条立起（scale+上移+淡入，顺序=高程），一条河用 dasharray 把自己画出来并带跟随亮点，三个地名… | 时长 158f（5.3s）；等高线 7 条 ×1… | 适用 讲地理/地质/流域/气候：一座山怎么长出来、水往哪走、地形如何决定… | demo `science/map-terrain-build/MapTerrainBuild.tsx` 12,648 B
 - `science/metaphor-bridge` [高] — 比喻桥——把"太阳"换成"一个篮球"再按真实相对比例量出地球：测量线延伸时距离读数真实上跳，走到的位置是一颗针尖大的点（图上放大约 9×，位置… | 时长 168f（5.6s）；篮球入场 16f +… | 适用 讲"这个东西到底有多大/多远/多少"：天体尺度、细胞与细菌、原子与… | demo `science/metaphor-bridge/MetaphorBridge.tsx` 13,619 B
 - `science/process-diagram-flow` [中高] — 流程示意（循环型）——节点先全部落位，箭头按次序逐段用 dasharray 画出来（画的次序=流程次序），一个令牌沿已点亮路径行进并让所在段变… | 时长 176f（5.9s）；4 节点落位 18f… | 适用 讲"这个过程怎么走一圈"：水循环、碳循环、食物链、经济循环、呼吸/… | demo `science/process-diagram-flow/ProcessDiagramFlow.tsx` 14,967 B
+- `science/compare-duel` [中高] — 对比对擂——三条对比轨逐维亮起，左侧读数先 pop、右侧读数沿对位线滑入咬合，优势标记从胜出一侧弹出，三轨之后总评轨归位报结论 | 时长 208f（约 7s）；三轨各 46f（错峰 14f）+ 总评 22f + 静止 30f | 适用 讲"这两样东西有什么区别"：有性/无性生殖、内燃机/电动机、近视/远视、燃烧/呼吸、两种方案 | demo `science/compare-duel/CompareDuel.tsx` 10,966 B
+- `science/timeline-evolution` [中高] — 演化时间轴——水平轴按真实年代比例定位，视口沿轴行进，节点滚到中心时卡片交替弹出并带引线，顶部年份读数随帧真实跳动，末节点急停推近 | 时长 276f（约 9.2s）；入场 20f + 5 段滚动（每段 20f + 节点 hold 24f）+ 推近与静止 36f | 适用 讲"这件事是怎么一步步变成这样的"：生命演化、恒星一生、元素发现史、气候变迁、技术演进 | demo `science/timeline-evolution/TimelineEvolution.tsx` 11,074 B
+- `science/exploded-assembly` [中高] — 拆解合体——整体先合体呈现，各构件沿半径方向撑开（轨道半径 ×1.45、核 ×1.18），每一件的引线标签在它到位时画入，电子始终绕核旋转，合回后末 30f 真静止 | 时长 180f（6s）；合体 24f + 炸开 34f + 悬停 62f + 合回 30f + 静止 30f | 适用 讲"一个东西由哪些部分组成、各部分在哪"：原子结构、细胞器、引擎拆解、心脏四腔、机械传动 | demo `science/exploded-assembly/ExplodedAssembly.tsx` 10,140 B
+- `science/growth-morph` [中高] — 生长变形——形态按阶段逐个构件长出（stagger 4f），阶段切换交叉淡入 + 微移，底部生长轴四节点连线并显示真实天数，末阶段成虫翅膀展开并持续扇动 | 时长 224f（约 7.5s）；每阶段 44f（构件生长 20f + 驻留 24f）+ 过渡 8f + 收尾 24f | 适用 讲"这个东西是怎么一步步长成的"：完全变态、生命周期、恒星演化、材料的相变 | demo `science/growth-morph/GrowthMorph.tsx` 13,622 B
 
 ## transition（15 张）
 
@@ -169,4 +173,4 @@
 - `ui-entrance/value-stagger-gradient` [中高] — 16 根柱入场时 delay 是时间错峰，同时高度/色相/位移/模糊四个属性各自铺成从首到末的数值梯度；第二拍把错峰原点换成中心，脉冲幅度以中… | 时长 约 5.0s（150f@30fps） | 适用 技法演示与参数化能力的展示镜头；也可直接当数据/频谱/均衡器类界面… | demo `ui-entrance/value-stagger-gradient/ValueStaggerGradient.tsx` 7,981 B
 - `ui-entrance/wall-reveal-moves` [中] — 整墙批量入场两式——bento 逐格点亮、蓝图描线成形，全部原位显形不位移，与 deck-deal-flyin 的飞入位移型互补成品类矩阵 | 时长 单式约 5s（A 150f / B 150… | 适用 功能墙/卡片墙/整页界面的整体亮相；内容已在原位、要"显形"而非"… | demo `ui-entrance/wall-reveal-moves/BentoLightUp.tsx ui-entrance/wall-reveal-moves/WireframeDrawOn.tsx` 19,906 B
 
-总计 demo 字节：2,158,717
+总计 demo 字节：2,204,519

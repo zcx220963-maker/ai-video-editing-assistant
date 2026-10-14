@@ -376,6 +376,22 @@
     "bytes": 14967
   },
   {
+    "relpath": "science/compare-duel/CompareDuel.tsx",
+    "bytes": 10966
+  },
+  {
+    "relpath": "science/exploded-assembly/ExplodedAssembly.tsx",
+    "bytes": 10140
+  },
+  {
+    "relpath": "science/growth-morph/GrowthMorph.tsx",
+    "bytes": 13622
+  },
+  {
+    "relpath": "science/timeline-evolution/TimelineEvolution.tsx",
+    "bytes": 11074
+  },
+  {
     "relpath": "transition/bottom-push-stack-wipe/BottomPushStackWipe.tsx",
     "bytes": 18501
   },
