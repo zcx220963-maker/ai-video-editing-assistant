@@ -285,7 +285,9 @@ class BaseNode(ABC):
 
     # ---- 统一的执行链路：取数 → 解析 → 处理 → 打包 → 入库 ----
 
-    async def __call__(self, state: NodeState, **params: Any) -> dict[str, Any]:
+    # ``state`` 位置专用，同 ``Interceptor.invoke``：节点入参里可以有叫 ``state`` 的键，
+    # 而调用侧是 ``node(state, **inputs)``——不写成位置专用就等着同一个 TypeError。
+    async def __call__(self, state: NodeState, /, **params: Any) -> dict[str, Any]:
         inputs = self.load_inputs_from_client(state, dict(params))
         parsed = await self._parse_input(state, inputs)
         outputs = await self.process(state, parsed)
@@ -420,7 +422,21 @@ class Interceptor:
         """DAG 依赖 + 必须校验 artifact_meta 的上游种类（契约在 BaseNode.upstream）。"""
         return node.upstream
 
-    async def invoke(self, name: str, state: NodeState, **params: Any) -> dict[str, Any]:
+    async def invoke(self, name: str, state: NodeState, /, **params: Any) -> dict[str, Any]:
+        """执行一个节点（``name``/``state`` 是**位置专用**，理由见下）。
+
+        ``/`` 不是风格洁癖，是修过的一次真机事故：``params`` 是**节点自己的入参**，
+        它当然可以有跟拦截器同名的键——``imagegen`` 的 schema 里就有一项 ``name``
+        （落盘文件名）。调用侧一律写成 ``invoke(node.name, state, **args)``，于是那个
+        ``name`` 既被第一个位置参数占着、又来一个同名关键字，Python 当场抛
+        ``TypeError: Interceptor.invoke() got multiple values for argument 'name'``。
+
+        后果比报错本身重：这句话原样冒到模型那边，它读到的是「内部参数错误」——一个
+        不含任何可动作信息的字符串，于是只能归因到「我的提示词写坏了」，连试两次
+        按规矩收手，把一条本来只是「没配后端、降级去检索」的腿报成了「今天走不通」，
+        还给用户开了一张四选项的卡。位置专用之后，同名入参一律落进 ``params``，
+        这类冲突在语法层面不可能再发生。
+        """
         # 客户端参数先留痕：依赖补齐以默认入参执行，跨节点开关靠 state.flags 传达
         state.flags.update(params)
         args = await self.inject_media_content_before(name, state, dict(params))
