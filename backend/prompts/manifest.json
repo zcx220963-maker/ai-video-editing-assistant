@@ -17,7 +17,7 @@
   "prompts": {
     "system_prompt": {
       "file": "system_prompt.md", "phase": "always", "kind": "always",
-      "referenced_by": ["assembly"], "fixed": true, "max_bytes": 3257,
+      "referenced_by": ["assembly"], "fixed": true, "max_bytes": 3571,
       "desc": "基础人格与硬规矩（固定核心）。唯一还留着内联兜底副本的一份。"
     },
     "planning_round": {
