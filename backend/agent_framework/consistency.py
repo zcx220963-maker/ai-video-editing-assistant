@@ -105,6 +105,11 @@ _SKILL_NOT_TOOLS = frozenset({
     #   进这份表不是「可以用」，是「不是工具名」——正文为了说「别写它 / 别拿它自证」
     #   而点名这两栏，不该挂成臆造工具告警。
     "subject_terms", "text_share",
+    #   R19 闸⑳ 的出片回执栏（`style_facts["original_shots"]`）：正文教模型
+    #   「走了原创哨兵的那几镜由回执如实报出」，点的是**读数栏位名**不是工具名。
+    #   `style_facts` 另外那几栏（`palettes` / `bleed_shots` / `textures`）今天没进正文，
+    #   真进了就一起收——这条豁免的口径是「回执栏位」，不是「正文里出现过的词」。
+    "original_shots",
 })
 
 # 明确不是工具名的**形态**（技能正文里大量出现，属正常内容）：

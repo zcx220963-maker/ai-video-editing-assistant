@@ -19,7 +19,11 @@ interface ShotProps {
   text?: string;
   highlight?: string[];
   words?: { text: string; startFrame: number }[];
-  subtitleMode?: 'full' | 'torn_highlight' | 'none';
+  /** 四档：`full` / `torn_highlight` / `none` / `inline`（R14 加的那一档母版**不画**
+   *  字幕带，文字交给镜头代码自己排）。这一份声明原先漏了 `inline`，而它是模型照抄的
+   *  起手模板——少写一档等于把那一档从「能用的写法」变成「看着不像合法的写法」。
+   *  真源是 `@dg/tokens` 的 `SUBTITLE_MODES`，契约侧逐字对过（`tests/test_code_spec.py`）。 */
+  subtitleMode?: 'full' | 'torn_highlight' | 'none' | 'inline';
   aspect?: 'portrait' | 'landscape' | 'square';
 }
 

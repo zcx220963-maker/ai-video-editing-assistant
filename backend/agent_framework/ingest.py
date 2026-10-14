@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 from typing import Any, AsyncIterator, Mapping
 
+from .asset_index import index_material
 from .storage import IntegrityConflict, Storage, StorageUnavailable, new_id
 from .storage.media import (
     ProbeError, kind_of, mime_of, needs_normalize, normalize_to_h264, probe,
@@ -154,6 +155,27 @@ async def ingest_bytes(
     except StorageUnavailable as e:
         await storage.objects.delete(key)      # 元数据没登记成功就不留孤儿字节
         raise IngestRejected(502, f"materials 登记失败：{e}") from e
+
+    # R13-T65：位图**同批**建一条「按 sha 找字节」的索引行（`asset_library`）。
+    #
+    # 为什么在这里：这是三条入料路径（前端 /upload、链接取料、Agent 工具）**共用**的那一处，
+    # 所以一处接线三条路都通——散到各接口里写，迟早有一路漏掉，而漏掉的表现是
+    # 「传了图却报找不到这张图」，排查的人会先去查渲染侧，方向从一开始就是错的。
+    #
+    # 为什么在 materials 登记**之后**：索引行指着 materials 那个对象键，先有对象与归属
+    # 才谈得上索引；而且这一步失败**不改判**入库成功（`asset_index` 只回空串不抛）——
+    # 用户在自己素材册里照样看得见这张图，两级保证不该用同一句话报。
+    #
+    # 只对位图做：视频/音频上屏走的是别的路（`clips` / `bgm.ref`），不进这张索引。
+    try:
+        await index_material(storage, {
+            "kind": kind, "filename": fname, "sha256": info.sha256,
+            "mime": mime_of(fname), "bytes": info.bytes,
+            "width": meta.get("width"), "height": meta.get("height"),
+            "object_key": key,
+        }, object_key=key)
+    except Exception:      # noqa: BLE001 - 索引腿是增益，任何意外都不该让上传失败
+        pass
 
     url = await storage.objects.presign_get(key)
     out: dict[str, Any] = {

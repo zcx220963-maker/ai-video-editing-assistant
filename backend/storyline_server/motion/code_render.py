@@ -46,7 +46,7 @@ import base64
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .. import mediaops
 from ..mediaops import MediaError
@@ -55,6 +55,7 @@ from . import code_spec as cspec
 from . import remotion_client as rc
 from . import render as rpipe
 from . import reveal_gate
+from . import judge_channel
 from . import review_loop
 
 Progress = Callable[[dict[str, Any]], "Awaitable[None] | None"]
@@ -380,6 +381,23 @@ async def _empty_check(sid: str, clip: Path, *, bg_hex: str, size: tuple[int, in
     return {"ratio": low, "span": round(span, 4)}
 
 
+#: 允许**逐镜不同**的 token 键（R14）。这不是给缺陷开后门：这两件事在 R14 之后
+#: 本来就是逐镜可配的观感决定（这一镜满幅、那一镜有安全区；这一镜暗底、那一镜浅底）。
+#: 它们进母版的 `used` 表，是为了让**闸④ 拿到这一镜真实的基准色**（`_bg_of` 读它判空）
+#: 与让 `_band_of` 拿到真实带子，不是为了参与跨镜一致性。把它们也拿去比，
+#: 等于把新能力判死——「这镜满幅、那镜有安全区」会被报成「母版的常量每镜不同」，
+#: 而那恰恰是这一版**要**的行为。
+#:
+#: 白名单只有这三项：`bodyWidth`/`bodyHeight`/`topSafe`/`gutter` 仍在比对面里，
+#: 因为它们报的是**画幅级**几何（满幅时 bodyWidth 才等于宽），逐镜不同只可能来自
+#: `bleed`——那件事已经由 `bleed` 这一栏自己表达了。两条一起看才判得准：
+#: 「bleed 一样而 bodyWidth 不同」是真漂移，仍然会红。
+#:
+#: R19 加第三项 `subtitleMode`：层E2 让字幕档可以**逐镜覆盖**（整片 `torn_highlight`、
+#: 某几镜 `inline`），而它同样是「这一镜的观感决定」，不是母版常量漂移。
+TOKEN_PER_SHOT_KEYS = frozenset({"bg", "bleed", "subtitleMode"})
+
+
 def check_token_drift(ledger: list[dict[str, Any]]) -> list[str]:
     """闸⑤：跨镜比对母版回读的 token，**容差 0**。→ 错误清单（空 = 通过）。
 
@@ -388,6 +406,8 @@ def check_token_drift(ledger: list[dict[str, Any]]) -> list[str]:
 
     只比**都读到了**的镜：某镜回读落空（服务端已经在 warnings 里报了）不该让整条片子
     陪葬，但那条落空必须已经在账上——静默跳过才是这个函数最该避免的失败模式。
+
+    `TOKEN_PER_SHOT_KEYS` 里那几个键跳过比对（理由见那份注释）。
     """
     errs: list[str] = []
     seen: dict[str, tuple[Any, str]] = {}     # token 名 → (值, 首个镜号)
@@ -398,6 +418,8 @@ def check_token_drift(ledger: list[dict[str, Any]]) -> list[str]:
             errs.append(f"闸⑤ {sid}：没读到母版 token，这一镜没参与跨镜一致性比对")
             continue
         for name, value in toks.items():
+            if name in TOKEN_PER_SHOT_KEYS:
+                continue
             first = seen.get(name)
             if first is None:
                 seen[name] = (value, sid)
@@ -833,7 +855,11 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
         "text": str(shot.get("text") or ""),
         "highlight": [str(h) for h in (shot.get("highlight") or [])],
         "words": frame_words,
-        "subtitleMode": str(spec.get("subtitle_mode") or "full"),
+        # 层E2（R19）：**这一镜**的字幕形态——先看镜级覆盖，没有才回落整片那一档。
+        # 母版那侧读的还是同一个 `subtitleMode` 键，所以它不必知道「逐镜」这件事：
+        # 「整片一档」与「逐镜覆盖」在母版看来是同一件事，区别只在注入时谁赢。
+        "subtitleMode": str(shot.get("subtitle_mode")
+                            or spec.get("subtitle_mode") or "full"),
         "fields": cspec.field_values(shot),
         # 母版进出场（T22）：档名 + 窗口帧数。`none` 或者窗口不足 2 帧时是 0/0，
         # 母版据此完全不套那层动画（于是「不选进出场」的片子逐帧与从前一致）。
@@ -854,6 +880,13 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
         # 而那两个数是这一侧排的班——母版自己算就成了第二个出处。
         props["revealProbeFrames"] = cspec.reveal_probe_frames(
             shot, frames=frames, fps=int(spec["fps"]))
+    # R14 风格档（底色 / 满幅）。**只在真申报了才发**——与 `reveal` 同一条理由：
+    # 给没申报的镜塞一个 `film_style: {bleed: false, bg: ""}` 会让 input_props 白涨字节
+    # （这一份 props 逐镜要过 HTTP），而母版读不到就当缺省值（`FILM_STYLE_DEFAULT`），
+    # 于是老片子的读数一个字节都不变。
+    film_style = cspec.film_style_of(shot)
+    if film_style:
+        props["film_style"] = film_style
     return props
 
 
@@ -1345,6 +1378,87 @@ async def _render_shots(shots: list[dict[str, Any]], *, spec: Mapping[str, Any],
     return clips, ledger, files, hitmaps, frames_used
 
 
+#: 静帧审美评审的整片开关（层 D2）。读法与 ``review_loop.REVIEW_KNOB`` 完全一致
+#: （``spec`` 里那一栏），**默认关**：这一档是**逐镜一次多模态调用**，是这条链上最贵的
+#: 一类调用。它把闸④ 的射程从「带子里有没有东西」抬到「画得好不好」，关着只是少一条
+#: 自动质检的路，不会让问题片子溜出去；反过来默认开会替所有人花掉这笔钱。
+#: 花钱的能力必须能被人关掉（BGM / 质感 / 转场 / 回看都是先例）。
+STILL_REVIEW_KNOB = "still_review"
+
+
+async def _still_review(spec: dict[str, Any], ledger: Sequence[Mapping[str, Any]],
+                        files: Mapping[str, Any], *,
+                        scanned: Mapping[str, Any] | None = None
+                        ) -> dict[str, Any]:
+    """逐镜静帧审美评审（层 D2）→ 一份三出口回执。**它不拦交付。**
+
+    闸④ 是**机器判据**（带内非底色占比 + 填充度），它天生判不了「构图失衡 / 元素重叠 /
+    廉价光效 / 文字读不清」——那些是审美，像素统计说不出话。这一趟把每一镜的关键帧递给
+    判断模型（复用 ``agent_framework.judge``，**不另起客户端**，Q90/Q91），按技能正文的
+    Q 组判据问一句「违反吗」，把结论摊在回执上。
+
+    三出口（**不许合并**）：``verdict=True`` 判红（画面站不住，一条**提醒**不是打回）、
+    ``verdict=False`` 判绿、``verdict=None`` **未判**（没配置 / 调用失败 / 低置信）。
+    「未判」与「判绿」在回执上必须是两句话——混成一格就又回到「没量过写成量过」。
+
+    开关关着时 ``enabled=False``、``shots`` 为空，并**明写**「这趟没开」：
+    「没开」既不是「缺席」（缺席＝压根不需要），更不是「通过」。
+    """
+    enabled = bool(spec.get(STILL_REVIEW_KNOB))
+    cap = await judge_channel.capability()
+    out: dict[str, Any] = {
+        "gate": "04-b", "knob": STILL_REVIEW_KNOB, "enabled": enabled,
+        "judge": dict(cap), "criteria": list(judge_channel.criteria_ids()),
+        "shots": {}, "notes": [],
+        "counts": {"pass": 0, "fail": 0, "undetermined": 0, "not_run": 0},
+    }
+    if not enabled:
+        out["note"] = (f"静帧审美评审这趟没开（spec 里没有 `{STILL_REVIEW_KNOB}`）——"
+                       "这一栏对每一镜都**没有结论**，不许读成「画面没问题」")
+        out["counts"]["not_run"] = len(ledger)
+        return out
+    if not cap.get("judge"):
+        # 没配置＝完全不启用（`judge.py` 的纪律）。这一栏如实记「做不了」，
+        # **不**把它折算成通过，也不抛——它是提醒层，不是交付门。
+        why = str(cap.get("why") or "")
+        out["note"] = f"评审做不了：{why}"
+        for i, r in enumerate(ledger):
+            out["shots"][str(r.get("id") or f"s{i + 1:02d}")] = {
+                "verdict": None, "confidence": 0.0, "why": why}
+            out["counts"]["undetermined"] += 1
+        return out
+    by_id = {str(s.get("id") or ""): s for s in (spec.get("shots") or [])}
+    scan = scanned if isinstance(scanned, Mapping) else {}
+    for i, r in enumerate(ledger):
+        sid = str(r.get("id") or f"s{i + 1:02d}")
+        slot = files.get(sid)
+        frame = slot.get("frame") if isinstance(slot, Mapping) else None
+        if frame is None:
+            # 没帧就不评：让模型闭着眼改代码是这条链上最坏的一种「判过了」。
+            out["shots"][sid] = {
+                "verdict": None, "confidence": 0.0,
+                "why": "这一镜的 frame.png 没找到——没帧就不评（不许拿读数代替画面）"}
+            out["counts"]["undetermined"] += 1
+            continue
+        got = await judge_channel.review_still(
+            shot=by_id.get(sid) or {"id": sid}, image=frame,
+            columns=review_loop.five_columns(scan.get(sid)))
+        out["shots"][sid] = {"verdict": got.get("verdict"),
+                             "confidence": float(got.get("confidence") or 0.0),
+                             "reason": str(got.get("reason") or ""),
+                             "why": str(got.get("why") or "")}
+        v = got.get("verdict")
+        out["counts"]["fail" if v is True else "pass" if v is False
+                      else "undetermined"] += 1
+    red = [sid for sid, s in out["shots"].items() if s["verdict"] is True]
+    if red:
+        out["notes"].append(
+            "闸④-b（静帧审美）判红：" + "、".join(red)
+            + "——这是**提醒**不是打回：像素上「有没有东西」由闸④ 管，"
+              "「好不好看」由这一条如实报出来给人看")
+    return out
+
+
 async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work: Path,
                              client: dict[str, Any] | None = None,
                              storage: Any = None,
@@ -1446,8 +1560,22 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
     # 为什么不在分镜期判前一条：一镜多长是 TTS 说了算的，分镜那会儿手里只有下限。
     plan = cspec.transition_plan(spec)
     shot_secs = [(str(r["id"]), float(r.get("sec") or 0.0)) for r in ledger]
+    # 层E1（R19）：把「只列覆盖」的 seams 摊成**逐接缝**的 (档, 时长) 一份，后面四处
+    # 全用这一份——时长对账 / 声画账 / 拼接 / 生效判据。四处各摊一遍就会出现
+    # 「判据按 A 算、ffmpeg 按 B 接」那种只有抽帧才看得见的分歧（`shot_texture`
+    # 那条「记账与渲染不许各写一遍」的同族教训）。
+    seam_eff: list[tuple[str, float]] = []
+    for st, d in cspec.seams_to_per_index(plan["seams"], shot_secs):
+        style_i = st or str(plan["style"])
+        span_i = float(d) if st else float(plan["duration"])
+        if style_i in ("", "none") or span_i <= 0:
+            style_i, span_i = "none", 0.0
+        seam_eff.append((style_i, span_i))
+    seam_secs = [d for _st, d in seam_eff]
+    seam_plan = [{"style": st, "duration": d} for st, d in seam_eff]
     misfit = cspec.check_transition(shot_secs, style=plan["style"],
-                                    duration=plan["duration"])[0]
+                                    duration=plan["duration"],
+                                    seams=plan["seams"])[0]
     if misfit:
         raise MediaError("一帧都没拼，先把转场说清楚：\n"
                          + "\n".join(f"  · {e}" for e in misfit))
@@ -1476,16 +1604,17 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
     bgm_sec: float | None = None
     if bgm is not None and Path(bgm).exists():
         bgm_sec = float(mediaops.probe(bgm)["duration"])
-    planned_film_sec = (sum(sec for _, sec in shot_secs)
-                        - max(0, len(clips) - 1) * plan["duration"])
+    planned_film_sec = (sum(sec for _, sec in shot_secs) - sum(seam_secs))
     voice_tails = [(str(r["id"]),
                     max(0.0, float(r.get("sec") or 0.0)
                         - (float(r.get("speech_sec") or 0.0) + rpipe.BREATH_LEAD_SEC)))
                    for r in ledger]
+    active_gaps = sum(1 for d in seam_secs if d > 0)
     av_errors, av_warns = cspec.check_av_accounting(
         narration=bool(spec.get("narration")), film_sec=planned_film_sec,
         clip_db=clip_db, clips_with_audio=clips_with_audio, bgm_sec=bgm_sec,
-        gaps=max(0, len(clips) - 1), overlap_sec=plan["duration"],
+        gaps=active_gaps, overlap_sec=(max(seam_secs) if seam_secs else 0.0),
+        overlap_secs=seam_secs,
         voice_tails=voice_tails, fps=fps)
     if av_errors:
         raise MediaError("闸⑰ 声画对账未通过，母带还没开始（一帧都没拼）：\n"
@@ -1558,11 +1687,13 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
             "status": row.get("status"),
         }
 
-    await asyncio.to_thread(mediaops.concat, clips, master, fps=fps, transition=plan)
+    await asyncio.to_thread(mediaops.concat, clips, master, fps=fps,
+                            transition=seam_plan)
     total = float(mediaops.probe(master)["duration"])
     not_taken = cspec.check_transition_effect([sec for _, sec in shot_secs], total,
                                               style=plan["style"],
-                                              duration=plan["duration"], fps=fps)
+                                              duration=plan["duration"], fps=fps,
+                                              seams=seam_secs)
     if not_taken:
         raise MediaError("\n".join(f"  · {e}" for e in not_taken))
 
@@ -1580,6 +1711,13 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
     info = mediaops.probe(out)
     timings = [r.get("render_timings") or {} for r in ledger if not r.get("cached")]
     ms = [float(t.get("per_frame_ms") or 0.0) for t in timings if t.get("per_frame_ms")]
+
+    # ---- 闸④ 的第三半：静帧审美评审（层 D2）----
+    # 放在**母带已经出好之后**：这一趟是逐镜一次多模态调用，是这条链上最贵的一类；
+    # 它只判「画面好不好看」，判错了也不该让已经烧好的像素白费。闸④ 的两半
+    # （非底色占比 / 填充度）是机器判据、红了出不了片；这一半是**提醒**，永远不打回。
+    still_receipt = await _still_review(spec, ledger, files, scanned=subject_scanned)
+
     return {"video": out, "duration": info["duration"], "width": info["width"],
             "height": info["height"], "fps": info["fps"], "shots": ledger,
             "shot_files": files,
@@ -1598,7 +1736,10 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
             # 上面那条判据判的就是这个差；这里留数是为了出片回执能自己算）。
             "transition": plan["style"],
             "transition_sec": plan["duration"],
-            "transition_gaps": max(0, len(clips) - 1),
+            # 层E1（R19）：**真落了转场的那几处**接缝数（硬接的那几处不算），
+            # 以及逐接缝的实际档与时长——整片一档时它就是同一个值重复 n−1 次。
+            "transition_gaps": active_gaps,
+            "transition_seams": seam_plan,
             "overlap_sec": round(sum(sec for _, sec in shot_secs) - total, 3),
             # 进出场同理：档名 + **逐镜**实际窗口帧数（窗口是该镜帧数的 10%、
             # 封顶 15 帧，短镜不足 2 帧时是 0——那时它确实没有动作，
@@ -1656,6 +1797,9 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
             # 「回看」这件事不在交付语里被说成做过——数据全部来自账（缓存键 + 切片字节），
             # 不来自模型的话。没开回看时红镜记 `not_run`（不是缺席、更不是通过）。
             "review_loop": review_receipt,
+            # 闸④-b 的回执（层 D2）：逐镜的**静帧审美**三出口。它是提醒层，不打回——
+            # 「没开」明写成 not_run、「没配置」明写成 undetermined，两者都不许读成通过。
+            "still_review": still_receipt,
             "degraded": [f"{r['id']}：{r['degraded']}" for r in ledger if r["degraded"]],
             # 闸④ 两半的读数留在返回里：定 EMPTY_MIN_RATIO / SPAN_MIN 终值要的是
             # 这些数字的分布，只留布尔就再不知道那条线离实际有多远

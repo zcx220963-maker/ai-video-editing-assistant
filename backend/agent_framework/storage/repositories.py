@@ -1450,7 +1450,14 @@ class AssetLibraryRepo(_Repo):
                           enabled: bool = True,
                           limit: int = 100,
                           offset: int = 0) -> list[dict[str, Any]]:
-        """列素材（可按源/主体/风格族过滤）。"""
+        """列素材（可按源/主体/风格族过滤）。
+
+        ``offset`` 在**内存里**切，不透传给 ``Datastore.select``——它的签名里没有这一位
+        （``db.py`` 只有 ``where/order_by/limit``），透传的后果是**每一次调用都
+        ``TypeError``**。这个洞长期没暴露，是因为唯一一个带偏移的调用方
+        （``asset_sources.live_source_counts``）把异常吞成了 ``None``，于是 ㉔ 供给面那道闸
+        的读数一直是「未判」——一条闸静默失效了而回执上看不出原因。
+        """
         where: dict[str, Any] = {"enabled": enabled}
         if source:
             where["source"] = source
@@ -1458,9 +1465,10 @@ class AssetLibraryRepo(_Repo):
             where["subject"] = subject
         if style_family:
             where["style_family"] = style_family
-        return await self.db.select(self.table, where=where,
+        rows = await self.db.select(self.table, where=where,
                                     order_by=["-created_at"],
-                                    limit=limit, offset=offset)
+                                    limit=(limit + offset) if offset > 0 else limit)
+        return rows[offset:] if offset > 0 else rows
 
     async def search(self, query: str, *, subject: str | None = None,
                      style_family: str | None = None,

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from ..plan_replay import (drain_plan_cards, drain_plan_round, record_plan_card,
                            reset_plan_cards)
+from .capability import probe_capabilities, render_capability_notes
 from .compile import PlanCompiler
 from .gate import PlanGate
 from .prompt import planning_section, planning_section_blocks, render_injections
@@ -47,6 +48,9 @@ __all__ = [
     # T42：技能正文按本片计划取块（判据 + 装配，与 skill.py 的分段标记成对）
     "sections_for_plan", "changed_film_knobs",
     "planning_section_blocks",
+    # R13：计划期探活（现查活库与密钥 → 那段「本机能力实测」）。装配层在
+    # `agent.plan()` 里调它，值经 `planning_section_blocks(capability_notes=…)` 注入。
+    "probe_capabilities", "render_capability_notes",
     "pending_continuation", "claims_plan_card", "claims_step_executed",
     # T41：执行轮工具面的按链装配（表 + 「如何请求扩面」那段说明，成对出现）
     "registry_for_round", "trimmed_nodes", "scope_lines", "plan_nodes",

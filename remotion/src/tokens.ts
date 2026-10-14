@@ -68,19 +68,28 @@ export const FILM_GEOMETRY = {
   portrait: {
     topSafe: 96, bottomSafe: 300, gutter: 72,
     caption: { height: 132, fontSize: 44, side: 72, radius: 14, padX: 34, padY: 18 },
+    bleedCaptionBottom: 120,
   },
   landscape: {
     topSafe: 48, bottomSafe: 300, gutter: 60,
     caption: { height: 240, fontSize: 78, side: 108, radius: 25, padX: 60, padY: 32 },
+    bleedCaptionBottom: 72,
   },
   square: {
     topSafe: 56, bottomSafe: 260, gutter: 64,
     caption: { height: 132, fontSize: 44, side: 72, radius: 14, padX: 34, padY: 18 },
+    bleedCaptionBottom: 96,
   },
 } as const;
 
-/** 字幕形态：与旧链同一套语义，值从整片开关注入，镜头代码碰不到。 */
-export const SUBTITLE_MODES = ['full', 'torn_highlight', 'none'] as const;
+/** 字幕形态：与旧链同一套语义，值从整片开关注入，镜头代码碰不到。
+ *
+ *  R14 加第四档 `inline`：**母版不画字幕条**，把 text/highlight/words 交回镜头代码
+ *  自己排（那三个值本来就在 `props` 里，镜头代码一直拿得到）。这是「文字进画面、
+ *  随构图摆」那一档——参考片普遍这么做，而前三档里它做不到：
+ *  `full`/`torn_highlight` 都是母版在画面带下方那条固定白底圆角条里画，
+ *  `none` 是整片没有字幕。`inline` 是唯一能让「这一镜的字压在画面上」成立的档。 */
+export const SUBTITLE_MODES = ['full', 'torn_highlight', 'none', 'inline'] as const;
 
 /** 闸⑤ 回读行的行首标记。server.mjs 里是同名字面量，两处必须一起改。 */
 export const TOKEN_LOG_MARKER = 'DG_TOKENS:';
@@ -140,5 +149,36 @@ export const ASSET_LOG_MARKER = 'DG_ASSETS:';
  *  Python 拿它去采样比色——「区域落在哪儿」只有一处实现，就是这里（两处各算一遍
  *  就是两把尺：母版按 img 的实时盒换算，Python 没有那个盒）。 */
 export const REVEAL_LOG_MARKER = 'DG_REVEAL:';
+
+/**
+ * R14 风格档：把母版的三件事（底色 / 画面带 / 字幕形态）从常量改成**按档排**。
+ *
+ * 为什么走**注入**而不是 props：与 `reveal` / `entrance` 同一条理由——它不是
+ * 「镜头代码自己的数据」，而是整片（或这一镜）的一个观感决定。镜头代码转交不了它，
+ * 所以母版自己从 `getInputProps()` 里取，`useBody()` 也取同一份，两侧不可能不一致。
+ *
+ * 为什么只有两个字段、**没有 palette**：色板今天由镜头代码 `import
+ * "@dg/themes/palettes.json"` 自己选（闸⑩ 就是照代码里绑的名字去解析颜色的）。
+ * 母版再收一个 palette 名，同一件事就有两个出处，迟早对不上。母版真正缺的只是
+ * 「底色是什么」——知道底色，它就能按亮度自己算字幕条该用深墨还是浅墨。
+ *
+ * 为什么不进 `used` 的跨镜比对：`bleed`/`bg` **允许逐镜不同**（那正是它们存在的
+ * 理由），而闸⑤ 判的是「20 镜排版有没有漂移」。Python 侧 `check_token_drift` 有一份
+ * 显式的逐镜白名单 `TOKEN_PER_SHOT_KEYS`，这两个键在里面。
+ */
+export interface FilmStyle {
+  /** 满幅：画面带 = 整帧，去掉 gutter 与上下安全区。
+   *  「满幅」是画得出整屏插画/描线的前提——不设它时所有镜头都被裁进中间一条带子里，
+   *  这正是成片「每镜都是同一个框」的结构原因。 */
+  bleed: boolean;
+  /** 底色。空串 = 用 `TOKENS.bg`（今天的行为）。
+   *  必须是 `#rrggbb`：闸④ 拿它当判空的基准色，读不到基准色它拒绝判（见
+   *  `code_render._bg_of`）。 */
+  bg: string;
+}
+
+/** 风格档的缺省值 —— **逐字等于今天**：不传 `film_style` 时母版读到的就是这一份，
+ *  于是既有片子的像素与 token 读数一个字节都不变。 */
+export const FILM_STYLE_DEFAULT: FilmStyle = { bleed: false, bg: '' };
 
 export type SubtitleMode = (typeof SUBTITLE_MODES)[number];

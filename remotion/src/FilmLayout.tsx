@@ -19,13 +19,14 @@ import {
   FIELD_LOG_MARKER,
   FIELD_PROBE_TAIL,
   FILM_GEOMETRY,
+  FILM_STYLE_DEFAULT,
   LAYOUT_LOG_MARKER,
   LAYOUT_PROBE,
   REVEAL_LOG_MARKER,
   TOKENS,
   TOKEN_LOG_MARKER,
 } from './tokens';
-import type { Aspect, SubtitleMode } from './tokens';
+import type { Aspect, FilmStyle, SubtitleMode } from './tokens';
 
 /** 镜头代码能拿到的画面带：成片设备像素，左上角是 (0,0)。 */
 export interface BodyBox {
@@ -53,12 +54,19 @@ export interface BodyBox {
  */
 export function useBody(aspect?: Aspect): BodyBox {
   const { width, height } = useVideoConfig();
-  return filmBody(width, height, aspect);
+  // R14：风格档也从注入里取，与母版同一份。`useBody()` 是镜头代码唯一量得到带子的口，
+  // 它必须知道「这一镜是不是满幅」——否则满幅片的镜头代码会按 936×1524 排版，
+  // 而母版实际裁的是 1080×1920，两侧各算一套几何就正是这条链最怕的漂移。
+  return filmBody(width, height, aspect, resolveFilmStyle(getInputProps()).bleed);
 }
 
 /** `useBody()` 的无钩子版本，母版自己也用它一次，于是两侧不可能算出两个数。 */
-export function filmBody(width: number, height: number, aspect?: Aspect): BodyBox {
+export function filmBody(width: number, height: number, aspect?: Aspect,
+                          bleed = false): BodyBox {
   const key = aspect ?? aspectFor(width, height);
+  // 满幅：没有页边距、没有上下安全区，整帧就是可画区。字幕条（若这一镜还有）
+  // 改成**叠在画面上**，位置见 `FILM_GEOMETRY[..].bleedCaptionBottom`。
+  if (bleed) return { x: 0, y: 0, w: width, h: height, aspect: key };
   const g = FILM_GEOMETRY[key];
   return {
     x: g.gutter,
@@ -67,6 +75,47 @@ export function filmBody(width: number, height: number, aspect?: Aspect): BodyBo
     h: height - g.topSafe - g.bottomSafe,
     aspect: key,
   };
+}
+
+/**
+ * R14 风格档的注入解析 —— 与 :func:`resolveReveal` / `resolveShotMotion` 同一套写法。
+ *
+ * 认不出的写法一律挡回缺省值，**不抛也不猜**：风格档的每个字段都有「不设 = 今天」
+ * 的语义，一个写坏的 `bg` 不该让整镜渲不出来，而应该退回母版原本的底色。
+ * `bg` 只收 `#rrggbb`：闸④ 拿它当判空的基准色（`code_render._bg_of` 读不到基准色
+ * 就拒绝判空），所以 `rgb()`/命名色/渐变一律不收——那会让闸④ 在这一镜上闭嘴。
+ */
+export function resolveFilmStyle(injected: unknown): FilmStyle {
+  const src = (injected && typeof injected === 'object' ? injected : {}) as Record<string, unknown>;
+  const raw = src.film_style;
+  const s = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const bg = String(s.bg ?? '').trim();
+  return {
+    bleed: s.bleed === true,
+    bg: /^#[0-9a-fA-F]{6}$/.test(bg) ? bg.toLowerCase() : FILM_STYLE_DEFAULT.bg,
+  };
+}
+
+/** `#rrggbb` → 相对亮度 0~1（sRGB 加权）。够用来判「这个底是深的还是浅的」。 */
+function luma(hex: string): number {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/.exec(hex.toLowerCase());
+  if (!m) return 1;
+  const [r, g, b] = [1, 2, 3].map((i) => parseInt(m[i], 16) / 255);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/**
+ * 字幕条的两个颜色，**按底色亮度算**，不查色板。
+ *
+ * 为什么按亮度而不是收一个色板名：色板今天由镜头代码 import（闸⑩ 照代码里绑的
+ * 名字解析颜色），母版再收一份就是同一件事两个出处。而母版真正需要知道的只是
+ * 「底深还是底浅」——知道这个，字幕条该用深墨还是浅墨就定了，且**不会出现
+ * 深底 + 深墨**那种读不出来的组合（闸⑩ 判的正是这个对比度）。
+ */
+function captionTone(bg: string): { paper: string; ink: string } {
+  return luma(bg) < 0.5
+    ? { paper: 'rgba(16,14,12,0.72)', ink: '#f4f1ea' }
+    : { paper: TOKENS.paper, ink: TOKENS.ink };
 }
 
 /** 从成片像素尺寸反推画幅：表以三种标准尺寸为准则，取最接近的那个。 */
@@ -967,6 +1016,12 @@ function probeLayout(root: Element, band: PxBox, convert: Convert) {
  * 往画面带里填东西，拿不到字幕绘制权 —— 于是「这一镜字幕比上一镜高 3 像素」这类
  * 漂移在结构上不可能发生，而不是靠闸⑤事后抓。
  *
+ * R14 起这三件事改成**按风格档排**（底色 / 满幅 / 字幕形态，见 `FilmStyle`）：
+ * 档从注入里读，镜头代码仍旧碰不到它。唯一的例外是 `subtitleMode='inline'`——
+ * 那一档母版**故意不画**字幕，把绘制权还给镜头代码（文字要随构图摆，只有它知道
+ * 主体在哪）。「独占」这句因此改成「独占**默认**的排版」：不申报风格档时，
+ * 上面那份独占逐字不变。
+ *
  * 闸⑤读的是这里回写的 `<meta name="dg-tokens">`：写的是**实际用上的值**，
  * 不是常量表的副本 —— 母版哪天被改坏，回读表会先红。
  */
@@ -992,7 +1047,18 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   // 不乘 u——见 tokens.ts 那条注释，乘 u 会把上下安全区按宽轴放大，横屏正文带塌到 31%。
   const u = width / 1080;
   const geo = FILM_GEOMETRY[aspect];
-  const body = filmBody(width, height, aspect);
+  // R14：风格档（底色 / 满幅）与字幕形态。三件事都从注入里取，镜头代码碰不到——
+  // 与 `reveal`/`entrance` 同一条回退逻辑。不传 `film_style` 时 `style` 就是缺省值，
+  // `bg` 落回 `TOKENS.bg`、`bleed` 为 false，于是老片子的读数一个字节都不变。
+  const style = resolveFilmStyle(getInputProps());
+  const bg = style.bg || TOKENS.bg;
+  const tone = captionTone(bg);
+  const body = filmBody(width, height, aspect, style.bleed);
+  // 满幅时字幕条**叠在画面上**（没有下安全区可站），位置由几何表给；
+  // 非满幅时仍旧站在下安全区正中——今天的行为逐字不变。
+  const captionBottom = style.bleed
+    ? geo.bleedCaptionBottom
+    : (geo.bottomSafe - geo.caption.height) / 2;
 
   const captionIn = interpolate(frame, [0, 0.25 * fps], [0, 1], {
     extrapolateLeft: 'clamp',
@@ -1027,10 +1093,16 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   };
 
   const used = {
-    version: 'film-layout@2',
+    version: 'film-layout@3',
     fontStack: TOKENS.fontStack,
     ink: TOKENS.ink,
-    bg: TOKENS.bg,
+    // R14：`bg` 报的是**这一镜实际排出去的底色**（风格档给了就用它），因为闸④ 拿
+    // 这一栏当判空的基准色。`bleed` 同理是这一镜的实际取值。
+    // 这两个键允许逐镜不同，Python 侧 `check_token_drift` 有一份显式白名单
+    // （`TOKEN_PER_SHOT_KEYS`）把它们排除在跨镜比对之外——不排除的话，
+    // 「这镜满幅、那镜有安全区」会被闸⑤ 判成「母版常量漂移」，新能力当场判死。
+    bg,
+    bleed: style.bleed,
     paper: TOKENS.paper,
     accent: TOKENS.accent,
     hl: TOKENS.hl,
@@ -1198,7 +1270,7 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   }, [frame, fps, revealIn]);
 
   return (
-    <AbsoluteFill style={{ background: TOKENS.bg, fontFamily: TOKENS.fontStack }}>
+    <AbsoluteFill style={{ background: bg, fontFamily: TOKENS.fontStack }}>
       {/* 闸⑤ 的回读锚点：必须是「实际用上的值」，不是常量表副本 */}
       <meta name="dg-tokens" content={JSON.stringify(used)} />
 
@@ -1222,7 +1294,12 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
           {children}
         </div>
 
-        {subtitleMode !== 'none' && text ? (
+        {/* R14：`inline` 档母版**不画字幕**——文字由镜头代码自己排进画面。
+            为什么不是母版换个位置画：参考片那种「文字压在画面上、随构图摆」
+            本质上是**这一镜的构图决定**，只有镜头代码知道它把主体放在哪。
+            母版插一脚就又是「每镜一条固定字幕带」。text/highlight/words 本来
+            就在 `props` 里，镜头代码一直拿得到，这一档只是把绘制权还回去。 */}
+        {subtitleMode !== 'none' && subtitleMode !== 'inline' && text ? (
           <Caption
             text={text}
             highlight={highlight}
@@ -1230,6 +1307,8 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
             mode={subtitleMode}
             opacity={captionIn}
             geo={geo}
+            bottom={captionBottom}
+            tone={tone}
           />
         ) : null}
       </AbsoluteFill>
@@ -1244,7 +1323,12 @@ const Caption: React.FC<{
   mode: SubtitleMode;
   opacity: number;
   geo: (typeof FILM_GEOMETRY)[Aspect];
-}> = ({ text, highlight, words, mode, opacity, geo }) => {
+  /** 字幕条底边到画面底的距离。非满幅时是下安全区正中（今天的行为），
+   *  满幅时是几何表给的叠层位置——母版算好传进来，不在这里再判一次满幅。 */
+  bottom: number;
+  /** 字幕条的两个颜色，按这一镜底色亮度算（见 `captionTone`）。 */
+  tone: { paper: string; ink: string };
+}> = ({ text, highlight, words, mode, opacity, geo, bottom, tone }) => {
   const frame = useCurrentFrame();
   const { width } = useVideoConfig();
   const cap = geo.caption;
@@ -1284,7 +1368,7 @@ const Caption: React.FC<{
         position: 'absolute',
         left: cap.side,
         right: cap.side,
-        bottom: (geo.bottomSafe - cap.height) / 2,
+        bottom,
         height: cap.height,
         display: 'flex',
         alignItems: 'center',
@@ -1296,9 +1380,9 @@ const Caption: React.FC<{
         style={{
           maxWidth: '100%',
           padding: `${cap.padY}px ${cap.padX}px`,
-          background: TOKENS.paper,
+          background: tone.paper,
           borderRadius: cap.radius,
-          color: TOKENS.ink,
+          color: tone.ink,
           fontSize: fontSize,
           lineHeight: 1.35,
           textAlign: 'center',

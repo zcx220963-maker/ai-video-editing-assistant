@@ -152,32 +152,67 @@ def scene_ranges(src: str | Path, threshold: float = 0.3,
     return out
 
 
+def _seams_of(transition: Any, n: int) -> list[dict[str, Any]]:
+    """把 ``transition`` 归一成**逐接缝**的一栏（长度 = ``n − 1``）。
+
+    两种写法都收：
+
+    * 一个映射 ``{"style": "fade", "duration": 0.4}``——整片同一档（R7-T22 的老路）；
+    * 一串逐接缝的映射 ``[{"style": "fade", "duration": 0.4}, {"style": "none", "duration": 0.0}]``
+      ——层E1 的逐接缝（渲染趟从 ``code_spec.transition_plan()["seams"]`` 摊好传进来）。
+
+    **为什么摊平由调用方做**：一处接缝归属「哪一镜之后」，只有拿着镜号的那一侧知道；
+    mediaops 手里只有文件路径。在这里再猜一次归属，就等于把那条对应关系写两遍，
+    而两处一旦漂开，「判据按 A 算、ffmpeg 按 B 接」只有抽帧才看得出来。
+
+    ``none`` 或时长 ≤0 的接缝一律归成 ``{"style": "none", "duration": 0.0}``：那一处
+    就是**硬接**（不用 xfade——ffmpeg 的 xfade 要求 duration > 0）。
+    """
+    if n < 2:
+        return []
+    rows: list[Any] = (list(transition) if isinstance(transition, (list, tuple))
+                       else [transition] * (n - 1))
+    out: list[dict[str, Any]] = []
+    for i in range(n - 1):
+        row = rows[i] if i < len(rows) else None
+        if not isinstance(row, Mapping):
+            row = {}
+        style = str(row.get("style") or "none").strip().lower()
+        try:
+            span = float(row.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            span = 0.0
+        if style == "none" or span <= 0:
+            style, span = "none", 0.0
+        out.append({"style": style, "duration": span})
+    return out
+
+
 def concat(clips: list[str | Path], dst: str | Path, *,
            fps: float | None = None,
-           transition: Mapping[str, Any] | None = None) -> Path:
+           transition: Any = None) -> Path:
     """按顺序拼接片段（concat filter 统一重编码，避免参数不一致导致的流错误）。
 
     ``fps`` 锁输出帧率：逐帧截图那条路（motion）的片段是「每段各自的秒数 × 同一帧率」，
     不锁帧率时 concat 会把段间时长差摊进时间戳，成片平均帧率掉到 9.7~9.84——
     画面看不出，但「成片字节量到的 fps」与 spec 对不上，机器证据只能标 UNVERIFIED。
 
-    ``transition`` 形如 ``{"style": "fade", "duration": 0.4}``（``style="none"`` 或省略＝
-    老路：硬接）。**转场落在这一层而不是镜头层**（R7-T22 / §3.1）：镜头层那套
+    ``transition`` 两种形状都收（见 :func:`_seams_of`）：一个整片档的映射，或一串
+    **逐接缝**的映射（层E1）。整片全是 ``none`` / 缺省时走老路：硬接、纯 ``concat``。
+
+    **转场落在这一层而不是镜头层**（R7-T22 / §3.1）：镜头层那套
     `@remotion/transitions` 要求相邻片段在同一棵 React 树里，而我们逐镜独立渲、
     按 `shot_cache_key` 缓存——树内转场等于把逐镜缓存整条保证作废。ffmpeg 在**拼接**
     这一趟做 xfade，逐镜切片一个字节都不动，所以换转场 0 镜重烧（见 code_spec.FILM_KNOBS）。
+    层E1 把「一处接缝一个档」也放在这一层，因此**逐接缝覆盖同样 0 镜重烧**。
     """
     if not clips:
         raise MediaError("concat 需要至少一个片段")
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    style = str((transition or {}).get("style") or "none").strip().lower()
-    try:
-        span = float((transition or {}).get("duration") or 0.0)
-    except (TypeError, ValueError):
-        span = 0.0
-    if style != "none" and span > 0 and len(clips) > 1:
-        return _concat_xfade(clips, dst, fps=fps, style=style, span=span)
+    seams = _seams_of(transition, len(clips))
+    if len(clips) > 1 and any(s["duration"] > 0 for s in seams):
+        return _concat_xfade(clips, dst, fps=fps, seams=seams)
     args: list[str] = []
     for c in clips:
         args += ["-i", str(c)]
@@ -195,21 +230,24 @@ def concat(clips: list[str | Path], dst: str | Path, *,
 
 
 def _concat_xfade(clips: list[str | Path], dst: Path, *, fps: float | None,
-                  style: str, span: float) -> Path:
-    """带接缝转场的拼接：逐接缝一次 ``xfade`` + 一次 ``acrossfade``。
+                  seams: list[dict[str, Any]]) -> Path:
+    """带接缝转场的拼接：**逐接缝**一次 ``xfade`` + 一次 ``acrossfade``；硬接那几处走 ``concat``。
 
-    时长账（``offset`` 的算法）：两段叠上 d 秒后，合并流的长度 = 两段之和 − d。
-    所以第 k 次合并（把第 k 段接上去）的 offset = **此前累计长度 − d**，
+    时长账（``offset`` 的算法）：两段叠上 d 秒后，合并流的长度 = 两段之和 − d；
+    硬接那一处 d = 0，长度就是两段之和。所以第 k 次合并的 ``offset`` = **此前累计长度 − d_k**，
     下面用 ``acc`` 逐次推。两个流必须叠同样多，否则第 2 段起配音就跟画面对不上——
     所以视频侧 xfade 与音频侧 acrossfade 用的是**同一个 d**。
 
-    每路输入先过一遍 ``fps/format/setsar`` 归一：xfade 要求两路尺寸、像素格式一致，
-    而逐镜切片虽然出自同一个母版，却各自过了一趟质感滤镜（`code_spec.TEXTURES`）——
-    归一放在这里比要求「滤镜链必须吐 yuv420p」可靠（后者是一句跨模块的约定，
-    改了没人知道）。``fps`` 给了就一并锁住，理由与 hardcut 那一路同族（帧率漂了，
-    成片字节量到的 fps 就与 spec 对不上）。
+    ``d = 0`` 的那一处**不用 xfade**（ffmpeg 的 xfade 要求 duration > 0），改用
+    ``concat`` 滤镜接一刀。这一条正是「整片淡入、中间硬切一刀」那种配法落地的地方，
+    也是层E1 之前表达不出来的东西（从前整片只有一个档，要么全叠要么全硬接）。
+
+    每路输入先过一遍 ``fps/format/setsar`` 归一：xfade 与 concat 都要求两路尺寸、
+    像素格式、帧率一致，而逐镜切片虽然出自同一个母版，却各自过了一趟质感滤镜
+    （`code_spec.TEXTURES`）——归一放在这里比要求「滤镜链必须吐 yuv420p」可靠
+    （后者是一句跨模块的约定，改了没人知道）。``fps`` 给了就一并锁住，理由与 hardcut
+    那一路同族（帧率漂了，成片字节量到的 fps 就与 spec 对不上）。
     """
-    d = float(span)
     durs: list[float] = []
     for c in clips:
         info = probe(c)
@@ -221,13 +259,22 @@ def _concat_xfade(clips: list[str | Path], dst: Path, *, fps: float | None,
     # 判据在 code_spec.check_transition（渲染趟调它，报的是一句带镜号的错），
     # 这一条是最后一道兜底：真正的调用者绕过了判据时，宁可在这里拒，也别让 ffmpeg
     # 静默吃掉整镜（它的失败形态是「少一段」而不是报错，那种错抽帧才发现）。
-    shortest = min(durs)
-    if d >= shortest:
-        raise MediaError(
-            f"转场 {d}s 不短于最短的一镜（{shortest:.2f}s）——xfade 会吃掉整段，"
-            f"拒绝拼接")
-    name = _XFADE.get(style, "fade")
-    norm_v = (f"fps={_num(fps)}," if fps else "") + "format=yuv420p,setsar=1"
+    # 逐接缝判：硬接那一处 d=0，本来就不会吃段，不该被「最短镜」那条线拦。
+    for i, seam in enumerate(seams[:len(clips) - 1]):
+        d_i = float(seam["duration"])
+        if d_i <= 0:
+            continue
+        shortest = min(durs[i], durs[i + 1])
+        if d_i >= shortest:
+            raise MediaError(
+                f"转场 {d_i}s 不短于最短的一镜（{shortest:.2f}s）——xfade 会吃掉整段，"
+                f"拒绝拼接")
+    # `settb=AVTB` 不是装饰：`concat` 吐出来的流时基是 1/1000000（滤镜默认），而没经过
+    # `concat` 的那几路还停在输入文件的时基（10fps 的切片是 1/10）。两种接法**混在同一条
+    # 链上**时，`xfade` 会在链接期报「First input link main timebase (1/1000000) do not
+    # match the corresponding second input link xfade timebase (1/10)」——纯叠化或纯硬接
+    # 都碰不到这一条，只有层E1 的混搭会。把每一路都钉到同一个时基上，这条就没了。
+    norm_v = (f"fps={_num(fps)}," if fps else "") + "settb=AVTB,format=yuv420p,setsar=1"
     norm_a = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
     args: list[str] = []
     for c in clips:
@@ -235,16 +282,29 @@ def _concat_xfade(clips: list[str | Path], dst: Path, *, fps: float | None,
     chain: list[str] = [f"[0:v]{norm_v}[v0]", f"[0:a]{norm_a}[a0]"]
     vprev, aprev, acc = "[v0]", "[a0]", durs[0]
     for k in range(1, len(clips)):
-        offset = acc - d
-        if offset < 0:
-            raise MediaError(f"第 {k + 1} 段接上去时累计长度只有 {acc:.3f}s < 转场 {d}s")
+        seam = seams[k - 1] if k - 1 < len(seams) else {"style": "none", "duration": 0.0}
+        d_k = float(seam["duration"])
         chain.append(f"[{k}:v]{norm_v}[vin{k}]")
         chain.append(f"[{k}:a]{norm_a}[ain{k}]")
-        chain.append(f"{vprev}[vin{k}]xfade=transition={name}:"
-                     f"duration={_num(d)}:offset={_num(offset)}[v{k}]")
-        chain.append(f"{aprev}[ain{k}]acrossfade=d={_num(d)}:c1=tri:c2=tri[a{k}]")
+        if d_k > 0:
+            offset = acc - d_k
+            if offset < 0:
+                raise MediaError(f"第 {k + 1} 段接上去时累计长度只有 {acc:.3f}s < 转场 {d_k}s")
+            name = _XFADE.get(str(seam["style"]), "fade")
+            chain.append(f"{vprev}[vin{k}]xfade=transition={name}:"
+                         f"duration={_num(d_k)}:offset={_num(offset)}[v{k}]")
+            chain.append(f"{aprev}[ain{k}]acrossfade=d={_num(d_k)}:c1=tri:c2=tri[a{k}]")
+            acc = acc + durs[k] - d_k
+        else:
+            # 硬接：一刀接上，长度相加。两路都过过上面那两个 `norm_*`，尺寸/像素格式/
+            # 帧率因此一致——`concat` 滤镜要求的正是这三样。
+            # **输入顺序是「每段先视频再音频」**（ffmpeg 文档那份 `[0:0][0:1][1:0][1:1]`
+            # 就是它）：`v=1:a=1` 要四个输入口，只喂两个视频口会在链接期报
+            # 「pad 1 (audio) 接到了视频输出」——硬接与 xfade 混在同一条链上时才会走到
+            # 这一支，所以这是层E1 真渲才发现的那一处（与上面那条纯 concat 老路同一顺序）。
+            chain.append(f"{vprev}{aprev}[vin{k}][ain{k}]concat=n=2:v=1:a=1[v{k}][a{k}]")
+            acc = acc + durs[k]
         vprev, aprev = f"[v{k}]", f"[a{k}]"
-        acc = acc + durs[k] - d
     args += ["-filter_complex", ";".join(chain), "-map", vprev, "-map", aprev,
              "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
              "-c:a", "aac"]

@@ -216,7 +216,12 @@ MOTION_ANCHOR_TOLERANCE_DIV = 3
 
 #: 母版 `<FilmLayout>` 真认的字幕形态。旧链那四档（torn/bottom…）随模板一起消失：
 #: 新链的字幕带只画在母版里，母版没实现的形态就不该出现在可选项里。
-SUBTITLE_MODES = ("full", "torn_highlight", "none")
+#:
+#: R14 加第四档 `inline`：**母版不画字幕条**，文字由镜头代码自己排进画面。
+#: 前三档都是「母版在画面带下方那条固定白底圆角条里画」或「不画」，只有 `inline`
+#: 能做到「这一镜的字压在画面上、随构图摆」——参考片普遍这么做，而这也是
+#: 成片不再长得像 PPT 的关键一档（每镜一条同款字幕带正是那个观感的来源）。
+SUBTITLE_MODES = ("full", "torn_highlight", "none", "inline")
 
 #: 一段镜头代码的体积上限。lint 与 bundle 都按字节走，超了不是"风格问题"而是
 #: 一次请求把容器内存吃掉一截——这条链一镜一次浏览器，宁可在这里拦。
@@ -609,7 +614,22 @@ def _norm_cite(raw: Mapping[str, Any], sid: str,
     derived_from = raw.get("derived_from") or []
     if not isinstance(derived_from, list):
         derived_from = [str(derived_from)]
-    derived_from = [_norm_demo_relpath(str(d)) for d in derived_from if str(d).strip()]
+    listed = [str(d).strip() for d in derived_from if str(d).strip()]
+    # 闸⑳ 的哨兵（R19）走**另一条路**：它不是一个 relpath，所以不能进 demo 白名单比对
+    # （`_norm_demo_relpath` 会把它当路径改写，白名单那一段也会报「不在语料里」——
+    # 而那两句都不是事实）。哨兵只认**单独出现**：与真 demo 混在一张表里就分不清
+    # 这一镜到底算不算原创，而「每镜都挂哨兵 + 顺手抄一份 demo」正是这条口子最省事的绕法。
+    if ORIGINAL_SENTINEL in listed:
+        others = [d for d in listed if d != ORIGINAL_SENTINEL]
+        if others:
+            _err(errors, f"{sid}：derived_from 里既有原创哨兵 {ORIGINAL_SENTINEL} 又列了 demo"
+                         f"（{'、'.join(others)}）——哨兵必须**单独**出现："
+                         "「这一镜从某份 demo 演化而来」与「这一镜不派生自任何 demo」"
+                         "是互斥的两句话，混在一张表里，闸⑳ 的配额就数不准，"
+                         "闸⑫ 也不知道该不该比骨架")
+        return card, [ORIGINAL_SENTINEL]
+
+    derived_from = [_norm_demo_relpath(d) for d in listed]
     derived_from = [d for d in derived_from if d]
     if not derived_from:
         _err(errors, f"{sid}：derived_from 为空——每一镜必须声明代码来自哪些 demo（relpath 列表）")
@@ -688,6 +708,51 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
                      f"（可用：{', '.join(TEXTURES)}，留空表示跟整片默认）")
         tex = ""
 
+    # R14 风格档（每镜）：满幅与底色。**留空 = 不申报**——母版据此用缺省（有安全区、
+    # 底色 TOKENS.bg），也就是今天的行为。这两项改的是像素，所以进缓存键；但它们
+    # **不进 `SHOT_KNOBS`**，而是像 `reveal` 那样只在真有值时进键（见 `shot_cache_key`：
+    # 无条件加会让 `None` 也成为一个值，所有既有镜的键全变、整片白烧一次）。
+    #
+    # `bleed` 只收布尔：满幅是「是/否」，写成 `"true"` / `1` / `"yes"` 在母版那侧
+    # 全落 false（`resolveFilmStyle` 判的是 `=== true`），静默不生效——那正是这条链
+    # 最该避免的失败模式，所以在这里当场打回。
+    bleed = raw.get("bleed")
+    if bleed is not None and not isinstance(bleed, bool):
+        _err(errors, f"{sid}：bleed={bleed!r} 不是布尔——满幅是「是/否」，"
+                     "写字符串或数字母版认不出（会静默当成不满幅）")
+        bleed = None
+    # `bg` 只收 #rrggbb：母版拿它当底色，**闸④ 还拿它当判空的基准色**
+    # （`code_render._bg_of` 读不到合法基准色就拒绝判空）。`rgb()`/命名色/渐变
+    # 一律不收——收了等于让闸④ 在这一镜上闭嘴。
+    bg = str(raw.get("bg") or "").strip()
+    if bg:
+        if _HEX_RE.match(bg):
+            bg = _expand_hex(bg)
+        else:
+            _err(errors, f"{sid}：bg={bg!r} 不是 #rrggbb —— 母版拿它当底色、"
+                         "闸④ 拿它当判空的基准色，只收 6 位十六进制（如 #0b1620）")
+            bg = ""
+
+    # 层E1 逐接缝转场（R19）：这一镜**到下一镜**那一处接缝的档。省略＝跟整片
+    # `transition`（也就是今天的行为）。最后一镜写它无效——它后面没有接缝，
+    # 所以不报错也不打回，只是不落账。
+    #
+    # 为什么这一栏**不进** `SHOT_KNOBS`：转场跑在拼接那一趟（ffmpeg `xfade`），
+    # 逐镜切片一个字节都不动，进缓存键就是「整片把淡出换成擦除要重烧 20 镜」。
+    # 与顶层那两栏同族，见 `FILM_KNOBS` 那段注释。
+    seam = str(raw.get("transition") or "").strip().lower()
+    if seam and seam not in TRANSITION_STYLES:
+        _err(errors, f"{sid}：transition={seam!r} 没有对应的转场"
+                     f"（可用：{', '.join(TRANSITION_STYLES)}）")
+        seam = ""
+    # 层E2 逐镜字幕档（R19）：省略＝跟整片 `subtitle_mode`。**进缓存键**——字幕带是
+    # 母版逐帧画进切片里的（与 `entrance`/`exit` 同族），不进键就会拿旧切片冒充新片。
+    sub = str(raw.get("subtitle_mode") or "").strip()
+    if sub and sub not in SUBTITLE_MODES:
+        _err(errors, f"{sid}：subtitle_mode={sub!r} 不支持"
+                     f"（母版只认：{', '.join(SUBTITLE_MODES)}）")
+        sub = ""
+
     # R1: card / derived_from 契约栏
     card, derived_from = _norm_cite(raw, sid, errors)
 
@@ -699,6 +764,15 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         "fields": _norm_fields(raw.get("fields"), sid, errors),
         "min_duration_sec": min_sec,
         "texture": tex,
+        # R14 风格档（每镜）。这里归一（`None` / 空串 = 没申报），但**只有真申报了的**
+        # 才进缓存键与注入——见 `film_style_of`。`None`/空串与「申报了 false/一个色」
+        # 在母版那侧是两件事：前者落缺省，后者落申报值。
+        "bleed": bleed,
+        "bg": bg,
+        # 层E1/E2（R19）两栏：省略记 `None`。`None` 与「申报了 none」在**母版那侧**
+        # 是同一件事（都落整片档），但在**账面**上要分得开——回执与补丁链读的是这里。
+        "transition": seam or None,
+        "subtitle_mode": sub or None,
         "source": {str(k): str(v) for k, v in src.items()},
         "card": card,
         "derived_from": derived_from,
@@ -887,6 +961,30 @@ def validate_code_spec(raw: dict[str, Any], *,
     return spec, errors
 
 
+def film_style_of(shot: Mapping[str, Any]) -> dict[str, Any]:
+    """这一镜的风格档（R14）：**只带真申报了的键**。
+
+    → `{}`，或 `{"bleed": bool, "bg": "#rrggbb"}` 的任意子集。
+
+    为什么只带申报了的键、不补全成完整一份：这一份要**进缓存键**、还要**逐镜过 HTTP**
+    （`code_render.shot_input_props` → 渲染容器）。补全之后 `{bleed: false, bg: ""}`
+    也成了一个值，于是所有既有镜的键全部改变、整片白烧一次 Remotion 帧，而它们
+    一个字节都没变——与 `shot_cache_key` 里 `reveal` 那一段是同一个教训。
+
+    也正因为「在 / 值不同 / 不在」三态两两算出不同的键，这一处省下的只是无谓的坏键，
+    不是判据：申报了 `bleed: false` 与没申报在母版那侧落同一个缺省，键不同只是多烧一次，
+    不会把两种画面混成一个。
+    """
+    out: dict[str, Any] = {}
+    bleed = shot.get("bleed")
+    if isinstance(bleed, bool):
+        out["bleed"] = bleed
+    bg = str(shot.get("bg") or "").strip().lower()
+    if bg:
+        out["bg"] = bg
+    return out
+
+
 def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
                    master_hash: str, lockfile_hash: str) -> str:
     """一镜的缓存键（spec §5.2，加上面 FILM_KNOBS 那条加项）。
@@ -929,6 +1027,20 @@ def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
     # 所以这一处省下的只是无谓的坏键，不是判据。
     if shot.get("reveal") is not None:
         payload["reveal"] = shot.get("reveal")
+    # R14 风格档（满幅 / 底色）改的是**像素**，所以必须进键——写法与上面 `reveal`
+    # 一字不差：**只在真有这一栏时才加**。塞进 `SHOT_KNOBS` 或无条件加，都会让
+    # `None` 也成为一个值，于是所有既有镜的键全部改变、整片白烧一次 Remotion 帧，
+    # 而它们一个字节都没变。
+    style = film_style_of(shot)
+    if style:
+        payload["film_style"] = style
+    # 层E2（R19）：这一镜**覆盖**了字幕档时也要进键。整片那一档本来就在 `FILM_KNOBS`
+    # 里（`subtitle_mode`），所以只有「申报过覆盖」才加——不加的话「同一段代码、整片
+    # full 而这一镜 inline」会共用一份切片，字幕带本该消失的那一镜会拿到带字幕带的
+    # 旧切片，而账面上一切正常（这正是「少算一个键就是拿旧片冒充新片」）。
+    sub_override = str(shot.get("subtitle_mode") or "")
+    if sub_override:
+        payload["subtitle_mode"] = sub_override
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -1136,6 +1248,20 @@ def style_facts(shots: list[dict[str, Any]]) -> dict[str, Any]:
             for sid, s in zip(ids, shots)},
         "text_only": [sid for sid, c in channels.items() if c == TEXT_CHANNEL],
         "text_only_middle": [sid for sid, c in middle if c == TEXT_CHANNEL],
+        # 闸⑲ 的三栏账（R19）：逐镜绑的色板名（认不出的记 None）、满幅镜、质感种数。
+        # 色板读的是**代码里那句绑定**（`shot_colors`），不是模型自报的一栏——自报会漂，
+        # 而这一道要拦的恰恰是「说换色板了但其实没有」。
+        "palettes": {sid: shot_colors(code)["palette"] for sid, code in zip(ids, codes)},
+        "bleed_shots": [sid for sid, s in zip(ids, shots) if s.get("bleed") is True],
+        # 质感只数**申报过的**值；有镜没申报时补一个空串占一格——空串表示「跟整片默认」，
+        # 它与任何具名档都不是同一个值，所以「一档都没申报」在这里读成 1 种（不是 0 种）。
+        "textures": sorted({str(s.get("texture") or "").strip()
+                            for s in shots if str(s.get("texture") or "").strip()}
+                           | ({""} if any(not str(s.get("texture") or "").strip()
+                                          for s in shots) else set())),
+        # 闸⑳ 的账（R19）：哪几镜走了原创哨兵。计划卡与出片回执读这一栏——
+        # 「1 镜原创」是**绿**（见 check_original_share），但用户仍该看得见是哪一镜。
+        "original_shots": original_shot_ids(shots),
         "hollow": [str(s.get("id") or f"i{i + 1}") for i, s in enumerate(shots)
                    if not has_concrete_item(str(s.get("text") or ""))],
         # 闸⑨：≥2 镜的同构组（≥3 镜那一档在 validate 里已经打回了）
@@ -1226,6 +1352,179 @@ def check_style_quota(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]
             f"这些镜没查到：{'、'.join(hollow)}。地名人名机器认不出，所以这一条只提醒不拦——"
             "但「每镜至少落一个具体项」是文案合同写的，逐镜看一眼再出片")
     return errors, warns
+
+
+# ---------------------------------------------------------------------------
+# 闸⑲ 风格配额（R19）：色板 / 质感 / 满幅 / 底色——**逼丰富**的那一道
+# ---------------------------------------------------------------------------
+#
+# 与 ⑦⑮⑯ 的分工：那三道判的是**反雷同**（通道别只一种、卡别同族扎堆、主体别写抽象词），
+# 这一道判的是**逼丰富**。在它之前，色板 / 质感 / 满幅 / 底色这四条**没有任何闸在判**，
+# 于是一条 20 镜片可以全用一套色板 + 一种质感 + 全常规版式而照样过闸——闸绿了，成片
+# 却是「同一张 PPT 换了二十遍字」。
+#
+# 强度分两档，判据的性质不同（不是偷懒）：
+#   · **结构判据（打回）**：色板种数、满幅镜数。这两件事在**代码字节**上就能数清
+#     （`shot_colors()["palette"]` 已经能认出每镜绑的是哪套色板；`bleed` 是归一后的
+#     布尔栏），而且「一镜都没满幅」「全片一个调子」是**确定的**退化形态。
+#   · **程度判据（只提醒）**：质感种数、`bg` 申报率。质感有「跟整片默认」这一态
+#     （没申报 ≠ 没质感），底色也不是每镜都该有——把这两条做成硬闸就会误伤
+#     「整片一档柔光 + 几镜换底色」这种合法配法。与闸⑨「宁可漏报，不许误报」同一纪律。
+
+#: 这一道从几镜起判。三镜片用三套色板是常态，不是纪律（与 ⑦ 的起步镜数同一个道理）。
+VARIETY_MIN_SHOTS = 6
+#: 色板种数下限 = ceil(n / 这个数)：镜数越多，越不该只用一个调子。
+VARIETY_PALETTE_DIV = 4
+#: 质感种数下限。
+VARIETY_MIN_TEXTURES = 3
+#: 满幅镜数下限 = ceil(n / 这个数)（20 镜 → 4 镜）。
+VARIETY_BLEED_DIV = 5
+#: `bg` 申报率下限（满幅镜另有一条更硬的：满幅**必须**给 `bg`，见判据 ④）。
+VARIETY_BG_SHARE = 0.25
+
+
+def check_style_variety(shots: list[dict[str, Any]]
+                        ) -> tuple[list[str], list[str], list[str]]:
+    """闸⑲ 风格配额：整片的**丰富度**够不够。→ (打回, 提醒, 未判)。
+
+    四条判据，强度见上面那段：
+
+    1. **色板种数** ≥ ``ceil(n / VARIETY_PALETTE_DIV)``（结构 → 打回）。读的是
+       ``shot_colors(code)["palette"]``——代码里那句 ``const palette = palettes["…"]``。
+       一镜都认不出色板时落**未判**（第三个出口），不装成通过：认不出与「只用了一套」
+       在回执上是两句话。
+    2. **满幅镜数** ≥ ``ceil(n / VARIETY_BLEED_DIV)``（结构 → 打回）。不写 `bleed` 时
+       每一镜都被裁进同一条居中的画面带里，这正是成片「像 PPT」的结构原因（R14 把
+       `bleed` 这条路开出来了，这一条是**逼它真的被用上**）。
+    3. **质感种数** ≥ ``VARIETY_MIN_TEXTURES``（程度 → 只提醒）。质感有「跟整片默认」
+       这一态，只数**申报过的**值，并把「没申报的镜数」写进提醒里——宁可漏报。
+    4. **`bg` 申报率** ≥ ``VARIETY_BG_SHARE``，且**满幅镜必须给 `bg`**（程度 → 只提醒）。
+       满幅不给底色时深色板的正文会压在母版奶油底上，而闸④ 还拿 `bg` 当判空的基准色。
+    """
+    errors: list[str] = []
+    warns: list[str] = []
+    undetermined: list[str] = []
+    n = len(shots)
+    if n < VARIETY_MIN_SHOTS:
+        return errors, warns, undetermined
+    facts = style_facts(shots)
+    ids = [str(s.get("id") or f"s{i + 1:02d}") for i, s in enumerate(shots)]
+
+    # ① 色板种数
+    bound = facts["palettes"]
+    known = sorted({v for v in bound.values() if v})
+    want_pal = -(-n // VARIETY_PALETTE_DIV)
+    if not known:
+        undetermined.append(
+            "闸⑲ 风格配额·色板这一档本片**没判**：一镜的色板都没能从代码里静态认出来"
+            "（写法不是 `const palette = palettes[\"…\"]`，或者容器里读不到 "
+            "`palettes.json`）。未判不是通过。")
+    elif len(known) < want_pal:
+        every = sorted(palettes())
+        errors.append(
+            f"闸⑲ 风格配额：{n} 镜只绑了 {len(known)} 套色板（{'、'.join(known)}），"
+            f"这一档至少要 {want_pal} 套。色板的唯一出处是 "
+            f"`remotion/src/themes/palettes.json` 的八套色板"
+            f"（{'、'.join(every) if every else 'vintage-kraft / deep-ocean / … 共八套'}）"
+            "——**逐镜按题材选**，别让二十镜共用一个调子：全片一个色正是成片"
+            "「像同一张 PPT 换字」的原因之一。写法照技能正文的模板："
+            "`const palette = palettes[\"<色板名>\"];` 写在代码顶部")
+
+    # ② 满幅镜数
+    bleeds = facts["bleed_shots"]
+    want_bleed = -(-n // VARIETY_BLEED_DIV)
+    if len(bleeds) < want_bleed:
+        errors.append(
+            f"闸⑲ 风格配额：{n} 镜只有 {len(bleeds)} 镜满幅（`bleed: true`），"
+            f"这一档至少要 {want_bleed} 镜。不写 `bleed` 时每一镜都被裁进同一条居中的"
+            "画面带里（左右留页边距、上下留安全区）——二十镜二十个母题共用同一个框，"
+            "这正是成片**像 PPT** 的结构原因。画整屏插画、满版描线、大场景、"
+            "背景要铺满的镜头就写 `bleed: true`（满幅镜记得同时给 `bg`）")
+
+    # ③ 质感种数（只提醒）
+    tex = facts["textures"]
+    if len(tex) < VARIETY_MIN_TEXTURES:
+        undeclared = sum(1 for s in shots if not str(s.get("texture") or "").strip())
+        warns.append(
+            f"质感提醒：{n} 镜只用了 {len(tex)} 种画面质感"
+            f"（{'、'.join(sorted(tex)) or 'none'}），低于 {VARIETY_MIN_TEXTURES} 种这条线。"
+            + (f"其中 {undeclared} 镜没写 `texture`（跟整片默认）。" if undeclared else "")
+            + "质感是**打磨层**不是构图层（滤镜跑在拼接之前的那一趟逐镜切片上），"
+              "换一档不重烧任何一镜的帧，所以「第 3 镜老电视、其余柔光」这种配法是免费的")
+
+    # ④ 底色申报（只提醒；满幅那一条更硬）
+    with_bg = [sid for sid, s in zip(ids, shots) if str(s.get("bg") or "").strip()]
+    bleed_no_bg = [sid for sid, s in zip(ids, shots)
+                   if s.get("bleed") is True and not str(s.get("bg") or "").strip()]
+    if bleed_no_bg or len(with_bg) < n * VARIETY_BG_SHARE:
+        warns.append(
+            f"底色提醒：{len(with_bg)}/{n} 镜申报了 `bg`"
+            + (f"，其中 {len(bleed_no_bg)} 个满幅镜没给（{'、'.join(bleed_no_bg)}）"
+               if bleed_no_bg else "")
+            + "——满幅镜**必须**给 `bg`：不给的话深色板的正文会压在母版的奶油底上"
+              "（页边一圈奶油、中间一块深色），而闸④ 还拿 `bg` 当「这一镜画了东西没有」"
+              "的基准色，读不到基准色它在这一镜上拒绝判空（未判不是通过）")
+    return errors, warns, undetermined
+
+
+# ---------------------------------------------------------------------------
+# 闸⑳ 原创哨兵（R19）：`derived_from: ["<original>"]` 与它的配额
+# ---------------------------------------------------------------------------
+#
+# 这一道拆的是 M1 那道结构性堵死（见 §B1）：`derived_from` **必填**且要求「代码必须
+# 像声明的 demo」（`DERIVED_MIN_SIM` 那一档的负样本通过率只有 1.690%），于是**没有
+# 「原创」这条路**——模型想画一个卡库里没有的东西，只能硬套一份 demo 的骨架，
+# 而 demo 骨架是 video-shotcraft 自家的产品宣传片语汇库（M2）。两条合起来就是
+# 「科普片画面上全是侧栏 / 看板 / Changelog / carousel」的机械原因。
+#
+# 为什么**不能简单降 DERIVED_MIN_SIM**：负样本（两份不同 demo）的 p98 = 0.605、
+# max = 0.736——降到 0.61 以下会让「两份不同 demo」也通过（假阳性），那条闸就不再
+# 拦「声明造假」了。所以正确做法是**加哨兵**：显式声明「这一镜不派生自任何 demo」，
+# 闸跳过骨架比对，但**原创不等于免检**——lint（闸①）与闸④⑧⑩ 照样判它。
+#
+# 为什么配额 ≤20%：卡库是这条链的**风格上限**（M1+M2 的结论），原创是给「卡库表达
+# 不了的那几镜」开的窄口子。不配配额，「每镜都挂哨兵」只差一步，整片立刻漂回
+# 手搓——而那正是取材轮 + 124 张卡想消灭的东西。
+
+#: 原创哨兵：写在 `derived_from` 里的这一个值表示「这一镜不从任何 demo 派生」。
+ORIGINAL_SENTINEL = "<original>"
+#: 这一道从几镜起判（与 ⑦ 同一档：镜数太少时「几镜原创」没有统计意义）。
+ORIGINAL_MIN_SHOTS = 6
+#: 原创镜的占比上限。
+ORIGINAL_MAX_SHARE = 0.20
+
+
+def original_shot_ids(shots: list[dict[str, Any]]) -> list[str]:
+    """走原创哨兵的那几镜（``style_facts["original_shots"]`` 与配额闸共用这一份判据）。"""
+    out: list[str] = []
+    for i, s in enumerate(shots):
+        if [str(d) for d in (s.get("derived_from") or [])] == [ORIGINAL_SENTINEL]:
+            out.append(str(s.get("id") or f"s{i + 1:02d}"))
+    return out
+
+
+def check_original_share(shots: list[dict[str, Any]]
+                         ) -> tuple[list[str], list[str]]:
+    """闸⑳ 原创配额：走原创哨兵的镜不得超过整片的 ``ORIGINAL_MAX_SHARE``。
+
+    → (打回清单, 提醒清单)。提醒恒空：**绿就是绿**——1 镜原创的片子不该在回执上
+    多出一条「注意有几镜是原创」，那会把「通过了」读成「有问题但算了」。
+    哪几镜走了原创由 ``style_facts["original_shots"]`` 如实报账（计划卡与回执都读它）。
+    """
+    errors: list[str] = []
+    n = len(shots)
+    if n < ORIGINAL_MIN_SHOTS:
+        return errors, []
+    ids = original_shot_ids(shots)
+    quota = max(1, int(n * ORIGINAL_MAX_SHARE))
+    if len(ids) > quota:
+        errors.append(
+            f"闸⑳ 原创配额：{n} 镜里有 {len(ids)} 镜声明了原创"
+            f"（{ORIGINAL_SENTINEL}：{'、'.join(ids)}），上限是 {quota} 镜"
+            f"（整片的 {ORIGINAL_MAX_SHARE:.0%}）——卡库是这条链的风格上限，"
+            "原创哨兵是给「卡库表达不了的那几镜」开的窄口子，不是绕开取材的常规路。"
+            "占多数的镜仍须声明它派生自哪份 demo（照 shots/INDEX.md 那一栏抄）")
+    return errors, []
 
 
 # ---------------------------------------------------------------------------
@@ -2252,7 +2551,19 @@ _SUBJECT_HINT = "活字盘"
 
 
 def transition_plan(spec: Mapping[str, Any]) -> dict[str, Any]:
-    """整片转场（拼接层）→ ``{"style": str, "duration": float}``；不转场时 duration=0。
+    """整片转场 + 逐接缝覆盖（层E1）→ ``{"style", "duration", "seams"}``。
+
+    ``style``/``duration`` 是**整片档**（不转场时 duration=0.0，与 R7-T22 逐字一致）；
+    ``seams`` **只列被逐镜覆盖过的那几处**，每项 ``{"after": 镜号, "style", "duration"}``。
+    没覆盖的接缝不在表里——它们跟整片档，这正是「旧片子」与「新片子」在这一栏上唯一的
+    差别：一条没写逐镜 `transition` 的片子，`seams` 就是空表，读数一个字节都不变。
+
+    为什么「只列覆盖」而不是「逐接缝铺平」：铺平之后每条接缝都有一个值，于是
+    「整片 fade、这一处没覆盖」与「整片 none、这一处 fade」在账面上长得一样，
+    而它们在画面上是两件事。空表 + 回落整片档，把这两件事分得开。
+
+    覆盖的时长沿用整片那一档；**整片压根不转场**时取 :data:`TRANSITION_SEC_DEFAULT`
+    （否则「整片硬接、这一处圆开」会落成一个 0 秒的转场，等于没写）。
 
     ``style`` 只可能是 :data:`TRANSITION_STYLES` 里的一个（越界按 none；调用它的那条
     路上 spec 已经过 ``validate_code_spec``，这里是给「有人手搓一份 spec 直接渲」兜底）。
@@ -2264,9 +2575,42 @@ def transition_plan(spec: Mapping[str, Any]) -> dict[str, Any]:
         span = float(spec.get("transition_sec") or 0.0)
     except (TypeError, ValueError):
         span = 0.0
-    if style == "none" or span <= 0:
-        return {"style": "none", "duration": 0.0}
-    return {"style": style, "duration": round(span, 3)}
+    base_span = round(span, 3) if (style != "none" and span > 0) else 0.0
+    seams: list[dict[str, Any]] = []
+    shots = list(spec.get("shots") or [])
+    for i, shot in enumerate(shots[:-1]):
+        row = shot if isinstance(shot, Mapping) else {}
+        raw = str(row.get("transition") or "").strip().lower()
+        if not raw or raw not in TRANSITION_STYLES:
+            continue
+        sid = str(row.get("id") or f"s{i + 1:02d}")
+        dur = base_span if base_span > 0 else float(TRANSITION_SEC_DEFAULT)
+        seams.append({"after": sid, "style": raw,
+                      "duration": 0.0 if raw == "none" else round(dur, 3)})
+    if style == "none" and not seams:
+        return {"style": "none", "duration": 0.0, "seams": []}
+    return {"style": style, "duration": base_span, "seams": seams}
+
+
+def seams_to_per_index(seams: Sequence[Mapping[str, Any]],
+                       pairs: Sequence[tuple[str, float]]
+                       ) -> list[tuple[str, float]]:
+    """把「只列覆盖」的 ``seams`` 摊成**逐接缝**的一栏（长度 = 接缝数 = 镜数 − 1）。
+
+    → ``[(档名, 时长), …]``；没被覆盖的那几处记 ``("", 0.0)``。
+
+    空串不是「硬接」，是「**没覆盖**」：调用方拿它去回落整片档。这两件事必须分得开，
+    否则「整片 fade、这一处没覆盖」会被读成「这一处硬接」——而画面上它明明是淡入。
+    """
+    by_after = {str(s.get("after") or ""): s for s in (seams or [])}
+    out: list[tuple[str, float]] = []
+    for sid, _sec in list(pairs)[:-1]:
+        row = by_after.get(str(sid))
+        if row is None:
+            out.append(("", 0.0))
+        else:
+            out.append((str(row.get("style") or ""), float(row.get("duration") or 0.0)))
+    return out
 
 
 def shot_motion_window(frames: int) -> int:
@@ -2316,7 +2660,9 @@ def check_av_accounting(*, narration: bool, film_sec: float, clip_db: float | No
                         clips_with_audio: int, bgm_sec: float | None, gaps: int,
                         overlap_sec: float,
                         voice_tails: Sequence[tuple[str, float]],
-                        fps: int) -> tuple[list[str], list[str]]:
+                        fps: int,
+                        overlap_secs: Sequence[float] | None = None
+                        ) -> tuple[list[str], list[str]]:
     """闸⑰：合成之前把声画对成数。→ (打回, 提醒)。
 
     * ``film_sec`` —— 成片该有多长，按**账**算：逐镜实测秒数之和 − 接缝数 × d
@@ -2330,6 +2676,10 @@ def check_av_accounting(*, narration: bool, film_sec: float, clip_db: float | No
       余量的算法在渲染那一层（``code_render``，用的是 ``render.BREATH_*`` 那几个常量），
       这里只判「够不够容下这个转场」——两处各算一遍那条呼吸算术就又有了第二个出处。
     * ``overlap_sec`` —— 每处转场的时长 d（``transition_plan`` 那一份），``gaps`` 是接缝数。
+    * ``overlap_secs`` —— 层E1 的**逐接缝**时长（长度 = 接缝数，硬接那几处是 0.0）。
+      给了就按它逐处判字尾；不给时按 ``overlap_sec`` 摊平成 ``gaps`` 处（＝从前的行为）。
+      为什么要逐处：整片 fade 0.4s、某一处覆盖成 0.9s 时，「每处都按 0.4 判」会漏掉
+      真会切到字的那一处，而「每处都按 0.9 判」会把另外几处误杀。
     """
     errors: list[str] = []
     warns: list[str] = []
@@ -2379,14 +2729,20 @@ def check_av_accounting(*, narration: bool, film_sec: float, clip_db: float | No
     #    那笔账的落点：`check_transition` 判的是「d 短于半镜」（会不会炸），
     #    这一条判的是「d 吃不吃得下这条片子自己的字尾」（会不会切到字）。
     if gaps > 0 and overlap_sec > 0 and len(voice_tails) >= 2:
-        for i in range(min(gaps, len(voice_tails) - 1)):
+        # 逐接缝的 d：给了 `overlap_secs` 就用它（层E1），否则按标量摊平（从前的行为）。
+        # 硬接那一处 d=0，直接跳过——没有交叠就吃不到字尾。
+        per_seam = (list(overlap_secs) if overlap_secs is not None
+                    else [float(overlap_sec)] * int(gaps))
+        for i, d in enumerate(per_seam[:max(0, len(voice_tails) - 1)]):
+            if float(d) <= 0:
+                continue
             sid_a, tail_a = voice_tails[i]
             sid_b, tail_b = voice_tails[i + 1]
             room = min(tail_a, tail_b)
-            if overlap_sec > room + AV_TAIL_SLACK_SEC:
+            if float(d) > room + AV_TAIL_SLACK_SEC:
                 errors.append(
                     f"闸⑰ 接缝 {i + 1}（{sid_a}→{sid_b}）的转场会切到字：d="
-                    f"{overlap_sec:.2f}s，而两侧语音之后的余量只有 {tail_a:.2f}s / "
+                    f"{float(d):.2f}s，而两侧语音之后的余量只有 {tail_a:.2f}s / "
                     f"{tail_b:.2f}s。转场是把两侧尾巴**交叠淡出**的，余量比它短的那一侧"
                     "会有半句话在淡出里——请把 d 降一档，或让这两镜各自长一点"
                     "（`min_duration_sec` 是一个下限，不是精确时长）")
@@ -2395,7 +2751,9 @@ def check_av_accounting(*, narration: bool, film_sec: float, clip_db: float | No
 
 
 def check_transition(pairs: Sequence[tuple[str, float]], *, style: str,
-                     duration: float) -> tuple[list[str], list[str]]:
+                     duration: float,
+                     seams: Sequence[Mapping[str, Any]] | None = None
+                     ) -> tuple[list[str], list[str]]:
     """转场的时长对账（T22；合成之前，与闸⑰ 同一档但不同事）。→ (打回, 提醒)。
 
     ``pairs`` 是**逐镜实测秒数** ``[(镜号, 秒), …]``，按播放顺序。为什么这条判据没有
@@ -2409,13 +2767,27 @@ def check_transition(pairs: Sequence[tuple[str, float]], *, style: str,
     换掉」——ffmpeg 到那时会报 ``Offset … is after the end`` 或悄悄吃掉整镜，
     两种都是失败。边界取**严格小于**：等于半镜时第一段的 ``offset + duration``
     正好顶到它的末尾，浮点误差会把一次好渲染挡在门外。
+
+    层E1（R19）：``seams`` 是 ``transition_plan()["seams"]``（**只列覆盖**的那一份）。
+    每一处接缝先查它有没有被覆盖——覆盖了就用覆盖的档与时长，没覆盖才回落
+    ``style``/``duration``。**硬接的那一处不判**（``none`` 没有重叠可超），所以
+    「整片 fade、中间硬切一刀」这种配法不会在硬切那一处报错。
     """
     errors: list[str] = []
-    if style not in TRANSITION_STYLES or style == "none" or len(pairs) < 2:
+    pairs = list(pairs)
+    if len(pairs) < 2:
         return errors, []
-    if duration <= 0:
-        _err(errors, f"转场对账：transition={style} 但时长是 {duration}s——"
-                     f"选了转场就得给一个正数（可选 {', '.join(TRANSITION_SEC_CHOICES)} 秒）")
+    if style not in TRANSITION_STYLES:
+        style = "none"
+    # 逐接缝的**实际**档与时长：覆盖优先，没覆盖回落整片档。
+    eff = [(st or style, (d if st else float(duration)))
+           for st, d in seams_to_per_index(seams or [], pairs)]
+    active = [(i, st, float(d)) for i, (st, d) in enumerate(eff)
+              if st not in ("", "none") and float(d) > 0]
+    if not active:
+        if not (seams or []) and style != "none" and float(duration) <= 0:
+            _err(errors, f"转场对账：transition={style} 但时长是 {duration}s——"
+                         f"选了转场就得给一个正数（可选 {', '.join(TRANSITION_SEC_CHOICES)} 秒）")
         return errors, []
     # 时长没拿到就不许判（也不许当通过）：`sec=0` 只可能来自「这一镜压根没算过时长」，
     # 那种情况下任何结论都是猜的。
@@ -2425,9 +2797,11 @@ def check_transition(pairs: Sequence[tuple[str, float]], *, style: str,
                      f"——这一趟拿不到时长就没法判转场合不合法，不许当通过")
         return errors, []
     violations: list[str] = []
-    for (sid_a, sec_a), (sid_b, sec_b) in zip(pairs, pairs[1:]):
+    for i, _st, span in active:
+        sid_a, sec_a = pairs[i]
+        sid_b, sec_b = pairs[i + 1]
         limit = TRANSITION_SHOT_SHARE * min(float(sec_a), float(sec_b))
-        if duration < limit:
+        if span < limit:
             continue
         short = sid_a if float(sec_a) <= float(sec_b) else sid_b
         short_sec = min(float(sec_a), float(sec_b))
@@ -2436,7 +2810,7 @@ def check_transition(pairs: Sequence[tuple[str, float]], *, style: str,
                   if ok else
                   f"本片没有一档转场落得进这半镜（[{', '.join(TRANSITION_SEC_CHOICES)}] 秒）")
         violations.append(
-            f"{sid_a}→{sid_b} 这一处：转场 {duration}s ≥ 相邻较短那一镜（{short} "
+            f"{sid_a}→{sid_b} 这一处：转场 {span:g}s ≥ 相邻较短那一镜（{short} "
             f"{short_sec:.2f}s）的一半 {limit:.2f}s——xfade 拿重叠区做混合，"
             f"重叠超过半镜就等于把这一镜换掉。{advice}，或把 {short} 这一镜加长"
             f"（min_duration_sec）")
@@ -2451,23 +2825,36 @@ def check_transition(pairs: Sequence[tuple[str, float]], *, style: str,
 
 def check_transition_effect(secs: Sequence[float], total_sec: float, *,
                             style: str, duration: float,
-                            fps: int) -> list[str]:
+                            fps: int,
+                            seams: Sequence[float] | None = None) -> list[str]:
     """转场**真的生效了**没有（T22 的机器判据）。→ 错误清单（空 = 生效或压根没选转场）。
 
     怎么判：「叠 n−1 次、每次 d 秒」在成片时长上是可以算出来的——成片应当比
-    逐镜之和**短** ``(n−1)×d`` 秒。这不是间接指标，它就是这件事本身：xfade 把两段
-    的重叠区合成一段，合掉了多少秒是量得到的。拼接层哪天退回硬接（或 filter 图写错了
+    逐镜之和**短** ``Σd`` 秒。这不是间接指标，它就是这件事本身：xfade 把两段的
+    重叠区合成一段，合掉了多少秒是量得到的。拼接层哪天退回硬接（或 filter 图写错了
     某一档），这条立刻红——而画面上「少了 4 秒」是看不出来的（这正是 P21 要的那种
     机器判据：断言「逐镜独立渲染仍命中缓存」管住上限，这条管住下限）。
+
+    层E1（R19）：``seams`` 给了就按它算——它是**逐接缝的实际时长**（长度 = 接缝数，
+    硬接那几处是 0.0，由 :func:`seams_to_per_index` + 整片档摊出来）。``Σ`` 为 0
+    等于全片硬接，这一条不说话。不给 ``seams`` 时按老口径 ``(n−1) × duration``。
 
     容差按帧给而不是按秒给：实测每次合并有约 1 帧的取整差（逐镜切片的容器时长与
     ffmpeg 内部认为的那一段长度差一帧），所以 ``(接缝数 + 2) / fps``。
     按秒给一个常数容差会在大镜数下把「一次都没生效」也放过去
     （11 处接缝 × 0.4 s = 4.4 s 的缺口，容差只要小于它就能抓到）。
     """
-    if style not in TRANSITION_STYLES or style == "none" or len(secs) < 2:
+    secs = list(secs)
+    if len(secs) < 2:
         return []
-    want = (len(secs) - 1) * float(duration)
+    if seams is not None:
+        want = sum(float(x) for x in seams)
+    else:
+        if style not in TRANSITION_STYLES or style == "none":
+            return []
+        want = (len(secs) - 1) * float(duration)
+    if want <= 0:
+        return []
     got = sum(float(x) for x in secs) - float(total_sec)
     tol = (len(secs) - 1 + 2) / max(1, int(fps))
     if abs(got - want) <= tol:
@@ -2570,6 +2957,10 @@ def check_derived_similarity(shots: list[dict[str, Any]]
     那是这段注释上一次的样子（写着「最高 0.603」），而它早已不是语料的事实。
 
     只出打回不出提醒：这一条的性质是「声明造假」，没有「可疑」档。
+
+    闸⑳ 的原创哨兵（R19）**跳过这一道**：`derived_from == ["<original>"]` 的镜声明里
+    压根没有 demo，无从比起——那不是「声明造假」，是另一条合法的路。跳过它**不等于
+    免检**：lint（闸①）与闸④⑧⑩ 照样判它，配额由 :func:`check_original_share` 管。
     """
     errors: list[str] = []
     warns: list[str] = []
@@ -2577,6 +2968,8 @@ def check_derived_similarity(shots: list[dict[str, Any]]
         sid = str(shot.get("id") or "")
         code = str(shot.get("code") or "")
         derived = shot.get("derived_from") or []
+        if [str(d) for d in derived] == [ORIGINAL_SENTINEL]:
+            continue
         if not code or not derived:
             continue
         shot_shape = canonical_shape(code)
@@ -3071,19 +3464,26 @@ def check_ink_contrast(shots: list[dict[str, Any]]
     return errors, warns, undetermined
 
 
-#: 整片层的六道判据（闸⑦ 风格配额 / 闸⑫ 与 demo 骨架同构 / 闸⑨ 跨镜同构 /
-#: 闸⑩ 文字对比度 / 闸⑮ 版式族配额 / 闸⑯ 主体具名）。**三处调用点**（plan_motion
-#: 入库前、render 烧像素前、patch 落盘前）与**两处报账**（计划卡、出片回执）都从
-#: 这一个元组取，规则因此不可能只在某一路上生效；这也是「清单只有一个」那条纪律
-#: 落在这一族判据上的样子（同一形状的清单漂移踩过三次，见 §9-Q90/Q91）。
-WHOLE_FILM_GATES = (check_style_quota, check_derived_similarity,
+#: 整片层的八道判据（闸⑦ 风格配额 / 闸⑲ 风格丰富度 / 闸⑫ 与 demo 骨架同构 /
+#: 闸⑳ 原创配额 / 闸⑨ 跨镜同构 / 闸⑩ 文字对比度 / 闸⑮ 版式族配额 / 闸⑯ 主体具名）。
+#: **三处调用点**（plan_motion 入库前、render 烧像素前、patch 落盘前）与**两处报账**
+#: （计划卡、出片回执）都从这一个元组取，规则因此不可能只在某一路上生效；这也是
+#: 「清单只有一个」那条纪律落在这一族判据上的样子（同一形状的清单漂移踩过三次，
+#: 见 §9-Q90/Q91）。
+#:
+#: ⑦ 与 ⑲ 是**一对**，别把它们的职责搞混：⑦ 管**反雷同**（画法通道别只一种、
+#: 纯文字镜别超三分之一），⑲ 管**逼丰富**（色板 / 满幅 / 质感 / 底色这四条
+#: 在此之前没有任何闸在判）。⑫ 与 ⑳ 同理：⑫ 判「声明派生就要真像」，⑳ 判
+#: 「走原创的那几镜别超过 20%」。
+WHOLE_FILM_GATES = (check_style_quota, check_style_variety,
+                    check_derived_similarity, check_original_share,
                     check_shot_structure, check_ink_contrast,
                     check_layout_family, check_subject_named)
 
 
 def whole_film_gate_results(shots: list[dict[str, Any]]
                             ) -> tuple[list[str], list[str], list[str]]:
-    """把整片六道闸的三个出口合成一份：``(打回, 提醒, 未判)``。
+    """把整片八道闸的三个出口合成一份：``(打回, 提醒, 未判)``。
 
     **三个出口是这一条的全部意思**（T28）：一道闸说不清的时候，它的答案既不是
     「过」也不是「不过」，而是「没判」——三者必须落在三个不同的格子里，因为回执、
@@ -3158,9 +3558,12 @@ KNOB_VALUE_LABELS: dict[str, dict[str, str]] = {
     },
     "rate": {"-20%": "很慢", "-10%": "稍慢", "+0%": "正常",
              "+10%": "稍快", "+20%": "较快", "+30%": "很快"},
-    # 母版 <FilmLayout> 只认这三档；旧链的 torn / bottom 随模板一起消失
+    # 母版 <FilmLayout> 只认这四档；旧链的 torn / bottom 随模板一起消失。
+    # `inline` 是唯一「文字进画面」的档（母版不画，交回镜头代码）——它的标签必须
+    # 说清这一点，不然选的人会以为它和 `none` 一样是「不上字幕」。
     "subtitle_mode": {"torn_highlight": "撕纸条·逐词点亮", "full": "整句字幕",
-                      "none": "不上字幕"},
+                      "none": "不上字幕",
+                      "inline": "文字进画面（母版不画，随构图摆）"},
     # 质感每一镜都能带一档（顶层是整片默认），标签要说清「加的是哪种观感」，不然选的人只能猜
     "texture": {"none": "不加（原片直出）", "film": "老胶片·颗粒与暗角",
                 "tv": "老电视·扫描线与色偏", "glow": "柔光·高光处泛开",
@@ -3237,7 +3640,7 @@ def knob_props() -> dict[str, Any]:
         },
         "subtitle_mode": {
             "type": "string", "enum": list(SUBTITLE_MODES), "default": "torn_highlight",
-            "description": "字幕形态，画在母版字幕带里，镜头代码碰不到它",
+            "description": "字幕形态。inline=母版不画、文字交回镜头代码排进画面",
         },
         "texture": {
             "type": "string", "enum": list(TEXTURES), "default": "none",
@@ -3660,6 +4063,66 @@ def spec_schema() -> dict[str, Any]:
                                                    "滤镜跑在拼接之前的那一趟逐镜片段上，"
                                                    "所以换它**不重烧这一镜的帧**——切片缓存存"
                                                    "的是加质感之前的像素"},
+                        # R14 版式档（每镜，与 texture 同族，但改的是**构图**不是滤镜）。
+                        # 为什么要有这两栏：不写 `bleed` 时每一镜都被裁进同一条居中的
+                        # 画面带里（左右留 gutter、上下留安全区），二十镜二十个母题共用
+                        # 同一个框——这正是成片「像 PPT」的结构原因。`bleed` 让一镜真的
+                        # 画满整帧，`bg` 让一镜有自己的底色，两者都省略＝今天的行为。
+                        #
+                        # R19 把「写不写」从**建议**改成**有闸在判**（闸⑲ 风格配额）：
+                        # 一镜都不满幅会被打回，用深色板的镜不给 `bg` 会出一条提醒。
+                        # 措辞必须与技能正文「版式档」那一节同源——正文是模型真正读到的
+                        # 那一份，schema 的散文送不到它那里（见 test_code_spec ⑦ 节）。
+                        #
+                        # `bleed` 必须是布尔：母版判的是 `=== true`（`resolveFilmStyle`），
+                        # 写成 `"true"` / `1` / `"yes"` 会静默落成「不满幅」——那正是这条链
+                        # 最该避免的失败模式，所以校验期就当场打回（见 `_norm_shot`）。
+                        "bleed": {"type": "boolean",
+                                  "description": "**满幅**：画面带＝整帧，去掉左右页边距与"
+                                                 "上下安全区。只在 `true` 时生效（写成"
+                                                 "字符串或数字母版认不出）。**省略＝常规版式**"
+                                                 "（有安全区）。**这是纪律不是可选项**："
+                                                 "闸⑲ 要求整片至少 ceil(镜数/5) 镜满幅"
+                                                 "（20 镜 → 4 镜），一镜都没有会被打回——"
+                                                 "不写它就等于把每一镜都裁进同一个居中框，"
+                                                 "那正是成片像 PPT 的结构原因。"
+                                                 "**用深色板的镜必须同时给 `bg`**"
+                                                 "（不给的话深色正文会压在母版奶油底上，"
+                                                 "而闸④ 拿不到基准色就拒绝判空）。"
+                                                 "满幅镜的字幕带会贴底（不再居中），母版按底色"
+                                                 "亮度自动换字色"},
+                        "bg": {"type": "string",
+                               "description": "这一镜的**底色**（`#rgb` 或 `#rrggbb`，母版归一"
+                                              "到 6 位）。**省略＝用母版的 `TOKENS.bg`**。只收"
+                                              "十六进制：母版拿它当底色、闸④ 还拿它当"
+                                              "「画面是不是空的」基准色，`rgb()`/命名色/"
+                                              "渐变一律不收（收了等于让闸④ 在这一镜上闭嘴）。"
+                                              "深底会让字幕带自动换成浅色字，不必自己管字幕。"
+                                              "**满幅镜（`bleed: true`）必须给**——"
+                                              "这也是闸⑲ 那条提醒判的东西"},
+                        # 层E1/E2（R19）：两条**逐镜**的覆盖栏。默认都跟整片档，
+                        # 所以「不写」与「从前」逐字节一致；写了的镜在缓存键上要进一项
+                        # （字幕档是母版画进切片的；转场不进键——它跑在拼接那一趟）。
+                        "transition": {"type": "string",
+                                       "enum": list(TRANSITION_STYLES),
+                                       "description": "**这一镜到下一镜**那一处接缝的转场"
+                                                      "（可省略＝跟整片 `transition`）。"
+                                                      "最后一镜写它无效（后面没有接缝）。"
+                                                      "用途：整片统一淡入，但在某两镜之间"
+                                                      "换成圆开 / 擦除——专业动效里转场本来就是"
+                                                      "**逐接缝**的，不是整片一个档。"
+                                                      "时长沿用整片 `transition_sec`。"
+                                                      "**换它不重烧任何一镜**：转场跑在拼接"
+                                                      "那一趟，逐镜切片一个字节都不动"},
+                        "subtitle_mode": {"type": "string",
+                                          "enum": list(SUBTITLE_MODES),
+                                          "description": "**这一镜**的字幕形态"
+                                                         "（可省略＝跟整片 `subtitle_mode`）。"
+                                                         "用途：整片走 `torn_highlight`，但某几镜"
+                                                         "要 `inline`（文字进画面、随构图摆）或"
+                                                         "要 `none`（整屏插画，不想压字）。"
+                                                         "**它与整片那一档都会进缓存键**"
+                                                         "（字幕带是母版画进切片里的）"},
                         "source": {"type": "object",
                                    "description": "出处 {\"标题\": …, \"链接\": …}。机器不判真伪，"
                                                   "它如实出现在分镜卡与逐镜账上（不进画面）。"

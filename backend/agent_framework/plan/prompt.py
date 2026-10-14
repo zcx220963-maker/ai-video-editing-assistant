@@ -208,12 +208,13 @@ async def planning_section(gate: PlanGate, *, feedback: str = "",
                            pending: Mapping[str, Any] | None = None,
                            session_history: Sequence[Mapping[str, Any]] = (),
                            session_artifacts: Sequence[str] = (),
-                           has_pending_plan: bool = False) -> str:
+                           has_pending_plan: bool = False,
+                           capability_notes: str = "") -> str:
     """规划轮的 system 段（纯文本）。账面要子块字节时用 ``planning_section_blocks``。"""
     text, _blocks = await planning_section_blocks(
         gate, feedback=feedback, prior=prior, pending=pending,
         session_history=session_history, session_artifacts=session_artifacts,
-        has_pending_plan=has_pending_plan)
+        has_pending_plan=has_pending_plan, capability_notes=capability_notes)
     return text
 
 
@@ -223,6 +224,7 @@ async def planning_section_blocks(gate: PlanGate, *, feedback: str = "",
                                   session_history: Sequence[Mapping[str, Any]] = (),
                                   session_artifacts: Sequence[str] = (),
                                   has_pending_plan: bool = False,
+                                  capability_notes: str = "",
                                   ) -> tuple[str, tuple[tuple[str, str], ...]]:
     """规划轮的 system 段：本轮**没有**剪辑执行工具，出口只有 ``submit_plan`` 或直接回答。
 
@@ -248,6 +250,10 @@ async def planning_section_blocks(gate: PlanGate, *, feedback: str = "",
     ``has_pending_plan`` 为真时，提示词里加一段 ``confirm_plan`` 的工具使用说明：
     用户在输入框打字确认已有计划（而非点按钮）时，LLM 调 ``confirm_plan`` 弹窗，
     不要反复说「本轮是规划轮」把用户困住。
+
+    ``capability_notes``（R13）：本机能力实测那一段。**值不由本模块算**——它要读活库
+    与密钥，而这一层是纯文案层；由 ``agent.plan()`` 现查后递进来（见
+    ``plan/capability.py``）。空串＝整块不出现（离线装配 / 启动期自检 / 没接 storage）。
     """
     nodes = sorted(gate.whitelist())
     must_include = _explicit_nodes(gate)
@@ -273,6 +279,11 @@ async def planning_section_blocks(gate: PlanGate, *, feedback: str = "",
         "pending_run_id": str((pending or {}).get("run_id") or ""),
         "pending_unfulfilled": "、".join((pending or {}).get("unfulfilled") or []),
         "pending_asked": neutralize((pending or {}).get("asked") or ""),
+        # R13：计划期探活那一段（`capability.py`）。它与其他守卫**不同源**——值不由本模块
+        # 算（本模块连 storage 都没有，也不该有：拼文案是个纯函数），而由 `agent.plan()`
+        # 现查活库与密钥后当参数递进来。递空串（离线装配 / 启动期自检 / 没接 storage）时
+        # 整块不出现，与加这一段之前**逐字相同**。
+        "capability_notes": clean(capability_notes),
     }
     library = getattr(gate, "prompt_library", None)
     # 文案一律来自磁盘：库（热替换目录）优先，库里没有就从仓库自带 prompts/ 读；

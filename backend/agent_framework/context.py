@@ -120,7 +120,17 @@ def default_runtime_context() -> str:
 
 
 def _fact_line(row: Mapping[str, Any]) -> str:
-    """一行素材事实：id | 文件名 | 类型 | 时长 | 分辨率 | 音轨。缺列就跳过该段。"""
+    """一行素材事实：id | 文件名 | 类型 | 时长 | 分辨率 | 音轨。缺列就跳过该段。
+
+    R13-T66：**位图**多带两段 ``sha256=…`` 与 ``ext=…``。理由只有一条——镜头侧
+    ``shots[].assets`` 的三键就是 ``name/sha256/ext``（``code_spec._norm_assets``），
+    而 sha256 必须是**完整 64 位十六进制**、ext 不能为空，两处任一不合规都在契约层被打回。
+    模型手上没有这两个值时只有两条路：去猜（猜错就是「传了图也用不上」），或者放弃用这张图。
+    所以事实行必须给全，而不是只给文件名。
+
+    **只对位图给**：视频/音频不进 ``shots[].assets``（它们走 ``clips`` / ``bgm.ref``），
+    给它们补两段等于往上下文里塞没人读的字节。
+    """
     bits = [str(row.get("id") or row.get("material_id") or "?"),
             str(row.get("filename") or "(未命名)"),
             str(row.get("kind") or "?")]
@@ -132,7 +142,19 @@ def _fact_line(row: Mapping[str, Any]) -> str:
         bits.append(f"{w}x{h}")
     if row.get("kind") in (None, "video"):
         bits.append("含音轨" if row.get("has_audio") else "无音轨")
+    if str(row.get("kind") or "") == "image":
+        sha = str(row.get("sha256") or "").strip().lower()
+        if len(sha) == 64:
+            bits.append(f"sha256={sha}")
+        ext = _ext_of(str(row.get("filename") or ""))
+        if ext:
+            bits.append(f"ext={ext}")
     return " | ".join(bits)
+
+
+def _ext_of(filename: str) -> str:
+    """文件名 → 小写扩展名（不带点）。空文件名回空串。"""
+    return Path(filename or "").suffix.lower().lstrip(".")
 
 
 def render_attachments_section(rows: Sequence[Mapping[str, Any]],
@@ -144,9 +166,15 @@ def render_attachments_section(rows: Sequence[Mapping[str, Any]],
     if rows:
         lines.append("本条消息附带以下素材（material_id 已通过归属校验，可直接使用）：")
         lines.extend(f"- {_fact_line(r)}" for r in rows)
-        video = [r for r in rows if str(r.get("kind") or "video") != "audio"]
+        # 三类分开说，因为**它们上屏的路不是同一条**：视频走 load_media、音频走 bgm 参数、
+        # 位图走 shots[].assets。混成一句「把以上全部 material_id 传给 load_media」，
+        # 位图会被送去一条不收它的腿（load_media 的 kinds 是 video/audio），
+        # 表现成「传了图却用不上」——那正是 R13 要治的那个病。
+        media = [r for r in rows
+                 if str(r.get("kind") or "video") not in ("audio", "image")]
         audio = [r for r in rows if str(r.get("kind") or "video") == "audio"]
-        if video:
+        image = [r for r in rows if str(r.get("kind") or "") == "image"]
+        if media:
             lines.append(
                 "剪辑链路第一步请把以上全部 material_id 原样传给 load_media(material_ids=[…])；"
                 "不要改写、臆造，也不要把文件名当路径传入。"
@@ -161,6 +189,19 @@ def render_attachments_section(rows: Sequence[Mapping[str, Any]],
                 "零素材出片（render_motion_code）直接把它的 "
                 "material_id 传给 bgm 参数即可；"
                 "有素材的剪辑链先调 select_BGM(query=歌名) 拿到引用，再交给渲染节点。"
+            )
+        if image:
+            # R13-T66：位图**能直接摆进某一镜**，路是 shots[].assets 那三键。
+            # 这一段存在的唯一理由：模型手上没有完整 sha256 与 ext 时，只有「猜」与
+            # 「放弃」两条路，而两条都表现为「传了图也用不上」。
+            lines.append(
+                "其中位图（kind=image）**能直接摆进某一镜**，不要传给 load_media："
+                "把它的三键原样填进 `shots[].assets`——`name` 用上面那一行的文件名、"
+                "`sha256` 用完整 64 位（上面那行给了）、`ext` 用不带点的扩展名，"
+                "镜头代码里再用 `staticFile(\"<name>\")` 引用同一个名字。"
+                "**但只有用户指名才能用**：用户说了「第 N 镜用我这张图」才填；"
+                "用户没指名就不要自己挑一张塞进去（闸㉛ 会拿它跟本会话里用户带进来的图比对，"
+                "对不上直接打回），也**不许凭记忆填一个 sha**。"
             )
     if rejected:
         lines.append("以下附件无法使用（不存在或无权访问），请向用户说明并忽略："

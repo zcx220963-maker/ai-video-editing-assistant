@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from . import asset_index
 from .identity import parse_storyline_session
 from .ingest import safe_segment
 from .storage import IntegrityConflict, StorageUnavailable, new_id
@@ -155,21 +156,17 @@ async def _ensure_index(storage: Any, *, data: bytes, ext: str, mime: str,
 
     为什么失败不抛：素材册那一行已经写成了，用户能在自己册子里看到这张图；索引少一行
     只影响「它能不能当镜头素材上屏」。这是两级保证，不该用同一句话报。
+
+    R13-T65 起这一条腿**只有一份实现**（`asset_index.ensure_index_row`）——上传件与出图
+    产物走的是同一个「sha → object_key」登记动作，两处各写一份的话，两份会在
+    「查重、失败姿态、object_key 布局」上慢慢走岔，而走岔的表现是闸⑬ 那种
+    「三处 sha16 对不上」，最难查的一类。
     """
-    try:
-        row = await storage.assets.get_by_sha(sha256)
-        if row:
-            return str(row["id"])
-        key = f"assets/imagegen/{sha256[:2]}/{sha256}.{ext}"
-        await storage.objects.put(key, _one_chunk(data), content_type=mime)
-        got = await storage.assets.add(
-            sha256=sha256, bytes_=len(data), mime=mime, ext=ext, object_key=key,
-            source=SOURCE, license=LICENSE, caption=(prompt or "")[:200],
-            src_id=_safe_name(prompt, sha256[:16], ext),
-            width=width, height=height, enabled=False)
-        return str(got["id"])
-    except Exception:  # noqa: BLE001 - 索引腿失败不改判「图已入库」
-        return ""
+    return await asset_index.ensure_index_row(
+        storage, sha256=sha256, ext=ext, mime=mime,
+        name=_safe_name(prompt, sha256[:16], ext),
+        data=data, bytes_=len(data), width=width, height=height,
+        source=SOURCE, license=LICENSE, caption=prompt or "")
 
 
 async def _one_chunk(data: bytes):

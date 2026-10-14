@@ -37,7 +37,8 @@ from .messages import ToolCall, assistant, system, tool_result, user
 from .prompts import prompt_text, read_prompts_file
 from .plan import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_step_executed,
                         pending_continuation, planning_section_blocks,
-                        preload_skills, reconcile, render_injections,
+                        preload_skills, probe_capabilities, reconcile,
+                        render_capability_notes, render_injections,
                         sections_for_plan,
                         ROUND_FILTER, SCOPE_CONDITION_KEY, SCOPE_SECTION,
                         plan_nodes, registry_for_round, scope_lines, trimmed_nodes)
@@ -2229,12 +2230,26 @@ class Agent:
             except Exception:
                 has_pending_plan = False
         async with self._lock_for(session.session_id):
+            # R13：出计划卡**之前**先看一眼这台机器手里真有什么。这一段是**事实**，
+            # 不是判据——它不拦计划（拦的事由 T68 的可见面收口去做），只保证「模型看到的
+            # 事实与机器的事实是同一个」。没有它，本机没配出图后端时模型照样把 `imagegen`
+            # 排进 steps，一路烧到第 9、10 步才停下来问用户。
+            #
+            # 只读、读不到就记未判（`capability.py` 里逐条兜住），所以它不会让规划轮变脆；
+            # 递空串时模板里那一块整块不出现，与加这一段之前**逐字相同**。
+            try:
+                capability_notes = render_capability_notes(
+                    await probe_capabilities(storage=self.storage, user_id=user_id,
+                                             conv_id=conversation_id))
+            except Exception:      # noqa: BLE001 - 探活是增益，失败不该让规划轮拼不出提示
+                capability_notes = ""
             # 账面要按子块读字节（`knobs` 在 §5.4 末列单列一行），所以走带子块的出口：
             # 整段文本与 `planning_section` 逐字相同，只是多带一份「子块 → 文本」。
             plan_text, plan_blocks = await planning_section_blocks(
                 gate, feedback=feedback, prior=prior, pending=pending,
                 session_history=session_history, session_artifacts=session_artifacts,
-                has_pending_plan=has_pending_plan)
+                has_pending_plan=has_pending_plan,
+                capability_notes=capability_notes)
             return await self.runner.run(
                 session, message, run_id=run_id, stream=stream, attachments=attachments,
                 registry=self._planning_registry(gate), planning=True,
