@@ -18,6 +18,10 @@ from .support import (PLAN_MAX_CANDIDATES, PLAN_STEPS_MAX, PlanIssues,
 from .structure import StructureChecks
 from .vocab import PlanVocabulary
 
+# ``user_says``（「这一项是用户在消息里指名要的」）的长度上限。卡上要原样显示这句话让
+# 用户核对，所以它得是**原话的一两个词**（「横屏」「15 帧」「we never」），不是整句转述。
+_USER_SAYS_MAX = 24
+
 
 class PlanValidator:
     """候选计划的服务端校验：errors 非空即打回，warnings 只在卡上挂角标。"""
@@ -269,12 +273,33 @@ class PlanValidator:
                 own = clean(opt.get("display")) if isinstance(opt, Mapping) else ""
                 values.append({"value": text, "kind": source[0],
                                "display": own or str(labels.get(text) or "")})
+            # 这一项是不是**用户自己在消息里指名要的**（``user_says`` 是他那句原话）。
+            # 真机那条 14 镜的 run：用户在消息里写死了「横屏」，模型给 ``aspect`` 只列了
+            # landscape 一个候选——它没错，用户确实没给别的余地——却被「只给了 1 个候选值
+            # 「landscape」，用户没有选择余地」打回；重写一轮还是一条同样的意见，到顶之后
+            # 整条 run 停在一个「画幅要横屏还是竖屏？」的弹窗上，14 镜的片子一镜未出。
+            # 旧措辞给的出路是「若确实不该由用户定，就不要把它做成开关」，而
+            # ``compile.validate_execute`` 只把**卡上列出的键**传给节点：把它从卡上删掉，
+            # 用户要的那个值就传不到执行里（``aspect`` 会按节点默认 portrait 跑）——
+            # 模型当时提的三个选项里，第一项正是这条错路（「把 aspect 从卡面开关里去掉，
+            # 直接按横屏 16:9 执行」）。所以「用户已定」必须是**能上卡的合法形态**。
+            user_says = clean(raw.get("user_says"))
+            # 这里要的是原话的一两个词（「横屏」「15 帧」），不是整句。**不静默截断**：
+            # 卡上显示的就是它写的这句话，截短了用户反而核不出对不上。
+            over_long = len(user_says) > _USER_SAYS_MAX
+            if over_long:
+                user_says = ""           # 不按「已定」算，退回普通开关那套判据
             # 这一个开关上的毛病**合成一条**：值反查不过 / 改完之后只剩一个候选 /
             # default 不在选项里——三者的修法是同一次编辑（重挑这几个候选值），分几行
             # 报就是把几行挤进了打回清单的窗口。真机第二轮打回列出的 8 条「只给了 1 个
             # 候选值」里，有两条正是被同一步骤的「值超过节点上界」引出来的：一个毛病
             # 报了两遍。措辞在有几种毛病时用顿分号串起来，每种都把具体取值点出来。
-            problems = self._switch_problems(bad, values, source)
+            problems = self._switch_problems(bad, values, source,
+                                             user_says=user_says)
+            if over_long:
+                problems.insert(0, f"user_says 太长（{len(clean(raw.get('user_says')))} 字）"
+                                   f"：这里只写用户点名那一两个词的原话"
+                                   f"（如「横屏」「15 帧」），不是整句")
             default = as_card_value(raw.get("default"))
             if default and default not in picked:
                 problems.append(f"default「{default}」不在选项里")
@@ -297,6 +322,10 @@ class PlanValidator:
                 "options": values,
                 "default": default or values[0]["value"],
             }
+            if user_says:
+                # 带进卡面：卡上把这一项显示成「已定 + 用户原话」（前端 plan-panel /
+                # 计划弹窗），用户可以核对自己是不是这么说的、也能改。
+                spec_meta["user_says"] = user_says
             if source[0] == "number":
                 spec_meta["unit"] = clean(spec.get("unit"))
             norm["param_options"].append(spec_meta)
@@ -320,16 +349,21 @@ class PlanValidator:
     @staticmethod
     def _switch_problems(bad: list[tuple[str, str]],
                          values: list[dict[str, str]],
-                         source: tuple[str, Any]) -> list[str]:
+                         source: tuple[str, Any], *,
+                         user_says: str = "") -> list[str]:
         """同一个开关上的毛病 → 一串独立的分句（调用方决定怎么串成一句话）。
 
-        三处容易漏的：
+        四处容易漏的：
         - **每个被拒的值都要点名**（连原因）。原先一个开关列 5 个都不合法就是 5 条
           几乎一样的话、每条还各带一遍可用清单——它们占的是**别的**判据的位置。
         - 值被拒光时不再补一句「没得选」：那是同一个毛病的回声，判据是「这些取值
           不合规」，不是「候选太少」。
         - 只剩一个候选（数值区间/布尔/枚举这三类取值范围本来就存在的）才提「没有
           选择余地」；`label`（曲库标签）给一个是对的，那是用户指名要的那一首。
+        - **用户已经指名要的那一项不算「没有选择余地」**（``user_says`` 是他那句原话）：
+          这一项的取值本来就是用户定的，卡上显示成「已定」让他核对，再凑一个他没提过
+          的候选反而是瞎编。真机那条 14 镜的 run 就是死在这一条上（见 ``_check_params``
+          里那段注释）。
         """
         out: list[str] = []
         if bad:
@@ -339,7 +373,8 @@ class PlanValidator:
             else:
                 pairs = "；".join(f"值「{text}」{reason}" for text, reason in bad)
                 out.append(f"有 {len(bad)} 个值反查不过：{pairs}")
-        if values and len(values) < 2 and source[0] in ("number", "bool", "enum"):
+        if (values and len(values) < 2 and source[0] in ("number", "bool", "enum")
+                and not user_says):
             hint = ""
             if source[0] == "number":
                 low, high = source[1]
@@ -351,8 +386,15 @@ class PlanValidator:
                 hint = "给 true 与 false 两个候选，让用户自己选"
             else:
                 hint = "请把该参数可用的取值多列几个，让用户有得挑"
+            # 出路写两条，各自说清代价：**从卡上删掉不等于「按用户的取值跑」**——
+            # compile 只把卡上列出的键传给节点，删了就按节点自己的默认值跑
+            # （aspect 的默认是 portrait 竖屏，正好与用户要的相反）。
             out.append(f"只给了 1 个候选值「{values[0]['value']}」，用户没有选择余地。"
-                       f"{hint}；若确实不该由用户定，就不要把它做成开关")
+                       f"{hint}；如果这一个值就是用户消息里指名要的，把用户的原话写进"
+                       f"这一项的 user_says——卡上会显示成「已定」让用户核对，也随时能改；"
+                       f"如果它是你替用户挑的、又不打算让他改，就别把它做成开关"
+                       f"（但**别从卡上删掉一个用户点名要的取值**：删了它就传不到执行，"
+                       f"节点会按自己的默认值跑）")
         return out
 
     @staticmethod

@@ -1455,9 +1455,16 @@ function planAskCard(card) {
   for (const s of planChosen(card).steps || []) {
     for (const o of s.params) {
       if (!o.options || !o.options.length) continue;
+      // 只有一个答案的问题不是问题：曲库标签（用户指名了那一首）与「用户已定」的取值
+      // 都只有一项，再弹一页问一遍就是拿他说过的话问他。值仍然进确认帧——planCardOf
+      // 已经把每一项的 default 填进 card.final，用户在链路面板上照样看得到、改得了。
+      if (o.options.length === 1) continue;
       const k = `${card.chosen}:${s.seq}:${o.key}`;
+      // 有多个候选但用户已经定过：预选他那个值，并把他的原话摆在标题上（免得他
+      // 以为我们又拿这事问他一遍）。
+      const note = o.user_says ? `（你说过「${o.user_says}」，已按此预选）` : "";
       pages.push(questionPage(
-        `第 ${s.seq} 步「${s.node_display}」的 ${o.display}？`,
+        `第 ${s.seq} 步「${s.node_display}」的 ${o.display}${note}？`,
         o.options.map((v) => ({
           key: String(v.value), label: v.label,
           recommended: v.value === o.default,
@@ -1869,6 +1876,8 @@ function planCardOf(src) {
         key: o.key,
         display: o.display || toolLabel(o.key),
         default: o.default,
+        // 「这一项是用户在消息里指名要的」——服务端把用户那句原话一路带到这里
+        user_says: o.user_says || "",
         unit: o.unit || "",
         options: (o.options || []).map((v) => ({
           value: v.value,
@@ -1912,6 +1921,12 @@ function planBubble(cid, src) {
 
 function planChosen(card) {
   return card.plans.find((p) => p.plan_id === card.chosen) || card.plans[0] || { steps: [] };
+}
+
+// 参数在链路面板上显示的取值：就是它的默认值（= 用户确认时不用改就按这个跑）。
+function planParamText(o) {
+  const hit = (o.options || []).find((v) => v.value === o.default);
+  return hit ? hit.label : String(o.default);
 }
 
 // 模板里的键与状态：与 PlanGate 的上限对齐（自定义 ≤5 条，每条 ≤200 字）。
@@ -2562,7 +2577,12 @@ function shortResult(result) {
 // 卡片折成一行摘要（默认收起，点开还是原来那些卡片）。
 // 只在展示层做：msgs() 那份数据一个字段都不动（回投帧的配对是按 call_id 在原始数组上
 // 找 running 那张卡片，改写数组会让配对错位）。
-const TOOL_GROUP_MIN = 3;           // 少于 3 张不折：折了比展开还长
+// 哪怕只有 1 张也折。原先卡在「少于 3 张不折（折了比展开还长）」，那是照「一轮十来次
+// 调用」的形状定的；真机那条 14 镜的 run 一轮的实际调用次数是
+// 1,2,1,3,3,3,3,2,2,2,1,2,2,2,2,2,1,1,2,2,1,1,1,…——39 轮里 22 轮只有 1 次、13 轮 2 次，
+// 够得上 3 张的只有 4 轮：整场几乎一张都没折上，用户看到的还是满屏卡片（他问的就是
+// 这个）。一张卡片是「标题＋参数＋结果」三五行，折起来就是一行，折了确实更短。
+const TOOL_GROUP_MIN = 1;
 const toolGroupsOpen = ref({});     // { 组键: true }
 
 function toolGroupKey(list, first) {
@@ -4186,6 +4206,16 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <div v-if="s.expectation" class="pp-exp">→ {{ s.expectation }}</div>
               <div v-if="s.skills && s.skills.length" class="pp-skills">
                 <span v-for="k in s.skills" :key="k" class="pp-skill">✦ {{ k }}</span>
+              </div>
+              <!-- 这一步按哪些取值跑，摆在这里：只有一个候选值的参数不再单独弹一页问，
+                   所以这里是用户唯一能看见它们的地方（凡是会影响成片的取值都得露出来）。 -->
+              <div v-if="(s.params || []).length" class="pp-params">
+                <span v-for="o in s.params" :key="o.key"
+                      class="pp-param" :class="{ pinned: !!o.user_says }">
+                  <em>{{ o.user_says ? "已定" : "可选" }}</em>
+                  {{ o.display }}：{{ planParamText(o) }}
+                  <i v-if="o.user_says">按你说的「{{ o.user_says }}」</i>
+                </span>
               </div>
               <label v-if="s.skippable" class="pp-skip">
                 <input type="checkbox" v-model="planModal.skip[skey(planModal, s.seq)]"
@@ -6097,6 +6127,12 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 .pp-skills { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
 .pp-skill { font-size: 11px; color: var(--gold); }
 .pp-skip { font-size: 11px; color: var(--ink-light); margin-top: 4px; display: inline-flex; gap: 4px; }
+.pp-params { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+.pp-param { font-size: 11px; color: var(--ink-light); }
+.pp-param em { font-style: normal; border: 1px solid currentColor; border-radius: 3px;
+              padding: 0 3px; margin-right: 4px; font-size: 10px; }
+.pp-param.pinned { color: var(--gold); }
+.pp-param i { font-style: normal; color: var(--ink-soft); }
 
 /* 计划确认弹窗：遮罩 + 居中卡片 */
 .plan-modal-mask {
