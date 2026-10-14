@@ -2945,6 +2945,14 @@ const savingImage = ref(false);
 const testingImage = ref(false);
 const testImageResult = ref(null);
 
+// 记忆（memories 表按身份摊开）：只由 Agent 的工具读写的话，用户看不见也改不掉。
+// 这三态对应「读到了什么 / 编辑中的草稿（按 category 存）/ 正在保存哪个」。
+// 草稿按类存：两个文本域各自编辑，保存一个不该动另一个。
+const memories = ref(null);
+const memoryDraft = ref({});
+const memorySaving = ref("");
+const memoryMsg = ref("");
+
 async function loadSettings() {
   await ensureIdentity();
   const r = await fetch("/settings", { headers: authHeaders() });
@@ -2991,10 +2999,79 @@ async function toggleSettings() {
   } catch (e) {
     keyError.value = "读不到当前设置：" + e.message;
   }
-  // MCP 清单走的是另一个端点（/mcp/servers 而不是 /settings/*），单独拉一次。
-  // 失败只写进这一区块自己的回话，不占 keyError——MCP 挂了不该让整页设置看起来是坏的。
+  // 记忆与 MCP 各有自己的端点，都单独拉一次；失败只写进各自区块的回话，
+  // 不占 keyError——记忆读不到不该让整页设置看起来是坏的。
+  memoryMsg.value = "";
+  await loadMemories();
   mcpSetMsg.value = "";
   await loadMcpAdmin();
+}
+
+// ---- 记忆：查看 / 编辑 / 删除（后端 /memories，与 Agent 的 update_memory 同一张表）----
+
+async function loadMemories() {
+  try {
+    await ensureIdentity();
+    const r = await fetch("/memories", { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    memories.value = j;
+    // 草稿初值 = 库里的现值。之后用户改了草稿、没保存就刷新时，会以库里为准——
+    // 这正是「保存」这个动作的意义：页面上看到的以库为准，不以未提交的编辑为准。
+    const draft = {};
+    for (const row of j.categories || []) draft[row.category] = row.content || "";
+    memoryDraft.value = draft;
+  } catch (e) {
+    memoryMsg.value = "读不到记忆：" + e.message;
+  }
+}
+
+async function saveMemory(category) {
+  if (memorySaving.value) return;
+  memorySaving.value = category;
+  memoryMsg.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch(`/memories/${encodeURIComponent(category)}`, {
+      method: "PUT",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ content: memoryDraft.value[category] || "" }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    memories.value = j;
+    const draft = {};
+    for (const row of j.categories || []) draft[row.category] = row.content || "";
+    memoryDraft.value = draft;
+    memoryMsg.value = j.status === "cleared" ? "已清空这一类。" : "已保存。";
+  } catch (e) {
+    memoryMsg.value = "保存失败：" + e.message;
+  } finally {
+    memorySaving.value = "";
+  }
+}
+
+async function deleteMemory(category) {
+  if (memorySaving.value) return;
+  memorySaving.value = category;
+  memoryMsg.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch(`/memories/${encodeURIComponent(category)}`, {
+      method: "DELETE", headers: authHeaders(),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    memories.value = j;
+    const draft = {};
+    for (const row of j.categories || []) draft[row.category] = row.content || "";
+    memoryDraft.value = draft;
+    memoryMsg.value = "已删除这一类记忆。";
+  } catch (e) {
+    memoryMsg.value = "删除失败：" + e.message;
+  } finally {
+    memorySaving.value = "";
+  }
 }
 
 async function saveLLM() {
@@ -4602,6 +4679,60 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           </div>
           <div v-for="n in testImageResult.notes || []" :key="n" class="set-note bad">{{ n }}</div>
         </div>
+        <!-- 记忆：Agent 自己攒的长期记忆，此前只能由 update_memory/read_memory 读写，
+             用户在界面上看不见也改不掉。这一块把它摊开——查、改、删都在这里。 -->
+        <div class="set-line set-head">
+          记忆（Agent 长期记忆）
+          <span v-if="memories" class="set-note">
+            共 {{ memories.total_lines }} 条 · {{ memories.total_bytes }} 字节
+          </span>
+        </div>
+        <template v-if="memories && memories.categories">
+          <div v-for="row in memories.categories" :key="row.category" class="mem-block">
+            <div class="set-note">
+              <b class="set-v">{{ row.label }}</b>
+              （category='{{ row.category }}'）·
+              {{ row.lines }} 条 / {{ row.bytes }} 字节
+              <template v-if="row.updated_at"> · 最后更新
+                {{ String(row.updated_at).slice(0, 16).replace("T", " ") }}</template>
+              <!-- 超预算这一类当轮不会整条注入（注入侧按条取舍、不截字），
+                   所以这里当场标出来——不然用户只会觉得「我明明写了它却不照做」。 -->
+              <b v-if="memories && row.bytes > memories.inject_per_category_bytes" class="bad">
+                · 已超单类预算 {{ memories.inject_per_category_bytes }} 字节，本轮可能不被注入
+              </b>
+            </div>
+            <textarea v-model="memoryDraft[row.category]" rows="4" spellcheck="false"
+                      class="mem-area"
+                      :placeholder="row.category === 'user'
+                        ? '用户偏好：如「旁白用女声」「成片默认竖屏」——每行一条'
+                        : '工具使用教训：如「渲染失败先查字体软链」——每行一条'"
+                      :disabled="memorySaving === row.category"></textarea>
+            <div class="set-line">
+              <button class="clip" :disabled="memorySaving === row.category"
+                      @click="saveMemory(row.category)">
+                {{ memorySaving === row.category ? "保存中…" : "保存" }}
+              </button>
+              <button class="clip ghost" :disabled="memorySaving === row.category || !row.lines"
+                      @click="deleteMemory(row.category)">删除这一类</button>
+            </div>
+          </div>
+        </template>
+        <p class="set-note">
+          每行一条。Agent 每轮按相关度召回前几条注入，
+          单类约 {{ memories ? memories.inject_per_category_bytes : 700 }} 字节、
+          合计约 {{ memories ? memories.inject_budget_bytes : 1400 }} 字节——
+          超出的条目本轮不会注入（模型看不到），所以这里存得越精炼越有用。
+          清空文本框再保存＝删除这一类。
+        </p>
+        <!-- 阈值取自后端（memory.MemoryContextSource 的两个类属性），前端不自己写一份：
+             两处各写一个数，改一处漏一处时这里会给出「说没超、其实超了」的错判。 -->
+        <p class="set-note">
+          这里的读写与 Agent 的 update_memory / read_memory 是**同一张表**；
+          「删除这一类」是不可撤销的整类清空。
+        </p>
+        <p v-if="memoryMsg" class="set-note"
+           :class="{ bad: memoryMsg.includes('失败') || memoryMsg.includes('读不到') }">{{ memoryMsg }}</p>
+
         <!-- MCP 外部工具：发版种子（backend/mcp.json，启动时入库）与这里登记的运行期
              那一路写的是**同一张表**，连接一律由 McpManager 发起——所以「哪台在线、
              贡献了几个工具」在这一个地方就能看全，不用去翻启动日志。 -->
@@ -5311,6 +5442,16 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   color: var(--ink-soft);
 }
 .probe b { font-weight: 600; margin-right: 6px; }
+/* 记忆区块：一个分类一块——说明行 + 多行文本域 + 保存/删除。 */
+.mem-block { display: flex; flex-direction: column; gap: 6px; padding: 8px 0;
+  border-top: 1px dotted var(--line); }
+.mem-area {
+  width: 100%; padding: 9px 12px; box-sizing: border-box;
+  font-family: ui-monospace, monospace; font-size: 12.5px; line-height: 1.6;
+  color: var(--ink); background: rgba(255, 253, 247, 0.9);
+  border: 1px dashed var(--line); border-radius: 4px; outline: none; resize: vertical;
+}
+.mem-area:focus { border-color: var(--vermilion); border-style: solid; }
 
 /* 气泡内的附件卡片 */
 .atts { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }

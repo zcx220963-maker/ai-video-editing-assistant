@@ -65,6 +65,7 @@ from .consumer import CHAT_TOPIC, SessionConsumer, session_key
 from .heartbeat import Heartbeat
 from .ingest import IngestRejected, ingest_bytes
 from .library_pick import pick_library_asset
+from .memory import CATEGORIES, MemoryContextSource
 from .identity import storyline_session_id
 from .orchestration import _safe
 from . import judge as judge_mod
@@ -704,6 +705,23 @@ class SkillFromRunRequest(BaseModel):
     conversation_id: str = ""
     name: str = ""
     display: str = ""
+
+
+class MemoryWriteRequest(BaseModel):
+    """PUT /memories/{category} 请求体：这一类记忆的**全文**（空串 = 清空这一类）。
+
+    与 update_memory 工具的 mode=append 不同，这里一律是**全量覆盖**：设置页上是一块
+    文本域，用户在框里看到什么、保存后库里就是什么。「留空即删除」写进契约，是为了让
+    「清空这一类」有一个不靠删按钮也能表达的写法（前端两个动作都走这条语义）。
+    """
+
+    content: str = ""
+
+
+#: 单类记忆的落库上限（字节）。定在 8 KB 是「远大于正常偏好、又小于会被静默截掉」之间：
+#: 注入侧 memory.py 每类 700 B、合计 1,400 B，超出的部分模型根本读不到。拦在这里，
+#: 是为了不让用户存进一坨模型看不见的文本还以为它生效了。
+_MEMORY_MAX_BYTES = 8192
 
 
 def create_app(
@@ -2012,6 +2030,38 @@ def create_app(
         llm = getattr(getattr(agent, "runner", agent), "llm", None)
         return llm if hasattr(llm, "complete") else get_default_llm()
 
+    async def _memory_view(user_id: str) -> dict[str, Any]:
+        """memories 表 → 设置页「记忆」区块。
+
+        **两类都列**（哪怕内容是空串）：设置页要能回答「这个身份到底有没有记忆」，
+        而 entries() 会把空类过滤掉——直接用它就变成「空 = 不显示」，用户无从区分
+        「没有这类」和「这类是空的」。逐类的行数/字节/最后更新时间都带上：注入侧是按
+        条数与字节取舍的，看得见这两个数才知道哪条正在被挤掉。
+        """
+        entries = await storage.memories.entries(user_id)
+        stamps = await storage.memories.stamps(user_id)
+        rows = []
+        for cat, label in CATEGORIES.items():
+            content = str(entries.get(cat) or "")
+            rows.append({
+                "category": cat,
+                "label": label,
+                "content": content,
+                "lines": len([ln for ln in content.splitlines() if ln.strip()]),
+                "bytes": len(content.encode("utf-8")),
+                "updated_at": stamps.get(cat),
+            })
+        return {
+            "categories": rows,
+            "total_lines": sum(r["lines"] for r in rows),
+            "total_bytes": sum(r["bytes"] for r in rows),
+            # 注入侧每类/合计的预算，**直接取 memory.py 那两个类属性**——数字写两份，
+            # 改了一处漏一处时面板会给出一个「说没超、其实超了」的错判。
+            "inject_budget_bytes": MemoryContextSource.total_bytes,
+            "inject_per_category_bytes": MemoryContextSource.per_category_bytes,
+            "kind": "memories",
+        }
+
     async def _settings_view(user_id: str) -> dict[str, Any]:
         """密钥现状的对外形态：只有掩码与来源，明文一次都不出门。"""
         llm = _runtime_llm()
@@ -2118,6 +2168,52 @@ def create_app(
     async def settings_get(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
         """模型配置现状（密钥掩码 + 生效来源 + 模型地址）。"""
         return await _settings_view(user_id)
+
+    # ---- 记忆（可视化查看 / 编辑 / 删除）----
+    #
+    # 为什么要有这三只接口：记忆此前**只**由 Agent 通过 update_memory / read_memory
+    # 读写，用户看不见、改不了、删不掉——一条写错的偏好只能靠模型自己想起来改。
+    # 真机事故：用户早先存了一条「不要人声」的偏好，后来的 prompt 却要女声旁白，
+    # 模型两条都收到、自己和解，用户全程不知道库里有那条记忆（§9-Q142）。
+    # 这三只接口把 memories 表按身份摊开给设置页，读用 entries、写用 write（全量覆盖）、
+    # 删用 drop_category——与工具走**同一张表、同一套分类白名单**，不新增真相。
+    @app.get("/memories")
+    async def memories_get(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """当前身份的全部记忆（user/tool 两类，空的也列出来——「没有」也要看得见）。"""
+        return await _memory_view(user_id)
+
+    @app.put("/memories/{category}")
+    async def memories_put(category: str, req: MemoryWriteRequest,
+                           user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """整类覆盖（空串 = 清空该类）。分类走白名单，越界即 400 不落库。"""
+        if category not in CATEGORIES:
+            raise HTTPException(400, f"未知记忆分类 {category!r}，仅支持 {sorted(CATEGORIES)}")
+        text = (req.content or "").strip()
+        if len(text.encode("utf-8")) > _MEMORY_MAX_BYTES:
+            # 不拦的话内容能落库、但注入侧会按 ~1.4 KB 截掉——用户看到存进去了、
+            # 模型却看不到，正是要治的那种「看着还在、其实没了」。当场说清楚。
+            raise HTTPException(400, f"单类记忆超过 {_MEMORY_MAX_BYTES} 字节；"
+                                     f"注入侧每类只有 ~700 字节预算，多余的部分模型读不到。"
+                                     f"请精简，或把教训拆到另一类。")
+        if text:
+            await storage.memories.write(user_id, category, text)
+        else:
+            await storage.memories.drop_category(user_id, category)
+        view = await _memory_view(user_id)
+        view["status"] = "saved" if text else "cleared"
+        return view
+
+    @app.delete("/memories/{category}")
+    async def memories_delete(category: str,
+                              user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """删掉这一类的全部记忆。删不动不报假成功——removed 是真实影响行数。"""
+        if category not in CATEGORIES:
+            raise HTTPException(400, f"未知记忆分类 {category!r}，仅支持 {sorted(CATEGORIES)}")
+        removed = await storage.memories.drop_category(user_id, category)
+        view = await _memory_view(user_id)
+        view["status"] = "deleted"
+        view["removed"] = int(removed or 0)
+        return view
 
     @app.post("/settings/api-key")
     async def settings_api_key(req: ApiKeyRequest,
