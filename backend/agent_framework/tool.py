@@ -198,6 +198,16 @@ class ToolRegistry:
         """装配期指定「执行前需人工审批」的工具名集合。"""
         self._approve = {n for n in names if n}
 
+    def approvals(self) -> set[str]:
+        """这份审批名单的副本。
+
+        为什么要读它：从父注册表构造子工具集时（Agent Team 的常驻子 Agent），
+        新注册表拿不到这一份设置，``--approve-tools`` 指定的那道人工断点会在子
+        Agent 里**静默消失**——同一台机器上，主 Agent 要批、子 Agent 不用批。
+        审批名单是安全属性，做子集时要连同它一起带过去。
+        """
+        return set(self._approve)
+
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
 

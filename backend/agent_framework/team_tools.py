@@ -34,6 +34,7 @@ from .subagent_manager import (
     SHUTDOWN,
     ManagedSubAgent,
     SubAgentManager,
+    build_inherited_registry,
     build_subagent_registry,
 )
 from .task_manager import TaskManager
@@ -174,8 +175,12 @@ class Team:
         if name in self.subagents and name in self._tasks and not self._tasks[name].done():
             return f"子 Agent {name} 已在运行中。"
         allow = list(allow_tools or [])
-        sub_registry = build_subagent_registry(self._parent_registry, allow) \
-            if allow else self._parent_registry
+        # 全量继承那一档必须**复制一份并剥掉派生类工具**，不能直接把父集对象递过去：
+        # 父集里有 spawn_subagent / start_subagent，递给子 Agent 就等于给了它
+        # 「再起一个」的口子，可以递归起下去、没有层数上限（一次性那条腿是靠
+        # 「注册表里根本不放 SpawnTool」杜绝的，两条腿必须一样硬）。
+        sub_registry = (build_subagent_registry(self._parent_registry, allow)
+                        if allow else build_inherited_registry(self._parent_registry))
         sub_agent = AgentOnceRun(
             self._llm,
             sub_registry,
@@ -212,7 +217,8 @@ class Team:
         task = asyncio.create_task(self._run_subagent(managed, prompt, ident))
         task.add_done_callback(lambda t, n=name: self._on_subagent_done(n, t))
         self._tasks[name] = task
-        return _json({"started": name, "allow_tools": allow or "（全量父工具集）"})
+        return _json({"started": name,
+                      "allow_tools": allow or "（全量父工具集，已剥掉派生类工具）"})
 
     async def _run_subagent(self, managed: ManagedSubAgent, prompt: str,
                             ident: Identity) -> dict[str, Any]:

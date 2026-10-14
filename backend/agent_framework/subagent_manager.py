@@ -199,16 +199,53 @@ class ManagedSubAgent:
         return None
 
 
+#: 任何一对「子 Agent 的工具面」里都不该出现的工具名：**派生类**。
+#: 一次性子 Agent 那条腿是靠「注册表里根本不放 SpawnTool」从结构上杜绝递归的
+#: （见 ``subagent.SubAgentRunner._build_child_registry``）；常驻那条腿此前是
+#: 「不写 allow_tools 就给父集全量」，而父集里就躺着 ``spawn_subagent`` 与
+#: ``start_subagent`` 本身——于是子 Agent 可以再起子 Agent，层层起、每一层都是一条
+#: 真的 LLM 循环，**没有层数上限**。提示词里那句「不能再派生」拦不住这个。
+#: 现在两条腿都从结构上杜绝：这里剥名字，与一次性腿的「不放进去」等价。
+SUBAGENT_DENY_TOOLS = frozenset({"spawn_subagent", "start_subagent"})
+
+
 def build_subagent_registry(
-    parent_registry: ToolRegistry, allow: list[str]
+    parent_registry: ToolRegistry, allow: list[str], *,
+    deny: frozenset[str] = SUBAGENT_DENY_TOOLS,
 ) -> ToolRegistry:
     """权限收敛：从父工具集里【只挑 allow 白名单】构造子 Agent 的独立工具集。
 
     对应文档“子 Agent 工具集是主 Agent 的子集”。未在父集中出现的名字会被忽略。
+    派生类工具**即使在白名单里也剥掉**：白名单是模型写的，模型没有理由需要
+    「让子 Agent 再派生」这个能力，而它对上层是不可见的（谁会想到自己起的子 Agent
+    又起了三层）。
     """
     sub = ToolRegistry()
     for tool_name in allow:
+        if tool_name in deny:
+            continue
         tool = parent_registry.get(tool_name)
         if tool is not None:
             sub.register(tool)
+    return sub
+
+
+def build_inherited_registry(
+    parent_registry: ToolRegistry, *, deny: frozenset[str] = SUBAGENT_DENY_TOOLS,
+) -> ToolRegistry:
+    """父工具集**全量继承**，但剥掉派生类工具（子 Agent 不能再派生）。
+
+    为什么不直接给父集对象：常驻子 Agent 起一条就多一个后台 asyncio 任务与一条
+    LLM 循环，而父集里的 ``start_subagent`` 让它可以自己再起——递归起来没人拦得住，
+    也没有任何一处会记「现在有多少层」。剥掉之后，子 Agent 拿到的仍是父集的
+    全部**干活**工具，只是没有了「再起一个」这个口子。
+    """
+    sub = ToolRegistry()
+    for tool in parent_registry.all_tools():
+        if tool.name in deny:
+            continue
+        sub.register(tool)
+    # 审批名单一起带过去：做子集时漏了它，`--approve-tools` 那道人工断点会在子 Agent
+    # 里静默失效（同一台机器上主 Agent 要批、子 Agent 不用批）。
+    sub.set_approval(parent_registry.approvals())
     return sub
