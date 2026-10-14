@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
+from agent_framework.designated_asset import check_shots_designated
 from agent_framework.orchestration import NodeState
 from agent_framework.retrieval import cite_fields, claims_verified, ledger, matches_ledger
 
@@ -224,7 +225,26 @@ class PlanMotionNode(StoryNode):
                 "出处闸未通过，分镜没有入库（本会话真打开过的页面才算出处）：\n"
                 + "\n".join(f"  · {e}" for e in cited[:12])
                 + (f"\n  · …另有 {len(cited) - 12} 条同类错误" if len(cited) > 12 else ""))
-        return plan_payload(spec, target=target, gate=gate)
+        # 闸㉛ 指名权（R13 §5）：用户上传的图**只有用户指名才能摆进镜**——模型凭记忆
+        # （或凭 sha 前缀猜）往 assets 里填一个上传件的 sha 时，闸⑬ 与渲染腿一路放行
+        # （字节在、索引行在），而用户从没说过「这一镜用我这张图」。
+        #
+        # **一处如实说明的偏差**：R13 原文要的判据是「本次 run 的 attachments」，
+        # 但 attachments 到不了 Storyline 进程（grep 0 命中）。实际判据是会话域双
+        # 集合（uploaded_shas × allowed_shas）——防的正是同一件事：凭记忆填的 sha
+        # 不会落在会话可见集合里，照样打回。偏差全文写在
+        # ``agent_framework.designated_asset`` 模块头。
+        designated_errs, designated_unjudged = await check_shots_designated(
+            self.storage, spec["shots"],
+            user_id=state.user_id or "", conv_id=state.conversation_id or "")
+        if designated_errs:
+            raise ValueError(
+                "指名权闸未通过，分镜没有入库（用户上传的图只有用户指名才能用）：\n"
+                + "\n".join(f"  · {e}" for e in designated_errs[:12])
+                + (f"\n  · …另有 {len(designated_errs) - 12} 条同类错误"
+                   if len(designated_errs) > 12 else ""))
+        return plan_payload(spec, target=target, gate=gate,
+                            designated_unjudged=designated_unjudged)
 
 
 def forage_payload(account: dict[str, Any]) -> dict[str, Any]:
@@ -264,7 +284,8 @@ def forage_payload(account: dict[str, Any]) -> dict[str, Any]:
 
 def plan_payload(spec: dict[str, Any], *, target: float | None = None,
                  next_hint: str = "",
-                 gate: dict[str, str] | None = None) -> dict[str, Any]:
+                 gate: dict[str, str] | None = None,
+                 designated_unjudged: list[str] | None = None) -> dict[str, Any]:
     """``plan_motion`` 产物的形状（归一后的 spec + 那份要给人看的账）——**单源**。
 
     为什么抽出来：``patch_motion_code`` 把一版局部改写回 ``plan_motion`` 时，必须写成与
@@ -274,6 +295,11 @@ def plan_payload(spec: dict[str, Any], *, target: float | None = None,
     ``gate`` 是出处闸顺手算出的每镜判定。闸只拦「冒充查证过」那一档，剩下三种
     （真对上了账、作者明写没核实、压根没填出处）**都会入库**——逐镜账要是把它们
     混成一个空白格，观众就没法知道画面右上角那行字的凭据是哪一种了。
+
+    ``designated_unjudged`` 是闸㉛（指名权）的未判档（R13 §5）。与 ``style_unjudged``
+    同一形状、同一规矩（T28）：非空即「本片有闸没量过」，卡面按阻断档显示，
+    **不许与提醒用同一种措辞与同一种颜色**——把「没判过」读成「小提醒一下」
+    就是 D-未判不绿那条病。
     """
     low, high = cspec.estimate_sec(spec)
     shots = spec["shots"]
@@ -348,6 +374,10 @@ def plan_payload(spec: dict[str, Any], *, target: float | None = None,
         # 不许与上一栏（提醒）用同一种措辞与同一种颜色。卡上看得见 = 用户能在
         # 烧像素之前就叫人补底色/重写代码，而不是等出片回执再发现。
         "style_unjudged": quota_undet,
+        # 闸㉛ 指名权的未判档（R13 §5，与 style_unjudged 同一形状同一规矩）：
+        # 「本会话上传件名册/素材册读不到」或「本片没用用户上传的图」。
+        # 打回那一档在入库前就抛了（见 process 里那一刀），走不到这里。
+        "designated_unjudged": list(designated_unjudged or []),
         "aspect": spec["aspect"],
         "resolution": f"{spec['width']}x{spec['height']}",
         "fps": spec["fps"],

@@ -202,7 +202,10 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                 providers=self.providers, work=work, bgm=bgm_path,
                 client=self._client(),
                 storage=self.storage,
-                progress=on_event, cache=_ObjectShotCache(self.storage.workspace, sess))
+                progress=on_event, cache=_ObjectShotCache(self.storage.workspace, sess),
+                # 闸㉛（指名权）与 T73（回看环前置）要的会话域身份：出片这一趟
+                # 的身份就是 NodeState 里那一个。不传 = 那道闸按未判走（不是放行）。
+                user_id=state.user_id or "", conv_id=state.conversation_id or "")
             await probe.drain()           # 迟到进度不能盖掉后面的终态
             frames, frame_reason = await self._spotcheck(state, out)
             object_key = f"renders/{_safe(sess)}/{_safe(artifact)}/motion.mp4"

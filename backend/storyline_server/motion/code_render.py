@@ -48,6 +48,8 @@ import json
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
+from agent_framework.designated_asset import check_shots_designated
+
 from .. import mediaops
 from ..mediaops import MediaError
 from ..providers import Providers
@@ -1465,7 +1467,8 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
                              bgm: Path | None = None,
                              progress: Progress | None = None,
                              cache: "rpipe.ShotCache | None" = None,
-                             review: bool | None = None) -> dict[str, Any]:
+                             review: bool | None = None,
+                             user_id: str = "", conv_id: str = "") -> dict[str, Any]:
     """整条链：代码分镜 spec → 成片。质感在**每一镜的切片**上过一趟滤镜
     （`_shot_texture`，拼接之前），母带那一趟只剩拼接与 BGM 闪避——都调 `render.py`
     的同一批函数，不在这里复制第二份。
@@ -1474,6 +1477,11 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
     显式 True/False 压过它。**默认关**：这一档每镜一次带帧的多模态调用，是最贵的调用，
     而它救的是「已经红了」的镜——开关关着只是少一条自动修复的路，不会让问题片子溜出去；
     关着的时候回执里那一栏对红镜是 `not_run`，**不许折算成通过**（Q112/Q113）。
+
+    ``user_id`` / ``conv_id`` 是闸㉛（指名权）的会话域身份。**空 = 不判那道闸**
+    （读不到身份 = 未判，不是放行也不是打回——R13 的偏差口径：attachments 到不了
+    本进程，判据落在会话域；没有身份就没有会话域）。调用方（出片节点）从 NodeState
+    带进来；离线直调不传，那道闸按未判走，账上如实记。
     """
     client = client or rc.endpoints()
     work.mkdir(parents=True, exist_ok=True)
@@ -1495,6 +1503,35 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
         raise MediaError(
             f"creation-remotion 没报出 {'、'.join(missing)}——缓存键缺这一段就会让"
             "「改了母版却命中旧切片」，整条片子拒绝开工比静默命中便宜")
+
+    # ---- 烧像素**之前**的两道闸（R13-T73 / R13-闸㉛）：一帧都不烧 ----
+    #
+    # T73：回看环开了而那条腿做不了（裁决通道没配 / 帧通道没落地）→ 当场打回并
+    # 点名，而不是渲到一半抛 ReviewBlocked。后者是旧形状：片子烧完（或烧到一半）
+    # 才发现回看跑不了，整条 run 白烧——而这件事在**第一帧之前**就查得出来。
+    # 合同原文（R13-Q163）：本卷只做失败前置，不补 judge_channel。
+    if review_enabled:
+        cap = await review_loop.capability()
+        if not cap.get("available"):
+            raise MediaError(
+                "回看环这趟开不了（spec 里 review=true）："
+                + str(cap.get("why") or "（探测没给出原因）")
+                + "——T73 的规矩：判据不可用时在**烧像素之前**打回并点名，"
+                "而不是渲染到一半抛 ReviewBlocked（那样整条片子白烧）。"
+                "把 review 关掉（缺省就是关，关着只是少一条自动修复的路，"
+                "不会让问题片子溜出去），或把缺的那半条腿配齐再开。")
+
+    # 闸㉛ 指名权（R13 §5）：用户上传的图只有用户指名才能摆进镜。plan_motion 入库前
+    # 判过一次，这里是**烧像素前**的第二道——inline spec（跳过 plan_motion 直接调
+    # 出片的那条路）也要过同一把尺，否则闸就只在一条路上生效（清单漂移的第四次）。
+    # 偏差与口径全文见 ``agent_framework.designated_asset`` 模块头。
+    if user_id:
+        des_errs, _des_unjudged = await check_shots_designated(
+            storage, shots, user_id=user_id, conv_id=conv_id or "")
+        if des_errs:
+            raise MediaError(
+                "闸㉛ 指名权未通过，一帧都没开始渲（用户上传的图只有用户指名才能用）：\n"
+                + "\n".join(f"  · {e}" for e in des_errs[:10]))
 
     clips, ledger, files, hitmaps, frames_used = await _render_shots(
         shots, spec=spec, providers=providers, work=work, client=client,

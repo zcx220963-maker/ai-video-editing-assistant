@@ -110,6 +110,14 @@ _SKILL_NOT_TOOLS = frozenset({
     #   `style_facts` 另外那几栏（`palettes` / `bleed_shots` / `textures`）今天没进正文，
     #   真进了就一起收——这条豁免的口径是「回执栏位」，不是「正文里出现过的词」。
     "original_shots",
+    #   T67 供给节（R13 §4）的**代码出处引用**：正文点名唯一真源时写的是模块路径——
+    #   ``agent_framework.plan.supply_order`` 那张四档表、``imagegen_nodes`` 模块头。
+    #   `_TOOLISH` 按 `\b` 切词，带下划线的三段（agent_framework / supply_order /
+    #   imagegen_nodes）各自被扫出来；它们是**模型调不到**的模块名，不是工具——不收
+    #   下这一条，真机启动日志就会把 T67 的同源引用整批报成「点名了不存在的工具」
+    #   （2026-10-14 那一批假告警的同一形状）。注意：若哪天真有一个工具叫
+    #   `supply_order`，它在 `known_set` 里先行通过，这份豁免不会挡它。
+    "agent_framework", "supply_order", "imagegen_nodes",
 })
 
 # 明确不是工具名的**形态**（技能正文里大量出现，属正常内容）：

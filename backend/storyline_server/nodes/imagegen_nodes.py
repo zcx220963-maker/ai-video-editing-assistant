@@ -1,19 +1,28 @@
-"""R6-T24 出图节点：链上**第一个**真的会去出图的节点。
+"""R6-T24 出图节点：链上**第一个**真的会去出图的节点——供给次序的第④档。
 
-为什么要单独一个节点（而不是让 ``search_illustration`` 顺手出图）：第五根因是
-「链路上没有图像」——素材库里没有合适的图时，链上唯一的动作是「没有就没有」，
-于是模型退回卡片+文字（§1.5 那支被驳回的形态的机制性根因）。出图是**另一条供给腿**，
-它与检索的关系是「先检索、未命中再出图」（§9-Q27 的写死优先级）：
+**本模块只讲它自己在次序里的位置。** 供给优先级的唯一真源是
+``agent_framework.plan.supply_order`` 那张四档表（R13 §4；散文面与它逐字双向
+比对，见 ``tests/test_imagegen.py`` 的 T67 判据）。表在本文档下方逐字嵌入：
 
-    检索库命中 → 用库里的（免费、不联网、可溯源）
-    未命中     → 本节点出图（要配置后端）
-    后端没配   → **明说降级**，绝不静默出一支没有图的片子
+① 用户指名的上传件（只有用户触发）：attachments 里的 material_id → 索引行 → shots[].assets
+② 库检索命中（模型触发）：search_illustration → select_illustration
+③ 代码自己画（模型触发）：rough / three / katex / vector 四条画法通道
+④ 出图 API（只有用户明确点名触发）：imagegen（配好 provider 与密钥才出得了图）
+降级允许且必须可见：没配出图后端时明说降级（回执写明「图像通道降级为素材库检索，本片 N 镜无图」），静默出片仍然是失败——降级本身不是失败，把没有的图写成有才是
+
+**出图是第④档**（最后一路、联网、花钱、只有用户明确点名触发）。它与检索的关系
+由闸㉙（``plan.supply_order.check_supply_order``）在执行层判，不由散文强调：
+第④档要真去出图，本 run 的产物总线里必须先有一次 ``search_illustration`` 返回
+``no_match`` 的留痕。R13 §5 末条明写「不许把它做成提示词里再强调一遍」——
+强调过三遍而执行层零判据，就是 R13 §0.10 那条现状（次序与用户拍板相反）。
 
 **为什么本节点不抛异常**（与大多数节点不同）：没配后端是**常态**（这仓今天就没有任何
 ``image_*`` 配置），抛异常会把整条规划/出片流程打断在一件「本来就有降级路径」的事情上。
 所以三种结局都回结构化回执：``ok:True`` 有图、``ok:False`` 且 ``degraded=True`` 没配
 后端、``ok:False`` 且 ``degraded=False`` 配了但这次没成。**降级可见 ≠ 失败，静默出片才
 是失败**——回执里的 ``message`` 就是给用户看的那句话，模型与页面都读得到。
+闸㉙ 打回也走这条回执路（``ok:False`` + 点名），而不是抛：抛会让整条 run 死在
+一个本来可以「先去检索」就能继续的分叉上。
 
 **密钥**：只由 ``secrets.resolve_image_config`` 读出来交给 ``image_backend``，本模块
 不落日志、不进返回值（T24：只验存在，绝不打印）。
@@ -27,20 +36,33 @@ from typing import Any
 from agent_framework import image_backend, secrets
 from agent_framework.identity import storyline_session_id
 from agent_framework.imagegen_library import store_generated
+from agent_framework.plan.supply_order import (
+    check_supply_order, render_supply_order, supply_order_undetermined_note,
+    traced_no_match_of)
 
 from .core_nodes import StoryNode, _obj
 
 
 class GenerateImageNode(StoryNode):
-    """出图：提示词 → 一张位图 → 落进素材册与「按 sha 找字节」的索引。"""
+    """出图：提示词 → 一张位图 → 落进素材册与「按 sha 找字节」的索引。
+
+    供给次序的第④档。**次序的唯一真源是**
+    ``agent_framework.plan.supply_order`` 那张四档表（R13 §4），本描述与
+    ``imagegen_nodes`` 模块头、``motion_explainer/SKILL.md`` 供给节三处散文面
+    与它逐字双向比对（T67）：表里有而散文没有 → 红；散文里有而表里没有 → 也红。
+    """
 
     name = "imagegen"
     display_name = "出图"
     description = (
-        "按提示词生成一张配图（需要页面「设置 → 出图后端」配好 provider 与密钥）。"
-        "供给优先级是「先检索素材库、未命中再出图」；没配后端时**明确降级为检索**并在回执里"
-        "说明，不会静默出一支没有图的片子。产物落在当前会话的素材册里，回执带 "
-        "asset 三键（name/sha256/ext），可直接填进 shots[].assets。")
+        "按提示词生成一张配图（需要页面「设置 → 出图后端」配好 provider 与密钥）——"
+        "它是供给次序的第④档（最后一路、联网、花钱、只有用户明确点名才调）。"
+        "供给优先级（唯一真源：agent_framework.plan.supply_order）：\n"
+        + render_supply_order()
+        + "\n闸㉙：本 run 必须先有一次 search_illustration 返回 no_match 的留痕，"
+        "本节点才允许出图；没有留痕时打回并给出路（不抛异常）。"
+        "产物落在当前会话的素材册里，回执带 asset 三键（name/sha256/ext），"
+        "可直接填进 shots[].assets。")
     input_schema = _obj("出图", {
         "prompt": {"type": "string",
                    "description": "画面描述。写「能被认出的东西」——主体是什么、什么构成、"
@@ -87,6 +109,27 @@ class GenerateImageNode(StoryNode):
             return {"ok": False, "degraded": True, "image": None, "asset": None,
                     "provider": "", "model": model, "size": size,
                     "message": "填了密钥或实例地址但没选后端，无法判断该把 key 交给谁"}
+
+        # 闸㉙ 取材次序（R13 §5）：第④档要真去出图，本 run 的产物总线里必须先有一次
+        # ``search_illustration`` 返回 ``no_match`` 的留痕。**判据在执行层（这里），
+        # 不在提示词里**——R13 §5 末条明写「不许把它做成提示词里再强调一遍」：强调过
+        # 三遍而执行层零判据，就是 §0.10 那条现状（次序与用户拍板相反，只是因为这台
+        # 部署没配出图 key 才没烧钱——那是偶然，不是规矩）。
+        #
+        # 留痕从产物总线读（``search_illustration`` 执行完自动进总线），是**机器记的**
+        # 而不是模型自报的「我检索过了」——自报的留痕会被模型记错，而记错的表现正是
+        # 本闸要防的那个序列。
+        why, _unjudged = check_supply_order(
+            traced_no_match=await traced_no_match_of(state.store),
+            used_imagegen=True)
+        if why:
+            # 打回也走回执路而不是抛（本节点不抛异常的理由见模块 docstring）：抛会让
+            # 整条 run 死在一个本来「先去检索再回来」就能继续的分叉上。回执带
+            # ``gate`` 一栏，回执层可以按它把这道闸的账与降级的账分开。
+            return {"ok": False, "degraded": False, "image": None, "asset": None,
+                    "provider": provider, "model": model, "size": size,
+                    "gate": "supply_order",
+                    "message": why}
 
         try:
             result = await asyncio.to_thread(
