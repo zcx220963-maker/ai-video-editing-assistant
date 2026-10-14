@@ -33,7 +33,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
-from .storage import IntegrityConflict, StorageUnavailable
+from .storage import IntegrityConflict
 
 #: 用户带来的图的来源档。与 imagegen 产物的 `imagegen`、外部源的 `wikimedia-commons` /
 #: `iconify` 并列，四者互不相等。
@@ -106,7 +106,11 @@ async def ensure_index_row(
         try:
             await storage.objects.put(key, _one_chunk(payload),
                                       content_type=mime or "")
-        except StorageUnavailable:
+        except Exception:                          # noqa: BLE001 - 见下方说明
+            # 只拦 `StorageUnavailable` 不够：对象存储那一层真会抛别的（MinIO 的
+            # ClientError 未必都被包住，内存替身的落盘写文件会抛 OSError）。这一条腿
+            # 的合同是「任何意外只回空串」——漏一种就足以让一次**本来成功**的上传
+            # 在索引这一步炸掉，而用户在自己素材册里明明看得见那张图。
             return ""
 
     try:

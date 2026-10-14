@@ -2400,9 +2400,25 @@ class Agent:
         # 技能正文**按本片计划取块**（T42/§5.7②）：默认集 + 本轮点名要的那几块。
         # 卡面一并传进去，只为一件事——读 `param_options[].default` 判「整片开关动没动过」
         # （编译结果看不出用户勾没勾）；拿不到卡面时按「动过」算（见 plan.skills 的注释）。
+        #
+        # `imagegen_visible`（R13-T68）：**这台机器这一轮调不调得到出图**。没配后端时
+        # `imagegen` 从节点集里摘掉，于是出图那一节（`whiteboard-imagegen`）连同伴生的
+        # 两块供给正文一起不注入。为什么在这里现查而不是缓存：密钥写在设置页、按用户
+        # 失效（`secrets.invalidate`），「用户刚填好」与「重启服务」都能让同一台机器
+        # 的读数翻过来——缓存的读数会把这台机器**已经修好**的那段时间继续当坏的。
+        imagegen_visible = True
+        if self.storage is not None:
+            try:
+                imagegen_visible = bool(
+                    (await probe_capabilities(storage=self.storage, user_id=user_id,
+                                              conv_id=conversation_id))
+                    .get("image_backend"))
+            except Exception:      # noqa: BLE001 - 探活是增益，读不到就按「看得见」算
+                imagegen_visible = True
         sections += await preload_skills(
             self.skill_loader, compiled.get("skills_hint") or (),
-            sections=sections_for_plan(compiled, plan))
+            sections=sections_for_plan(compiled, plan,
+                                       imagegen_visible=imagegen_visible))
         # 工具面按这张计划裁（T41）：只发计划用得到的剪辑节点 + 通用件，被裁的节点名
         # 进「如何请求扩面」那一小节（裁的是 schema 字节，不是可发现性，Q56）。
         steps = compiled.get("steps") or []

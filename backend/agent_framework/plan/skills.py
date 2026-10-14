@@ -141,11 +141,12 @@ def wants_sound_design(compiled: Any) -> bool:
     return not seen
 
 
-def sections_for_plan(compiled: Any, card: Any = None) -> tuple[str, ...]:
+def sections_for_plan(compiled: Any, card: Any = None, *,
+                      imagegen_visible: bool = True) -> tuple[str, ...]:
     """本片计划 → 这次点名要的正文块（升序；空表＝只要默认集）。
 
     ``compiled`` 是执行轮的编译结果（``{"steps": [{node, params, …}]}``），``card`` 是那张
-    计划卡（可选，只为读 ``param_options[].default``）。判据五条，逐条都能反证：
+    计划卡（可选，只为读 ``param_options[].default``）。判据六条，逐条都能反证：
 
     1. 计划里有写代码的节点（``MOTION_NODES``）→ 发 ``MOTION_SECTIONS`` 三块；
     2. 计划**动过**整片开关 → 追加 ``film-knobs``（见 ``changed_film_knobs``）；
@@ -153,8 +154,16 @@ def sections_for_plan(compiled: Any, card: Any = None) -> tuple[str, ...]:
     4. 本片有旁白或配乐 → 追加 ``sound-design``（见 ``wants_sound_design``）；
     5. 写代码**且**有供给腿 → 追加 ``SUPPLY_SECTIONS`` 两块（T57；条件是两条腿**同时**
        在计划里，理由见 ``SUPPLY_SECTIONS`` 上面那段）；
-    6. 写代码**且**计划里有 `imagegen` → 追加 ``WHITEBOARD_SECTIONS`` 一块（T62；
-       条件比第 5 条窄一档，理由见 ``WHITEBOARD_SECTIONS`` 上面那段）。
+    6. 写代码**且**计划里有 `imagegen` **且这一轮它真的调得到** → 追加
+       ``WHITEBOARD_SECTIONS`` 一块（T62/T68；条件比第 5 条窄一档，理由见
+       ``WHITEBOARD_SECTIONS`` 上面那段）。
+
+    ``imagegen_visible=False``（R13-T68）＝ **这台机器没配出图后端**。此时把 ``imagegen``
+    从节点集里整条摘掉：第 3/5/6 三条判据都当它不在计划里。为什么不是「照发、让节点
+    自己降级」：那一节的正文讲的是「出图腿的视觉规范」，读者是「正在给某个镜头配图」
+    的那个模型——而它这一轮调不到出图（``GenerateImageNode`` 会回一条降级回执）。
+    发出去等于教一条今天走不通的路（§5.7 第②条「通道条件」的反面），而且烧到第 9、10 镜
+    才停下来问用户，正是清单第②项那张四选项卡的根因。
 
     计划里**一个 motion 节点都没有**时返回空表：那一轮要么是常规剪辑（另一份技能），
     要么只是问一句——此时 ``preload_skills`` 的 ``names`` 本来也不含这份技能，
@@ -162,6 +171,8 @@ def sections_for_plan(compiled: Any, card: Any = None) -> tuple[str, ...]:
     """
     steps = _steps(compiled)
     nodes = _nodes(steps)
+    if not imagegen_visible:
+        nodes = nodes - {"imagegen"}
     writes_code = bool(nodes.intersection(MOTION_NODES))
     has_supply = bool(nodes.intersection(IMAGE_NODES))
     out: list[str] = []
