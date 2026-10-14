@@ -43,10 +43,11 @@ MANIFEST_FILE = "manifest.json"
 #: 清单里合法的「相」——某一份提示词属于哪个环节。见 manifest.json 的 note。
 PHASES = ("always", "planning", "editing", "subagent", "guard", "skill_flow", "script")
 
-#: 清单里 kind 的合法取值。**与 context.LEDGER_KINDS 是同一组词，但刻意不 import**：
-#: prompts.py 被 context.py 反向依赖（它只 TYPE_CHECKING 地引 PromptLibrary），
-#: 这里 import 回去就成环。两处都是"三个字符串"，改一处漏一处的代价由
-#: tests/test_prompt_manifest.py 的对账断言兜住。
+#: 清单里 kind 的合法取值。**与 context.LEDGER_KINDS 是同一组词，这里自留一份**：
+#: prompts.py 刻意不依赖包内任何模块（只 import json/re，是装配顺序里最先可用的那一层；
+#: context.py 反过来只在 TYPE_CHECKING 下引本模块的 PromptLibrary）。两处都是「三个
+#: 字符串」，同值由 tests/test_prompt_library.py ⑧ 那条对账断言钉住——只靠人眼，
+#: 改一处漏一处不会有任何红灯。
 LEDGER_KINDS_LOCAL = ("always", "conditional", "on_demand")
 
 
