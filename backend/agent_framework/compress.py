@@ -120,20 +120,42 @@ DEFAULT_FOLD_PREVIEW = 200
 
 TRUNCATE_MARKER = "结果已截断"
 
+#: 截断回执里那半句「怎么把剩下的拿回来」，**按工具分**。
+#: 为什么不能一句话通用：工具不同，路就不同。原先那半句列的是「读文件带 offset/limit、
+#: 检索限定路径、分页取列表」，对 `load_skill` 一条都不成立——技能正文不在会话工作区
+#: 里（`read_file` 打不开 `skills/…`，检索也没有那个起点），也没有「换关键词重取」这
+#: 一说。真机实测（14 镜「薄肌理论」）：模型读到「middle was truncated」之后照着这句
+#: 话去 read_file 撞「文件不存在」、去检索撞「检索起点不存在」，然后只能把同一份技能
+#: 反复加载（每次切点还一样），十几次调用全烧在找回那段上。**回执给一条走不通的路，
+#: 比不给更坏**——模型会一条条试。默认那句是给没列在这里的通用工具用的，一字不改。
+_RECOVERY_HINT = {
+    "load_skill": ('再用 load_skill 取同一份 name（附件加 path），带 offset/limit 按行续读'
+                   '——技能文件不在会话工作区里，read_file / grep 找不到它们'),
+    "read_file": "再用 read_file 带 offset/limit 按行续读",
+    "grep": "用 grep 换更窄的 pattern、或限定 path/glob 再检索一次",
+    "fetch_url": "换一条更具体的链接（这一份太长，抓取工具没有「只取某一节」的参数），"
+                 "或换一个源再抓",
+    "web_search": "换更具体的关键词、或换一个源站再检索一次",
+}
+_DEFAULT_RECOVERY_HINT = ("用更窄的参数重取一次（读文件带 offset/limit、检索限定路径、"
+                          "分页取列表）")
+
 #: 这些工具的结果里带着「模型必须原样引回去」的 id / 候选清单，永不折叠。
 #: 截断那头仍然只切中间（头尾都留），所以就算被折叠，id 也还在预览的开头。
 NEVER_FOLD_TOOLS = frozenset({"submit_plan", "confirm_plan", "ask_user"})
 
 
-def truncate_result(text: str, limit: int) -> str:
+def truncate_result(text: str, limit: int, *, tool: str = "") -> str:
     """结果文本超过 ``limit`` 字节时截成「头 + 回执 + 尾」；没超就原样返回。
 
     为什么头尾都留、只切中间：头是「这个工具成功了、给了什么」，尾常带「共 N 条 /
     失败清单 / 下一步」，中间那段（长列表、大段正文）才是重复度最高的部分。
 
     为什么留回执而不是静默截断：模型看到半截 JSON 会当成完整结果去解析，然后基于
-    残缺数据下判断——那是**无声**的错误。回执里写原文多大、怎么重取（读文件带
-    offset、检索限定路径），它就有路可走。
+    残缺数据下判断——那是**无声**的错误。回执里写原文多大、怎么重取，它就有路可走。
+
+    ``tool`` 用来挑那半句「怎么重取」：路是按工具分的，给错一条模型就会照着试
+    （见 ``_RECOVERY_HINT`` 的说明）。不传就还是原来那句通用的。
     """
     if limit <= 0:
         return text
@@ -151,8 +173,8 @@ def truncate_result(text: str, limit: int) -> str:
     receipt = (
         f"\n\n[{TRUNCATE_MARKER}｜原文 {n} 字节（约 {estimate_tokens(text)} token），"
         f"此处只给了开头与结尾，中间被省掉。"
-        f"需要原文就用更窄的参数重取一次（读文件带 offset/limit、检索限定路径、"
-        f"分页取列表），不要凭这段推测缺失的内容。]\n"
+        f"需要原文就{_RECOVERY_HINT.get(tool, _DEFAULT_RECOVERY_HINT)}，"
+        f"不要凭这段推测缺失的内容。]\n"
     )
     return head + receipt + tail
 
@@ -189,7 +211,7 @@ class ToolResultGate:
         那份文本被收口。
         """
         raw = content if isinstance(content, str) else str(content)
-        return truncate_result(raw, self.result_max_bytes)
+        return truncate_result(raw, self.result_max_bytes, tool=name)
 
     def shrink(self, messages: list[Message]) -> dict[str, int]:
         """就地把更早的工具结果折叠成预览；返回这一趟的统计（无动作则全 0）。

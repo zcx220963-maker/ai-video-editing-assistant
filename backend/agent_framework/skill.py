@@ -406,8 +406,27 @@ class SkillManifestContextSource:
         return "\n\n".join(sections)
 
 
+#: 正文超过这个体量就在末尾附一句「共几行、怎么续读」。取值在闸的截断线
+#: （`compress.DEFAULT_RESULT_MAX_BYTES`，24 KB）**之下**：等回执说「中间被省掉」
+#: 才告诉它怎么取，模型已经先撞上那面墙、已经开始了那串找不回来的尝试。
+_PAGING_NOTE_BYTES = 8_000
+
+
 class LoadSkillTool(Tool):
-    """按需加载：命中技能后拉取其完整正文，或按相对路径拉某个附件。"""
+    """按需加载：命中技能后拉取其完整正文，或按相对路径拉某个附件，都可按行分页。
+
+    **为什么非得分页不可**（真机实测，14 镜「薄肌理论」那条 run）：这份技能的
+    ``SKILL.md`` 有 42 KB，进链前会被 `compress.ToolResultGate` 按字节切掉中间一段
+    （那条回执只说「中间被省掉，请用更窄的参数重取」）。而技能正文**只有这一条取值
+    的路**：它不在会话工作区里（模型去 `read_file skills/…/SKILL.md` 撞「文件不存在」，
+    又去 检索 那个目录撞「检索起点不存在」），也没有「换关键词」这一说。于是模型只能
+    抱着那句「中间被省掉」把同一份技能反复加载（每次切点还一样），十几次调用全烧在
+    找回那段上——**回执给了它一条走不通的路**。
+
+    所以分页做在工具这一侧，按**行**切：offset 是 1 起始的行号，页脚直接写出「共 N 行、
+    下一句该怎么写」。上面那道字节闸不用撤——它拦别的大结果仍然对，只是从这里出去的
+    正文不再是「切在哪一行看运气」。
+    """
 
     def __init__(self, loader: SkillLoader) -> None:
         self._loader = loader
@@ -424,8 +443,11 @@ class LoadSkillTool(Tool):
     def description(self) -> str:
         return (
             "按名称加载技能的完整说明。缺省返回 SKILL.md 正文（并列出附件清单）；"
-            "传 path（如 references/x.md、scripts/y.py）返回该附件内容。"
-            "附件来自对象存储，只认技能登记过的相对路径，不接受任意文件路径。"
+            "传 path（如 references/x.md、scripts/y.py）返回该附件内容；"
+            "正文与附件都可以用 offset（1 起始的行号）与 limit（行数）按行分页续读，"
+            "回执末尾会写明共有多少行。"
+            "附件来自对象存储，只认技能登记过的相对路径，不接受任意文件路径"
+            "——技能文件不在会话工作区里，用 read_file / grep 找不到它们。"
         )
 
     @property
@@ -436,6 +458,9 @@ class LoadSkillTool(Tool):
                 "name": {"type": "string", "description": "技能名称（来自 <skills> 清单）"},
                 "path": {"type": "string",
                          "description": "可选：技能目录内附件的相对路径；缺省取正文"},
+                "offset": {"type": "integer",
+                           "description": "可选：起始行号（1 起始）；与 limit 一起分页续读"},
+                "limit": {"type": "integer", "description": "可选：读取行数；缺省整份"},
             },
             "required": ["name"],
         }
@@ -444,7 +469,8 @@ class LoadSkillTool(Tool):
     def read_only(self) -> bool:
         return True
 
-    async def execute(self, name: str, path: str | None = None) -> str:
+    async def execute(self, name: str, path: str | None = None,
+                      offset: int | None = None, limit: int | None = None) -> str:
         skill = await self._loader.get(name)
         if skill is None:
             return f"Error: 未找到技能 {name}"
@@ -452,7 +478,7 @@ class LoadSkillTool(Tool):
             return f"Error: 技能 {name} 不可用（{skill.unavailable_reason}）"
         rel = (path or "").strip().lstrip("/")
         if rel:
-            return await self._read_file(skill, rel)
+            return await self._read_file(skill, rel, offset=offset, limit=limit)
         if not skill.body:
             return f"技能 {name} 无正文内容。location={skill.location}"
         head = f"[skill:{name} location={skill.location}]"
@@ -460,11 +486,58 @@ class LoadSkillTool(Tool):
             listing = "\n".join(f"  - {f['relpath']}（{f.get('bytes', 0)} 字节）"
                                 for f in skill.files)
             head += "\n附件（用 load_skill(name, path=\"相对路径\") 读取）：\n" + listing
-        return f"{head}\n{skill.body}"
+        body, err = self._page(skill.body, offset, limit)
+        if err:
+            return err
+        if body is None:
+            return f"{head}\n{skill.body}{self._paging_note(name, skill.body)}"
+        # 分页那头**不重复整份附件清单**：它是几百字节到 1 KB 的目录，跟着每一页
+        # 发一遍就是按页数翻倍，而模型翻页时找的是正文。名字与位置留着——它得能对上
+        # 「这是刚才那份技能的正文切片」。
+        return f"[skill:{name} location={skill.location}]\n{body}"
 
-    async def _read_file(self, skill: Skill, rel: str) -> str:
+    @staticmethod
+    def _page(text: str, offset: int | None, limit: int | None) -> tuple[str | None, str]:
+        """按行切片 → ``(正文, 错误)``。没给 offset/limit 就是 ``(None, "")``，
+        调用方照原样给整份：**只在真的在分页时改变输出形状**，不传参数的老路径一字不动。
+
+        越界不夹取而是回一句人话错误（与 `read_file` 同一形状）：夹取会让模型以为
+        「后面没有了」，而它其实只是把行号写错了。
+        """
+        if not offset and not limit:
+            return None, ""
+        lines = text.splitlines()
+        start = max(1, int(offset or 1))
+        if start > len(lines):
+            return None, f"Error: offset {start} 超出末尾（全文共 {len(lines)} 行）"
+        end = len(lines) if not limit else min(len(lines), start + max(1, int(limit)) - 1)
+        chunk = "\n".join(lines[start - 1:end])
+        return f"{chunk}\n\n（第 {start}–{end} 行，共 {len(lines)} 行）", ""
+
+    @staticmethod
+    def _paging_note(name: str, text: str) -> str:
+        """整份给出时，太长的正文附一句「共几行、怎么续读」。
+
+        阈值取在闸的截断线（24 KB）**之下**：等回执说「中间被省掉」才告诉它怎么取，
+        模型已经先撞上那面墙了。行数写出来，它才知道该从第几行接着要。
+        """
+        if len(text.encode("utf-8")) <= _PAGING_NOTE_BYTES:
+            return ""
+        total = len(text.splitlines())
+        return (f"\n\n（这份正文共 {total} 行；太长读不完时用 "
+                f'load_skill(name="{name}", offset=行号, limit=行数) 按行续读，'
+                f"不要追问原文里没有的东西。）")
+
+    async def _read_file(self, skill: Skill, rel: str,
+                         *, offset: int | None = None, limit: int | None = None) -> str:
         if rel == "SKILL.md":
-            return f"[skill:{skill.name} location={skill.location}]\n{skill.body}"
+            body, err = self._page(skill.body, offset, limit)
+            if err:
+                return err
+            if body is not None:
+                return f"[skill:{skill.name} location={skill.location}]\n{body}"
+            return (f"[skill:{skill.name} location={skill.location}]\n{skill.body}"
+                    + self._paging_note(skill.name, skill.body))
         if not any(f["relpath"] == rel for f in skill.files):
             known = ", ".join(f["relpath"] for f in skill.files) or "（该技能无附件）"
             return f"Error: 技能 {skill.name} 无附件 {rel}；在案的附件：{known}"
@@ -473,11 +546,20 @@ class LoadSkillTool(Tool):
         except StorageUnavailable as exc:
             return f"Error: 读取附件 {rel} 失败：{exc}"
         try:
-            return f"[skill:{skill.name} file={rel}]\n{data.decode('utf-8')}"
+            text = data.decode("utf-8")
         except UnicodeDecodeError:
             url = await self._loader.attachment_url(skill, rel)
             return (f"[skill:{skill.name} file={rel}] 非文本附件（{len(data)} 字节），"
                     f"可直接访问的临时链接：{url}")
+        body, err = self._page(text, offset, limit)
+        if err:
+            return err
+        if body is not None:
+            return f"[skill:{skill.name} file={rel}]\n{body}"
+        # 附件这一路**不加**页脚：取附件是「把这份字节原样交给模型」，正文一字不改是
+        # 它唯一的契约（`test_code_forage` ⑥ 拿最大那份 demo 逐字节验的就是这条）。
+        # 缺的那半句由闸那边的回执补上——它已经知道这是 load_skill 的结果。
+        return f"[skill:{skill.name} file={rel}]\n{text}"
 
 
 def register_skill_tools(registry, loader: SkillLoader) -> None:
