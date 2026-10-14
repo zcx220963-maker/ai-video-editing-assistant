@@ -236,8 +236,10 @@ class PlanVocabulary:
         判据仍然只有 ``enum_source`` 一份：逐个算与整批算的结果逐字一致
         （``tests/test_plan_gate.py`` 的 ⑬ 把两边的键集对了一遍）。
 
-        ``keys`` 是校验器回喂用的键名清单，**只含 ``enum_source`` 真认得的键**（枚举 /
-        布尔 / 带界数值 / 曲库标签四类之一）；不额外算一遍，就是上面那批 ``knobs``。
+        ``keys`` 是这批开关的键名清单（**只含 ``enum_source`` 真认得的键**：枚举 /
+        布尔 / 带界数值 / 曲库标签四类之一），不额外算一遍，就是上面那批 ``knobs``。
+        校验器回喂走的是 ``knobs`` 那一支（``knobs.knob_hint``：键名连取值域一起给），
+        ``keys`` 留着给「只要键集」的消费者与用例。
         """
         knobs: list[dict[str, str]] = []
         props = self.props_for(node)

@@ -15,7 +15,8 @@ from typing import Any, Mapping, Sequence
 
 from .support import MCP_PREFIX, clean
 
-__all__ = ["bare_node", "knob_facts_for_round", "knob_lines", "plan_node_hits"]
+__all__ = ["bare_node", "knob_brief", "knob_facts_for_round", "knob_hint", "knob_lines",
+           "plan_node_hits"]
 
 # 节点名在自然语言里的形态：ASCII 标识符（`plan_motion` / `storyline_asr`）。
 # 只用来从用户原话里把节点名捞出来；捞不到的后果只是这一段不发（见 `plan_node_hits`）。
@@ -134,8 +135,41 @@ def knob_lines(facts: Sequence[Mapping[str, Any]]) -> list[str]:
     for fact in facts:
         parts = []
         for knob in fact["knobs"]:
-            tail = f"；默认 {knob['default']}" if knob["default"] else ""
             note = f"——{knob['note']}" if knob["note"] else ""
-            parts.append(f"{knob['key']}({knob['kind']}: {knob['values']}{tail}){note}")
+            parts.append(knob_brief(knob) + note)
         lines.append(f"· {fact['node']}：" + "｜".join(parts))
     return lines
+
+
+def knob_brief(knob: Mapping[str, Any]) -> str:
+    """单个开关的一行：``键名(类别: 取值域；默认 x)``。
+
+    提示段与校验器的打回消息共用它：模型的两次机会里，同一件事不能有两种写法
+    （提示段发过一遍的东西，打回时得能一眼对上）。
+    """
+    tail = f"；默认 {knob['default']}" if knob.get("default") else ""
+    return f"{knob['key']}({knob['kind']}: {knob['values']}{tail})"
+
+
+def knob_hint(fact: Mapping[str, Any], *, prefix: str = "这个节点") -> str:
+    """「…能上卡的开关是：…；」——打回消息里回喂给模型的那半句。
+
+    为什么必须回喂（T40）：开关清单从此只在本轮计划命中该节点时才进提示段，
+    冷启动那一轮模型看不到它。模型凭印象造了一个键名时，校验器只回一句
+    「没有这个参数」，它就只剩「换个名字再猜」这一条路。这里把真开关一次给全；
+    节点真的没有可上卡开关时如实说没有，不给一张空清单蒙它。
+
+    **取值域和键名一起给**（真机实测，14 镜「薄肌理论」那条 run）：第一枪是冷启动，
+    ``knob_facts_for_round`` 一条开关事实都不发，模型的第一次提交纯凭印象——它把
+    竖屏写成了一个叫 ``portrait`` 的**自造开关**。打回时只回喂了键名，于是第二枪它
+    写出了 ``aspect`` 这个真键、值却还是猜的（``16:9`` / ``9:16``，真值是
+    landscape / portrait / square），``voice`` 写成 female / male——**第二枪又是一整套
+    新错**。而 `max_retries=1` 只给两次机会，整条 run 就断在这里。键名与取值域本来
+    就同居一份 ``knob_facts_for``，一起给不多花一次取数。
+
+    ``prefix`` 是主语：校验器说「这个节点」，补依赖那处说的是缺的那个节点名。
+    """
+    knobs = list(fact.get("knobs") or ())
+    if not knobs:
+        return f"{prefix}没有能上卡的开关，"
+    return f"{prefix}能上卡的开关是：" + "｜".join(knob_brief(k) for k in knobs) + "；"

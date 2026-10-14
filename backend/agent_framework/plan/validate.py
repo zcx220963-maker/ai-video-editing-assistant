@@ -11,26 +11,12 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from .knobs import knob_hint
 from .support import (PLAN_MAX_CANDIDATES, PLAN_STEPS_MAX, PlanIssues,
                       add_implicit_skills, as_card_value, clean, coerce_plans,
                       num, topology_view)
 from .structure import StructureChecks
 from .vocab import PlanVocabulary
-
-
-def _knob_keys_hint(fact: Mapping[str, Any]) -> str:
-    """「这个节点能上卡的开关是：…」——打回消息里回喂给模型的那半句。
-
-    为什么必须回喂（T40）：开关清单从此只在本轮计划命中该节点时才进提示段，
-    冷启动那一轮模型看不到它。模型凭印象造了一个键名时，校验器只回一句
-    「没有这个参数」，它就只剩「换个名字再猜」这一条路——真机实测那条路烧掉的是
-    一整轮迭代预算。这里把真键名一次给全；节点真的没有可上卡开关时如实说没有，
-    不给一张空清单蒙它。
-    """
-    keys = [str(k) for k in fact.get("keys") or ()]
-    if not keys:
-        return "这个节点没有能上卡的开关，"
-    return "这个节点能上卡的开关是：" + "、".join(keys) + "；"
 
 
 class PlanValidator:
@@ -56,13 +42,37 @@ class PlanValidator:
             return [], issues
         allowed = self.vocab.whitelist()
         skills = await self._skill_map()
+        hints = await self._explicit_knob_hints()
         out: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         for index, plan in enumerate(raw, start=1):
-            norm = await self._validate_plan(plan, index, allowed, skills, issues, seen_ids)
+            norm = await self._validate_plan(plan, index, allowed, skills, issues,
+                                             seen_ids, hints)
             if norm is not None:
                 out.append(norm)
         return out, issues
+
+    async def _explicit_knob_hints(self) -> dict[str, str]:
+        """「缺的那个前置补进 steps 时，它自己能配什么开关」——按节点一句，缺什么给什么。
+
+        为什么要专门备一份（真机实测，14 镜「薄肌理论」那条 run）：打回消息让模型把
+        ``片段分组`` / ``片段筛选`` / ``脚本模板推荐`` 三个前置补进 steps，**却没说过
+        这三个节点能配什么**。模型补上步骤的同时给它们各造了一个开关（``grouping``
+        / ``keep`` / ``template``），第二枪的 21 条意见里 9 条是这一条引出来的——
+        **上一枪的忠告，直接生产了下一枪的错误**。而 `max_retries=1` 只给两次机会，
+        等于这一枪就没得改了。这里把这三个节点的真实开关随那句忠告一起给出去。
+
+        只在真有这类节点时才取数：``explicit_call_nodes`` 常在为空，那时一次都不问
+        （取开关事实要走一遍 ``enum_source``，曲库标签那一路是真去取标签的）。
+        """
+        out: dict[str, str] = {}
+        for node in sorted(self.vocab.explicit_call_nodes()):
+            fact = await self.vocab.knob_facts_for(node)
+            head = knob_hint(fact, prefix=f"「{node}」")
+            # 两种处境两种收尾：本来就没开关的，写上这一步就行；有开关的，只许用这些。
+            out[node] = head + ("写上这一步即可，不要为它配参数。" if not fact.get("knobs")
+                                else "只写这些，别的名字不要造。")
+        return out
 
     async def _skill_map(self) -> dict[str, Any]:
         """技能表。``__unreadable__`` 是哨兵：没接技能库与读不到同一种处境——
@@ -76,7 +86,8 @@ class PlanValidator:
 
     async def _validate_plan(self, plan: Mapping[str, Any], index: int,
                              allowed: set[str], skills: Mapping[str, Any],
-                             issues: PlanIssues, seen_ids: set[str]) -> dict[str, Any] | None:
+                             issues: PlanIssues, seen_ids: set[str],
+                             hints: Mapping[str, str]) -> dict[str, Any] | None:
         tag = clean(plan.get("plan_id")) or f"p{index}"
         # 本份计划之后出的每条意见都记上来源：三份候选的毛病往往一模一样，
         # 打回清单要按它把「同一件事在第几份上」合成一条（``PlanIssues.groups``）。
@@ -107,7 +118,7 @@ class PlanValidator:
         # 被推去问用户「这轮没有剪辑工具怎么办」（那一轮就是死路）。
         view = norm_steps if ok else topology_view(self.vocab.contract, steps)
         self.structure.topology(tag, view, issues)
-        self.structure.explicit_deps(tag, view, issues)
+        self.structure.explicit_deps(tag, view, issues, hints=hints)
         if ok:
             # 跳过规则要写回步骤字段（skippable / skip_reason），只在归一化过的步骤上跑。
             self.structure.skip_rules(tag, view, issues)
@@ -295,16 +306,16 @@ class PlanValidator:
         # 知道这一步要删/改哪几个，而不会以为「只错了一个」。真机实测（14 镜那一条 run）
         # 56 条意见里 12 条是造开关，乘 3 份候选 = 36 条，其中大半从没被列出来过。
         if unknown:
-            knob_hint = _knob_keys_hint(await self.vocab.knob_facts_for(norm["node"]))
+            knobs = knob_hint(await self.vocab.knob_facts_for(norm["node"]))
             if len(unknown) == 1:
                 issues.error(f"计划 {tag} 第 {index} 步（{norm['node']}）没有参数"
-                             f"「{unknown[0]}」，不许在卡上造这个开关；{knob_hint}"
+                             f"「{unknown[0]}」，不许在卡上造这个开关；{knobs}"
                              f"这类诉求请走「其他」。")
             else:
                 names = "".join(f"「{k}」" for k in unknown)
                 issues.error(f"计划 {tag} 第 {index} 步（{norm['node']}）没有参数{names}"
                              f"（这一步一共造了 {len(unknown)} 个不存在的开关）："
-                             f"不许在卡上造这些开关；{knob_hint}这类诉求请走「其他」。")
+                             f"不许在卡上造这些开关；{knobs}这类诉求请走「其他」。")
 
     @staticmethod
     def _switch_problems(bad: list[tuple[str, str]],

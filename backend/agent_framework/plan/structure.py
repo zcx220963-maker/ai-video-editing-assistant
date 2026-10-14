@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from .support import PlanIssues, clean
 from .vocab import PlanVocabulary
@@ -43,7 +43,8 @@ class StructureChecks:
                                  f"排在它的前置「{dep}」之前，与 DAG 契约冲突。")
 
     def explicit_deps(self, tag: str, steps: list[dict[str, Any]],
-                      issues: PlanIssues) -> None:
+                      issues: PlanIssues, *,
+                      hints: Mapping[str, str] | None = None) -> None:
         """卡上必须列出「不会自动补齐」的前置，否则执行轮跑到那一步必炸。
 
         执行期拦截器**只**自动补齐没标 ``require_explicit_call`` 的依赖；标了的那几个
@@ -61,6 +62,13 @@ class StructureChecks:
         查的是**传递闭包**，而且要**穿过没上卡的中间节点**：真机三张卡都是
         ``select_BGM → generate_script → script_template_rec``（最后一个不可补齐），
         中间那个自己不是，但它踩着一个是的。
+
+        ``hints`` 是「缺的那个节点本身能配什么开关」（``PlanValidator._explicit_knob_hints``）。
+        为什么要随这句忠告一起给（真机实测，14 镜「薄肌理论」那条 run）：光说「把它也写进
+        steps」，模型补上步骤时会顺手给这个从没用过的节点**造**开关——三个前置各造一个
+        （``grouping`` / ``keep`` / ``template``），下一枪的 21 条意见里 9 条是这么来的。
+        **上一枪的忠告生产了下一枪的错误**，而 `max_retries=1` 只给两次机会。
+        拿不到事实（没接词表 / 契约没接上）时这一段自动省略，退回原措辞。
         """
         explicit = self.vocab.explicit_call_nodes()
         if not explicit:
@@ -83,7 +91,8 @@ class StructureChecks:
                     issues.error(
                         f"计划 {tag} 的步骤「{step['node']}」依赖「{dep}」，"
                         f"但 {dep} 不会自动补齐（它需要你传入创意决策参数）。"
-                        f"请把 {dep} 也写进这张计划的 steps，排在 {step['node']} 之前。")
+                        f"请把 {dep} 也写进这张计划的 steps，排在 {step['node']} 之前。"
+                        f"{(hints or {}).get(dep, '')}")
                 # 没上卡的中间节点**也要继续顺着它的前置查**：原先这里 `continue`
                 # 直接掐断，于是上面那种写法一路放行，卡面看着齐全，用户点完确认
                 # 跑到 select_BGM 才被执行期拦下。执行期的
