@@ -70,6 +70,21 @@ _MAX_SAME_RESULT_REPEATS = 2   # 同参同结果最多真跑 2 次，第 3 次�
 _MAX_SAME_ARGS_ATTEMPTS = 5    # 同参（结果在变，可能有进展）最多真跑 5 次
 _MAX_REFUSALS_BEFORE_FAILURE = 2   # 同样的事实告过两次还照打 → 改记真失败，让老守卫接手
 
+# ---- 读卡上限（家族级熔断）----
+#
+# 上面两条判据都按**参数**计数，于是真机 2026-10-14 那两次失败一次都没被拦下：
+# 模型是一份一份地读**不同的** shot 卡——每份参数都是新的、每次调用都成功，
+# 逐字相同那两条闸永远攒不满。实测 run `a3d8ff08098a` / `10292c4bf616` 各 40 轮
+# 撞上 ``max_iterations`` failed，后者 158 次工具调用里 **144 次是 load_skill**、
+# 读了 45 张不同的卡，**一次都没调用 submit_plan**，零张计划卡。
+#
+# 而这个上限不是新纪律，是 SKILL.md:65 早就写死、只是没人执行的那一条：
+# 「**不要读超过 15 张卡。** 124 张卡不需要全看，INDEX.md 的一句话描述足够选卡。」
+# 索引够用这句禁令才成立——2026-10-14 上半场索引是空的（§9-Q140），禁令就只剩
+# 「凭卡名猜」，模型只能逐张打开；下半场索引修好了，模型**照样**逐张打开。
+# 所以这条闸不能只靠「把索引修好」的道德劝说，要在执行层拦住。
+_MAX_SHOT_CARDS = 15
+
 
 def _digest(obj: Any) -> str:
     """按 JSON 字节算的稳定摘要。
@@ -86,6 +101,35 @@ def _digest(obj: Any) -> str:
 
 def _repeat_key(name: str, arguments: Any) -> str:
     return f"{name}\x00{_digest(arguments if arguments is not None else {})}"
+
+
+#: 一张 shot 卡：`shots/<类别>/<卡名>.md`。
+_SHOT_CARD_RE = re.compile(r"^shots/[^/]+/[^/]+\.md$")
+
+
+def _shot_card_path(name: str, arguments: Any) -> str:
+    """这一枪读的是不是某张 shot 卡；是就返回归一化后的路径，否则空串。
+
+    **只认 `load_skill` + `path=shots/<类别>/<卡>.md` 这一种形状，索引不在其中。**
+    `shots/INDEX.md` 恰恰是「一次调用顶掉全部读卡」的那一份：把它也限进上限，
+    等于把模型唯一的选卡依据也拿走——2026-10-14 上半场正是因为索引是空的才逼出
+    逐张读卡（§9-Q140），这道闸要是顺手把索引也拦掉，就是把那个坑再挖一遍。
+
+    归一化只做两件必要的事：去掉首尾空白与 `./` 前缀，好让 `./shots/a/b.md`
+    与 `shots/a/b.md` 算同一张卡（否则换个写法就绕开了计数）。
+    """
+    if name != "load_skill":
+        return ""
+    args = arguments
+    if not isinstance(args, dict):
+        try:
+            args = json.loads(args or "{}")
+        except (TypeError, ValueError):
+            return ""
+    path = str((args or {}).get("path") or "").strip()
+    while path.startswith("./"):
+        path = path[2:]
+    return path if _SHOT_CARD_RE.match(path) else ""
 
 
 # 单次工具调用硬超时（秒）：MCP tool_timeout=600s 在此之前先触发并给出更具体的错误；
@@ -1537,6 +1581,9 @@ class AgentOnceRun:
         # 本 run 的重复调用账：key → {n, same, last, refused}。
         # n=同参数真跑次数，same=连续逐字相同结果的次数，last=上次结果的字节摘要。
         repeats: dict[str, dict[str, Any]] = ctx.extras.setdefault("_repeat_tracker", {})
+        # 本 run 读过哪些 shot 卡（路径集合）与告过几次。上限见 `_MAX_SHOT_CARDS`：
+        # 按**卡**计数，不按参数——这正是参数级那两条闸看不见的那一维。
+        cards_read: set[str] = ctx.extras.setdefault("_shot_cards_read", set())
 
         # 结构性并批：把**同层就绪、互不依赖**的兄弟节点自动补进本批。
         #
@@ -1598,6 +1645,36 @@ class AgentOnceRun:
                     counts_as_failure=harsh)
             return None
 
+        def _shot_card_gate(tc: ToolCall) -> ToolError | None:
+            """读卡上限：放行时**当场把这张卡记进账**，超了就不执行。
+
+            记账放在放行这一刻、而不是跑完之后：一次回复里的几枪是并发打的
+            （实测一轮 4–5 枪），「先查后记」会让同批里每一张都以为自己是第 15 张，
+            一轮就把上限撑破。这一小段没有 await，不会交错。
+
+            告话按 `_MAX_REFUSALS_BEFORE_FAILURE` 升级成真失败，让
+            `_MAX_CONSECUTIVE_FAILURES` 那道老闸接手把 `load_skill` 停掉——
+            否则模型可以一直刷便宜回执，40 轮照样烧完（只是不再烧 3.4M token）。
+            """
+            card = _shot_card_path(tc.name, tc.arguments)
+            if not card:
+                return None                        # 不是卡（索引/技能正文/别的工具）
+            if card in cards_read:
+                return None                        # 重读同一张：归参数级那两条闸管
+            if len(cards_read) < _MAX_SHOT_CARDS:
+                cards_read.add(card)
+                return None
+            n = ctx.extras["_shot_card_refusals"] = ctx.extras.get("_shot_card_refusals", 0) + 1
+            return ToolError(
+                tc.name,
+                f"Error: 这一轮已经读过 {len(cards_read)} 张 shot 卡，到上限了"
+                f"（SKILL.md:65：「不要读超过 {_MAX_SHOT_CARDS} 张卡」），"
+                f"`{card}` 这次不执行。索引 `shots/INDEX.md` 每行都带着卡名、能量、"
+                f"一句话描述、时长、适用与 demo 字节——**选卡看那一份就够**，"
+                f"不必逐张打开卡全文。现在就交计划（规划轮调用 submit_plan）："
+                f"把选中的卡名照抄进行首的 `<类别>/<卡名>` 填进 `card`。",
+                counts_as_failure=n > _MAX_REFUSALS_BEFORE_FAILURE)
+
         def _note_repeat(tc: ToolCall, result: Any) -> None:
             """跑完记账：结果字节和上次一样就把「无进展」连续数加一，不一样就归一。
 
@@ -1629,7 +1706,9 @@ class AgentOnceRun:
                 await self.hooks.after_tool_call(
                     ctx, tc.name, tc.arguments, None, 0.0, error=r, call_id=tc.id)
                 return r
-            blocked = _blocked_repeat(tc)
+            # 先过家族级的读卡上限，再过参数级那两条：一次规划轮里读 45 张**不同的**
+            # 卡时，参数级判据一次都不会响（每份参数都是新的），必须由这一层拦。
+            blocked = _shot_card_gate(tc) or _blocked_repeat(tc)
             if blocked is not None:
                 # 熔断不是「工具坏了」：默认 counts_as_failure=False，别把「换个思路再来」
                 # 再压一层失败计数（第二次起才升级，见 _blocked_repeat）。
