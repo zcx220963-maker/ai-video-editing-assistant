@@ -14,6 +14,7 @@ import re
 from typing import Any
 
 from .messages import Message
+from .prompts import read_prompts_file
 
 _PREVIEW_LEN = 160
 _MAX_STEPS = 40
@@ -261,20 +262,8 @@ def _fallback_body(steps: list[dict[str, Any]], user_request: str) -> str:
     )
 
 
-_POLISH_SYSTEM = (
-    "你是一名资深 Agent 工程师兼流程整理专家。把一次真实执行的工具调用流水，"
-    "提炼为一篇**可复用**的 WORKFLOW SKILL.md（中文）。只输出 markdown 正文，"
-    "不要 frontmatter、不要代码围栏。\n"
-    "泛化是第一原则：素材 ID、片段 ID、ASR 段 id、具体时长/比例/曲目等"
-    "会话特定值，在流程正文里一律改写成「按用户当次诉求确定」的推导说明"
-    "（如 material_ids=用户素材列表；比例/时长=用户要求；BGM=用户指定曲目）；"
-    "工具结果里的 JSON 一律不要引用。流程正文讲**意图与顺序**"
-    "（每步先说什么目的，再列需要用户诉求决定的参数），不要发明流水里没有的工具，"
-    "步骤顺序即流水顺序。\n"
-    "结构：# 角色定义 (Role)、# 何时使用 (When)、# 执行流程 (Workflow)"
-    "（逐步，可跳过的步骤标注「可跳过」）、# 参数如何随诉求变化、"
-    "# 本次执行参数示例（仅参考，放流水里的具体值）、# 约束条件 (Constraints)。"
-)
+# 润色用的 system 提示：文案在 prompts/polish_system.md（2026-10-14 从本文件搬出）。
+_POLISH_SYSTEM = read_prompts_file("polish_system.md")
 
 
 async def draft_body(steps: list[dict[str, Any]], user_request: str, *,

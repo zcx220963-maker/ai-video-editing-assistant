@@ -53,8 +53,9 @@ from agent_framework.broadcast import OUTBOUND_CHANNEL
 from agent_framework.checkpoint import CheckpointManager
 from agent_framework.compress import ContextCompressor, make_llm_summarizer
 from agent_framework.context import ContextBuilder
-from agent_framework.prompts import build_prompt_library
+from agent_framework.prompts import build_prompt_library, validate_manifest
 from agent_framework.agent import _refresh_prompt_texts as refresh_prompt_texts
+from agent_framework.ask_gate import refresh_prompt_texts as refresh_ask_gate_texts
 from agent_framework.ask_user import AskUserTool
 from agent_framework.consumer import CHAT_TOPIC, session_key
 from agent_framework.heartbeat import Heartbeat
@@ -83,7 +84,11 @@ from agent_framework.skill import (
     register_skill_tools,
 )
 from agent_framework.subagent import make_spawn_tool, refresh_subagent_prompt
-from agent_framework.team_tools import Team, register_team_tools
+from agent_framework.team_tools import (
+    Team,
+    refresh_team_subagent_prompt,
+    register_team_tools,
+)
 from agent_framework.tool import ToolRegistry
 from agent_framework.tools.cron import CronScheduler, register_cron_tools
 from agent_framework.tools.file import register_file_tools, session_workspace_root
@@ -313,10 +318,26 @@ def build_runtime(
     # 在构造时就固化进 SubAgentRunner，PlanGate 也要拿这份引用——晚一步就变成
     # 「磁盘上有一份、跑的永远是内联那份」。
     prompt_library = build_prompt_library(False if prompts_dir is False else prompts_dir)
-    # 让 agent.py 里的纠错提示也换成磁盘版本（内联那几段是回落值）
+    # 清单自检（动态选择层）：清单登记的每一份都要在、非空、不超 max_bytes，
+    # 且盘上不许有清单外的 .md。这里**故意让服务起不来**——提示词随代码分发，
+    # 「清单说了、盘上没有」是部署坏了；旧行为（静默少发一段）在真机上表现为
+    # 模型忽然收不到某条纠错说明，只查得到「它没照做」，查不到「那段根本没发」。
+    # prompts_dir=False（显式关掉磁盘）时不校验：那时本来就不读盘。
+    if prompt_library.dir is not None:
+        _prompt_problems = validate_manifest(prompt_library.dir)
+        if _prompt_problems:
+            raise RuntimeError(
+                "提示词清单自检未通过（prompts/manifest.json 与磁盘对不上）：\n  - "
+                + "\n  - ".join(_prompt_problems))
+    # 让 agent.py 里的纠错提示也换成磁盘版本（五段 *_TEXT 已在 import 时读盘，这里换的是热替换目录那份）
     refresh_prompt_texts(prompt_library)
-    # 子 Agent 的 system 提示词同理（CHILD_SYSTEM_PROMPT 那份内联是回落值）
+    # 打回文案（ask_gate：弹窗 nudge / 计划卡 nudge / 无弹窗说明）同样换成库里的
+    refresh_ask_gate_texts(prompt_library)
+    # 子 Agent 的 system 提示词同理（CHILD_SYSTEM_PROMPT 在 import 时已读盘）
     refresh_subagent_prompt(prompt_library)
+    # 常驻子 Agent（Agent Team）的那份也是；它在 start_subagent 里当场取全局，
+    # 所以在这里刷一次就覆盖了后续所有创建
+    refresh_team_subagent_prompt(prompt_library)
 
     mq = build_message_queue(mq_backend, bootstrap_servers=bootstrap_servers)
     if storage is None:

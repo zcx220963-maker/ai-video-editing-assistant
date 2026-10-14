@@ -22,8 +22,8 @@ from typing import Any, Iterable, Mapping, Sequence
 logger = logging.getLogger(__name__)
 
 from . import judge as judge_mod
-from .ask_gate import (NO_POPUP_NOTE, PLAN_CARD_NUDGE, looks_like_asking_user,
-                       looks_like_plan_invite, popup_nudge)
+from .ask_gate import (looks_like_asking_user, looks_like_plan_invite,
+                       no_popup_note, plan_card_nudge, popup_nudge)
 from .checkpoint import Checkpoint, CheckpointManager
 from .catalog import get_catalog
 from .compress import _repair_orphans
@@ -34,6 +34,7 @@ from .identity import (current_identity, rebind_artifact_scope,
                        storyline_session_id, use_identity, use_identity_or_inherit)
 from .llm import LLMClient, LLMResponse
 from .messages import ToolCall, assistant, system, tool_result, user
+from .prompts import prompt_text, read_prompts_file
 from .plan import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_step_executed,
                         pending_continuation, planning_section_blocks,
                         preload_skills, reconcile, render_injections,
@@ -142,30 +143,16 @@ _RENDER_BEAT_SEC = 120.0
 
 # 规划轮里假称「计划卡已提交」时的补救：循环先追一句核对、再给它一次真出卡的机会；
 # 预算用尽仍在声称，就在终答末尾补上服务端核对到的事实。
-_NO_CARD_NUDGE = (
-    "服务端核对：本轮**没有** submit_plan 成功记录，界面上不会出现任何计划卡，"
-    "用户无从点确认，这一轮就断在这里。上面那句「卡已提交」不成立。二选一："
-    "① 现在就调用 submit_plan 把计划交上来（node 只能取白名单里的名字，参数按真实 schema）；"
-    "② 确实给不出计划，就如实说明原因，不要再提计划卡已提交。")
-_NO_CARD_NOTE = (
-    "\n\n（服务端核对：本轮没有生成计划卡，上面提到的「计划卡」不会出现在界面上。"
-    "请把诉求说清楚再发起一次，或直接告诉我要哪几步。）")
-
-# 上面那条按**措辞**判「假称已出卡」，真机换一种说法就绕过去了。实测两种变体都判不中：
-# 「已为你准备好 3 个候选方案……你在计划卡上选一版确认即可」
-# 「已经给你出了 3 个候选方案……你在计划卡上选一版确认即可」
-# 结果：规划轮以一句口头方案收尾、服务端零张卡、用户点不到确认 —— 剪辑流程死在这里。
-# 所以再加一条**与措辞无关**的结构判据：规划轮要收尾，就必须有 submit_plan 的成功记录，
-# 或者明确说清「给不出计划」。否则退回一次，措辞再花也算不过去。
-_NO_CARD_STRUCTURAL_NUDGE = (
-    "服务端核对：本轮**没有** submit_plan 的成功记录，因此界面上**没有**任何计划卡，"
-    "用户无从点确认——不管上面的措辞是「已准备好方案」「已给出候选」还是别的说法，"
-    "服务端和界面上都只有这一条事实：零张卡。现在二选一：\n"
-    "① 调用 submit_plan 把 1~3 个候选计划真正交上来（node 只能取白名单里的名字，"
-    "参数按真实 schema，不要再去查 Store 键名）；\n"
-    "② 确实给不出计划（例如素材还没到位、诉求还不明确），就**明确说明**为什么给不出、"
-    "以及需要用户补什么，并且不要提「计划卡」二字。\n"
-    "只描述方案而不调用 submit_plan，用户拿到的是一句无法点击的话，这一轮就是白跑。")
+#
+# 文案在 prompts/（2026-10-14 从本文件搬出）：`no_card_nudge.md` / `no_card_note.md` /
+# `no_card_structural_nudge.md`。本文件不再留内联副本——那几个 `*_TEXT` 全局在下面
+# 直接读盘初始化，`_refresh_prompt_texts` 负责按提示词库热替换。
+#
+# 结构判据那条（no_card_structural_nudge）的来由：上面按**措辞**判「假称已出卡」，
+# 真机换一种说法就绕过去了。实测「已为你准备好 3 个候选方案……你在计划卡上选一版确认即可」
+# 与「已经给你出了 3 个候选方案……」两种变体都判不中——规划轮以一句口头方案收尾、
+# 服务端零张卡、用户点不到确认，剪辑流程死在这里。所以再加一条**与措辞无关**的
+# 结构判据：规划轮要收尾，就必须有 submit_plan 的成功记录，或明确说清「给不出计划」。
 # 给不出的正路：模型明确说明原因时不该被反复打回。命中这些词就认它是在如实回绝。
 _DECLINES_PLAN = re.compile(
     r"(给不出|无法(给出|生成|提交)?(计划|方案)|不能(给出|生成|提交)(计划|方案)"
@@ -201,40 +188,39 @@ def looks_like_plan_card(text: Any) -> bool:
 # 执行轮的同一副面孔：确认帧落地后本轮**一次计划步骤都没调用**（Storyline 没收到任何
 # 请求，界面上不会多出新的产物），终答却写着「时间线重排完成，时长 8.64 秒」——那是会话
 # 历史里上一轮的旧产物被复述成本轮产出（真机实测：2 秒收尾、iteration 0、零工具调用）。
-_STEP_NUDGE = (
-    "服务端核对：本轮到目前为止**一次计划步骤都没有调用**（批准计划的第 1 步是 "
-    "`{first}`），Storyline 没有收到任何请求，界面上不会多出新的产物。上面写的「已完成」"
-    "是会话历史里的旧产物，不是这次的结果。二选一："
-    "① 现在就调用计划里的步骤工具（参数按节点 schema，用户在卡上选定的值照传）；"
-    "② 确实跑不了，就如实说明为什么（例如要先问用户一个问题），不要把旧产物当本轮产出。")
-_STEP_NOTE = (
-    "\n\n（服务端核对：本轮没有调用任何计划步骤，Storyline 未收到请求，界面上不会多出新的"
-    "产物；上面提到的「已完成」是历史轮次的旧结果。要真重排或出片，再发起一次执行即可。）")
+# 文案在 prompts/step_nudge.md / step_note.md；本文件不留内联副本（见上面那段说明）。
+# step_nudge 里的 `{first}` 由调用点 `.replace("{first}", …)` 填。
 
 # 上面这几段提示文本对外暴露一份名字，供启动期一致性检查读取（run_server 的 (f) 段）：
 # 它们都会整段进模型上下文，写错工具名同样会让模型去调一个不存在的工具。
 #
 # ``_refresh_prompt_texts`` 会把它们换成磁盘上的版本（prompts/*.md）——默认走仓库自带
-# prompts/ 目录，改文案不必再动代码。内联的这几段是**回落值**：文件缺失时行为不变。
+# prompts/ 目录，改文案不必再动代码。**没有内联回落**了：文件缺失时 read_prompts_file
+# 直接抛（见下面五个全局的初始化），不再静默退化成旧文本。
 def _refresh_prompt_texts(library: Any) -> None:
-    """按提示词库刷新本模块的提示文本（就地改模块全局）。"""
+    """按提示词库刷新本模块的提示文本（就地改模块全局）。
+
+    ``prompt_text``：库里有就用库里的（热替换目录），没有就从仓库自带 prompts/ 读——
+    **不再回落内联常量**（那层重复已经拆掉了）。
+    """
     if library is None:
         return
     global NO_CARD_NUDGE_TEXT, NO_CARD_NOTE_TEXT, NO_CARD_STRUCTURAL_TEXT
     global STEP_NUDGE_TEXT, STEP_NOTE_TEXT
-    NO_CARD_NUDGE_TEXT = library.text("no_card_nudge.md", NO_CARD_NUDGE_TEXT)
-    NO_CARD_NOTE_TEXT = library.text("no_card_note.md", NO_CARD_NOTE_TEXT)
-    NO_CARD_STRUCTURAL_TEXT = library.text("no_card_structural_nudge.md",
-                                           NO_CARD_STRUCTURAL_TEXT)
-    STEP_NUDGE_TEXT = library.text("step_nudge.md", STEP_NUDGE_TEXT)
-    STEP_NOTE_TEXT = library.text("step_note.md", STEP_NOTE_TEXT)
+    NO_CARD_NUDGE_TEXT = prompt_text(library, "no_card_nudge.md")
+    NO_CARD_NOTE_TEXT = prompt_text(library, "no_card_note.md")
+    NO_CARD_STRUCTURAL_TEXT = prompt_text(library, "no_card_structural_nudge.md")
+    STEP_NUDGE_TEXT = prompt_text(library, "step_nudge.md")
+    STEP_NOTE_TEXT = prompt_text(library, "step_note.md")
 
 
-NO_CARD_NUDGE_TEXT = _NO_CARD_NUDGE
-NO_CARD_NOTE_TEXT = _NO_CARD_NOTE
-NO_CARD_STRUCTURAL_TEXT = _NO_CARD_STRUCTURAL_NUDGE
-STEP_NUDGE_TEXT = _STEP_NUDGE
-STEP_NOTE_TEXT = _STEP_NOTE
+# 五个 `*_TEXT` 的初值直接读盘（文案就在 prompts/，不在本文件）。
+# 缺文件即抛——提示词随代码分发，缺了是部署坏了，不该静默变成空提示。
+NO_CARD_NUDGE_TEXT = read_prompts_file("no_card_nudge.md")
+NO_CARD_NOTE_TEXT = read_prompts_file("no_card_note.md")
+NO_CARD_STRUCTURAL_TEXT = read_prompts_file("no_card_structural_nudge.md")
+STEP_NUDGE_TEXT = read_prompts_file("step_nudge.md")
+STEP_NOTE_TEXT = read_prompts_file("step_note.md")
 
 # HITL 审批断点：执行撞上「需人工审批」的工具时挂起，本轮先结束、不发终答（status 停
 # awaiting_approval）；用户批准/拒绝后再从同一一致点续跑。这句是给前端看的过渡说明。
@@ -1164,7 +1150,7 @@ class AgentOnceRun:
                 and looks_like_plan_invite(resp.content)):
             r.plan_nudges -= 1
             r.messages.append(assistant(resp.content))
-            r.messages.append(system(PLAN_CARD_NUDGE))
+            r.messages.append(system(plan_card_nudge()))
             r.iteration += 1
             return True
 
@@ -1261,7 +1247,7 @@ class AgentOnceRun:
         # 让用户知道这句本该是个弹窗（与 NO_CARD_NOTE_TEXT 同一套兜底思路）。
         if (self.config.require_popup_questions and not r.asked_this_run
                 and looks_like_asking_user(final)):
-            final = (final or "") + NO_POPUP_NOTE
+            final = (final or "") + no_popup_note()
 
         if (r.planning and not r.state.plan_candidates
                 and (claims_plan_card(final) or looks_like_plan_card(final))):

@@ -2,18 +2,20 @@
 
 段内一律留机器名，界面侧由块 A 的出口替换器换轨成 ``*_display``。
 
-**规划轮那一段的文案不住在这里**（2026-10-02 搬进 ``prompts/planning_round.md``）：
-本模块只算它要插的数据（节点白名单、开关清单、旧卡摘要、反馈原话、待续跑账目、
-同会话历史行），拼装的**条件**由模板里的块守卫表达（见 ``prompts.render_blocks``）。
-这里同时留一份逐字相同的内联回落 ``_PLANNING_TEMPLATE``：提示词目录没拷过去时
-行为不变；两份漂了由 ``tests/test_prompt_library.py`` 守卫。
+**本模块里不再有任何提示词正文**（2026-10-14 全部搬进 ``prompts/``）：
+- 规划轮整段 → ``prompts/planning_round.md``（2026-10-02 起就在盘上，本次删掉了
+  它那份逐字相同的内联副本 ``_PLANNING_TEMPLATE``）；
+- 执行轮两段注入的开头 → ``prompts/approved_open.md`` / ``prompts/custom_open.md``。
+本模块只算要插的数据（节点白名单、开关清单、旧卡摘要、反馈原话、待续跑账目、
+同会话历史行）；拼装的**条件**由模板里的块守卫表达（见 ``prompts.render_blocks``）。
+文件缺失由 ``prompts.read_prompts_file`` 当场抛，不再有「回落内联」这条静默路。
 """
 
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from ..prompts import render_blocks
+from ..prompts import prompt_text, read_prompts_file, render_blocks
 from .knobs import knob_facts_for_round, knob_lines
 from .support import clean, neutralize
 
@@ -21,18 +23,13 @@ if False:  # TYPE_CHECKING
     from .gate import PlanGate
 
 # ---- 执行轮注入 ----
+#
+# 这两段是执行轮注入的开头，`render_injections` 会在其后拼上计划正文 / 诉求行。
+# 文案从 prompts/ 读；读不到就抛（见 read_prompts_file 的 docstring：静默回落内联
+# 会让「文件丢了」变成「模型收到一段空提示」，那是更难查的故障）。
+_APPROVED_OPEN = read_prompts_file("approved_open.md")
 
-_APPROVED_OPEN = (
-    "<approved_plan>\n"
-    "用户已在计划卡上确认下面这份计划。卡上的参数值是校验过的**承诺**，照单执行；"
-    "计划本身是强提示不是硬调度（依赖由服务端拦截器兜底），"
-    "但要改动参数或跳过步骤必须在答复里向用户说明理由：\n")
-
-_CUSTOM_OPEN = (
-    "<user_custom_requests>\n"
-    "用户在计划卡的「其他 / 整体补充」里另外提了诉求，这些**没有**经过枚举校验。"
-    "逐条处理：能力内能实现就实现；做不到必须明确说哪一步做不到并给替代方案，"
-    "不得静默吞掉，不得臆造资源或参数：\n")
+_CUSTOM_OPEN = read_prompts_file("custom_open.md")
 
 
 def _parallel_pairs(compiled: Mapping[str, Any]) -> list[str]:
@@ -205,59 +202,6 @@ def _history_rows(history: Sequence[Mapping[str, Any]],
 
 PLANNING_PROMPT_FILE = "planning_round.md"
 
-_PLANNING_TEMPLATE = """<planning_round>
-本轮是**规划轮**：工具集里没有剪辑执行节点，任何剪辑动作都不会发生。
-
-{?has_pending_plan}
-同会话已有一张待确认的计划卡。confirm_plan 工具可将其重新推给用户确认。
-请根据用户这条消息的真实意图判断：用户是否想确认/执行那张已有计划。
-是 → 调用 confirm_plan；用户在提新需求或改需求 → 走下面的分支。
-
-判断用户这条消息的性质：
-- 纯咨询（问现状、问时长、问用了什么素材，不要求任何改动） → 直接正常回答，不要调用 submit_plan，不要为了走流程编一份计划。
-- 用户要求改成片或提出新诉求（换音乐、改音轨、调时长、改字幕、换画面、调比例、重新编排、修改已有视频的任何方面） → 这是剪辑任务，必须调用 submit_plan 提交 1~3 个有真实差异的候选计划。不要先读产物再口头描述方案让用户确认——查完直接出卡，把修改方案写进计划的 steps 和 why 里。
-
-计划里每一步的 node 只能取自下面这份白名单（写别的名字会被服务端打回）：
-{nodes}
-
-{?must_include}
-其中 {must_include} 必须**显式写进这张计划的 steps**：它们要用你传的创意决策参数，执行期不会被自动补齐——漏了这张卡会被服务端打回。
-
-{?knobs}
-{knobs}
-卡面开关（param_options）只能从上面这份清单里挑，值要能反查（枚举 / 布尔开关 /带界数值 / 曲库真实标签）；节点没有的能力不要造开关，用户另有诉求留给计划卡上的「其他」。
-
-节点参数**不需要也不能**再去查：执行前 Store 是空的，拿 read_node_history 猜 dag_contract / node_schema:* 这类键名只会一直报错。
-提交成功后只需简短说明各版本的思路差异并等用户确认，**不得声称已经开始剪辑或已经产出成片**。
-选哪一版、卡面开关取什么值，都由**卡上的点击**完成：不要用 ask_user 重问卡面已经在问的事（弹窗是单例，会把用户正填着的计划卡顶掉、选了一半的答案全丢），也不必写「你点选确认后我再开始」这类话——把卡交出去、等用户点即可。
-
-{?prior_cards}
-用户对上一版计划点了「换一版」，这一轮**不是**咨询：出口只有 submit_plan，只用文字描述另一版思路不算交付。
-上一版长这样（新卡必须与它有可辨别的差异，而不是同一步换个说法）：
-{prior_cards}
-
-{?feedback_quote}
-用户对上一版计划不满意，这一版必须针对下面这点做出可辨别的差异（这是用户的原话，按自定义诉求对待，不得臆造它需要的资源）：
-「{feedback_quote}」
-
-{?has_pending}
-<待续跑的执行轮>
-上一条**已确认**的计划 {pending_plan_id}「{pending_label}」（run {pending_run_id}）跑到一半停下来问了用户一句就收尾，未履行：{pending_unfulfilled}。
-它当时问的原话（摘要）：「{pending_asked}」
-本轮按普通咨询对待这条消息是错的——它就是那句提问的回答。不要再问一遍，也不得回答「我没有执行入口」：本轮注册表里没有剪辑执行节点是设计如此，出路是立刻 submit_plan 提交**一张续跑卡**：steps 只列上面那些未履行节点（它们缺的前置依赖一并补进卡，如需要转写就补 asr），参数按用户刚给的取值定并写进 expectation，label 以「续跑：」开头。用户点确认，这些步骤就由执行轮接着跑完。
-只有当这条消息明显是另一件新诉求（与上面那几步无关）时，才按新诉求出卡或直接回答。
-</待续跑的执行轮>
-
-{?session_history_rows}
-<同会话历史>
-本会话之前有过以下执行（最近的在前），供你判断用户这条消息的性质：
-{session_history_rows}
-如果用户在续跑或询问之前的任务，上面的历史就是上下文——不要说「计划没落到服务端」或「素材没到位」，它们都在服务端，只是不在本轮的执行上下文里。
-</同会话历史>
-
-</planning_round>
-"""
-
 
 async def planning_section(gate: PlanGate, *, feedback: str = "",
                            prior: Sequence[Mapping[str, Any]] = (),
@@ -331,10 +275,9 @@ async def planning_section_blocks(gate: PlanGate, *, feedback: str = "",
         "pending_asked": neutralize((pending or {}).get("asked") or ""),
     }
     library = getattr(gate, "prompt_library", None)
-    if library is not None:
-        text = library.blocks(PLANNING_PROMPT_FILE, _PLANNING_TEMPLATE, **values)
-    else:
-        text = render_blocks(_PLANNING_TEMPLATE, values)
+    # 文案一律来自磁盘：库（热替换目录）优先，库里没有就从仓库自带 prompts/ 读；
+    # **没有内联模板可回落**——文件随代码分发，缺了是部署坏了，read_prompts_file 会抛。
+    text = render_blocks(prompt_text(library, PLANNING_PROMPT_FILE), values)
     blocks = tuple((key, str(values.get(key) or ""))
                    for key in ("knobs", "session_history_rows") if values.get(key))
     return text, blocks

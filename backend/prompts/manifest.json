@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "note": [
+    "提示词的**唯一声明点**：每一份 prompts/*.md 在这里登记「它属于哪一相、什么时候发、谁在读它、能长多大」。",
+    "为什么要有它：此前「哪一份提示词在哪个环节生效」散在 8 个 .py 的调用点里（library.text(\"xxx.md\", 内联兜底)），",
+    "没有人能一眼答出「这个进程总共会发哪几段提示词、每段多大」。搬进磁盘解决了「文案在代码里」，",
+    "但没有解决「谁在什么时候发」——这张表补的就是后者：它是提示词层的账面（§5.4 那张字节账的提示词侧）。",
+    "phase = 哪一相会用到它：always（每次装配都发）/ planning（规划轮）/ editing（执行轮与副链）/ subagent（派生出来的子 Agent）/",
+    "        guard（收尾守卫打回时才发的纠错说明）/ skill_flow（沉淀技能时）/ script（文案节点）。",
+    "kind = 进入上下文的方式：always（无条件常发）/ conditional（有守卫条件才发）/ on_demand（由某一步现取）。",
+    "referenced_by = 读它的工具名或装配位；空数组表示「还没有任何东西在读它」——那是一条该被追问的账。",
+    "fixed = true 的只有 system_prompt 一处：它是「最基础的固定」，其余全部按相动态加载。",
+    "max_bytes = 这份文件的字节上限（现值 × 1.15）。它拦的是「往一条纠错说明里粘贴一整篇教程」——",
+    "            不是 §5.4 那张表（那拦的是**装配后**的段字节，两把尺量的不是一回事）。",
+    "校验入口：agent_framework.prompts.validate_manifest()，在 run_server 启动期跑；缺文件 / 空文件 / 超上限都当场让服务起不来。"
+  ],
+  "prompts": {
+    "system_prompt": {
+      "file": "system_prompt.md", "phase": "always", "kind": "always",
+      "referenced_by": ["assembly"], "fixed": true, "max_bytes": 3257,
+      "desc": "基础人格与硬规矩（固定核心）。唯一还留着内联兜底副本的一份。"
+    },
+    "planning_round": {
+      "file": "planning_round.md", "phase": "planning", "kind": "conditional",
+      "referenced_by": ["submit_plan"], "fixed": false, "max_bytes": 4765,
+      "desc": "规划轮整段（含 knobs / 同会话历史两个子块），按块守卫条件出现。"
+    },
+    "editing_round": {
+      "file": "editing_round.md", "phase": "editing", "kind": "conditional",
+      "referenced_by": ["assembly"], "fixed": false, "max_bytes": 1531,
+      "desc": "剪辑副链的系统提示内核（副链与主链共用提示词库）。"
+    },
+    "subagent_system": {
+      "file": "subagent_system.md", "phase": "subagent", "kind": "on_demand",
+      "referenced_by": ["spawn_subagent"], "fixed": false, "max_bytes": 672,
+      "desc": "派生 SubAgent 的 system 提示（子 Agent 不能再派生）。"
+    },
+    "team_subagent_system": {
+      "file": "team_subagent_system.md", "phase": "subagent", "kind": "on_demand",
+      "referenced_by": ["start_subagent"], "fixed": false, "max_bytes": 693,
+      "desc": "Agent Team 常驻子 Agent 的 system 提示（收件箱/任务板腿）。"
+    },
+    "no_card_nudge": {
+      "file": "no_card_nudge.md", "phase": "guard", "kind": "conditional",
+      "referenced_by": ["submit_plan"], "fixed": false, "max_bytes": 473,
+      "desc": "规划轮假称「卡已提交」时的补救（措辞判据版）。"
+    },
+    "no_card_structural_nudge": {
+      "file": "no_card_structural_nudge.md", "phase": "guard", "kind": "conditional",
+      "referenced_by": ["submit_plan"], "fixed": false, "max_bytes": 883,
+      "desc": "同上，但与措辞无关的结构判据版（规划轮收尾必须有 submit_plan 成功记录）。"
+    },
+    "no_card_note": {
+      "file": "no_card_note.md", "phase": "guard", "kind": "conditional",
+      "referenced_by": ["submit_plan"], "fixed": false, "max_bytes": 213,
+      "desc": "打回机会用尽后的兜底说明（附在终答末尾）。"
+    },
+    "step_nudge": {
+      "file": "step_nudge.md", "phase": "guard", "kind": "conditional",
+      "referenced_by": ["read_node_history"], "fixed": false, "max_bytes": 605,
+      "desc": "执行轮一步未调却声称「已完成」时的补救；带 {first} 占位符。"
+    },
+    "step_note": {
+      "file": "step_note.md", "phase": "guard", "kind": "conditional",
+      "referenced_by": ["read_node_history"], "fixed": false, "max_bytes": 280,
+      "desc": "同上，打回用尽后的兜底说明。"
+    },
+    "popup_nudge": {
+      "file": "popup_nudge.md", "phase": "guard", "kind": "conditional",
+      "referenced_by": ["ask_user"], "fixed": false, "max_bytes": 1021,
+      "desc": "把问题写进正文、没走 ask_user 弹窗时的打回（普通轮）。"
+    },
+    "popup_nudge_planning": {
+      "file": "popup_nudge_planning.md", "phase": "guard", "kind": "conditional",
+      "referenced_by": ["ask_user", "submit_plan"], "fixed": false, "max_bytes": 746,
+      "desc": "同上，规划轮变体（多一条正路：直接 submit_plan）。"
+    },
+    "no_popup_note": {
+      "file": "no_popup_note.md", "phase": "guard", "kind": "conditional",
+      "referenced_by": ["ask_user"], "fixed": false, "max_bytes": 244,
+      "desc": "弹窗打回用尽后，让用户知道这句本该是个弹窗。"
+    },
+    "plan_card_nudge": {
+      "file": "plan_card_nudge.md", "phase": "guard", "kind": "conditional",
+      "referenced_by": ["submit_plan"], "fixed": false, "max_bytes": 655,
+      "desc": "把整套方案写成正文、要用户打字确认时的打回（该出卡却出了散文）。"
+    },
+    "polish_system": {
+      "file": "polish_system.md", "phase": "skill_flow", "kind": "on_demand",
+      "referenced_by": ["POST /skills/from_run"], "fixed": false, "max_bytes": 1177,
+      "desc": "把一次真实执行流水润色成可复用 SKILL.md 的系统提示。"
+    },
+    "approved_open": {
+      "file": "approved_open.md", "phase": "editing", "kind": "conditional",
+      "referenced_by": ["assembly"], "fixed": false, "max_bytes": 328,
+      "desc": "执行轮 <approved_plan> 段的开头（含「并批提速」那段的措辞由代码拼接）。"
+    },
+    "custom_open": {
+      "file": "custom_open.md", "phase": "editing", "kind": "conditional",
+      "referenced_by": ["assembly"], "fixed": false, "max_bytes": 336,
+      "desc": "执行轮 <user_custom_requests> 段（卡上「其他/整体补充」的诉求）。"
+    },
+    "script_prompt": {
+      "file": "script_prompt.md", "phase": "script", "kind": "on_demand",
+      "referenced_by": ["generate_script"], "fixed": false, "max_bytes": 450,
+      "desc": "文案节点写旁白文案的模板（带 {style}/{request}/{structure}/{groups} 占位符）。"
+    }
+  }
+}

@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Mapping
@@ -35,6 +36,108 @@ _BLOCK_SEP = re.compile(r"\n[ \t]*\n")
 
 # 仓库自带的提示词目录（随包分发，作为默认来源）
 DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+
+# 提示词清单（唯一声明点，见该文件里的 note）。
+MANIFEST_FILE = "manifest.json"
+
+#: 清单里合法的「相」——某一份提示词属于哪个环节。见 manifest.json 的 note。
+PHASES = ("always", "planning", "editing", "subagent", "guard", "skill_flow", "script")
+
+#: 清单里 kind 的合法取值。**与 context.LEDGER_KINDS 是同一组词，但刻意不 import**：
+#: prompts.py 被 context.py 反向依赖（它只 TYPE_CHECKING 地引 PromptLibrary），
+#: 这里 import 回去就成环。两处都是"三个字符串"，改一处漏一处的代价由
+#: tests/test_prompt_manifest.py 的对账断言兜住。
+LEDGER_KINDS_LOCAL = ("always", "conditional", "on_demand")
+
+
+def load_manifest(directory: str | Path | None = None) -> dict[str, Any]:
+    """读提示词清单；目录里没有清单就回一个空壳（``{"prompts": {}}``）。
+
+    不抛「没清单」是刻意的：清单是**增益**（它给的是「谁在什么时候发」的账），
+    没有它提示词照样按调用点读得到。真正要拦的「清单说有、文件却没了」在
+    :func:`validate_manifest` 里判——那一头才该让服务起不来。
+    """
+    d = Path(directory) if directory else DEFAULT_PROMPTS_DIR
+    path = d / MANIFEST_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"version": 0, "prompts": {}}
+    if not isinstance(raw, dict) or not isinstance(raw.get("prompts"), dict):
+        return {"version": 0, "prompts": {}}
+    return raw
+
+
+def validate_manifest(directory: str | Path | None = None) -> list[str]:
+    """清单自检：返回问题清单（空 = 通过）。启动期调用，非空即让服务起不来。
+
+    四条判据各自能单独判红，都是「清单说了什么、盘上是不是那样」的对账：
+      ① 清单登记的每一份文件都**在**且**非空**——文件没了，模型那一段就是空的；
+      ② 实际字节 **≤ 清单里的 max_bytes**——拦「往一条纠错说明里粘了一篇教程」；
+      ③ 每一份 *.md 都在清单里登记了（除清单自己与 README）——防「新加的文件没人记账」；
+      ④ phase / kind 是已知取值——拼错的相会让 `prompts_for_phase` 静默漏掉它。
+    文件缺失报的是**路径**不是内容，跑这个不需要读进机密。
+    """
+    d = Path(directory) if directory else DEFAULT_PROMPTS_DIR
+    problems: list[str] = []
+    manifest = load_manifest(d)
+    entries = manifest.get("prompts") or {}
+    seen: set[str] = set()
+    for name, meta in sorted(entries.items()):
+        if not isinstance(meta, Mapping):
+            problems.append(f"清单项 {name!r} 不是对象")
+            continue
+        fname = str(meta.get("file") or "")
+        seen.add(fname)
+        if not fname:
+            problems.append(f"清单项 {name!r} 没写 file")
+            continue
+        phase = str(meta.get("phase") or "")
+        if phase not in PHASES:
+            problems.append(f"{name}：phase={phase!r} 不在 {PHASES}")
+        if str(meta.get("kind") or "") not in LEDGER_KINDS_LOCAL:
+            problems.append(f"{name}：kind={meta.get('kind')!r} 不在 {LEDGER_KINDS_LOCAL}")
+        path = d / fname
+        try:
+            body = path.read_text(encoding="utf-8")
+        except OSError:
+            problems.append(f"{name}：清单登记的文件不存在——{path}")
+            continue
+        if not body.strip():
+            problems.append(f"{name}：文件是空的——{path}")
+            continue
+        n = len(body.encode("utf-8"))
+        cap = meta.get("max_bytes")
+        if isinstance(cap, int) and n > cap:
+            problems.append(f"{name}：{n} B 超过清单上限 {cap} B——"
+                            f"要么删内容，要么按 Q55 走流程改 manifest.json 里的 max_bytes")
+    if d.is_dir():
+        for p in sorted(d.glob("*.md")):
+            if p.name not in seen:
+                problems.append(f"盘上有 {p.name}，清单里没登记——新加的提示词要记账"
+                                f"（manifest.json 的 prompts 加一项）")
+    return problems
+
+
+def read_prompts_file(name: str, directory: str | Path | None = None) -> str:
+    """直接从提示词目录读一份文本；**缺了或空了就抛**，不静默给空串。
+
+    给「没有注入 PromptLibrary 的模块」用（规划段之外的执行轮注入、文案节点、
+    技能沉淀）。它们此前各自揣一份内联副本，现在统一从磁盘取：仓库自带目录是随
+    代码分发的，所以「没有库」不等于「没有文件」。真缺文件是**部署坏了**，
+    当场抛比让模型收到一段空提示诚实。
+    """
+    d = Path(directory) if directory else DEFAULT_PROMPTS_DIR
+    path = d / name
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise FileNotFoundError(
+            f"提示词文件读不到：{path}（{e}）。它随代码分发，缺了说明部署不完整——"
+            f"不要给内联兜底，那会让「文件丢了」变成「模型收到空提示」这种静默故障。") from e
+    if not text.strip():
+        raise ValueError(f"提示词文件是空的：{path}")
+    return text
 
 
 def render_template(text: str, values: Mapping[str, Any]) -> str:
@@ -167,6 +270,35 @@ class PromptLibrary:
     def system_prompt(self, fallback: str) -> str:
         return self.text(self.main_filename, fallback)
 
+    def body(self, name: str) -> str | None:
+        """磁盘上这份提示词的**原样**文本；文件不在就是 None（不回落、不渲染）。
+
+        给 :func:`prompt_text` 用：调用点要的是「库里有就拿库里的、没有就去仓库目录拿」，
+        而不是「库里没有就用内联兜底」——后者正是要拆掉的那层重复。
+        """
+        return self._read(name)
+
+    # ---- 清单（动态选择层：谁在什么时候发）----
+
+    def manifest(self) -> dict[str, Any]:
+        """这份库的提示词清单；目录里没有清单就是空壳（``prompts`` 为空）。"""
+        return load_manifest(self.dir) if self.dir else {"version": 0, "prompts": {}}
+
+    def prompts_for_phase(self, phase: str) -> list[dict[str, Any]]:
+        """这一相会用到哪几份提示词（按名字排序）。**答案来自清单，不来自调用点**——
+        这正是「哪一份在哪个环节生效」不再散在 8 个 .py 里的那个口子。
+        """
+        out: list[dict[str, Any]] = []
+        for name, meta in sorted((self.manifest().get("prompts") or {}).items()):
+            if isinstance(meta, Mapping) and meta.get("phase") == phase:
+                out.append({"name": name, **dict(meta)})
+        return out
+
+    def entry(self, name: str) -> dict[str, Any]:
+        """清单里一项的元数据（没有就回空 dict）。"""
+        meta = (self.manifest().get("prompts") or {}).get(name)
+        return dict(meta) if isinstance(meta, Mapping) else {}
+
     # ---- 观测 / 自检 ----
 
     def loaded_from_disk(self) -> list[str]:
@@ -179,7 +311,24 @@ class PromptLibrary:
         files = self.loaded_from_disk()
         if not files:
             return "提示词库：未接目录，全部使用内联默认值"
-        return f"提示词库：{self.dir}（{len(files)} 份：{', '.join(files)}）"
+        n = len(self.manifest().get("prompts") or {})
+        tail = f"，清单登记 {n} 项" if n else "（目录里没有 manifest.json）"
+        return f"提示词库：{self.dir}（{len(files)} 份：{', '.join(files)}）{tail}"
+
+
+def prompt_text(library: PromptLibrary | None, name: str) -> str:
+    """取一份提示词正文，**没有内联兜底**。
+
+    优先用注入的 ``library``（它可能指向一个热替换目录），库里没有这份文件时
+    退回仓库自带的 ``prompts/`` 目录（`read_prompts_file`，缺了当场抛）。
+    「库里没有就回落内联常量」这条老路到此为止——它是「同一段文案两份」的入口，
+    而 prompts/ 是随代码分发的，所以「库没接」根本不等于「文件没有」。
+    """
+    if library is not None:
+        raw = library.body(name)
+        if raw and raw.strip():
+            return raw
+    return read_prompts_file(name)
 
 
 def build_prompt_library(directory: str | Path | bool | None,

@@ -23,6 +23,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .prompts import prompt_text, read_prompts_file
+
 # 强索取措辞：这些单独出现（**不带问号**）就足以判定为「在向用户提问」。
 #
 # 为什么不能要求问号：用户点名的场景恰恰不带问号——「请把视频链接发我」
@@ -163,53 +165,46 @@ def looks_like_asking_user(text: Any) -> bool:
     return False
 
 
-# 打回时喂给模型的服务端核对（与 _NO_CARD_STRUCTURAL_NUDGE 同风格：先陈述事实再给两条路）
-POPUP_NUDGE = (
-    "服务端核对：上面这段是在向用户提问／要用户做决定，但你没有调用 ask_user，"
-    "所以界面上**不会**弹出选项卡——用户只能自己打字回答，而且经常答非所问。\n"
-    "现在二选一：\n"
-    "① 调用 ask_user 把这个问题重新问一遍：title 写清问什么，options 给 2~6 个有真实差异的"
-    "选项，把你建议的那个标 recommended=true；用户还能自己写一条。**调用后就停下等用户选**，"
-    "不要在同一条回复里替用户把选择也定了。\n"
-    "② 如果你其实不需要用户拿主意（信息已经够你判断），就把疑问去掉，直接给出结论，"
-    "不要再问。\n"
-    "凡是要用户拿主意，就必须是弹窗——没有例外，包括「请你发素材/贴链接」这种请求，"
-    "也要用选项（例如「我现在上传」「我把链接贴给你」「用你已有的某条素材」）。"
-)
-
-# 规划轮的变体：那一轮还多一条正路——直接把计划交上来
-POPUP_NUDGE_PLANNING = (
-    "服务端核对：上面这段是在向用户提问／要用户做决定，但你没有调用 ask_user，"
-    "所以界面上**不会**弹出选项卡——用户只能自己打字回答。\n"
-    "现在三选一：\n"
-    "① 用 ask_user 把这个问题重新问一遍（title + 2~6 个有真实差异的选项，"
-    "建议的那个标 recommended=true），然后停下等用户选；\n"
-    "② 诉求已经够清楚，就直接 submit_plan 把 1~3 个候选计划交上来；\n"
-    "③ 信息确实不够，也照样用 ask_user 问，不要写在正文里。\n"
-    "凡是要用户拿主意，就必须是弹窗——没有例外，包括「请你发素材/贴链接」这种请求。"
-)
-
-# 打回机会用尽后的兜底说明：让用户知道这句本该是个弹窗
-NO_POPUP_NOTE = (
-    "\n\n（服务端核对：这句本该以选项卡弹窗的形式问你，但模型没有调用提问工具，"
-    "所以只能以文字呈现。你可以直接打字回复，或重新发起一次让它用弹窗问。）"
-)
-
-# 命中 looks_like_plan_invite 时打回用：该出卡的时候出了散文。
+# 打回时喂给模型的服务端核对文案。**文案在 prompts/，本文件不再有正文**
+# （2026-10-14 搬出）：先前这四段是内联常量，改一句要去 .py 里找，
+# 与「提示词和技能动态加载」这个对外口径相抵。现在从磁盘读，缺了即抛。
 #
-# 为什么这比"再弹一个窗"对：用户要的是**可点的计划卡**（能改开关、能看编排），
-# 不是一个"要不要继续"的弹窗。真机实测模型把整套方案写成正文并说
-# 「确认这个方案就回复我」——用户既没卡可点，也被告知要打字。
-PLAN_CARD_NUDGE = (
-    "你把整个方案写成了正文，并要求用户「回复」来确认——这不合规矩。"
-    "方案**必须**走 submit_plan 出成计划卡：用户在卡上点选、动开关，不必打字。"
-    "请立刻调用 submit_plan，把你刚才那份方案整理成 1~3 个候选计划"
-    "（每步给 node / why / expectation；会影响成片效果的取值写进该步的 param_options，"
-    "每个参数给 ≥2 个真实候选）。正文里不要再重复整份方案，一两句说明差异即可，"
-    "也不要再要求用户回复确认——确认由卡上的点击完成。"
-)
+# 刷新：`refresh_prompt_texts(library)` 就地改下面这几个模块全局；调用方（agent.py）
+# 要么走 `popup_nudge()` / `plan_card_nudge()` / `no_popup_note()` 这几个**在调用时**
+# 读全局的函数，要么经模块属性访问——`from .ask_gate import PLAN_CARD_NUDGE` 那种
+# 早绑定拿的是**旧值**，刷新后不会变（改文案只在重启后生效，静默失效最坏）。
+POPUP_NUDGE_FILE = "popup_nudge.md"
+POPUP_NUDGE_PLANNING_FILE = "popup_nudge_planning.md"
+NO_POPUP_NOTE_FILE = "no_popup_note.md"
+PLAN_CARD_NUDGE_FILE = "plan_card_nudge.md"
+
+POPUP_NUDGE = read_prompts_file(POPUP_NUDGE_FILE)
+POPUP_NUDGE_PLANNING = read_prompts_file(POPUP_NUDGE_PLANNING_FILE)
+NO_POPUP_NOTE = read_prompts_file(NO_POPUP_NOTE_FILE)
+PLAN_CARD_NUDGE = read_prompts_file(PLAN_CARD_NUDGE_FILE)
+
+
+def refresh_prompt_texts(library: Any) -> None:
+    """按提示词库刷新本模块的打回文案（就地改模块全局）。同 ``agent._refresh_prompt_texts``。"""
+    if library is None:
+        return
+    global POPUP_NUDGE, POPUP_NUDGE_PLANNING, NO_POPUP_NOTE, PLAN_CARD_NUDGE
+    POPUP_NUDGE = prompt_text(library, POPUP_NUDGE_FILE)
+    POPUP_NUDGE_PLANNING = prompt_text(library, POPUP_NUDGE_PLANNING_FILE)
+    NO_POPUP_NOTE = prompt_text(library, NO_POPUP_NOTE_FILE)
+    PLAN_CARD_NUDGE = prompt_text(library, PLAN_CARD_NUDGE_FILE)
 
 
 def popup_nudge(planning: bool) -> str:
-    """按轮次取打回文案。"""
+    """按轮次取打回文案。**调用时**读全局，所以 refresh 之后这里拿到的是新的。"""
     return POPUP_NUDGE_PLANNING if planning else POPUP_NUDGE
+
+
+def plan_card_nudge() -> str:
+    """「该出卡却写了散文」的打回文案（调用时读全局，理由同 popup_nudge）。"""
+    return PLAN_CARD_NUDGE
+
+
+def no_popup_note() -> str:
+    """弹窗打回用尽后的兜底说明（调用时读全局）。"""
+    return NO_POPUP_NOTE

@@ -21,25 +21,19 @@ from .context import ContextBuilder
 from .hooks import AgentHook, CompositeHook, ToolTraceHook, _current_hook_ctx, _current_hooks
 from .llm import LLMClient
 from .mq import MessageQueue
+from .prompts import read_prompts_file
 from .session import Session
 from .tool import Tool, ToolRegistry
 
 # 子 Agent 工具装配器：往传入的 registry 里注册一批工具（不含 spawn）。
 ToolRegistrar = Callable[[ToolRegistry], None]
 
-# 子 Agent 的 system 提示词也搬进了提示词库（2026-10-02，`prompts/subagent_system.md`）：
-# 这里是**逐字相同的内联回落**，两份漂了由 tests/test_prompt_library.py 守卫。
+# 子 Agent 的 system 提示词在提示词库里（2026-10-02 起在盘上，2026-10-14 删掉内联副本）。
+# 名字保留为「默认值」，但它的值来自磁盘、**不是**内联文本——子 Agent 提示词同样不该
+# 在代码里留第二份（同一段文案改一处漏一处）。
 SUBAGENT_PROMPT_FILE = "subagent_system.md"
 
-_CHILD_SYSTEM_PROMPT_DEFAULT = (
-    "你是被主 Agent 派生出来的子 Agent，负责专注完成下面这个子任务并给出简洁结论。"
-    "无论任何情况，你必须始终用简体中文思考和回复。"
-    "你在调用工具前对步骤的任何说明文字，也必须是简体中文，绝不允许输出英文句子——"
-    "即使工具返回的是英文内容也不允许改变语言。"
-    "工具失败处理：同一工具连续失败 2 次后，必须停止重试，向用户说明失败原因并询问如何处理，"
-    "不要盲目改参数反复重试同一工具。"
-    "不要偏离任务、不要再派生子任务。"
-)
+_CHILD_SYSTEM_PROMPT_DEFAULT = read_prompts_file(SUBAGENT_PROMPT_FILE)
 CHILD_SYSTEM_PROMPT = _CHILD_SYSTEM_PROMPT_DEFAULT
 
 

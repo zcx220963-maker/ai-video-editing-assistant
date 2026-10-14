@@ -27,6 +27,7 @@ from agent_framework.orchestration import (
     NodeState,
     _safe,
 )
+from agent_framework.prompts import read_prompts_file
 from agent_framework.storage import Storage, StorageUnavailable, to_ref
 from agent_framework.render_library import register_render
 
@@ -804,13 +805,11 @@ class ScriptTemplateRecNode(StoryNode):
         return {"templates": [tpl], "source": "llm_template_id"}
 
 
-_SCRIPT_PROMPT = """你是短视频文案作者。根据素材分组与脚本模板写旁白文案。
-总要求：{style}；整体主题：{request}
-模板结构：{structure}
-各分组素材画面（按叙事顺序）：
-{groups}
-只输出 JSON（不要解释、不要代码块标记）：
-{{"title": "12字内标题", "groups": [{{"group_id": "…", "raw_text": "该组旁白文案，60-120字口语化"}}]}}"""
+# 文案生成的提示词在 `prompts/script_prompt.md`（2026-10-14 从本文件搬出，与
+# agent_framework 侧同一套口径：提示词都在 prompts/，代码里不留第二份）。
+# 它带 `{style}/{request}/{structure}/{groups}` 四个命名占位，调用点照旧 `.format(...)`；
+# 文件里的 JSON 示例用 `{{`/`}}` 转义，与内联时保持一致。
+_SCRIPT_PROMPT = read_prompts_file("script_prompt.md")
 
 
 def normalize_custom_script(raw_custom: Any) -> str:

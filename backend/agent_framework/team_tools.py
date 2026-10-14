@@ -28,6 +28,7 @@ from .editing_agent import plan_team_from_dag
 from .hooks import AgentHook
 from .identity import Identity, current_identity_or, use_identity
 from .message_center import MessageCenter, register_message_tools
+from .prompts import read_prompts_file
 from .session import SessionManager
 from .subagent_manager import (
     SHUTDOWN,
@@ -40,15 +41,26 @@ from .tool import Tool, ToolRegistry
 
 MAIN_AGENT_NAME = "main_agent"
 
-SUBAGENT_SYSTEM_PROMPT = (
-    "你是 Agent Team 中的常驻子 Agent。无论任何情况，你必须始终用简体中文思考和回复。"
-    "你在调用工具前对步骤的任何说明文字，也必须是简体中文，绝不允许输出英文句子——"
-    "即使工具返回的是英文内容也不允许改变语言。"
-    "工具失败处理：同一工具连续失败 2 次后，必须停止重试，向用户说明失败原因并询问如何处理，"
-    "不要盲目改参数反复重试同一工具。"
-    "依据任务指令使用可用的工具完成任务，完成后给出简洁结论；"
-    "若收件箱或,任务板有新工作则继续。"
-)
+# Agent Team 常驻子 Agent 的系统提示：文案在 `prompts/team_subagent_system.md`
+# （2026-10-14 从本文件的内联常量搬出）。它与 `subagent_system.md`（SpawnTool 派生的
+# 子 Agent）是**两份不同的角色说明**：一个靠收件箱/任务板续跑，一个干完一件事就收尾。
+TEAM_SUBAGENT_PROMPT_FILE = "team_subagent_system.md"
+SUBAGENT_SYSTEM_PROMPT = read_prompts_file(TEAM_SUBAGENT_PROMPT_FILE)
+
+
+def refresh_team_subagent_prompt(library: Any) -> None:
+    """按提示词库刷新常驻子 Agent 的 system 提示词（就地改模块全局）。
+
+    与 ``subagent.refresh_subagent_prompt`` 的差别：那个必须在**构造 runner 之前**刷新，
+    因为 SubAgentRunner 在构造时就把文本固化进实例了；这里的读取点是
+    ``Team.start_subagent`` 里的 ``ContextBuilder(SUBAGENT_SYSTEM_PROMPT, …)``——
+    按模块全局**当场取值**，所以只要在创建任何一个常驻子 Agent 之前刷过就行
+    （run_server 在装配期调，天然早于任何 start_subagent）。
+    """
+    if library is None:
+        return
+    global SUBAGENT_SYSTEM_PROMPT
+    SUBAGENT_SYSTEM_PROMPT = library.text(TEAM_SUBAGENT_PROMPT_FILE, SUBAGENT_SYSTEM_PROMPT)
 
 
 def _json(data: Any) -> str:
