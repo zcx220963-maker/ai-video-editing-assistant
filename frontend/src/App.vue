@@ -2556,6 +2556,74 @@ function shortResult(result) {
   return result.length > 200 ? result.slice(0, 200) + "…" : result;
 }
 
+// ---- 一轮里的工具卡片折成一行 ----
+// 模型一「用起工具」就是连着好几张卡片、每张一个「助」印记，把对话压得看不见——
+// 用户问的「调了一堆工具还占满会话窗口」在界面上就是这件事。这里把**连续**的工具
+// 卡片折成一行摘要（默认收起，点开还是原来那些卡片）。
+// 只在展示层做：msgs() 那份数据一个字段都不动（回投帧的配对是按 call_id 在原始数组上
+// 找 running 那张卡片，改写数组会让配对错位）。
+const TOOL_GROUP_MIN = 3;           // 少于 3 张不折：折了比展开还长
+const toolGroupsOpen = ref({});     // { 组键: true }
+
+function toolGroupKey(list, first) {
+  return `${first.call_id || first.tool}#${list.indexOf(first)}`;
+}
+
+// v-for 的 :key 必须落在**原始**下标上，不能落在视图下标上：展开一组会在它后面
+// 插进若干项，视图下标全体后移 → 后面每条消息都被当成新节点重建，而其中可能有
+// `<video>`（重建 = 播放从头开始）。原始数组不随展开变化，所以它才是稳的那个。
+const _rawIdx = new WeakMap();
+
+function rawKey(m, i) {
+  const ri = _rawIdx.get(m);
+  return ri === undefined ? "v" + i : "r" + ri;
+}
+
+function toggleToolGroup(key) {
+  toolGroupsOpen.value = { ...toolGroupsOpen.value, [key]: !toolGroupsOpen.value[key] };
+}
+
+function toolGroupSummary(items) {
+  const counts = new Map();
+  for (const m of items) {
+    const label = toolLabel(m.tool, m.tool_display);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  return [...counts.entries()].map(([k, n]) => (n > 1 ? `${k} ×${n}` : k)).join("、");
+}
+
+function viewMsgs(cid) {
+  const list = msgs(cid);
+  const out = [];
+  let run = [];
+  const flush = () => {
+    if (!run.length) return;
+    if (run.length >= TOOL_GROUP_MIN) {
+      const key = toolGroupKey(list, run[0]);
+      const open = !!toolGroupsOpen.value[key];
+      out.push({
+        role: "assistant", kind: "toolgroup", key, items: run.slice(), open,
+        running: run.some((m) => m.state === "running"),
+        failed: run.filter((m) => m.error).length,
+      });
+      // 展开时把原来的卡片原样排在后面——不复制一份卡片样式，展开的与单张的是同一段
+      // 模版（复制一份迟早两边长得不一样）。
+      if (open) out.push(...run);
+    } else {
+      out.push(...run);
+    }
+    run = [];
+  };
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
+    _rawIdx.set(m, i);
+    if (m.kind === "tool" && m.role === "assistant") run.push(m);
+    else { flush(); out.push(m); }
+  }
+  flush();
+  return out;
+}
+
 // ---- 剪辑进度卡：从工具调用流里动态收集剪辑步骤，一眼看出进行中/失败/还剩哪些 ----
 // 只是展示层排序参考：agent 实际走哪些步骤由它自己决定，没走的不会出现。
 const PIPE_ORDER = [
@@ -3629,7 +3697,9 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           </div>
         </div>
 
-        <div v-for="(m, i) in msgs(active)" :key="i" class="row" :class="m.role">
+        <div v-for="(m, i) in viewMsgs(active)"
+             :key="m.kind === 'toolgroup' ? 'g' + m.key : rawKey(m, i)"
+             class="row" :class="m.role">
           <div class="mark" aria-hidden="true">
             <span v-if="m.role === 'user'">人</span>
             <span v-else class="seal-mini" :class="m.state">助</span>
@@ -3665,6 +3735,20 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                     要你这一眼或这一耳朵。
                   </div>
                 </details>
+              </div>
+            </template>
+            <template v-else-if="m.kind === 'toolgroup'">
+              <!-- 一轮里连着好几张工具卡片，折成这一行（默认收起）。点开把原卡片
+                   原样接在后面（见 viewMsgs），所以展开的与单张的用的是同一段模版。 -->
+              <div class="tool-group" :class="{ open: m.open }">
+                <button class="tg-head" @click="toggleToolGroup(m.key)">
+                  <span class="tt-ico">🔧</span>
+                  <b>本轮 {{ m.items.length }} 次工具调用</b>
+                  <span class="tg-list">{{ toolGroupSummary(m.items) }}</span>
+                  <span v-if="m.running" class="tt-spin">执行中…</span>
+                  <span v-else-if="m.failed" class="tg-fail">✗ {{ m.failed }} 次失败</span>
+                  <span class="tg-toggle">{{ m.open ? "收起 ▴" : "展开 ▾" }}</span>
+                </button>
               </div>
             </template>
             <template v-else-if="m.kind === 'tool'">
@@ -5422,6 +5506,18 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .tt-copy:hover { opacity: 0.95; color: var(--vermilion-deep); }
 .tt-ico { font-size: 14px; }
+/* 一轮里的工具卡片折成的一行：整行可点（点开/收起），比逐张卡片矮一大截。 */
+.tool-group { font-family: ui-monospace, monospace; font-size: 12.5px; }
+.tg-head {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  width: 100%; text-align: left; cursor: pointer;
+  background: none; border: none; padding: 0; font: inherit; color: var(--ink);
+}
+.tg-head b { font-family: var(--serif); font-size: 13px; color: var(--ink); }
+.tg-head:hover b { color: var(--vermilion); }
+.tg-list { color: var(--ink-soft); font-size: 11.5px; }
+.tg-fail { color: var(--vermilion-deep); font-size: 11px; }
+.tg-toggle { margin-left: auto; color: var(--ink-soft); font-size: 11px; opacity: 0.75; }
 .tt-spin { color: var(--vermilion); animation: pulse 0.9s infinite; font-size: 11px; }
 .tt-time { color: var(--ink-soft); font-size: 11px; }
 .tt-args { display: flex; flex-wrap: wrap; gap: 4px 8px; padding-left: 22px; color: var(--ink-soft); }
