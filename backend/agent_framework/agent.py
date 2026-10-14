@@ -26,7 +26,7 @@ from .ask_gate import (looks_like_asking_user, looks_like_plan_invite,
                        no_popup_note, plan_card_nudge, popup_nudge)
 from .checkpoint import Checkpoint, CheckpointManager
 from .catalog import get_catalog
-from .compress import _repair_orphans
+from .compress import ToolResultGate, _repair_orphans
 from .context import (ContextBuilder, LEDGER_ENTRY_TYPE, Section,
                       check_tools_budget, tools_box)
 from .hooks import AgentHook, AgentHookContext, CompositeHook, _current_hook_ctx, _current_hooks
@@ -455,6 +455,12 @@ class AgentConfig:
     # 时打回一次，要求改用 submit_plan 出卡（见 ask_gate.looks_like_plan_invite）。
     # 置 False 即关闭这道保证。
     plan_card_nudges: int = 1
+    # 工具结果的体积闸门（见 compress.ToolResultGate）。这三个数是这次补的：
+    # 在此之前工具结果**一条都没有闸门**，整条 run 的历史结果每轮原样重发，
+    # 真机首发提示词因此到过 258K token。0 = 关闭对应那一档（截断 / 折叠）。
+    tool_result_max_bytes: int = 24_000
+    tool_results_fold_at_bytes: int = 96_000
+    tool_results_keep_recent: int = 3
 
 
 @dataclass
@@ -540,6 +546,14 @@ class AgentOnceRun:
         # 放内存即可：它只影响「同一进程、同一条 run 内要不要再弹一次」，
         # 跨重启后重弹一次无害（用户顶多再看一眼同一份编排），不值得为它加一列。
         self._render_confirmed: set[tuple[str, str]] = set()
+        # 工具结果闸门：一次 run 内部每轮都把全部历史结果重发，那段此前完全没有闸门
+        # （压缩器只在 ``ContextBuilder.build()`` 里跑，那时工具结果一条都还没有）。
+        # 它只改消息**内容**、不删消息，所以 tool_calls 的配对不受影响。
+        self.tool_gate = ToolResultGate(
+            result_max_bytes=self.config.tool_result_max_bytes,
+            fold_at_bytes=self.config.tool_results_fold_at_bytes,
+            keep_recent=self.config.tool_results_keep_recent,
+        )
         # 渲染确认门「问过没有」记在 ``RunState.render_gate_asked``（随指针行落盘），
         # 不再放内存：内存版本会被进程重启与续跑换代打穿，
         # 真机实测因此又把同一道题问了两遍。见 _tool_round 里的完整说明。
@@ -745,6 +759,14 @@ class AgentOnceRun:
                         r.approval_note = ""
                         r.iteration += 1
                         continue
+                    # 上下文瘦身：本轮的工具结果在**进链那一刻**已经按单条上限截断过
+                    # （见 _run_tool_round），这里再按**累计体积**把更早的结果折叠成
+                    # 预览。不做的话每轮都重发全部历史结果，第 40 轮的提示词就是几十万
+                    # token——真机 run a3d8ff08098a 的 258K/5.7M 就是这么来的。
+                    # 放在落盘**之前**：快照里存的是瘦身后的那份，续跑不会把体积带回来。
+                    # 统计每轮都写（即使一条都没折）：`total_bytes` 是「这一轮的窗口里
+                    # 工具结果占了多少」的直接读数，出问题时要能查到折了多少。
+                    r.ctx.extras["context_gate"] = self.tool_gate.shrink(r.messages)
                     # 一致点：即将调用 LLM 之前落盘，恢复从这里续跑即可避免重放工具。
                     # 状态与消息一起落：崩溃恢复取到的调用清单/候选计划/q 片段
                     # 必须和这一条一致点上的 messages 同批，否则对账会多算或漏算。
@@ -1762,7 +1784,10 @@ class AgentOnceRun:
             # 只是不往消息链里写——产物已在产物表里。
             if str(tc.id).startswith("auto-"):
                 continue
-            ctx.messages.append(tool_result(tc.id, tc.name, r))
+            # 进链那一刻收口（单条上限）：结果**对象**不动，只截喂给模型的那份文本
+            # ——`_follow_inflight_renders` 还要拿原对象去读 job 状态。
+            ctx.messages.append(tool_result(
+                tc.id, tc.name, self.tool_gate.text(tc.name, r)))
         for name, times in nagging:
             ctx.messages.append(system(
                 f"⚠️ 工具「{name}」已连续失败 {times} 次。请立即停止重试该工具，"

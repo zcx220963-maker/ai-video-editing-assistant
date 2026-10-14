@@ -94,6 +94,153 @@ def make_llm_summarizer(llm: LLMClient, max_chars: int = 500) -> Summarizer:
     return summarize
 
 
+# ---------------------------------------------------------------------------
+# 执行循环里的工具结果闸门（活列表）
+#
+# 与上面那个 ContextCompressor 的分工：压缩器跑在 ``ContextBuilder.build()`` 里，
+# 也就是**一轮 run 开始前**、一条工具结果都还没产生的时候。它管的是「会话历史」
+# （user/assistant 行）。而一次 run 内部的 ReAct 循环每轮都会把**全部**已发生的
+# 工具结果重新发一遍，这一段此前**完全没有闸门**——真机 run a3d8ff08098a：
+# 40 轮下来首发提示词 258K token、整条 run 累计 5.7M token，其中大头就是
+# ``load_skill`` 的整篇正文与 ``fetch_url`` 的整页网页被逐轮重发。
+# 下面这层补的就是这一段。
+# ---------------------------------------------------------------------------
+
+#: 单条工具结果超过这个体积就截断（字节）。
+DEFAULT_RESULT_MAX_BYTES = 24_000
+
+#: 活列表里全部工具结果的合计体积超过这个数，就开始折叠更早的那些（字节）。
+DEFAULT_FOLD_AT_BYTES = 96_000
+
+#: 最近这么多条工具结果永不折叠——模型当前正在用的那一批必须完整。
+DEFAULT_KEEP_RECENT_RESULTS = 3
+
+#: 折叠后保留的预览字符数。
+DEFAULT_FOLD_PREVIEW = 200
+
+TRUNCATE_MARKER = "结果已截断"
+
+#: 这些工具的结果里带着「模型必须原样引回去」的 id / 候选清单，永不折叠。
+#: 截断那头仍然只切中间（头尾都留），所以就算被折叠，id 也还在预览的开头。
+NEVER_FOLD_TOOLS = frozenset({"submit_plan", "confirm_plan", "ask_user"})
+
+
+def truncate_result(text: str, limit: int) -> str:
+    """结果文本超过 ``limit`` 字节时截成「头 + 回执 + 尾」；没超就原样返回。
+
+    为什么头尾都留、只切中间：头是「这个工具成功了、给了什么」，尾常带「共 N 条 /
+    失败清单 / 下一步」，中间那段（长列表、大段正文）才是重复度最高的部分。
+
+    为什么留回执而不是静默截断：模型看到半截 JSON 会当成完整结果去解析，然后基于
+    残缺数据下判断——那是**无声**的错误。回执里写原文多大、怎么重取（读文件带
+    offset、检索限定路径），它就有路可走。
+    """
+    if limit <= 0:
+        return text
+    raw = text.encode("utf-8")
+    n = len(raw)
+    if n <= limit:
+        return text
+    # 回执本身要占几十字节，从留出的余量里扣，免得「截完仍然超限」。
+    head_budget = int(limit * 0.72)
+    tail_budget = max(0, limit - head_budget - 300)
+    # 按字节切、按字符解码并丢掉半个字符：切在 UTF-8 中间会造出乱码，
+    # 模型读到的就是乱码。
+    head = raw[:head_budget].decode("utf-8", "ignore")
+    tail = raw[-tail_budget:].decode("utf-8", "ignore") if tail_budget else ""
+    receipt = (
+        f"\n\n[{TRUNCATE_MARKER}｜原文 {n} 字节（约 {estimate_tokens(text)} token），"
+        f"此处只给了开头与结尾，中间被省掉。"
+        f"需要原文就用更窄的参数重取一次（读文件带 offset/limit、检索限定路径、"
+        f"分页取列表），不要凭这段推测缺失的内容。]\n"
+    )
+    return head + receipt + tail
+
+
+class ToolResultGate:
+    """一次 run 内部对工具结果的收口：单条截断 + 按累计体积折叠更早的结果。
+
+    **只改内容、不删消息**，所以 ``assistant(tool_calls)`` 与它那批 tool 回执的配对
+    永远不动——那是最容易被 LLM API 以 400 打回来的地方（``_repair_orphans`` 处理的
+    正是这类破坏的后果）。
+
+    省下的不只是钱：工具结果占的窗口越小，同一批事实越不会被挤到「被丢弃的历史」
+    那一段里去，所以这一层同时也是**准确率**的事。
+    """
+
+    def __init__(
+        self,
+        *,
+        result_max_bytes: int = DEFAULT_RESULT_MAX_BYTES,
+        fold_at_bytes: int = DEFAULT_FOLD_AT_BYTES,
+        keep_recent: int = DEFAULT_KEEP_RECENT_RESULTS,
+        fold_preview: int = DEFAULT_FOLD_PREVIEW,
+    ) -> None:
+        self.result_max_bytes = int(result_max_bytes)
+        self.fold_at_bytes = int(fold_at_bytes)
+        self.keep_recent = int(keep_recent)
+        self.fold_preview = int(fold_preview)
+
+    def text(self, name: str, content: Any) -> str:
+        """工具结果 → 进链的那段文本（单条超限即截断）。
+
+        调用点用它取代 ``messages.tool_result`` 里的 ``str(content)``：结果对象本身
+        不动（``_follow_inflight_renders`` 还要按原对象取 job 状态），只有喂给模型的
+        那份文本被收口。
+        """
+        raw = content if isinstance(content, str) else str(content)
+        return truncate_result(raw, self.result_max_bytes)
+
+    def shrink(self, messages: list[Message]) -> dict[str, int]:
+        """就地把更早的工具结果折叠成预览；返回这一趟的统计（无动作则全 0）。
+
+        触发条件是**累计**体积（``fold_at_bytes``）而不是条数：两条 200KB 的网页和
+        两百条 200 字节的回执，前者才是要治的。合计在预算内时一条都不动——平时
+        模型看到的仍是原样结果，只有真撑大时才瘦身。
+        """
+        stats = {"folded": 0, "freed_bytes": 0, "total_bytes": 0}
+        idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+        if len(idx) <= self.keep_recent:
+            return stats
+
+        def size(i: int) -> int:
+            return len(str(messages[i].get("content") or "").encode("utf-8"))
+
+        total = sum(size(i) for i in idx)
+        stats["total_bytes"] = total
+        if total <= self.fold_at_bytes:
+            return stats
+
+        for i in idx[: len(idx) - self.keep_recent]:
+            if total <= self.fold_at_bytes:
+                break
+            m = messages[i]
+            content = str(m.get("content") or "")
+            if FOLD_MARKER in content:  # 已折叠过：不重复加回执（否则越折越长）
+                continue
+            if m.get("name") in NEVER_FOLD_TOOLS:
+                continue
+            before = size(i)
+            # 小回执不折：折了省不了几个字节，却会磨掉「这条调用出过什么错」这类
+            # 短而关键的事实（错误原因、id、用户那句新要求）——折叠只对真正大的结果
+            # 才有意义，那才是要治的东西。
+            if before <= self.fold_preview + 200:
+                continue
+            preview = content[: self.fold_preview]
+            folded = (
+                f"[{FOLD_MARKER}｜{m.get('name', '')}｜这条是更早一轮的调用结果，"
+                f"原文 {before} 字节，此处只留开头。需要原文就重新调用一次该工具"
+                f"（用更窄的参数）。]\n{preview}…"
+            )
+            messages[i] = {**m, "content": folded}
+            delta = before - size(i)
+            total -= delta
+            stats["folded"] += 1
+            stats["freed_bytes"] += delta
+        stats["total_bytes"] = total
+        return stats
+
+
 class ContextCompressor:
     def __init__(
         self,
