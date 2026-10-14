@@ -24,7 +24,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Iterable
+from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Sequence
 
 from .storage import StorageUnavailable
 from .tool import Tool
@@ -411,6 +411,24 @@ class SkillManifestContextSource:
 #: 才告诉它怎么取，模型已经先撞上那面墙、已经开始了那串找不回来的尝试。
 _PAGING_NOTE_BYTES = 8_000
 
+#: 章节目录最多列几行标题。真机那份技能 44 个小节全列约 1.2 KB——它进的是闸的**尾巴**
+#: 那 28%（约 6.7 KB），列得下；但这个数不该随技能变大而无限长，超出的按行号往后取即可。
+_OUTLINE_MAX_ROWS = 48
+
+#: 「无附件 xxx」那条错误里最多列几个在案附件。上百个全列是十几 KB 的一团路径，
+#: 而模型此刻只想知道「我写的名字错在哪」——完整清单在整份加载时已经给过。
+_MISSING_LIST_MAX = 12
+
+#: 一个目录下附件数达到这么多，清单里就折叠成「目录 / 件数 / 索引在哪」一行。
+_BULK_MIN = 8
+
+#: 折叠那一行要指出的索引附件名：这几批同族文件各自带一份完整清单。
+_INDEX_NAMES = ("INDEX.md", "MANIFEST.json", "README.md")
+
+#: 附件清单最多列几行。真机那份技能 290 个附件逐个列是 17.6 KB——比闸的头窗口还大，
+#: 会把同一份回复里排在后面的正文与章节目录整个挤出窗口。折叠之后是十几行。
+_MANIFEST_MAX_EXACT = 20
+
 
 class LoadSkillTool(Tool):
     """按需加载：命中技能后拉取其完整正文，或按相对路径拉某个附件，都可按行分页。
@@ -426,6 +444,18 @@ class LoadSkillTool(Tool):
     所以分页做在工具这一侧，按**行**切：offset 是 1 起始的行号，页脚直接写出「共 N 行、
     下一句该怎么写」。上面那道字节闸不用撤——它拦别的大结果仍然对，只是从这里出去的
     正文不再是「切在哪一行看运气」。
+
+    **分页之后紧接着暴露的第二处**（同一条 run 修完重跑）：模型翻得动，就一路翻下去
+    ——674 行顺读了 11 页，又回头重取其中 9 页，**四十几轮工具调用一个计划都没交出来**。
+    它缺的不是「怎么续读」，是**「这一节在第几行」**与**「哪几行已经看过了」**：它明确
+    知道自己要闸⑦ 通道表 / ㉑ 动效锚定 / reveal / 数据镜 / 节点参数，却只能按 120 行一段
+    顺读，读完凭印象回头猜（offset 240 / 359 / 478 / 597 全是猜的，真值在 335 / 631 /
+    481 / 596）。所以：
+
+    - 整份给出时附一份**带行号的章节目录**（``_outline``）——那一份文档里唯一查不到的
+      事实，就在标题里摆着；
+    - 页脚写全三件事（``_page``）：这一页从哪一节开始、接着读的 offset 是几、**到底了
+      没有**——有「这是最后一页」这个确定信号，回头重取就没有理由。
     """
 
     def __init__(self, loader: SkillLoader) -> None:
@@ -445,7 +475,8 @@ class LoadSkillTool(Tool):
             "按名称加载技能的完整说明。缺省返回 SKILL.md 正文（并列出附件清单）；"
             "传 path（如 references/x.md、scripts/y.py）返回该附件内容；"
             "正文与附件都可以用 offset（1 起始的行号）与 limit（行数）按行分页续读，"
-            "回执末尾会写明共有多少行。"
+            "回执末尾会写明共有多少行。长正文在**整份给出时**还附一份带行号的章节目录，"
+            "要哪一节直接按那个行号取那一节——**别从头顺读**。"
             "附件来自对象存储，只认技能登记过的相对路径，不接受任意文件路径"
             "——技能文件不在会话工作区里，用 read_file / grep 找不到它们。"
         )
@@ -483,18 +514,20 @@ class LoadSkillTool(Tool):
             return f"技能 {name} 无正文内容。location={skill.location}"
         head = f"[skill:{name} location={skill.location}]"
         if skill.files:
-            listing = "\n".join(f"  - {f['relpath']}（{f.get('bytes', 0)} 字节）"
-                                for f in skill.files)
-            head += "\n附件（用 load_skill(name, path=\"相对路径\") 读取）：\n" + listing
+            head += (f"\n附件（{len(skill.files)} 个，用 "
+                     f'load_skill(name, path="相对路径") 读取）：\n'
+                     + "\n".join(self._attachment_listing(skill.files)))
         body, err = self._page(skill.body, offset, limit)
         if err:
             return err
         if body is None:
-            return f"{head}\n{skill.body}{self._paging_note(name, skill.body)}"
-        # 分页那头**不重复整份附件清单**：它是几百字节到 1 KB 的目录，跟着每一页
-        # 发一遍就是按页数翻倍，而模型翻页时找的是正文。名字与位置留着——它得能对上
-        # 「这是刚才那份技能的正文切片」。
-        return f"[skill:{name} location={skill.location}]\n{body}"
+            return (f"{head}{self._outline(skill.body)}"
+                    f"\n{skill.body}{self._paging_note(name, skill.body)}")
+        # 分页那头**不重复整份附件清单**（几百字节到 1 KB 的目录，跟着每一页发一遍
+        # 就是按页数翻倍）与**整份章节目录**（它在第一次加载时给过）。名字与位置留着
+        # ——模型得能对上「这是刚才那份技能的正文切片」。
+        return (f"[skill:{name} location={skill.location}]"
+                f"{self._outline(skill.body, only_from=offset)}\n{body}")
 
     @staticmethod
     def _page(text: str, offset: int | None, limit: int | None) -> tuple[str | None, str]:
@@ -503,6 +536,10 @@ class LoadSkillTool(Tool):
 
         越界不夹取而是回一句人话错误（与 `read_file` 同一形状）：夹取会让模型以为
         「后面没有了」，而它其实只是把行号写错了。
+
+        页脚三件事：**这一页在哪一节**、**接着读的 offset 是几**、**到底了没有**。
+        真机实测（14 镜「薄肌理论」那条 run）：这三件都没有时，模型读了 674 行里的
+        11 页、又回头重取其中 9 页——它没有一个能确认「哪几行已经看过了」的办法。
         """
         if not offset and not limit:
             return None, ""
@@ -512,7 +549,87 @@ class LoadSkillTool(Tool):
             return None, f"Error: offset {start} 超出末尾（全文共 {len(lines)} 行）"
         end = len(lines) if not limit else min(len(lines), start + max(1, int(limit)) - 1)
         chunk = "\n".join(lines[start - 1:end])
-        return f"{chunk}\n\n（第 {start}–{end} 行，共 {len(lines)} 行）", ""
+        where = LoadSkillTool._heading_at(lines, start)
+        where = f"——从「{where}」这一节开始" if where else ""
+        rest = ("**到底了**" if end >= len(lines) else f"接着读用 offset={end + 1}")
+        return f"{chunk}\n\n（第 {start}–{end} 行，共 {len(lines)} 行{where}；{rest}）", ""
+
+    @staticmethod
+    def _attachment_listing(files: Sequence[Mapping[str, Any]]) -> list[str]:
+        """附件清单：**小目录逐个列，大目录折叠成一行**。
+
+        为什么非要折叠（真机实测，14 镜「薄肌理论」那条 run）：这份技能有 **290 个附件**，
+        逐个列出来是 **17.6 KB**——比单条工具结果 24 KB 的闸的头窗口（约 17.3 KB）还大。
+        后果不是「清单难看」，是**它把同一份回复里排在它后面的东西整个挤出窗口**：章节目录
+        （1.2 KB）刚好落在切点之外，模型一个字都没看到。清单本身也在中途被切断——真机那次
+        模型就是拿这半截清单去猜路径的。
+
+        折叠的判据只用**目录 + 件数**，不认技能内容：一个目录下件数不多就照原样列（模型
+        要按 path 取值，名字得是真的）；件数多说明那是一批同族文件，给「目录 / 件数 /
+        哪一份是它的索引」就够——真机这两批各有一份现成的索引附件（``shots/INDEX.md``
+        与 ``demos/MANIFEST.json``），完整相对路径本来就在里面。
+        """
+        rows = [str(f.get("relpath") or "") for f in files]
+        size = {str(f.get("relpath") or ""): f.get("bytes", 0) for f in files}
+        groups: dict[str, list[str]] = {}
+        for rel in rows:
+            groups.setdefault(rel.split("/", 1)[0] if "/" in rel else "", []).append(rel)
+        out: list[str] = []
+        # 根目录上的先列（pipeline.md / sound-design.md 这类是模型真会点名的）
+        for name in sorted(groups, key=lambda k: (k != "", k)):
+            members = sorted(groups[name])
+            if not name or len(members) < _BULK_MIN:
+                out.extend(f"  - {rel}（{size.get(rel, 0)} 字节）" for rel in members)
+                continue
+            index = next((rel for rel in members
+                          if rel.rsplit("/", 1)[-1] in _INDEX_NAMES), "")
+            if index:
+                out.append(f"  - {name}/：{len(members)} 个文件，完整相对路径见 {index}")
+            else:
+                out.append(f"  - {name}/：{len(members)} 个文件，如 "
+                           + "、".join(members[:3]) + " …")
+        if len(out) > _MANIFEST_MAX_EXACT:
+            rest = len(out) - _MANIFEST_MAX_EXACT
+            out = out[:_MANIFEST_MAX_EXACT] + [f"  …（另有 {rest} 项未列出）"]
+        return out
+
+    @staticmethod
+    def _heading_at(lines: list[str], lineno: int) -> str:
+        """第 ``lineno`` 行往上最近的那个标题（没有就给空串）。"""
+        for i in range(min(lineno, len(lines)), 0, -1):
+            line = lines[i - 1]
+            if line.startswith("#"):
+                return line.lstrip("#").strip()[:40]
+        return ""
+
+    @staticmethod
+    def _outline(text: str, *, only_from: int | None = None) -> str:
+        """长正文的**章节目录**：标题 + 行号。短正文不给（几十行加张目录纯属噪音）。
+
+        为什么非给不可（真机实测，14 镜「薄肌理论」那条 run）：这份技能 674 行、44 个小节，
+        模型明确知道自己要哪几节（闸⑦ 通道表 / ㉑ 动效锚定 / reveal / 数据镜 / 节点参数），
+        **却无从知道它们在文件里的哪一行**——于是它按 120 行一段顺读，读完再回头猜着取
+        （offset 240 / 359 / 478 / 597 全是猜的，真值在 335 / 631 / 481 / 596），四十几轮
+        工具调用一个计划都没交出来。**"要哪一节在哪一行"是这一份文档唯一查不到的事实**，
+        而它本来就在标题里摆着。
+
+        ``only_from``：分页调用只在**第一页**附目录——它在整份加载时已经给过一次，每页
+        再发一遍就是按页数翻倍。
+        """
+        if len(text.encode("utf-8")) <= _PAGING_NOTE_BYTES:
+            return ""
+        if only_from not in (None, 1):
+            return ""
+        rows = [(i, ln) for i, ln in enumerate(text.splitlines(), start=1)
+                if ln.startswith("#")]
+        if not rows:
+            return ""
+        shown = rows[:_OUTLINE_MAX_ROWS]
+        body = "\n".join(f"  {i:>4}  {ln.strip()[:52]}" for i, ln in shown)
+        more = (f"\n  …还有 {len(rows) - len(shown)} 节（按行号往后取即可）"
+                if len(rows) > len(shown) else "")
+        return ("\n章节目录（左边是行号：要哪一节就 load_skill(name, offset=那个行号) "
+                f"直取那一节，**不要从头顺读**）：\n{body}{more}")
 
     @staticmethod
     def _paging_note(name: str, text: str) -> str:
@@ -535,12 +652,20 @@ class LoadSkillTool(Tool):
             if err:
                 return err
             if body is not None:
-                return f"[skill:{skill.name} location={skill.location}]\n{body}"
-            return (f"[skill:{skill.name} location={skill.location}]\n{skill.body}"
+                return (f"[skill:{skill.name} location={skill.location}]"
+                        f"{self._outline(skill.body, only_from=offset)}\n{body}")
+            return (f"[skill:{skill.name} location={skill.location}]"
+                    f"{self._outline(skill.body)}\n{skill.body}"
                     + self._paging_note(skill.name, skill.body))
         if not any(f["relpath"] == rel for f in skill.files):
-            known = ", ".join(f["relpath"] for f in skill.files) or "（该技能无附件）"
-            return f"Error: 技能 {skill.name} 无附件 {rel}；在案的附件：{known}"
+            # 附件清单**只报一小截**：真机实测这份技能有两百多个附件，全倒出来是十几 KB
+            # 的一团路径（还多半会被闸从中间切掉），而模型此刻只想知道「我写的那个名字
+            # 错在哪」。完整清单本来就在整份加载的那一段里给过。
+            names = [f["relpath"] for f in skill.files]
+            head = "、".join(names[:_MISSING_LIST_MAX]) or "（该技能无附件）"
+            more = f"…（共 {len(names)} 个）" if len(names) > _MISSING_LIST_MAX else ""
+            return (f"Error: 技能 {skill.name} 无附件 {rel}；在案的附件有 {head}{more}。"
+                    f"完整清单见整份加载该技能时给的那一节。")
         try:
             data = await self._loader.read_attachment(skill, rel)
         except StorageUnavailable as exc:
