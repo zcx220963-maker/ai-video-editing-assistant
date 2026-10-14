@@ -66,6 +66,15 @@ class Capabilities:
     # TTS（edge-tts 免费）
     tts_voice: str = "zh-CN-XiaoxiaoNeural"
     tts_rate: str = "+0%"
+    # TTS 逐组并发。原先是**一组一组串着等**（每组一次网络往返，10 组就是 10 个
+    # provider_timeout 的窗口），而它几乎全是等待——不并就是白等。
+    # 但不能无限开：免费 TTS 有软限流，打太狠会被拒，而这条链的降级是
+    # 「静音垫」，那是**质量退化**而不是变慢（见 GenerateVoiceoverNode 的 fallback）。
+    tts_concurrency: int = 4
+    # 相邻分组之间的 AI 转场：每条是一次 ffmpeg xfade，走 asyncio.to_thread
+    # （真进程级并行，抢的是 CPU）。3 是「两三条几乎白捡、再多开始互相拖」的档位；
+    # 这台机器同时还要跑渲染与 ASR，抢过头整条链一起慢。
+    transition_concurrency: int = 3
     # 剪辑参数
     scene_threshold: float = 0.3
     min_shot_sec: float = 0.6
@@ -171,6 +180,9 @@ class Settings:
                                              Capabilities.provider_timeout_sec)),
             tts_voice=c.get("tts_voice", Capabilities.tts_voice),
             tts_rate=c.get("tts_rate", Capabilities.tts_rate),
+            tts_concurrency=int(c.get("tts_concurrency", Capabilities.tts_concurrency)),
+            transition_concurrency=int(c.get("transition_concurrency",
+                                             Capabilities.transition_concurrency)),
             scene_threshold=float(c.get("scene_threshold", Capabilities.scene_threshold)),
             min_shot_sec=float(c.get("min_shot_sec", Capabilities.min_shot_sec)),
             max_shot_sec=float(c.get("max_shot_sec", Capabilities.max_shot_sec)),

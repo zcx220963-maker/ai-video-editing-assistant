@@ -1182,26 +1182,38 @@ class GenerateVoiceoverNode(StoryNode):
         # 原声模式：音轨由素材原声承担，不合成 TTS（有无口播段都一样）
         if _wants_original_audio(state, inputs):
             return {"voiceover": [], "mode": "original_audio"}
-        out = []
-        for s in inputs["generate_script"]["group_scripts"]:
-            dst = self._work(state, "voiceover") / f"{_safe(s['group_id'])}.mp3"
-            try:
-                await self._capped(self.providers.tts(s["raw_text"], dst))
-                src = "edge-tts"
-            except (ProviderError, TimeoutError):
-                dst = self._work(state, "voiceover") / f"{_safe(s['group_id'])}-fb.wav"
-                await asyncio.to_thread(mediaops.silent_wav, dst,
-                                        max(2.0, len(s["raw_text"]) * 0.22))
-                src = "silent_fallback"
-            try:
-                info = await asyncio.to_thread(mediaops.probe, dst)
-                dur = float(info["duration"])
-            except MediaError:
-                dur = max(2.0, len(s["raw_text"]) * 0.22)
-            # 自产的字节只有进了对象存储才谈得上「产物」：工作区随时会被回收
-            ref = await self._keep(state, dst, "voiceover")
-            out.append({"group_id": s["group_id"], "path": ref,
-                        "duration": round(dur, 3), "source": src})
+        # 逐组并发（不是逐组串着等）：每组一次网络往返、纯粹是等待，10 组串起来就是
+        # 10 个 provider_timeout 的窗口。并发度有上限（caps.tts_concurrency）——
+        # 免费 TTS 有软限流，打太狠会被拒，而这条链的降级是「静音垫」，
+        # 那是质量退化而不是变慢。
+        sem = asyncio.Semaphore(max(1, int(getattr(
+            self.settings.caps, "tts_concurrency", 4))))
+
+        async def _one(s: dict[str, Any]) -> dict[str, Any]:
+            async with sem:
+                dst = self._work(state, "voiceover") / f"{_safe(s['group_id'])}.mp3"
+                try:
+                    await self._capped(self.providers.tts(s["raw_text"], dst))
+                    src = "edge-tts"
+                except (ProviderError, TimeoutError):
+                    dst = self._work(state, "voiceover") / f"{_safe(s['group_id'])}-fb.wav"
+                    await asyncio.to_thread(mediaops.silent_wav, dst,
+                                            max(2.0, len(s["raw_text"]) * 0.22))
+                    src = "silent_fallback"
+                try:
+                    info = await asyncio.to_thread(mediaops.probe, dst)
+                    dur = float(info["duration"])
+                except MediaError:
+                    dur = max(2.0, len(s["raw_text"]) * 0.22)
+                # 自产的字节只有进了对象存储才谈得上「产物」：工作区随时会被回收
+                ref = await self._keep(state, dst, "voiceover")
+                return {"group_id": s["group_id"], "path": ref,
+                        "duration": round(dur, 3), "source": src}
+
+        # gather 保序：voiceover 与 group_scripts 的下标必须一一对应
+        # （下游 plan_timeline 按 group_id 取时长，错位就是音画不同步）。
+        out = list(await asyncio.gather(
+            *[_one(s) for s in inputs["generate_script"]["group_scripts"]]))
         return {"voiceover": out}
 
 
@@ -1214,26 +1226,42 @@ class GenerateAITransitionNode(StoryNode):
     async def process(self, state, inputs):
         caps = self.settings.caps
         groups = inputs["group_clips"]["groups"]
-        transitions = []
         style = random.choice(TRANSITION_STYLES)
-        for a, b in zip(groups, groups[1:]):
+        # 逐对并发：每条转场是一次 ffmpeg xfade（走 to_thread，真进程级并行，
+        # 抢的是 CPU），相邻对之间没有任何数据依赖。此前是 for 循环逐条 await，
+        # N 个分组就白等 N 次编解码。
+        # 并发度必须封顶（caps.transition_concurrency）：这台机器同时还要跑
+        # 逐镜渲染与 ASR，ffmpeg 抢过头是整条链一起变慢，不是这一节点变快。
+        sem = asyncio.Semaphore(max(1, int(getattr(
+            caps, "transition_concurrency", 3))))
+
+        async def _one(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any] | None:
+            if not (a.get("clips") and b.get("clips")):
+                return None
             tail, head = a["clips"][-1], b["clips"][0]
             dst = self._work(state, "ai_transitions") / \
                 f"{_safe(a['group_id'])}_{_safe(b['group_id'])}.mp4"
             try:
                 tail_src = await self._local(state, tail["path"], "material")
                 head_src = await self._local(state, head["path"], "material")
-                await asyncio.to_thread(
-                    mediaops.xfade_clip, tail_src, head_src,
-                    max(tail["start"], tail["end"] - caps.transition_sec),
-                    head["start"], dst, style, caps.transition_sec,
-                    (head["width"] or 1280, head["height"] or 720))
-                transitions.append({"path": await self._keep(state, dst, "ai_transitions"),
-                                    "style": style,
-                                    "between": [a["group_id"], b["group_id"]],
-                                    "duration": caps.transition_sec})
+                async with sem:
+                    await asyncio.to_thread(
+                        mediaops.xfade_clip, tail_src, head_src,
+                        max(tail["start"], tail["end"] - caps.transition_sec),
+                        head["start"], dst, style, caps.transition_sec,
+                        (head["width"] or 1280, head["height"] or 720))
+                return {"path": await self._keep(state, dst, "ai_transitions"),
+                        "style": style,
+                        "between": [a["group_id"], b["group_id"]],
+                        "duration": caps.transition_sec}
             except Exception:
-                continue  # 转场缺失不阻断主链路
+                return None  # 转场缺失不阻断主链路
+
+        pairs = list(zip(groups, groups[1:]))
+        done = await asyncio.gather(*[_one(a, b) for a, b in pairs])
+        # 顺序照 pairs 保下来（缺的跳过）：下游按 between 找对应分组，
+        # 顺序错乱会让「第几段用哪个转场」与编排对不上。
+        transitions = [t for t in done if t is not None]
         return {"ai_transitions": transitions}
 
 

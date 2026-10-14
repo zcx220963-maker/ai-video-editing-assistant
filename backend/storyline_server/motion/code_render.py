@@ -348,12 +348,15 @@ async def _empty_check(sid: str, clip: Path, *, bg_hex: str, size: tuple[int, in
     「留白多的版式」这一种风格判死，而这条链没有权利替审美定风格。那一档由报告层
     拿 `fill_span` 现算成提醒（见 `motion_code_nodes._result`），两处不各存一份。
     """
-    stats = []
-    for frac in EMPTY_SAMPLES:
-        png = shot_work / f"empty{int(frac * 100)}.raw"
-        stats.append(await asyncio.to_thread(
-            _frame_diff_stats, clip, duration * frac, bg_hex=bg_hex, size=size,
-            out=png, band=band))
+    # 三个取样点并发（原来是逐帧 await，每帧一次 ffmpeg，三帧就是三趟白等）。
+    # 三个调用之间没有任何共享：取样时刻不同（-ss 不同）、落盘文件各一个
+    # （empty15/50/85.raw）、只读不写同一个 clip。gather 保序：下面按位置取
+    # ratios / span，顺序错了「最低占比」就取错了帧。
+    stats = list(await asyncio.gather(*[
+        asyncio.to_thread(_frame_diff_stats, clip, duration * frac, bg_hex=bg_hex,
+                          size=size, out=shot_work / f"empty{int(frac * 100)}.raw",
+                          band=band)
+        for frac in EMPTY_SAMPLES]))
     ratios = [s[0] for s in stats]
     low = min(ratios)
     span = max(s[1] for s in stats)
