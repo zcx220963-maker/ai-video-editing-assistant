@@ -552,6 +552,38 @@ def _norm_demo_relpath(d: str) -> str:
     return d[len(DEMO_PREFIX):] if d.startswith(DEMO_PREFIX) else d
 
 
+#: 打回时最多点几份真文件名（一份一行的写法是文件小，读起来才知道是几份）。
+_DEMO_SUGGEST_MAX = 6
+
+
+def demo_dir_files(rel: str, known: Any = None) -> tuple[str, list[str]]:
+    """``derived_from`` 写错时，盘上真正能写的是哪几份 → ``(目录, 文件名列表)``。
+
+    真机实测（14 镜那条 run，``034d6b4201ea``）：模型照「卡名 → `<卡名驼峰>.tsx`」的写法
+    填 ``derived_from``，14 镜里 **11 镜命中**——这个规律在语料里多数卡上成立，所以它不是
+    乱猜，是照多数派归纳出来的。落空的那 3 镜恰好是「卡名 ≠ demo 文件名」：
+    ``data/chart-live-moves`` 下真正的三份叫 AxisRescaleShockV2 / OscilloscopeStreamV2 /
+    UnitDotSwarmRegroupV2，而 INDEX.md 那一行给的是**卡名**（末尾的 46,666 B 是该目录
+    三份之和，不是某一份）。它拿不到名字，只能猜；猜错之后原先的回执又只叫它「从
+    demos/MANIFEST.json 里选」——那是一个 10 KB 的附件，又是一次往返。所以名字直接给。
+
+    判据只有「同一个目录」这一条（字符串前缀），**不做相似度猜名字**：模型要的是真的那
+    几份，给它一个「看起来像」的反而引出下一轮瞎猜。两种写法都认——给了目录名本身
+    （``data/chart-live-moves``）与给了目录下的错文件名（``data/chart-live-moves/X.tsx``）。
+    目录也对不上（比如整个类别名写错）就返回空：那时能给的只有整份清单，而清单本来就在
+    INDEX.md / MANIFEST.json 里，回执不必再抄一遍（抄了也只是把 10 KB 挪个地方）。
+    """
+    rels = tuple(known if known is not None else _known_demo_relpaths())
+    if not rels:
+        return "", []
+    rel = _norm_demo_relpath(rel).rstrip("/")
+    dirs = {r.rsplit("/", 1)[0] for r in rels if "/" in r}
+    d = rel if rel in dirs else (rel.rsplit("/", 1)[0] if "/" in rel else "")
+    if d not in dirs:
+        return "", []
+    return d, sorted(r.rsplit("/", 1)[1] for r in rels if r.startswith(d + "/"))
+
+
 def _norm_cite(raw: Mapping[str, Any], sid: str,
                errors: list[str]) -> tuple[str, list[str]]:
     """``card`` / ``derived_from`` 两栏的归一与白名单校验——**单源**。
@@ -585,10 +617,27 @@ def _norm_cite(raw: Mapping[str, Any], sid: str,
         known_demos = _known_demo_relpaths()
         if known_demos:
             for d in derived_from:
-                if d not in known_demos:
+                if d in known_demos:
+                    continue
+                # 打回要**能照着改**。旧措辞只叫它「从 demos/MANIFEST.json 里选」——那是一份
+                # 10 KB 的附件：模型得再取一次、再读一遍，才拿到「这一个目录下真正叫什么」。
+                # 真机那条 run（034d6b4201ea）就卡在这里收尾：3 镜被同一条打回，它没有名字
+                # 可抄，只能改用「换成同族的卡 / 砍成 11 镜」去问用户。名字给出来，就够了。
+                d_dir, files = demo_dir_files(d, known_demos)
+                if files:
+                    shown = files[:_DEMO_SUGGEST_MAX]
+                    tail = "" if len(shown) == len(files) else f"…（共 {len(files)} 份）"
                     _err(errors, f"{sid}：derived_from={d!r} 不在 demo 语料白名单中"
-                                 f"（共 {len(known_demos)} 个 demo），"
-                                 f"必须从 demos/MANIFEST.json 里选")
+                                 f"（共 {len(known_demos)} 个 demo）——{d_dir}/ 下真有的几份："
+                                 + "、".join(f"{d_dir}/{f}" for f in shown) + tail
+                                 + "。**照抄其中一份**：这一栏要的是具体某一份文件，"
+                                   "不是目录名，也不是照卡名拼出来的 <卡名>.tsx"
+                                   "——卡名与 demo 的文件名常常不是一回事")
+                else:
+                    _err(errors, f"{sid}：derived_from={d!r} 不在 demo 语料白名单中"
+                                 f"（共 {len(known_demos)} 个 demo）——照 shots/INDEX.md 那一行"
+                                 f"的 demo 栏抄（那一栏给的就是真文件名），"
+                                 f"或从 demos/MANIFEST.json 里选")
     return card, derived_from
 
 
@@ -2658,6 +2707,8 @@ def collect_demos(plan: list[dict[str, Any]]
 
     ``relpath`` 走 ``_norm_cite``——与闸⑫/分镜轮同一份白名单；不在册的当场打回，
     **不给字节**（给了就等于承认了一个不存在的出处，模型照着写出来的代码回头必被闸⑫ 打回）。
+    **不在册的那几条不再在这里重复报**：``_norm_cite`` 刚逐条报过，而且报得比这里准（它点名了
+    盘上真有的几份）。这里只报「**在册却读不到**」——那才是语料缺件，是模型该转告的事。
     """
     errors: list[str] = []
     rows: list[dict[str, Any]] = []
@@ -2670,6 +2721,7 @@ def collect_demos(plan: list[dict[str, Any]]
     oversize: list[dict[str, Any]] = []
     seen: set[str] = set()
     total = 0
+    known = _known_demo_relpaths()
     for row in rows:
         for rel in row["derived_from"]:
             if rel in seen:
@@ -2677,9 +2729,22 @@ def collect_demos(plan: list[dict[str, Any]]
             seen.add(rel)
             data = demo_bytes(rel)
             if data is None:
-                errors.append(
-                    f"取材轮：demo {rel!r} 在 MANIFEST 里，盘上却读不到"
-                    "——这一份的字节取不回来，取材不算完成（先修语料，别拿记忆补）")
+                # 不在白名单的那几条，`_norm_cite` 刚刚逐条报过，而且报得比这里准（点名了
+                # 盘上真有的那几份）。旧代码在这里**又报一次**，论断还是反的——它写着
+                # 「在 MANIFEST 里」——于是同一条回执里两句话互相打脸（「不在白名单」与
+                # 「在 MANIFEST 里」），模型读成「不是我写错名字，是语料缺件」，
+                # 转手把这个不该它解决的问题弹给了用户。不清单里，就别替它下结论。
+                if known and rel not in known:
+                    continue
+                if known:
+                    errors.append(
+                        f"取材轮：demo {rel!r} 在 MANIFEST 里，盘上却读不到"
+                        "——这一份的字节取不回来，取材不算完成（先修语料，别拿记忆补）")
+                else:
+                    errors.append(
+                        f"取材轮：demo {rel!r} 在盘上读不到，这一份的字节取不回来"
+                        "——而 demos/MANIFEST.json 也没读出来，说不清它是清单里的还是"
+                        "本来就缺件；先把这两样任一对上再调本工具")
                 continue
             # 第一份无论多大都照给：一份全文都比「一份都不给」有用，而这个上限
             # 本来就是防「一轮塞太多」，不是防「单件太大」。

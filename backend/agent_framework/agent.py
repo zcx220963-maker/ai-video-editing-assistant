@@ -1678,8 +1678,10 @@ class AgentOnceRun:
                 f"Error: 这一轮已经读过 {len(cards_read)} 张 shot 卡，到上限了"
                 f"（SKILL.md:65：「不要读超过 {_MAX_SHOT_CARDS} 张卡」），"
                 f"`{card}` 这次不执行。索引 `shots/INDEX.md` 每行都带着卡名、能量、"
-                f"一句话描述、时长、适用与 demo 字节——**选卡看那一份就够**，"
-                f"不必逐张打开卡全文。现在就交计划（规划轮调用 submit_plan）："
+                f"一句话描述、时长、适用，以及 demo 的**文件名**与字节——"
+                f"**选卡、填 `derived_from` 都看那一份就够**（`derived_from` 照抄 demo 栏里的"
+                f"relpath：文件名与卡名多数对不上，别拿卡名去拼），不必逐张打开卡全文。"
+                f"现在就交计划（规划轮调用 submit_plan）："
                 f"把选中的卡名照抄进行首的 `<类别>/<卡名>` 填进 `card`。",
                 counts_as_failure=n > _MAX_REFUSALS_BEFORE_FAILURE)
 

@@ -54,7 +54,8 @@ demo 实现是参数的真相——你的工作是**选卡 + 把 demo 代码适�
 ## 选卡方法
 
 **先读 `shots/INDEX.md`（一次加载技能调用）**——它列了全部 124 张卡的卡名、能量、一句话描述，
-扫完就能选卡，不要逐张调「加载技能」读卡全文。
+以及每张卡 demo 的**文件名**（`derived_from` 就照抄那一栏），扫完就能选卡，
+不要逐张调「加载技能」读卡全文。
 
 选卡流程：
 1. 读 `shots/INDEX.md`（1 次调用）→ 按选题选 3-5 个类别
@@ -67,7 +68,11 @@ demo 实现是参数的真相——你的工作是**选卡 + 把 demo 代码适�
 
 ## 适配 demo 代码
 
-每张卡的「参考实现」指向 `demos/<category>/<card-name>/` 下的 TSX 文件。适配步骤：
+每张卡的「参考实现」指向 `demos/<category>/<card-name>/` 下的 TSX 文件。
+**目录名是卡名，里面的文件名不是**——`camera/basic-3d-scene` 下那份叫 `Basic3DScene.tsx`、
+`camera/depth-layer-moves` 那份叫 `MultiplaneReal.tsx`，**多数卡都对不上**。所以 `derived_from`
+**照抄 `shots/INDEX.md` demo 栏里的 relpath**（那一栏写的就是盘上真有的文件名），
+别照卡名拼 `<卡名>.tsx`——拼错的名字取材轮当场打回。适配步骤：
 
 1. **先取材，再写码**：把这一版分镜写成**只有骨架**的一份（每镜带 `id`/`text`/`card`/
    `derived_from`，**一镜都不带 `code`**）交给 `plan_motion`。这一轮叫**取材轮**：它不回
@@ -237,8 +242,9 @@ export default Shot;
 - 首尾各留一镜：开场与收尾的呼吸镜（`min_duration_sec` 给 1.5~2.5）。
 - `source` 如实填。没查到的不要写上去。
 - `card` 填卡名（如 `aurora-bloom-bg-flip`），`derived_from` 填 demo 的 relpath
-  （如 `effects/aurora-bloom-bg-flip/AuroraBloomBgFlip.tsx`——**相对 `demos/` 的写法**，
-  与 `demos/MANIFEST.json` 里的键一致；带 `demos/` 前缀的写法也收，会归一）。
+  （如 `camera/depth-layer-moves/MultiplaneReal.tsx`——**相对 `demos/` 的写法**，
+  与 `demos/MANIFEST.json` 里的键一致；带 `demos/` 前缀的写法也收，会归一。
+  **照抄 `shots/INDEX.md` demo 栏**：文件名与卡名多数对不上，别拿卡名去拼）。
   闸 `derived_from` 校验白名单读的就是那份 MANIFEST，不在清单里的路径逐镜打回。
 - `assets` 每项含 `{name, sha256, ext}`（可选 `source`/`alpha`/`layer`）。`staticFile(name)`
   引图时，lint 规则 `dg/staticfile-asset-check` 双向对账：代码里引了但 `assets` 没声明 →
