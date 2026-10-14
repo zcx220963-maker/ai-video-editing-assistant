@@ -795,6 +795,10 @@ def build_runtime(
         fetch_policy=fetch_policy,
         skill_loader=skill_loader,
         skills_dir=skills_import_dir,
+        # 设置页「提示词」区块的数据源。`--no-prompts`/全内联那档 library.dir 是 None，
+        # 这时传 False（＝「没有目录可列」）而不是 None——None 的语义是「按仓库默认目录」，
+        # 两者混了会让「全内联」也在页面上列出一堆其实没接线的文件。
+        prompt_dir=prompt_library.dir if prompt_library is not None and prompt_library.dir else False,
         mcp_manager=mcp_manager,
         editing_contract=editing_contract,
         broadcast_url=broadcast_url or None,

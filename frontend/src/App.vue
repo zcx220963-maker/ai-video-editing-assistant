@@ -3003,6 +3003,10 @@ async function toggleSettings() {
   // 不占 keyError——记忆读不到不该让整页设置看起来是坏的。
   memoryMsg.value = "";
   await loadMemories();
+  // 提示词清单一同拉一次：它是「哪句话在生效」的答案，与记忆一样属于
+  // 「此前只有代码里能看到」的东西；失败同样只写进自己区块的回话。
+  promptOpen.value = "";
+  await loadPrompts();
   mcpSetMsg.value = "";
   await loadMcpAdmin();
 }
@@ -3071,6 +3075,49 @@ async function deleteMemory(category) {
     memoryMsg.value = "删除失败：" + e.message;
   } finally {
     memorySaving.value = "";
+  }
+}
+
+// ---- 提示词一览（后端 /prompts，读 prompts/manifest.json + 磁盘）----
+// 只读，**不给编辑**：这些文件随代码分发（Dockerfile COPY 进镜像），在页面上改完
+// 落不进镜像、下次部署就被覆盖——「改了不生效」比「不让改」更难查。要看正文是因为
+// 「哪句话在生效」此前只散在 8 个 .py 与 prompts/ 目录里，用户只能去翻仓库。
+const prompts = ref(null);
+const promptsMsg = ref("");
+const promptOpen = ref("");       // 正在展开正文的那一份（空 = 都收起）
+const promptOpenText = ref("");   // 该份的正文
+const promptOpenErr = ref("");
+
+async function loadPrompts() {
+  promptsMsg.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch("/prompts", { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    prompts.value = j;
+  } catch (e) {
+    promptsMsg.value = "读不到提示词清单：" + e.message;
+  }
+}
+
+async function togglePrompt(name) {
+  if (promptOpen.value === name) {
+    promptOpen.value = "";
+    return;
+  }
+  promptOpen.value = name;
+  promptOpenText.value = "";
+  promptOpenErr.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch(`/prompts/${encodeURIComponent(name)}`, { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    if (promptOpen.value !== name) return;  // 展开期间又点了别的，这份结果作废
+    promptOpenText.value = j.text || "";
+  } catch (e) {
+    promptOpenErr.value = "读不到正文：" + e.message;
   }
 }
 
@@ -4733,6 +4780,64 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         <p v-if="memoryMsg" class="set-note"
            :class="{ bad: memoryMsg.includes('失败') || memoryMsg.includes('读不到') }">{{ memoryMsg }}</p>
 
+        <!-- 提示词一览：此前「哪句话在生效」只散在 8 个 .py 与 prompts/ 目录里，只能翻仓库。
+             这一块把清单摊开——按相分组、每份的字节数/调用点/占位符，点开看全文。
+             **只读**：文件随代码分发进镜像，页面上改完落不进下次部署（见 loadPrompts）。 -->
+        <div class="set-line set-head">
+          提示词（发给模型的话）
+          <span v-if="prompts && prompts.entries" class="set-note">
+            共 {{ prompts.entries.length }} 份 · 每轮常发合计 {{ prompts.always_bytes }} 字节
+          </span>
+        </div>
+        <p v-if="prompts && prompts.note" class="set-note">{{ prompts.note }}</p>
+        <template v-if="prompts && prompts.dir">
+          <p class="set-note">
+            目录 {{ prompts.dir }}（清单 version {{ prompts.version }}）。
+            每轮必发的那几份是固定段，其余按链（规划 / 剪辑 / 子 Agent）与按需加载——
+            带 <b class="pmt-fixed">固定</b> 标记的就是唯一还带内联兜底的那份。
+          </p>
+          <!-- 清单与磁盘对不上（清单说有、盘上没有 / 加了文件没记账 / 某份超上限）时
+               当场标红，不等下一次重启在日志里发现——启动期那条同样会拦服务。 -->
+          <div v-for="p in (prompts.problems || [])" :key="p" class="set-note bad">自检：{{ p }}</div>
+          <div v-for="ph in prompts.phases" :key="ph.key" class="pmt-phase">
+            <div class="set-note">{{ ph.label }}</div>
+            <div v-for="e in prompts.entries.filter(x => x.phase === ph.key)"
+                 :key="e.name" class="pmt-row">
+              <button class="pmt-head" @click="togglePrompt(e.name)">
+                <span class="pmt-name">{{ e.name }}</span>
+                <span class="set-note">
+                  {{ e.kind_label }} · {{ e.bytes }} 字节<template
+                    v-if="e.max_bytes">／上限 {{ e.max_bytes }}</template>
+                  · {{ e.file }}
+                  <template v-if="e.fixed"> · <b class="pmt-fixed">固定</b></template>
+                  <template v-if="e.over_cap"> · <b class="bad">已超上限</b></template>
+                  <template v-if="e.missing"> · <b class="bad">文件读不到</b></template>
+                </span>
+                <span class="set-note">{{ promptOpen === e.name ? "收起" : "看正文" }}</span>
+              </button>
+              <div class="set-note">{{ e.desc }}</div>
+              <div v-if="e.referenced_by && e.referenced_by.length" class="set-note">
+                调用点：{{ e.referenced_by.join(" · ") }}
+              </div>
+              <!-- 占位符要列出来：漏喂一个键不会抛错，只会让那段文案静默消失。 -->
+              <div v-if="e.placeholders && e.placeholders.length" class="set-note">
+                模板占位符：{{ e.placeholders.map(k => "{" + k + "}").join(" ") }}
+              </div>
+              <template v-if="promptOpen === e.name">
+                <div v-if="promptOpenErr" class="set-note bad">{{ promptOpenErr }}</div>
+                <pre v-else-if="promptOpenText" class="pmt-body">{{ promptOpenText }}</pre>
+                <div v-else class="set-note">读取中…</div>
+              </template>
+            </div>
+          </div>
+          <p class="set-note">
+            正文里的机器名会被换成中文名（如 skill id → 技能显示名），所以这里看到的字节数
+            与正文字符数可能差几十字节，不是数据坏了。
+            要改提示词就改仓库里的 <code>prompts/</code>（新增或改动要同步 manifest.json 的记账），改完重建。
+          </p>
+        </template>
+        <p v-if="promptsMsg" class="set-note bad">{{ promptsMsg }}</p>
+
         <!-- MCP 外部工具：发版种子（backend/mcp.json，启动时入库）与这里登记的运行期
              那一路写的是**同一张表**，连接一律由 McpManager 发起——所以「哪台在线、
              贡献了几个工具」在这一个地方就能看全，不用去翻启动日志。 -->
@@ -5452,6 +5557,24 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   border: 1px dashed var(--line); border-radius: 4px; outline: none; resize: vertical;
 }
 .mem-area:focus { border-color: var(--vermilion); border-style: solid; }
+/* 提示词区块：按相（phase）分组，每份一行、点开看正文。只读——不给输入框，
+   因为改这里落不进镜像（见 loadPrompts 上方那段注释）。 */
+.pmt-phase { display: flex; flex-direction: column; gap: 2px; padding: 6px 0 2px; }
+.pmt-row { display: flex; flex-direction: column; gap: 4px; padding: 6px 0;
+  border-top: 1px dotted var(--line); }
+.pmt-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+  background: none; border: none; padding: 0; text-align: left; cursor: pointer;
+  font: inherit; color: var(--ink); }
+.pmt-head:hover .pmt-name { color: var(--vermilion); }
+.pmt-name { font-family: ui-monospace, monospace; font-size: 12.5px; font-weight: 600; }
+.pmt-fixed { color: var(--vermilion); font-weight: 600; }
+.pmt-body {
+  margin: 0; padding: 9px 11px; max-height: 22rem; overflow: auto;
+  white-space: pre-wrap; word-break: break-word;
+  font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.65;
+  color: var(--ink); background: rgba(255, 253, 247, 0.9);
+  border: 1px dashed var(--line); border-radius: 4px;
+}
 
 /* 气泡内的附件卡片 */
 .atts { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }

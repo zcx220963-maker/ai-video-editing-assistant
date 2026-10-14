@@ -66,6 +66,8 @@ from .heartbeat import Heartbeat
 from .ingest import IngestRejected, ingest_bytes
 from .library_pick import pick_library_asset
 from .memory import CATEGORIES, MemoryContextSource
+from .prompts import (DEFAULT_PROMPTS_DIR, PHASES, load_manifest, placeholders_in,
+                      validate_manifest)
 from .identity import storyline_session_id
 from .orchestration import _safe
 from . import judge as judge_mod
@@ -724,6 +726,26 @@ class MemoryWriteRequest(BaseModel):
 _MEMORY_MAX_BYTES = 8192
 
 
+#: 提示词清单里 phase / kind 的中文名，给设置页「提示词」区块用。
+#: 为什么不并成一份「值→名」表：phase 与 kind 的取值集合会各自长，而「每轮常发」这两个字
+#: 在两个维度里含义不同（一个是「这个环节」、一个是「这个频率」），并了就再也分不开。
+#: 兜底一律 `.get(key, key)`：漏写一个中文名只会让页面露出英文键，不会让区块崩掉。
+_PHASE_LABELS: dict[str, str] = {
+    "always": "每轮装配",
+    "planning": "规划轮",
+    "editing": "剪辑链",
+    "subagent": "子 Agent",
+    "guard": "门禁回执",
+    "skill_flow": "技能沉淀",
+    "script": "文案节点",
+}
+_KIND_LABELS: dict[str, str] = {
+    "always": "每轮常发",
+    "conditional": "条件发",
+    "on_demand": "按需（模型自己去读）",
+}
+
+
 def create_app(
     agent: Agent,
     mq: MessageQueue,
@@ -740,6 +762,9 @@ def create_app(
     fetch_policy: FetchPolicy | None = None,          # /fetch_media 的护栏（上限/超时/yt-dlp）
     skill_loader: Any | None = None,  # SkillLoader：/tools 端点用
     skills_dir: str | Path | None = None,  # 技能导入目录：/skills/reload 热同步用
+    # 提示词目录：设置页「提示词」区块的数据源。None = 仓库自带 prompts/（与
+    # build_prompt_library 同约定）；False = 本次启动是全内联模式，没有目录可列。
+    prompt_dir: str | Path | bool | None = None,
     mcp_manager: Any | None = None,   # McpManager：/mcp/servers 动态注册端点用
     editing_contract: Any | None = None,   # ContractSlot：/runs/*/fork 展开 rerun_nodes 的下游
     broadcast_url: str | None = None,      # Redis DSN：多副本时把 OutBound 帧广播给各实例
@@ -2062,6 +2087,71 @@ def create_app(
             "kind": "memories",
         }
 
+    async def _prompts_view() -> dict[str, Any]:
+        """提示词清单 → 设置页「提示词」区块（**只读**）。
+
+        为什么只读、不给「在这里改」：这些文件随代码分发（镜像里的 `/app/prompts`）。
+        运行期改一份，下一次重建就没了，而且会造出「磁盘一份、镜像一份」的第二真相
+        ——正是提示词这一层这次要消掉的东西（§9-Q143）。要看就给全量正文，要改就改
+        仓库里的 `prompts/`，改完重建。
+
+        为什么把「每轮常发合计」单独算一个数：区块要能一眼回答「固定的那部分有多少」。
+        按 kind=always 求和就是那个数（`system_prompt` 一份），其余都是按链/按需发——
+        这就是「只保留最基础的作为固定」在账面上的样子。
+        """
+        if prompt_dir is False:
+            return {"dir": None, "entries": [], "problems": [],
+                    "note": "本次启动是全内联模式（prompt_library 没接线），磁盘上没有提示词目录可列。",
+                    "kind": "prompts"}
+        d = Path(prompt_dir) if prompt_dir else DEFAULT_PROMPTS_DIR
+        manifest = load_manifest(d)
+        raw_entries = manifest.get("prompts") or {}
+        entries: list[dict[str, Any]] = []
+        for name, meta in sorted(raw_entries.items()):
+            if not isinstance(meta, Mapping):
+                continue
+            fname = str(meta.get("file") or "")
+            try:
+                text = (d / fname).read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            n = len(text.encode("utf-8"))
+            cap = meta.get("max_bytes")
+            phase = str(meta.get("phase") or "")
+            kind = str(meta.get("kind") or "")
+            entries.append({
+                "name": name,
+                "file": fname,
+                "phase": phase,
+                "phase_label": _PHASE_LABELS.get(phase, phase),
+                "kind": kind,
+                "kind_label": _KIND_LABELS.get(kind, kind),
+                # fixed=True 的那一份是唯一还带内联兜底的（今天只有 system_prompt）：
+                # 面板上要能把「哪些是固定、哪些是动态」分开看，这个标记就是分界线。
+                "fixed": bool(meta.get("fixed")),
+                "bytes": n,
+                "max_bytes": cap if isinstance(cap, int) else None,
+                "over_cap": bool(isinstance(cap, int) and n > cap),
+                "referenced_by": [str(x) for x in (meta.get("referenced_by") or [])],
+                # 占位符列出来是给「这份是模板，调用点必须把键喂齐」用的：
+                # 漏一个键不会报错，只会让那段文案静默消失（见 prompts.render_blocks）。
+                "placeholders": sorted(placeholders_in(text)),
+                "desc": str(meta.get("desc") or ""),
+                "missing": not text.strip(),
+            })
+        return {
+            "dir": str(d),
+            "version": manifest.get("version") or 0,
+            "entries": entries,
+            # 自检结果原样给前端：清单说「有」而盘上没有时，区块要当场显示红字，
+            # 而不是等下一次重启才在日志里发现（启动期那条同样会拦）。
+            "problems": validate_manifest(d),
+            "total_bytes": sum(e["bytes"] for e in entries),
+            "always_bytes": sum(e["bytes"] for e in entries if e["kind"] == "always"),
+            "phases": [{"key": p, "label": _PHASE_LABELS.get(p, p)} for p in PHASES],
+            "kind": "prompts",
+        }
+
     async def _settings_view(user_id: str) -> dict[str, Any]:
         """密钥现状的对外形态：只有掩码与来源，明文一次都不出门。"""
         llm = _runtime_llm()
@@ -2214,6 +2304,56 @@ def create_app(
         view["status"] = "deleted"
         view["removed"] = int(removed or 0)
         return view
+
+    # ---- 提示词（只读一览 / 看全量正文）----
+    #
+    # 为什么要有这两只接口：提示词此前只有两种「看见」方式——读代码（内联常量已经全删，
+    # 现在代码里没有正文）或进容器 cat 文件。用户问「到底哪几份是写死的、哪些是动态加载的」
+    # 时，两边都答不上来。清单（prompts/manifest.json）本来就把答案记着，只是没人把它摊开。
+    # **只读是刻意的**：文件随代码分发，运行期改一份下次重建就没，还会造出第二真相
+    # （§9-Q143）。所以这里只给「看」，改还是回仓库改 prompts/。
+    @app.get("/prompts")
+    async def prompts_get(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """提示词清单 + 每份的实际字节/上限/相位/谁在读（不含正文，正文走下面那一只）。"""
+        return await _prompts_view()
+
+    @app.get("/prompts/{name}")
+    async def prompts_get_one(name: str,
+                              user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """一份提示词的完整正文。``name`` 是本清单里的**键**（不是路径）。
+
+        路径**只**来自清单的 ``file`` 字段，入参一个字符都不进路径——但仍然要挡
+        「清单自己写了 `../`」这一手：清单也是盘上可写的文件，凭它逃出提示词目录
+        就会把任意文本（`/etc/passwd`、`.env`）当提示词读出去。
+        """
+        if prompt_dir is False:
+            raise HTTPException(404, "本次启动是全内联模式，没有提示词目录可读")
+        d = (Path(prompt_dir) if prompt_dir else DEFAULT_PROMPTS_DIR).resolve()
+        meta = (load_manifest(d).get("prompts") or {}).get(name)
+        if not isinstance(meta, Mapping):
+            raise HTTPException(404, f"清单里没有这份提示词：{name!r}")
+        fname = str(meta.get("file") or "")
+        path = (d / fname).resolve()
+        if not path.is_relative_to(d):
+            raise HTTPException(400, f"清单里的 file 指到了提示词目录之外：{fname!r}")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as e:
+            raise HTTPException(404, f"文件读不到：{fname}（{e}）") from e
+        phase = str(meta.get("phase") or "")
+        kind = str(meta.get("kind") or "")
+        return {
+            "name": name, "file": fname, "text": text,
+            "bytes": len(text.encode("utf-8")),
+            "lines": len([ln for ln in text.splitlines() if ln.strip()]),
+            "phase": phase, "phase_label": _PHASE_LABELS.get(phase, phase),
+            "kind": kind, "kind_label": _KIND_LABELS.get(kind, kind),
+            "fixed": bool(meta.get("fixed")),
+            "max_bytes": meta.get("max_bytes") if isinstance(meta.get("max_bytes"), int) else None,
+            "referenced_by": [str(x) for x in (meta.get("referenced_by") or [])],
+            "placeholders": sorted(placeholders_in(text)),
+            "desc": str(meta.get("desc") or ""),
+        }
 
     @app.post("/settings/api-key")
     async def settings_api_key(req: ApiKeyRequest,
