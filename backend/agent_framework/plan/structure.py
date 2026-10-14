@@ -149,9 +149,22 @@ class StructureChecks:
         """
         vocab = (self.vocab.vocabulary() | self.vocab.param_keys() | self.vocab.enum_values()
                  | self.vocab.output_keys())
+        bad: list[str] = []
         for text in texts:
             for token in _ALIAS.findall(clean(text or "")):
                 if token in vocab or self.vocab.resolve_tool(token) is not None:
                     continue
-                issues.error(f"计划 {tag} 的文案引用了不存在的名字「{token}」"
-                             f"（词表里没有，界面换不成中文）。")
+                if token not in bad:        # 同一个名字在 why/label/expectation 里各写一遍
+                    bad.append(token)       # 只算一处：判据是「这个名字不在词表里」
+        # 按**整份计划**合批上报，一条判据一条意见：同一个臆造名字写进了三步的 why 与
+        # expectation 就是 6 条一模一样的话，全用来挤打回清单的窗口，而模型删掉那个
+        # 名字一次就全好了。名字一个不少地列出来，它才知道要改几处。
+        if not bad:
+            return
+        if len(bad) == 1:
+            issues.error(f"计划 {tag} 的文案引用了不存在的名字「{bad[0]}」"
+                         f"（词表里没有，界面换不成中文）。")
+            return
+        names = "".join(f"「{t}」" for t in bad)
+        issues.error(f"计划 {tag} 的文案引用了 {len(bad)} 个不存在的名字{names}"
+                     f"（词表里没有，界面换不成中文）。")

@@ -78,6 +78,9 @@ class PlanValidator:
                              allowed: set[str], skills: Mapping[str, Any],
                              issues: PlanIssues, seen_ids: set[str]) -> dict[str, Any] | None:
         tag = clean(plan.get("plan_id")) or f"p{index}"
+        # 本份计划之后出的每条意见都记上来源：三份候选的毛病往往一模一样，
+        # 打回清单要按它把「同一件事在第几份上」合成一条（``PlanIssues.groups``）。
+        issues.current = tag
         if tag in seen_ids:
             issues.error(f"plan_id「{tag}」重复。")
         seen_ids.add(tag)
@@ -212,7 +215,7 @@ class PlanValidator:
             issues.error(f"计划 {tag} 第 {index} 步的 param_options 必须是列表。")
             return
         props = self.vocab.props_for(norm["node"])
-        hint = ""                      # 该节点真实开关清单，第一次要用时才去算（见下）
+        unknown: list[str] = []        # 本步造出来的、节点上不存在的开关（合批上报，见下）
         for raw in raw_opts:
             if not isinstance(raw, Mapping):
                 issues.error(f"计划 {tag} 第 {index} 步的参数项不是对象。")
@@ -225,10 +228,7 @@ class PlanValidator:
                 # （本会话还没有计划上下文）那一轮模型没有清单可抄，凭印象造键名时
                 # 唯一的出路不该是「再猜一次」。判据与规划段那份清单同一份
                 # （`vocab.knob_facts_for`），所以这里不会告诉它一个上不了卡的键。
-                if not hint:
-                    hint = _knob_keys_hint(await self.vocab.knob_facts_for(norm["node"]))
-                issues.error(f"计划 {tag} 第 {index} 步（{norm['node']}）没有参数「{key}」，"
-                             f"不许在卡上造这个开关；{hint}这类诉求请走「其他」。")
+                unknown.append(key)
                 continue
             options = raw.get("options")
             if not isinstance(options, list) or not options:
@@ -244,12 +244,13 @@ class PlanValidator:
             labels = spec.get("value_labels") or {}
             values: list[dict[str, str]] = []
             picked: set[str] = set()
+            bad: list[tuple[str, str]] = []     # 同一个开关上没过反查的值（合批上报）
             for opt in options:
                 value = opt.get("value") if isinstance(opt, Mapping) else opt
                 text = as_card_value(value)
                 reason = self._value_rejected(source, text)
                 if reason:
-                    issues.error(f"计划 {tag} 第 {index} 步「{key}」的值「{text}」{reason}。")
+                    bad.append((text, reason))
                     continue
                 if text in picked:
                     continue
@@ -257,35 +258,27 @@ class PlanValidator:
                 own = clean(opt.get("display")) if isinstance(opt, Mapping) else ""
                 values.append({"value": text, "kind": source[0],
                                "display": own or str(labels.get(text) or "")})
-            if not values:
-                continue
-            # 单值开关 = 没给用户选择权。用户的原话是「有需要的参数也弹窗式询问，
-            # 永远不要瞎编」——一个只有一个值的开关，用户既看不出这是个可改的决定，
-            # 也只能靠「其他」打字。所以**取值范围本来就存在**的那几类（数值区间、
-            # 布尔、枚举）必须给至少两个真实候选，推荐值放 default。
-            #
-            # 但 `label`（曲库标签这类"指名道姓"的源）不在此列：用户说「用 Someday
-            # I'll Fly 做配乐」时，那首歌就是唯一答案，硬凑第二个候选反而是瞎编。
-            if len(values) < 2 and source[0] in ("number", "bool", "enum"):
-                hint = ""
-                if source[0] == "number":
-                    low, high = source[1]
-                    hint = (f"该参数是数值区间 "
-                            f"{'?' if low is None else f'{low:g}'}~"
-                            f"{'?' if high is None else f'{high:g}'}，"
-                            f"请给 2~4 个有真实差异的候选（如 0.1/0.2/0.3/0.5）")
-                elif source[0] == "bool":
-                    hint = "给 true 与 false 两个候选，让用户自己选"
-                else:
-                    hint = "请把该参数可用的取值多列几个，让用户有得挑"
-                issues.error(f"计划 {tag} 第 {index} 步的参数「{key}」只给了 1 个候选值"
-                             f"「{values[0]['value']}」，用户没有选择余地。{hint}；"
-                             f"若确实不该由用户定，就不要把它做成开关。")
-                continue
+            # 这一个开关上的毛病**合成一条**：值反查不过 / 改完之后只剩一个候选 /
+            # default 不在选项里——三者的修法是同一次编辑（重挑这几个候选值），分几行
+            # 报就是把几行挤进了打回清单的窗口。真机第二轮打回列出的 8 条「只给了 1 个
+            # 候选值」里，有两条正是被同一步骤的「值超过节点上界」引出来的：一个毛病
+            # 报了两遍。措辞在有几种毛病时用顿分号串起来，每种都把具体取值点出来。
+            problems = self._switch_problems(bad, values, source)
             default = as_card_value(raw.get("default"))
             if default and default not in picked:
-                issues.error(f"计划 {tag} 第 {index} 步「{key}」的 default「{default}」"
-                             f"不在选项里。")
+                problems.append(f"default「{default}」不在选项里")
+            if problems:
+                head = f"计划 {tag} 第 {index} 步的参数「{key}」"
+                if len(problems) == 1:
+                    # 只有一处毛病时保持原先逐字的措辞（「…的参数「x」只给了 1 个候选值…」），
+                    # 免得读回执的人以为判据换了。「值…」「default…」是接着前半句说的
+                    # （要有「的」），「只给了…」「有 N 个值…」自己就是一句完整的话。
+                    one = problems[0]
+                    glue = "的" if one.startswith(("值「", "default")) else ""
+                    issues.error(f"{head}{glue}{one}。")
+                else:
+                    # 几处毛病串成一条：修法是同一次编辑，分几行报就是几行挤窗口。
+                    issues.error(f"{head}：" + "；".join(problems) + "。")
                 continue
             spec_meta: dict[str, Any] = {
                 "key": key,
@@ -296,6 +289,60 @@ class PlanValidator:
             if source[0] == "number":
                 spec_meta["unit"] = clean(spec.get("unit"))
             norm["param_options"].append(spec_meta)
+        # 造出来的开关**合批上报**：一个节点上写错六个键名，原先就是六条几乎一样的话
+        # （每条还各带一遍该节点的真实开关清单），一步就把清单窗口吃掉一半。判据只有
+        # 一条——「键不在这个节点上」——所以只报一条，把六个键名全列出来：模型一次就
+        # 知道这一步要删/改哪几个，而不会以为「只错了一个」。真机实测（14 镜那一条 run）
+        # 56 条意见里 12 条是造开关，乘 3 份候选 = 36 条，其中大半从没被列出来过。
+        if unknown:
+            knob_hint = _knob_keys_hint(await self.vocab.knob_facts_for(norm["node"]))
+            if len(unknown) == 1:
+                issues.error(f"计划 {tag} 第 {index} 步（{norm['node']}）没有参数"
+                             f"「{unknown[0]}」，不许在卡上造这个开关；{knob_hint}"
+                             f"这类诉求请走「其他」。")
+            else:
+                names = "".join(f"「{k}」" for k in unknown)
+                issues.error(f"计划 {tag} 第 {index} 步（{norm['node']}）没有参数{names}"
+                             f"（这一步一共造了 {len(unknown)} 个不存在的开关）："
+                             f"不许在卡上造这些开关；{knob_hint}这类诉求请走「其他」。")
+
+    @staticmethod
+    def _switch_problems(bad: list[tuple[str, str]],
+                         values: list[dict[str, str]],
+                         source: tuple[str, Any]) -> list[str]:
+        """同一个开关上的毛病 → 一串独立的分句（调用方决定怎么串成一句话）。
+
+        三处容易漏的：
+        - **每个被拒的值都要点名**（连原因）。原先一个开关列 5 个都不合法就是 5 条
+          几乎一样的话、每条还各带一遍可用清单——它们占的是**别的**判据的位置。
+        - 值被拒光时不再补一句「没得选」：那是同一个毛病的回声，判据是「这些取值
+          不合规」，不是「候选太少」。
+        - 只剩一个候选（数值区间/布尔/枚举这三类取值范围本来就存在的）才提「没有
+          选择余地」；`label`（曲库标签）给一个是对的，那是用户指名要的那一首。
+        """
+        out: list[str] = []
+        if bad:
+            if len(bad) == 1:
+                text, reason = bad[0]
+                out.append(f"的值「{text}」{reason}")
+            else:
+                pairs = "；".join(f"值「{text}」{reason}" for text, reason in bad)
+                out.append(f"有 {len(bad)} 个值反查不过：{pairs}")
+        if values and len(values) < 2 and source[0] in ("number", "bool", "enum"):
+            hint = ""
+            if source[0] == "number":
+                low, high = source[1]
+                hint = (f"该参数是数值区间 "
+                        f"{'?' if low is None else f'{low:g}'}~"
+                        f"{'?' if high is None else f'{high:g}'}，"
+                        f"请给 2~4 个有真实差异的候选（如 0.1/0.2/0.3/0.5）")
+            elif source[0] == "bool":
+                hint = "给 true 与 false 两个候选，让用户自己选"
+            else:
+                hint = "请把该参数可用的取值多列几个，让用户有得挑"
+            out.append(f"只给了 1 个候选值「{values[0]['value']}」，用户没有选择余地。"
+                       f"{hint}；若确实不该由用户定，就不要把它做成开关")
+        return out
 
     @staticmethod
     def _value_rejected(source: tuple[str, Any], text: str) -> str:

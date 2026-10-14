@@ -13,8 +13,12 @@ from ..hooks import _current_hook_ctx
 from ..tool import Tool, ToolError
 from .support import PLAN_MAX_CANDIDATES
 
-# 一次回喂最多列出几条校验意见。截断本身不可怕，不说明截断了才可怕（见 ``_listed``）。
-_MAX_LISTED_ISSUES = 12
+# 一次回喂最多列出几条校验意见（**按判据分组后的条数**，不是原始条数）。截断本身
+# 不可怕，不说明截断了才可怕（见 ``_listed``）。定这个数的两头都要顾：大了会把单条
+# 工具结果顶过 ``compress.DEFAULT_RESULT_MAX_BYTES``（24 KB）被第二道闸从中间切掉，
+# 那是「清单被静默截断」的另一种写法；小了就是这个上限本身变成新的墙。一条意见
+# 约 100~200 B，24 条 ≈ 4 KB，两头都够宽。
+_MAX_LISTED_ISSUES = 24
 
 if False:  # TYPE_CHECKING：构造参数只做标注，运行期不需要（避免与 gate 形成环）
     from .gate import PlanGate
@@ -144,18 +148,28 @@ class SubmitPlanTool(Tool):
         return tries
 
     @staticmethod
-    def _listed(errors: list[str]) -> str:
-        """校验意见 → 回喂清单。**超过上限要如实说明还有多少没列**。
+    def _listed(issues: Any) -> str:
+        """校验意见 → 回喂清单（**先分组，再按上限截**）。超过上限要如实说还剩多少。
 
-        截断而不说，模型会以为「清单就这些」，改完再交又撞上没列出来的那几条——
-        一轮迭代就是这么白烧的（真机实测：两次提交才把规则一层层试出来）。
+        为什么分组在前：三份候选计划往往犯同一批毛病，逐条列出来就是同一件事的三份
+        拷贝，**先把窗口占满**——真机实测（14 镜那份「薄肌理论」）第一次打回 56 条、
+        列出 12 条而那 12 条全出自第一份候选，第二次 46 条、列出 11 条，两次都没让模型
+        看见另外两份的同一批问题。`PlanIssues.groups` 把「只有计划标签不同」的意见合成
+        一条之后，同一份清单只剩十几条，一次就能交全。
+
+        截断而不是不截：一份把节点全写乱的计划可以有几百条意见，全塞进去会撞上
+        `compress.DEFAULT_RESULT_MAX_BYTES`——那是**头尾留、中间切**，等于让第二道闸
+        把这份清单又无声地剪一刀（比这里明着截更坏）。所以这里明截，并且**按组**报出
+        还剩几组、共几处：模型至少知道自己没看到东西，而不是以为「清单就这些」。
         """
-        shown = errors[:_MAX_LISTED_ISSUES]
-        text = "\n- ".join(shown)
-        rest = len(errors) - len(shown)
-        if rest > 0:
-            text += (f"\n- （另有 {rest} 条问题未逐条列出——上面每一条都给了判据，"
-                     f"请按同一套判据把整份计划从头过一遍，别只改列出来的这几条。）")
+        groups = issues.groups()
+        shown = groups[:_MAX_LISTED_ISSUES]
+        text = "\n- ".join(item[0] for item in shown)
+        rest = groups[len(shown):]
+        if rest:
+            text += (f"\n- （另有 {len(rest)} 组判据、共 {sum(n for _, n in rest)} 处未逐条"
+                     f"列出——上面每一条都给了判据，请按同一套判据把整份计划从头过一遍："
+                     f"把不合规的开关**删掉**，诉求改走卡上的「其他」，不要凭猜重写一遍。）")
         return text
 
     async def execute(self, plans: Any) -> str:
@@ -163,7 +177,7 @@ class SubmitPlanTool(Tool):
         tries = self._tries(ctx)
         normalized, issues = await self._gate.validate({"plans": plans})
         if issues.errors:
-            listed = self._listed(issues.errors)
+            listed = self._listed(issues)
             if tries > self._max_retries:
                 # 到顶了：再审下去只是让模型换着说法重交。出路是把卡点交回用户
                 # ——但**必须走 ask_user**（弹窗），而且要说清是哪一步写不出来。

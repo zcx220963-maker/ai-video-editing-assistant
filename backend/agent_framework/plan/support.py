@@ -192,10 +192,20 @@ def neutralize(text: str) -> str:
 
 @dataclass
 class PlanIssues:
-    """一次校验的结论：errors 非空即打回，warnings 只在卡上挂角标。"""
+    """一次校验的结论：errors 非空即打回，warnings 只在卡上挂角标。
+
+    ``errors`` 是原文清单，**只增不改**（``agent.py`` 的确认帧那条路直接
+    ``"；".join(errors)`` 用它）。这里另记每条意见**出自哪份候选计划**
+    （``sources`` 与 ``errors`` 一一对应），好让 ``groups()`` 把「只有计划标签不同」
+    的同一件事合成一条——见它的说明。
+    """
 
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: 每条 error 的来源计划标签；"" = 与具体哪一份候选无关（如 plan_id 重复）。
+    sources: list[str] = field(default_factory=list)
+    #: 当前正在校验的那一份计划的标签，由 ``PlanValidator`` 进入每份计划时设置。
+    current: str = ""
 
     @property
     def ok(self) -> bool:
@@ -203,9 +213,50 @@ class PlanIssues:
 
     def error(self, msg: str) -> None:
         self.errors.append(msg)
+        self.sources.append(self.current)
 
     def warn(self, msg: str) -> None:
         self.warnings.append(msg)
+
+    def groups(self) -> list[tuple[str, int]]:
+        """errors → 合并去重后的清单 ``(文本, 命中处数)``，按首次出现排序。
+
+        **合并判据**：两句话去掉开头那截「计划 {来源标签}」之后**逐字节相同**。
+        那说明撞的是同一判据、同一步骤、同一组取值，只是分别发生在两份候选计划上
+        ——分开列一遍不提供任何新信息，却按候选数**成倍**吃清单窗口。
+
+        为什么这不是小事（真机实测，14 镜那份「薄肌理论」）：一次提交 3 份候选，
+        校验出 56 条，列出的 12 条**全是第一份候选的**——另外两份的同一批毛病一条
+        也没露头（回执只写「另有 42 条」）。模型照着能看见的 12 条改完再交，第二轮
+        又是 46 条、列出 11 条，还多撞进「单值开关没有选择余地」那条规则。两次
+        打回用完，框架把它推去问用户，整条 run 到此为止。**根子不在「没列全」，
+        而在「数不清」**：模型没有任何办法知道自己还差几条、差在哪几份上，只能
+        一份一份地试，而候选份数就是那个乘数。
+
+        不合并的两种情形，都是宁可不合也不许合错：来源标签为空（与候选无关的意见）、
+        去掉标签后仍有差异（判据/步骤/取值确实不同）。同一判据在同一份计划上重复
+        命中（如一个节点出现了三次）会如实标出「共命中 N 处」，不抹成一处。
+        """
+        rows: list[list[Any]] = []          # [文本, 处数, 命中标签]
+        index_of: dict[str, int] = {}
+        for i, msg in enumerate(self.errors):
+            tag = self.sources[i] if i < len(self.sources) else ""
+            head = f"计划 {tag}"
+            body = msg[len(head):] if tag and msg.startswith(head) else None
+            # 键：带标签的意见按「去掉标签的正文」合并，不带标签的按原文（连同来源）
+            key = f"{tag}\x00{msg}" if body is None else f"\x00{body}"
+            pos = index_of.get(key)
+            if pos is None:
+                index_of[key] = len(rows)
+                rows.append([msg, 1, [tag] if body is not None else []])
+                continue
+            row = rows[pos]
+            row[1] += 1
+            if body is not None and tag not in row[2]:
+                row[2].append(tag)
+                row[0] = f"计划 {'、'.join(row[2])}{body}"
+        return [(row[0] + (f"（这一条判据共命中 {row[1]} 处）" if row[1] > len(row[2]) else ""),
+                 int(row[1])) for row in rows]
 
 def topology_view(contract: Any, steps: Any) -> list[dict[str, Any]]:
     """原始步骤 → 够拓扑检查用的最小形状（位置、节点名、契约里现成的 requires）。
