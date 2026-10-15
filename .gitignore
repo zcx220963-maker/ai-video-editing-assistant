@@ -93,3 +93,6 @@ openchatcut-src/
 # 并行外部 agent（workbuddy）留在工作树里的状态文件
 /.wb*
 /.workbuddy-ai/
+
+# 抽帧验证的一次性产物（f228529 混入库，全项目零引用）
+/video_frames/
