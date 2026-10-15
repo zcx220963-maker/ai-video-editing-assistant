@@ -17,6 +17,11 @@
 - **选区改**：成片后在画面上框选，或在时间轴上点选一段，仅重烧受影响的部分。
 - **工程能力**：崩溃可续跑的执行快照、多用户隔离、模型密钥按用户配置、技能按需加载、MCP 扩展、长期记忆。
 
+## 技术栈
+
+Python 3.12 · FastAPI · SQLAlchemy（async）+ PostgreSQL 16 · MinIO · MCP（fastmcp / mcp）· OpenAI 兼容 SDK ·
+ffmpeg · MoviePy · faster-whisper · edge-tts · Remotion 4 + React 19 · Vue 3 + Vite · Docker Compose · Caddy
+
 ## 架构
 
 ```
@@ -164,11 +169,6 @@ Dockerfile               主服务与剪辑服务镜像，两阶段构建：构�
 | 首次语音转写耗时较长 | 首次运行会下载 faster-whisper 模型权重，此后常驻本地 |
 | 构建时 apt 报 `Failed to fetch` | 网络或代理对个别软件包丢包，重试构建或更换网络 |
 | 图形片渲染耗时较长 | 渲染服务使用 CPU 软件渲染，约 0.1 秒/帧；可适当提高 `DG_RENDER_SLOTS` 与 `MOTION_RENDER_PARALLEL`，需注意内存占用 |
-
-## 技术栈
-
-Python 3.12 · FastAPI · SQLAlchemy（async）+ PostgreSQL 16 · MinIO · MCP（fastmcp / mcp）· OpenAI 兼容 SDK ·
-ffmpeg · MoviePy · faster-whisper · edge-tts · Remotion 4 + React 19 · Vue 3 + Vite · Docker Compose · Caddy
 
 ## 许可证
 
