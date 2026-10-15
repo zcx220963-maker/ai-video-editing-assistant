@@ -83,3 +83,13 @@ backend/start.bat
 openchatcut-src/
 # 另一个 CLI 的忽略文件，内容由本文件同步出去，再入库就是两份互相抄
 .zcodeignore
+
+# ---- 会话内草稿与外部 agent 状态（2026-10-15 收口：推送前最后一次扫剩的全是这类）----
+# 一次性探针/取证产物：_gate_out.txt、_tsc_*.txt、remotion/_curve.mjs 这类根目录或 remotion 直下划线开头文件
+/_*.*
+/remotion/_*.*
+# 会话临时目录与脚本副本：.tmp_b24/、.tmp_recovered_shots/、backend/.tmp_args.py
+.tmp_*
+# 并行外部 agent（workbuddy）留在工作树里的状态文件
+/.wb*
+/.workbuddy-ai/
