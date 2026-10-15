@@ -110,6 +110,11 @@ _SKILL_NOT_TOOLS = frozenset({
     #   `style_facts` 另外那几栏（`palettes` / `bleed_shots` / `textures`）今天没进正文，
     #   真进了就一起收——这条豁免的口径是「回执栏位」，不是「正文里出现过的词」。
     "original_shots",
+    #   出片回执里预览质检档的体检栏（`render_motion_code` 结果的 `qc_warnings`）：正文教模型
+    #   「照实转告、别据此自己重渲」，点的是读数栏位名，与 `original_shots` 同一口径。
+    "qc_warnings",
+    #   分镜回执里系统自动修字色的说明栏（`plan_motion` 结果的 `autofix_notes`），同一口径。
+    "autofix_notes",
     #   T67 供给节（R13 §4）的**代码出处引用**：正文点名唯一真源时写的是模块路径——
     #   ``agent_framework.plan.supply_order`` 那张四档表、``imagegen_nodes`` 模块头。
     #   `_TOOLISH` 按 `\b` 切词，带下划线的三段（agent_framework / supply_order /
@@ -118,6 +123,13 @@ _SKILL_NOT_TOOLS = frozenset({
     #   （2026-10-14 那一批假告警的同一形状）。注意：若哪天真有一个工具叫
     #   `supply_order`，它在 `known_set` 里先行通过，这份豁免不会挡它。
     "agent_framework", "supply_order", "imagegen_nodes",
+    #   闸注册表两张表（§「闸在哪个时刻判」）里的**渲染客户端内部函数名**：
+    #   ``stage_asset``（闸⑱ 投递腿，remotion_client.py:149）、
+    #   ``narration_for``（闸② 按 TTS 实测算帧，code_render.py:179）。
+    #   正文拿它们当**判据的代码出处**点名，模型一个都调不到——真机启动日志
+    #   2026-10-15 把它们两个报成「技能正文点名了不存在的工具」。
+    #   改正文措辞治不了：`_TOOLISH` 不认反引号，按词扫。
+    "stage_asset", "narration_for",
 })
 
 # 明确不是工具名的**形态**（技能正文里大量出现，属正常内容）：

@@ -26,7 +26,8 @@ from .ask_gate import (looks_like_asking_user, looks_like_plan_invite,
                        no_popup_note, plan_card_nudge, popup_nudge)
 from .checkpoint import Checkpoint, CheckpointManager
 from .catalog import get_catalog
-from .compress import ToolResultGate, _repair_orphans
+from .compress import (DEFAULT_FOLD_AT_BYTES, DEFAULT_KEEP_RECENT_RESULTS,
+                       DEFAULT_RESULT_MAX_BYTES, ToolResultGate, _repair_orphans)
 from .context import (ContextBuilder, LEDGER_ENTRY_TYPE, Section,
                       check_tools_budget, tools_box)
 from .hooks import AgentHook, AgentHookContext, CompositeHook, _current_hook_ctx, _current_hooks
@@ -53,6 +54,35 @@ from .render_gate import (ADJUST_OPTION, CONFIRM_OPTION,
 from .run_state import RunState, tool_names_in
 from .session import Session, SessionManager
 from .tool import ToolError, ToolRegistry, is_tool_error, plan_batches
+
+
+#: 节点校验打回的标记语：带着「照清单改」的错误是**可执行的反馈**，不是工具坏了。
+#: 剪辑服务端的分镜/出片节点打回时一律带其中一句（motion_plan / motion_code_nodes）。
+#: 真机 run d27b37bf1419：plan_motion 四次都是「改完再交」的清单（lint 一次、对比度三次），
+#: 却被当成「工具连续失败 4 次」熔断，模型只好换去 render_web 出了一条 HTML 幻灯片。
+_ACTIONABLE_MARKERS = ("没有入库", "照清单改", "改完重调", "改完再调", "改完先重调",
+                       "一帧都没开始渲")
+#: 反馈类打回的上限：防的是「改来改去总不对」的死循环，给得比真失败宽得多。
+_MAX_FEEDBACK_ROUNDS = 8
+
+
+def _last_render_failed(messages: Sequence[Any], node: str) -> bool:
+    """这条出片通道最近一次的结果（它自己的回执，或 render_status 的终态）是不是失败。"""
+    for m in reversed(messages):
+        if not isinstance(m, dict) or m.get("role") != "tool":
+            continue
+        name = str(m.get("name") or "")
+        if name != node and not name.endswith("render_status"):
+            continue
+        text = str(m.get("content") or "")
+        return (text.startswith("Error") or '"status": "failed"' in text
+                or "渲染失败" in text)
+    return False
+
+
+def _is_actionable_feedback(r: Any) -> bool:
+    text = str(getattr(r, "detail", "") or r)
+    return any(m in text for m in _ACTIONABLE_MARKERS)
 
 
 # 同一个工具连续失败多少次后，本轮不再真执行（成功一次即清零）。
@@ -87,6 +117,20 @@ _MAX_REFUSALS_BEFORE_FAILURE = 2   # 同样的事实告过两次还照打 → �
 # 所以这条闸不能只靠「把索引修好」的道德劝说，要在执行层拦住。
 _MAX_SHOT_CARDS = 15
 
+# ---- 读技能正文的分页上限（同一族的第二条家族级闸）----
+#
+# 读卡闸治不了的那一维是**同一份正文的重叠窗口**。真机 run `c364585634f2`
+# （2026-10-15，「已达最大迭代次数 40」）里 26 份**参数各不相同**的 load_skill，
+# 19 份打在 motion_explainer 的 SKILL.md 上：offset 220 取了三个窗口（limit 60/180/300）、
+# 531 先 limit=190 再 limit=180、715 与 720、895 与 896 各差一两行——
+# 每份参数都是新的、每一枪都成功，参数级那两条闸一次都没响。
+#
+# 上限不能压到「只许整份取一次」：正文过 24 KB 会被压缩闸从中间切掉，
+# 模型按行续读是 compress.py `_RECOVERY_HINT["load_skill"]` 亲手教的做法。
+# 10 页放得下老实地把一份千行正文翻完（每页一两百行），放不下的是同一区间换个
+# 行数再来一遍。
+_MAX_SKILL_BODY_PAGES = 10
+
 
 def _digest(obj: Any) -> str:
     """按 JSON 字节算的稳定摘要。
@@ -109,6 +153,27 @@ def _repeat_key(name: str, arguments: Any) -> str:
 _SHOT_CARD_RE = re.compile(r"^shots/[^/]+/[^/]+\.md$")
 
 
+def _call_args(arguments: Any) -> dict[str, Any] | None:
+    """工具参数取成字典；拿不到就回 None（调用方把这枪当「不认识」放行，不报错）。
+
+    参数到这一层可能还是 JSON 字符串（模型直出、未过解析那一路），所以两种形状都得认。
+    """
+    if isinstance(arguments, dict):
+        return arguments
+    try:
+        parsed = json.loads(arguments or "{}")
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _norm_path(value: Any) -> str:
+    path = str(value or "").strip()
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
 def _shot_card_path(name: str, arguments: Any) -> str:
     """这一枪读的是不是某张 shot 卡；是就返回归一化后的路径，否则空串。
 
@@ -122,16 +187,44 @@ def _shot_card_path(name: str, arguments: Any) -> str:
     """
     if name != "load_skill":
         return ""
-    args = arguments
-    if not isinstance(args, dict):
-        try:
-            args = json.loads(args or "{}")
-        except (TypeError, ValueError):
-            return ""
-    path = str((args or {}).get("path") or "").strip()
-    while path.startswith("./"):
-        path = path[2:]
+    args = _call_args(arguments)
+    if args is None:
+        return ""
+    path = _norm_path(args.get("path"))
     return path if _SHOT_CARD_RE.match(path) else ""
+
+
+def _skill_body_page(name: str, arguments: Any) -> tuple[str, str] | None:
+    """这一枪读的是不是**某技能正文**的某一页；是就返回 ``(技能名, 页键)``，否则 None。
+
+    「缺省取正文」和 ``path="SKILL.md"`` 是同一件事（见 skill.py ``LoadSkillTool.execute``
+    的分支），两种写法都得算正文，否则换个写法就绕开计数。附件（``path`` 是别的相对
+    路径）**不算**：shot 卡有读卡上限那一族闸，其余附件是「一次取一份不同文件」，
+    重复取同一份归参数级那两条闸管。
+
+    页键只认 ``(起始行, 行数)``，缺省 offset 记成 1、缺省 limit 记成 ``whole``：
+    「整份」与「offset=1 整份」是同一页。行号按整数归一，好让 ``"220"`` 与 ``220`` 同键。
+    """
+    if name != "load_skill":
+        return None
+    args = _call_args(arguments)
+    if args is None:
+        return None
+    skill = str(args.get("name") or "").strip()
+    if not skill:
+        return None
+    if _norm_path(args.get("path")).lower() not in ("", "skill.md"):
+        return None
+
+    def _line(value: Any, default: int) -> int | str:
+        if value is None:
+            return default
+        try:
+            return max(1, int(float(str(value).strip())))
+        except (TypeError, ValueError):
+            return default
+
+    return (skill, f"{_line(args.get('offset'), 1)}:{_line(args.get('limit'), 'whole')}")
 
 
 # 单次工具调用硬超时（秒）：MCP tool_timeout=600s 在此之前先触发并给出更具体的错误；
@@ -459,9 +552,12 @@ class AgentConfig:
     # 工具结果的体积闸门（见 compress.ToolResultGate）。这三个数是这次补的：
     # 在此之前工具结果**一条都没有闸门**，整条 run 的历史结果每轮原样重发，
     # 真机首发提示词因此到过 258K token。0 = 关闭对应那一档（截断 / 折叠）。
-    tool_result_max_bytes: int = 24_000
-    tool_results_fold_at_bytes: int = 96_000
-    tool_results_keep_recent: int = 3
+    # 默认值指回 compress 的常量，不在这份配置里另抄一份数：真机 run 97c1289eba35
+    # 把 compress 的 24_000 改成 60_000 之后改了三轮没生效，根因就是这里把旧数
+    # 写死了——它传给 ToolResultGate 时把模块默认整个盖掉，改常量的那几轮全是空转。
+    tool_result_max_bytes: int = DEFAULT_RESULT_MAX_BYTES
+    tool_results_fold_at_bytes: int = DEFAULT_FOLD_AT_BYTES
+    tool_results_keep_recent: int = DEFAULT_KEEP_RECENT_RESULTS
 
 
 @dataclass
@@ -760,21 +856,9 @@ class AgentOnceRun:
                         r.approval_note = ""
                         r.iteration += 1
                         continue
-                    # 上下文瘦身：本轮的工具结果在**进链那一刻**已经按单条上限截断过
-                    # （见 _run_tool_round），这里再按**累计体积**把更早的结果折叠成
-                    # 预览。不做的话每轮都重发全部历史结果，第 40 轮的提示词就是几十万
-                    # token——真机 run a3d8ff08098a 的 258K/5.7M 就是这么来的。
-                    # 放在落盘**之前**：快照里存的是瘦身后的那份，续跑不会把体积带回来。
-                    # 统计每轮都写（即使一条都没折）：`total_bytes` 是「这一轮的窗口里
-                    # 工具结果占了多少」的直接读数，出问题时要能查到折了多少。
-                    r.ctx.extras["context_gate"] = self.tool_gate.shrink(r.messages)
-                    # 一致点：即将调用 LLM 之前落盘，恢复从这里续跑即可避免重放工具。
-                    # 状态与消息一起落：崩溃恢复取到的调用清单/候选计划/q 片段
-                    # 必须和这一条一致点上的 messages 同批，否则对账会多算或漏算。
-                    if r.cp is not None:
-                        r.state.persist(r.cp)
-                        await self.checkpoint.save_progress(
-                            r.cp, iteration=r.iteration, messages=r.messages)
+                    # 上下文瘦身 + 一致点落盘（为什么这个顺序、为什么统计每轮都写，
+                    # 都写在 `_pass_point` 那一节里）
+                    await self._pass_point(r)
                     r.ctx.iteration = r.iteration
                     await self.hooks.before_iteration(r.ctx)
 
@@ -808,6 +892,27 @@ class AgentOnceRun:
         finally:
             _current_hooks.reset(hooks_token)
             _current_hook_ctx.reset(ctx_token)
+
+    async def _pass_point(self, r: "_Round") -> None:
+        """循环里的一致点：**先**折叠更早的工具结果，**再**落盘状态与消息。
+
+        本轮的工具结果在进链那一刻已按单条上限截断过（见 `_run_tool_round`），这里
+        补的是**累计体积**：不折的话每轮都重发全部历史结果，第 40 轮的提示词就是几十万
+        token——真机 run a3d8ff08098a 的 258K/5.7M 就是这么来的。
+
+        顺序不能倒：瘦身放在落盘之前，快照里存的才是瘦身后的那份，续跑不会把体积带回来。
+        统计每轮都写（即使一条都没折）：`total_bytes` 是「这一轮的窗口里工具结果占了多少」
+        的直接读数，出问题时要能查到折了多少。
+
+        状态与消息一起落（即将调用 LLM 之前）：崩溃恢复取到的调用清单/候选计划/q 片段
+        必须和这一条一致点上的 messages 同批，否则对账会多算或漏算；从这里续跑也避开了
+        重放工具。
+        """
+        r.ctx.extras["context_gate"] = self.tool_gate.shrink(r.messages)
+        if r.cp is not None:
+            r.state.persist(r.cp)
+            await self.checkpoint.save_progress(r.cp, iteration=r.iteration,
+                                                messages=r.messages)
 
     def _open_run(self, session: Session, messages: list, start_iteration: int,
                   cp: Checkpoint | None, *, run_id: str | None,
@@ -1003,8 +1108,9 @@ class AgentOnceRun:
                     preview, motion=motion,
                     labels=self._motion_value_labels(first) if motion else None,
                     title="" if first == RENDER_NODE else
-                    f"接下来要出的是「{get_catalog().label(first)}」，确认开始渲染吗？")
+                    f"渲染前计划确认：即将按下面的分镜出「{get_catalog().label(first)}」，开始渲染吗？")
                 ask["render_node"] = first
+                await self._sign_thumbs(ask)
                 return await self._pause(r, resp.tool_calls, reason=ask["title"], ask=ask)
 
         await self._execute_tool_calls(r.ctx, resp.tool_calls, r.reg)
@@ -1048,6 +1154,13 @@ class AgentOnceRun:
         认的是 **(这条 run, 这个通道)**：确认过 ``render_video`` 只压制它自己，
         模型若改提另一个出片通道，那是一次未确认的新渲染，该交给门。
         """
+        # 上一次确认过的渲染**失败了**就不算「已经在渲」：放行这次重交（门已答过，不再问）。
+        # 真机 run d27b37bf1419：render_web 第一次失败（file:// 取不到），模型改成内联 HTML
+        # 重交，被这里回了一句「已经提交渲染」——其实什么都没在渲，进度永远是 0。
+        for tc in resp.tool_calls:
+            if (tc.name in RENDER_NODES and (r.run_id, tc.name) in self._render_confirmed
+                    and _last_render_failed(r.messages, tc.name)):
+                self._render_confirmed.discard((r.run_id, tc.name))
         repeat = [tc for tc in resp.tool_calls
                   if tc.name in RENDER_NODES and (r.run_id, tc.name) in self._render_confirmed]
         if not repeat:
@@ -1173,7 +1286,7 @@ class AgentOnceRun:
                 and looks_like_plan_invite(resp.content)):
             r.plan_nudges -= 1
             r.messages.append(assistant(resp.content))
-            r.messages.append(system(plan_card_nudge()))
+            r.messages.append(system(plan_card_nudge(r.planning)))
             r.iteration += 1
             return True
 
@@ -1593,6 +1706,9 @@ class AgentOnceRun:
         # 本 run 读过哪些 shot 卡（路径集合）与告过几次。上限见 `_MAX_SHOT_CARDS`：
         # 按**卡**计数，不按参数——这正是参数级那两条闸看不见的那一维。
         cards_read: set[str] = ctx.extras.setdefault("_shot_cards_read", set())
+        # 本 run 每个技能正文取过哪些行窗口（技能名 → {起始行×行数}）。同样按**窗口**
+        # 计次而不是按参数：上限见 `_MAX_SKILL_BODY_PAGES`。
+        body_pages: dict[str, set[str]] = ctx.extras.setdefault("_skill_body_pages", {})
 
         # 结构性并批：把**同层就绪、互不依赖**的兄弟节点自动补进本批。
         #
@@ -1686,6 +1802,45 @@ class AgentOnceRun:
                 f"把选中的卡名照抄进行首的 `<类别>/<卡名>` 填进 `card`。",
                 counts_as_failure=n > _MAX_REFUSALS_BEFORE_FAILURE)
 
+        def _skill_body_gate(tc: ToolCall) -> ToolError | None:
+            """同一份技能正文的重叠窗口上限：放行时**当场记账**（理由同 `_shot_card_gate`）。
+
+            回执必须把「已经取过哪些窗口」摆出来再打回：这一枪不是工具坏了，而是
+            模型在同一段里换行数重来一遍。只说「到上限了」它只会换个 offset 再试——
+            真机那条 run 就是这么从 220 换到 222、从 531 换到 535 的。
+            """
+            page = _skill_body_page(tc.name, tc.arguments)
+            if not page:
+                return None
+            skill, key = page
+            pages = body_pages.setdefault(skill, set())
+            if key in pages:
+                return None                        # 同一窗口重取：归参数级那两条闸管
+            if len(pages) < _MAX_SKILL_BODY_PAGES:
+                pages.add(key)
+                return None
+            n = ctx.extras["_skill_body_refusals"] = \
+                ctx.extras.get("_skill_body_refusals", 0) + 1
+
+            def _page_label(p: str) -> tuple[int, int, str]:
+                off, _, lim = p.partition(":")
+                return (int(off), -1 if lim == "whole" else int(lim), p)
+
+            covered = "、".join(
+                f"{_page_label(p)[0]} 行起"
+                + ("整份" if _page_label(p)[1] < 0 else f"×{_page_label(p)[1]} 行")
+                for p in sorted(pages, key=_page_label))
+            return ToolError(
+                tc.name,
+                f"Error: 技能 `{skill}` 的正文这一轮已经按 {len(pages)} 个不同的行窗口"
+                f"取过（{covered}），到上限了（一份正文最多 {_MAX_SKILL_BODY_PAGES} 个窗口），"
+                f"这次不再执行。"
+                f"这些窗口合起来基本就是整份正文——**再换一个起始行不会带来新信息**。"
+                f"请直接用已经读到的内容交计划（规划轮调用 submit_plan）；"
+                f"确实知道缺哪一节，就照整份加载时给的那份**章节目录**取行号，"
+                f"limit 只给到下一节的前一行，别取一个和上面重叠的大窗口。",
+                counts_as_failure=n > _MAX_REFUSALS_BEFORE_FAILURE)
+
         def _note_repeat(tc: ToolCall, result: Any) -> None:
             """跑完记账：结果字节和上次一样就把「无进展」连续数加一，不一样就归一。
 
@@ -1717,9 +1872,10 @@ class AgentOnceRun:
                 await self.hooks.after_tool_call(
                     ctx, tc.name, tc.arguments, None, 0.0, error=r, call_id=tc.id)
                 return r
-            # 先过家族级的读卡上限，再过参数级那两条：一次规划轮里读 45 张**不同的**
-            # 卡时，参数级判据一次都不会响（每份参数都是新的），必须由这一层拦。
-            blocked = _shot_card_gate(tc) or _blocked_repeat(tc)
+            # 先过两道家族级闸（读卡上限、正文窗口上限），再过参数级那两条：
+            # 一次规划轮里读 45 张**不同的**卡、或同一份正文取 19 个**重叠的**窗口时，
+            # 参数级判据一次都不会响（每份参数都是新的），必须由这一层拦。
+            blocked = _shot_card_gate(tc) or _skill_body_gate(tc) or _blocked_repeat(tc)
             if blocked is not None:
                 # 熔断不是「工具坏了」：默认 counts_as_failure=False，别把「换个思路再来」
                 # 再压一层失败计数（第二次起才升级，见 _blocked_repeat）。
@@ -1768,13 +1924,23 @@ class AgentOnceRun:
         # 守卫提示必须排在本批**全部**回执之后：assistant(tool_calls) 与它的逐条
         # tool 回执之间插任何别的角色，OpenAI 兼容口径直接 400（tool_calls 未收口）。
         nagging: list[tuple[str, int]] = []
+        # 一批并发里同一个工具失败几条都只记**一次**：4 条并发取文件同时失败是「一次没取对」，
+        # 不是「连续失败 4 次」——真机里正是这样把还没试过的那批正确路径一起熔断了。
+        bumped: set[str] = set()
+        feedback_counts: dict[str, int] = ctx.extras.setdefault("_feedback_counts", {})
         for tc in tool_calls:
             r = results[tc.id]
             # 「可执行的反馈」不算故障：submit_plan 被校验打回是让模型改输入，重交是
             # 正路。算进来的话，守卫两次就叫停，把「计划还没写对」升级成「工具坏了，
             # 去问用户怎么办」——真机实测的岔路就在这里。
             if is_tool_error(r):
-                if r.counts_as_failure:
+                failure = r.counts_as_failure
+                if failure and _is_actionable_feedback(r):
+                    # 节点给了改法清单：按反馈处理，超过上限才升级成失败
+                    feedback_counts[tc.name] = feedback_counts.get(tc.name, 0) + 1
+                    failure = feedback_counts[tc.name] > _MAX_FEEDBACK_ROUNDS
+                if failure and tc.name not in bumped:
+                    bumped.add(tc.name)
                     fail_counts[tc.name] = fail_counts.get(tc.name, 0) + 1
                     if fail_counts[tc.name] >= 2 and tc.name not in {n for n, _ in nagging}:
                         nagging.append((tc.name, fail_counts[tc.name]))
@@ -1793,9 +1959,9 @@ class AgentOnceRun:
                 tc.id, tc.name, self.tool_gate.text(tc.name, r)))
         for name, times in nagging:
             ctx.messages.append(system(
-                f"⚠️ 工具「{name}」已连续失败 {times} 次。请立即停止重试该工具，"
-                f"向用户说明失败原因并询问如何处理（换素材、换参数、跳过这步或换方案），"
-                f"不要继续重试。连续失败到 {_MAX_CONSECUTIVE_FAILURES} 次后该工具不再执行。"
+                f"⚠️ 工具「{name}」已连续失败 {times} 次。请立即停止原样重试该工具，"
+                f"自己改走替代方案（换参数、换素材、换工具、跳过非关键步骤或降级），"
+                f"并在答复里说明；确实无路可走时才向用户说明原因并给出建议方案。连续失败到 {_MAX_CONSECUTIVE_FAILURES} 次后该工具不再执行。"
             ))
         # 无进展重复的预告：闸已经攒到第二次，下一次就不真执行了。
         # 放在全部回执之后——理由同上面那批守卫提示（tool_calls 未收口时插别的角色直接 400）。
@@ -1851,10 +2017,8 @@ class AgentOnceRun:
                     args = candidate
                 break
         source: dict[str, Any] | None = None
-        spec = args.get("spec")
-        if isinstance(spec, Mapping) and spec:
-            source = dict(spec)
-        elif self.storage is not None:
+        stored: Mapping[str, Any] | None = None
+        if self.storage is not None:
             try:
                 ident = current_identity()
                 sid = storyline_session_id(session.user_id, session.conversation_id)
@@ -1862,13 +2026,35 @@ class AgentOnceRun:
                 row = (await self.storage.artifacts(sid, art)
                        .snapshot()).get("plan_motion")
                 if isinstance(row, Mapping) and row:
-                    source = dict(row)
+                    stored = row
             except Exception:  # noqa: BLE001 - 摘要读失败不该拦住确认流程
                 logger.exception("读取分镜产物失败（渲染确认门继续，只是少一块摘要）")
+        spec = args.get("spec")
+        if isinstance(spec, Mapping) and spec:
+            source = dict(spec)
+            # 手写 spec 那一路也带上分镜轮渲好的预览图（镜号对得上的才用）。
+            if stored and isinstance(stored.get("preview_frames"), Mapping):
+                source["preview_frames"] = dict(stored["preview_frames"])
+        elif stored:
+            source = dict(stored)
         if source is None:
             return None
         return {**source, **{k: v for k, v in args.items()
                               if k in MOTION_KNOBS and v not in (None, "")}}
+
+    async def _sign_thumbs(self, ask: dict[str, Any]) -> None:
+        """确认卡分镜行的预览图：对象键 → 现签 URL（签不出就不带图，卡照样弹）。"""
+        objects = getattr(self.storage, "objects", None)
+        if objects is None:
+            return
+        for row in ask.get("storyboard") or []:
+            key = row.pop("thumb_key", None)
+            if not key:
+                continue
+            try:
+                row["thumb"] = await objects.presign_get(key, ttl_sec=6 * 3600)
+            except Exception:  # noqa: BLE001 - 缺一张预览不拦确认
+                logger.debug("预览图签名失败：%s", key)
 
     def _motion_value_labels(self, node: str = MOTION_NODE) -> dict[str, dict[str, str]]:
         """确认卡回显开关取值时用的「人话」表：``{开关名: {取值: 标签}}``。

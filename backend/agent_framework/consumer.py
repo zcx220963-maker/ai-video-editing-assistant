@@ -14,6 +14,12 @@ from .connection_manager import OUTBOUND_TOPIC
 from .mq import MessageQueue
 
 CHAT_TOPIC = "chat"
+#: 新消息入口。auto：一句话直接进执行轮，没提到的创作决定由模型自己定，一路做到出片；
+#: 渲染前确认门（render_gate）弹出计划确认卡，那是唯一的强制确认点。
+#: plan：老行为——先进规划轮出计划卡，用户点选后再执行（适合想逐项把关的人）。
+ENTRY_AUTO = "auto"
+ENTRY_PLAN = "plan"
+_ENTRIES = frozenset({ENTRY_AUTO, ENTRY_PLAN})
 CONSUMER_GROUP = "agent-workers"
 
 
@@ -56,8 +62,11 @@ class SessionConsumer:
         *,
         topic: str = CHAT_TOPIC,
         group: str = CONSUMER_GROUP,
+        default_entry: str = ENTRY_AUTO,
     ) -> None:
         self.agent = agent
+        # 新消息的默认入口（帧里的 mode 可逐条覆盖）。见 ENTRY_AUTO / ENTRY_PLAN。
+        self.default_entry = default_entry if default_entry in _ENTRIES else ENTRY_AUTO
         self.mq = mq
         self.topic = topic
         self.group = group
@@ -127,7 +136,8 @@ class SessionConsumer:
                     attachments=attachments, feedback=str(action.get("feedback") or ""),
                     revise_of=str(action.get("revise_of") or ""))
             else:
-                # 默认入口就是规划轮（不是用户可关的开关）：剪辑诉求先出计划卡再执行。
+                # 默认入口由 default_entry 决定（帧里的 mode 可逐条覆盖）：
+                # auto 直接进执行轮、渲染前统一弹确认卡；plan 先出计划卡再执行。
                 # 无剪辑节点 / 未接计划门时 plan() 自己退回 handle()，闲聊与咨询照原样回答。
                 # 「继续」是唯一的例外：那是接着跑在途 run，不是又一条新诉求。
                 if resume:
@@ -193,9 +203,15 @@ class SessionConsumer:
                                 "error": "请先确认上方的选项卡，再发送新消息。",
                             })
                             return "ok"
-                        answer = await self.agent.plan(
-                            user_id, conversation_id, message, run_id=run_id,
-                            stream=True, attachments=attachments)
+                        mode = str(payload.get("mode") or self.default_entry)
+                        if mode == ENTRY_PLAN:
+                            answer = await self.agent.plan(
+                                user_id, conversation_id, message, run_id=run_id,
+                                stream=True, attachments=attachments)
+                        else:
+                            answer = await self.agent.handle(
+                                user_id, conversation_id, message, run_id=run_id,
+                                stream=True, attachments=attachments)
         except Exception as e:  # noqa: BLE001  失败也要回执，前端不能干等
             await self.mq.publish(
                 OUTBOUND_TOPIC,

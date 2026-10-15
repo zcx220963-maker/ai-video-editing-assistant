@@ -9,8 +9,13 @@
  * 两条纪律写在这里而不是调用方：
  * 1. **render-shot 口自己再 lint 一遍**。否则「先调 /lint 再调渲染」是调用方的
  *    自觉，而不是闸——绕过一次就等于闸① 不存在。
- * 2. **同一时刻只渲一镜**。无头 WebGL 走软件渲染，并发会把容器打到 OOM，
- *    而 OOM 现场比排队慢一点难查得多。
+ * 2. **打包串行、渲染限路并发**。打包要写同一份 `src/user-shots/shot.tsx`，必须一镜一镜来
+ *    （每镜 1~3 秒）；打包产物是独立目录，之后的逐帧渲染（每镜 17~35 秒，真正的大头）
+ *    按 `DG_RENDER_SLOTS` 路并发（缺省 2）。无头 WebGL 走软件渲染，开太多路会把容器
+ *    打到 OOM——路数是给机器配的，不是越大越好。
+ *
+ * 另有 POST /render-stills：同一套打包，只渲几帧小 JPEG（渲染前计划确认卡上的预览图）。
+ * 成本约是整镜渲染的百分之一，这是 Remotion 官方推荐的「抽几帧看」的验证方式。
  */
 import http from 'node:http';
 import fs from 'node:fs/promises';
@@ -42,21 +47,132 @@ async function loadRemotion() {
   if (remotionApi) return remotionApi;
   // 具名导出：这一版 @remotion/renderer 没有一个叫 renderer 的命名空间，
   // 解构 { renderer } 会得到 undefined，取它的方法时进程直接没了。
-  const [{ bundle }, { selectComposition, renderMedia }] = await Promise.all([
-    import('@remotion/bundler'),
-    import('@remotion/renderer'),
-  ]);
-  remotionApi = { bundle, selectComposition, renderMedia };
+  const [{ bundle }, { selectComposition, renderMedia, renderStill, openBrowser }] =
+    await Promise.all([
+      import('@remotion/bundler'),
+      import('@remotion/renderer'),
+    ]);
+  remotionApi = { bundle, selectComposition, renderMedia, renderStill, openBrowser };
   return remotionApi;
 }
 
-/** 串行渲染闸：一次只放一镜进去。 */
+/** 打包串行闸：打包要写同一份 shot.tsx，一次只放一镜进去。 */
 let chain = Promise.resolve();
 const serialize = (fn) => {
   const run = chain.then(fn, fn);
   chain = run.then(() => {}, () => {});
   return run;
 };
+
+/** 渲染限路闸：打包完的产物是独立目录，逐帧渲染可以多路并发。
+ *  释放时把名额**直接交给**下一个等待者（不先减再加），避免两者之间被第三个插队超额。 */
+const RENDER_SLOTS = Math.max(1, Number(process.env.DG_RENDER_SLOTS || 2));
+let slotsBusy = 0;
+const slotWaiters = [];
+function releaseSlot() {
+  const next = slotWaiters.shift();
+  if (next) next();
+  else slotsBusy -= 1;
+}
+async function acquireSlot() {
+  if (slotsBusy < RENDER_SLOTS) {
+    slotsBusy += 1;
+    return;
+  }
+  await new Promise((resolve) => slotWaiters.push(resolve));
+}
+
+/** 打包一镜：写 shot.tsx → bundle()。调用方负责把它放进 `serialize`。 */
+async function bundleShot(code, shotId) {
+  const { bundle } = await loadRemotion();
+  await fs.mkdir(path.dirname(SHOT_FILE), recursiveDir);
+  await fs.mkdir(OUT, recursiveDir);
+  // publicDir 是 bundle 的入参：目录不存在 bundler 会当场炸，而「这一镜一件素材都没有」
+  // 是完全正常的一镜。先建出来，代价是一次 mkdir。
+  const publicDir = shotPublicDir(shotId);
+  await fs.mkdir(publicDir, recursiveDir);
+  // `bundle()` 只铺一个目录当 `staticFile()` 的根，而字体不在这一镜的素材目录里
+  // （`public/fonts/` 是随镜像发的公共命名空间）——先接进来，否则每一个镜头都会
+  // 因为母版加载字体而 404 收场。详见 `linkShippedNamespaces` 的注释。
+  const shipped = await linkShippedNamespaces(shotId);
+  await fs.writeFile(SHOT_FILE, code, 'utf8');
+  const t0 = Number(process.hrtime.bigint() / 1000000n);
+  const serveUrl = await bundle({
+    entryPoint: path.join(ROOT, 'src', 'index.ts'),
+    publicDir,
+    webpackOverride: (cfg) => ({
+      ...cfg,
+      resolve: {
+        ...cfg.resolve,
+        alias: {
+          ...(cfg.resolve?.alias ?? {}),
+          '@dg/film': path.join(ROOT, 'src', 'FilmLayout.tsx'),
+          '@dg/tokens': path.join(ROOT, 'src', 'tokens.ts'),
+          '@dg/fonts': path.join(ROOT, 'src', 'fonts.ts'),
+          '@dg/motion': path.join(ROOT, 'src', 'demos', '_fixtures', 'Motion.tsx'),
+          '@dg/polish': path.join(ROOT, 'src', 'demos', '_fixtures', 'Polish.tsx'),
+          '@dg/brand': path.join(ROOT, 'src', 'demos', '_fixtures', 'Brand.tsx'),
+          '@dg/fixtures': path.join(ROOT, 'src', 'demos', '_fixtures'),
+          '@dg/lib': path.join(ROOT, 'src', 'lib'),
+          '@dg/themes': path.join(ROOT, 'src', 'themes'),
+
+        },
+      },
+    }),
+  });
+  return { serveUrl, shipped, bundleMs: Number(process.hrtime.bigint() / 1000000n) - t0 };
+}
+
+/** 预览静帧：同一套打包，渲几帧小 JPEG（base64 内联回传，不落 /out）。 */
+async function renderStills(payload) {
+  const code = String(payload.code ?? '');
+  const shotId = String(payload.input_props?.shotId ?? '');
+  const inputProps = {
+    ...(payload.input_props ?? {}),
+    fps: Number(payload.input_props?.fps ?? 30),
+    durationInFrames: Number(payload.input_props?.durationInFrames ?? 0),
+  };
+  if (!inputProps.durationInFrames) {
+    const err = new Error('durationInFrames 必须由调用方注入');
+    err.status = 400;
+    throw err;
+  }
+  const frames = (Array.isArray(payload.frames) ? payload.frames : [])
+    .map(Number).filter(Number.isFinite).slice(0, 4);
+  if (!frames.length) frames.push(Math.floor(inputProps.durationInFrames * 0.7));
+  const scale = Math.min(1, Math.max(0.2, Number(payload.scale ?? 0.4)));
+  const { selectComposition, renderStill, openBrowser } = await loadRemotion();
+  const { serveUrl, bundleMs } = await serialize(() => bundleShot(code, shotId));
+  await acquireSlot();
+  let browser = null;
+  try {
+    const t0 = Number(process.hrtime.bigint() / 1000000n);
+    browser = await openBrowser('chrome', {
+      browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
+    });
+    const composition = await selectComposition({
+      serveUrl, id: 'shot', inputProps, puppeteerInstance: browser,
+      browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
+    });
+    const last = composition.durationInFrames - 1;
+    const stills = [];
+    for (const f of frames) {
+      const frame = Math.max(0, Math.min(last, Math.round(f)));
+      const { buffer } = await renderStill({
+        serveUrl, composition, inputProps, frame, puppeteerInstance: browser,
+        imageFormat: 'jpeg', jpegQuality: 80, scale,
+        browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
+      });
+      stills.push({ frame, jpeg_b64: buffer ? Buffer.from(buffer).toString('base64') : '' });
+    }
+    const ms = Number(process.hrtime.bigint() / 1000000n) - t0;
+    console.log(`[stills] ${shotId} ${stills.length}帧 bundle=${bundleMs}ms render=${ms}ms`);
+    return { ok: true, stills, timings: { bundle_ms: bundleMs, render_ms: ms } };
+  } finally {
+    if (browser) await browser.close({ silent: true }).catch(() => {});
+    releaseSlot();
+  }
+}
 
 /** 浏览器版本：整个进程生命周期只探一次并缓存。
  *  实测教训：Windows 上 chrome.exe --version 会把请求转交给已在跑的实例、永不返回，
@@ -171,49 +287,59 @@ async function renderShot(payload) {
     err.status = 400;
     throw err;
   }
-  const outputLocation = path.join(OUT, `${key}.mp4`);
+  // 渲染参数透传口。这一层以前一个参数都不接，全吃 Remotion 默认（并发=min(8,核/2)、
+  // crf 18、png、scale 1），于是**验收循环**只有一种档：改一镜也得按成片分辨率烧一遍，
+  // 来回十几分钟。加这个口不是为省而省——`draft` 只换像素档，不换判据：
+  //   · 闸⑭ 抽的是 64 px 宽的灰度差，输出多大都归一到同一张采样图；
+  //   · 闸⑥⑧⑲-a/⑳/㉕ 读的是母版量出来的**比例盒**（占带的份额），与分辨率无关；
+  //   · 母版几何按 `useBody()` 报回来的设备像素算 K 倍率，缩档是自相似的。
+  // 草稿档唯一看不出来的是 1 px 发丝线与字体微调，那一档由最终成片渲染兜住。
+  const rp = payload.render ?? {};
+  const draft = rp.draft === true;
+  const scale = rp.scale == null ? 1 : Number(rp.scale);
+  if (!Number.isFinite(scale) || scale <= 0.2 || scale > 1) {
+    const err = new Error(`render.scale 必须在 0.2~1 之间（收到 ${payload.render?.scale}）`);
+    err.status = 400;
+    throw err;
+  }
+  const imageFormat = rp.image_format ?? null;
+  if (imageFormat !== null && !['png', 'jpeg', 'webp'].includes(imageFormat)) {
+    const err = new Error(`render.image_format 只认 png/jpeg/webp（收到 ${imageFormat}）`);
+    err.status = 400;
+    throw err;
+  }
+  const jpegQuality = rp.jpeg_quality == null ? null : Number(rp.jpeg_quality);
+  if (jpegQuality !== null && (!Number.isFinite(jpegQuality) || jpegQuality < 0 || jpegQuality > 100)) {
+    const err = new Error(`render.jpeg_quality 必须在 0~100（收到 ${rp.jpeg_quality}）`);
+    err.status = 400;
+    throw err;
+  }
+  const crf = rp.crf == null ? null : Number(rp.crf);
+  if (crf !== null && (!Number.isFinite(crf) || crf < 0 || crf > 51)) {
+    const err = new Error(`render.crf 必须在 0~51（收到 ${rp.crf}）`);
+    err.status = 400;
+    throw err;
+  }
+  const concurrency = rp.concurrency == null ? null : Number(rp.concurrency);
+  if (concurrency !== null && (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 32)) {
+    const err = new Error(`render.concurrency 必须是 1~32 的整数（收到 ${rp.concurrency}）`);
+    err.status = 400;
+    throw err;
+  }
+  // 草稿与成片**不能共用一个产物名**：`/out/<key>.mp4` 是切片缓存的字节身份，
+  // 让一份 0.4 倍的片子占住成片档的键，下一次命中缓存就是在拿草稿冒充成片。
+  const fileKey = draft ? `${key}.draft` : key;
+  const outputLocation = path.join(OUT, `${fileKey}.mp4`);
 
-  const { bundle, selectComposition, renderMedia } = await loadRemotion();
-  await fs.mkdir(path.dirname(SHOT_FILE), recursiveDir);
-  await fs.mkdir(OUT, recursiveDir);
-  // publicDir 是 bundle 的入参：目录不存在 bundler 会当场炸，而「这一镜一件素材都没有」
-  // 是完全正常的一镜。先建出来，代价是一次 mkdir。
-  const publicDir = shotPublicDir(shotId);
-  await fs.mkdir(publicDir, recursiveDir);
-  // `bundle()` 只铺一个目录当 `staticFile()` 的根，而字体不在这一镜的素材目录里
-  // （`public/fonts/` 是随镜像发的公共命名空间）——先接进来，否则每一个镜头都会
-  // 因为母版加载字体而 404 收场。详见 `linkShippedNamespaces` 的注释。
-  const shipped = await linkShippedNamespaces(shotId);
-  await fs.writeFile(SHOT_FILE, code, 'utf8');
+  const { selectComposition, renderMedia } = await loadRemotion();
+  const { serveUrl, shipped, bundleMs } = await serialize(() => bundleShot(code, shotId));
+  // 打包完之后的逐帧渲染按名额并发（见 RENDER_SLOTS）。
+  await acquireSlot();
+  try {
 
   const warnings = [];
   let tokens = null;
   const now = () => Number(process.hrtime.bigint() / 1000000n);
-  const t0 = now();
-  const serveUrl = await bundle({
-    entryPoint: path.join(ROOT, 'src', 'index.ts'),
-    publicDir,
-    webpackOverride: (cfg) => ({
-      ...cfg,
-      resolve: {
-        ...cfg.resolve,
-        alias: {
-          ...(cfg.resolve?.alias ?? {}),
-          '@dg/film': path.join(ROOT, 'src', 'FilmLayout.tsx'),
-          '@dg/tokens': path.join(ROOT, 'src', 'tokens.ts'),
-          '@dg/fonts': path.join(ROOT, 'src', 'fonts.ts'),
-          '@dg/motion': path.join(ROOT, 'src', 'demos', '_fixtures', 'Motion.tsx'),
-          '@dg/polish': path.join(ROOT, 'src', 'demos', '_fixtures', 'Polish.tsx'),
-          '@dg/brand': path.join(ROOT, 'src', 'demos', '_fixtures', 'Brand.tsx'),
-          '@dg/fixtures': path.join(ROOT, 'src', 'demos', '_fixtures'),
-          '@dg/lib': path.join(ROOT, 'src', 'lib'),
-          '@dg/themes': path.join(ROOT, 'src', 'themes'),
-
-        },
-      },
-    }),
-  });
-  const bundleMs = now() - t0;
 
   const t1 = now();
   const composition = await selectComposition({
@@ -325,6 +451,11 @@ async function renderShot(payload) {
       overwrite: true,
       chromiumOptions: { gl: GL, headless: true },
       onBrowserLog,
+      // 调用方没给的仍吃 Remotion 默认（scale 1、png、crf 18、并发 min(8,核/2)）。
+      ...(scale !== 1 ? { scale } : {}),
+      ...(imageFormat ? { imageFormat, ...(jpegQuality !== null ? { jpegQuality } : {}) } : {}),
+      ...(crf !== null ? { crf } : {}),
+      ...(concurrency !== null ? { concurrency } : {}),
     });
   } catch (err) {
     const e = new Error(`Remotion 渲染失败：${err?.message?.slice(0, 300) ?? err}`);
@@ -482,7 +613,12 @@ async function renderShot(payload) {
   return {
     ok: true,
     cache_key: key,
-    artifact: `/artifact/${encodeURIComponent(key)}`,
+    artifact: `/artifact/${encodeURIComponent(fileKey)}`,
+    // 调用方按这两个数核对产物：草稿档的 mp4 尺寸是 `composition.* × scale`，
+    // 拿成片宽高去对一份 0.4 倍的片子会误判成「渲染尺寸错了」。
+    draft,
+    render_scale: scale,
+    ...(concurrency !== null ? { render_concurrency: concurrency } : {}),
     bytes: (await fs.stat(outputLocation)).size,
     composition: {
       fps: composition.fps,
@@ -522,6 +658,9 @@ async function renderShot(payload) {
     reveal_used: Object.keys(revealSnapshots).length ? revealSnapshots : null,
     warnings,
   };
+  } finally {
+    releaseSlot();
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -544,8 +683,25 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/render-shot') {
       const body = await readBody(req);
-      const result = await serialize(() => renderShot(body));
+      // 打包在 renderShot 里串行、渲染限路并发——这里不再整条串行。
+      const result = await renderShot(body);
       return send(res, 200, result);
+    }
+    if (req.method === 'POST' && url.pathname === '/render-stills') {
+      const body = await readBody(req);
+      return send(res, 200, await renderStills(body));
+    }
+    // 草稿档产物只喂闸、不留存：验收循环一镜要烧十几遍，靠这个口在批量探针收尾时
+    // 把 /out 里的 `<key>.draft.mp4` 扫干净（成片档的 `<key>.mp4` 一个都不碰）。
+    if (req.method === 'POST' && url.pathname === '/purge-drafts') {
+      const names = (await fs.readdir(OUT)).filter((n) => n.endsWith('.draft.mp4'));
+      let bytes = 0;
+      for (const n of names) {
+        const f = path.join(OUT, n);
+        bytes += (await fs.stat(f)).size;
+        await fs.rm(f, { force: true });
+      }
+      return send(res, 200, { ok: true, removed: names.length, bytes });
     }
     if (req.method === 'POST' && url.pathname === '/stage-assets') {
       const body = await readBody(req);

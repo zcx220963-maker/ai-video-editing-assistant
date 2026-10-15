@@ -87,6 +87,7 @@ def health(*, base: str | None = None, timeout: int = 10) -> dict[str, Any]:
 
 
 def lint(code: str, *, declared_fields: list[str] | None = None,
+         assets: list[Any] | None = None,
          base: str | None = None, timeout: int = 60) -> dict[str, Any]:
     """闸①。恒 200，返回 {ok, errors, declared}；不 ok 由调用方决定打回还是放弃。
 
@@ -97,6 +98,9 @@ def lint(code: str, *, declared_fields: list[str] | None = None,
     payload: dict[str, Any] = {"code": code}
     if declared_fields is not None:
         payload["declared_fields"] = list(declared_fields)
+    if assets:
+        # 与渲染口同一份素材名单：不传的话引用了素材的镜会被素材规则误判。
+        payload["assets"] = list(assets)
     _, j = _request("POST", "/lint", base=base, payload=payload, timeout=timeout)
     return j
 
@@ -104,11 +108,19 @@ def lint(code: str, *, declared_fields: list[str] | None = None,
 def render_shot(*, code: str, cache_key: str, input_props: dict[str, Any],
                 declared_fields: list[str] | None = None,
                 assets: list[dict[str, Any]] | None = None,
+                render: dict[str, Any] | None = None,
                 base: str | None = None, timeout: int = 900) -> dict[str, Any]:
     """渲一镜。服务端会自己再 lint 一遍，返回的 `errors` 就是拒绝理由。
 
     抛错时 `lint_errors` 非空 = 闸①拒绝（重交代码可修），为空 = 渲染/超预算类失败。
     `assets` 是本镜声明的素材列表（传给服务端做 staticFile 双向对账）。
+
+    `render` 是**像素档**：`{draft, scale, image_format, jpeg_quality, crf, concurrency}`。
+    不传＝服务端默认（成片档），传了也只是换档，**不换判据**——闸⑭ 读 64 px 宽的灰度差、
+    闸⑥⑧⑲-a 读比例盒，都与输出分辨率无关。所以 `draft=True` 那一档是给验收循环用的：
+    一镜改十几遍时先按草稿档数闸，判据绿了再按成片档烧一次。
+    草稿档**不许进切片缓存**（服务端把产物落在 `<key>.draft.mp4`，与成片档不同名，
+    就是为了不让一份缩了的片子占住成片键去冒充成片）。
     """
     payload: dict[str, Any] = {"code": code, "cache_key": cache_key,
                                "input_props": input_props}
@@ -116,6 +128,8 @@ def render_shot(*, code: str, cache_key: str, input_props: dict[str, Any],
         payload["declared_fields"] = list(declared_fields)
     if assets is not None:
         payload["assets"] = list(assets)
+    if render is not None:
+        payload["render"] = dict(render)
     status, j = _request("POST", "/render-shot", base=base, payload=payload,
                          timeout=timeout)
     if status != 200 or not j.get("ok"):
@@ -164,6 +178,23 @@ def stage_asset(*, relpath: str, sha16: str, bytes_b64: str,
     return j
 
 
+def render_stills(*, code: str, input_props: dict[str, Any], frames: list[int],
+                  scale: float = 0.4, base: str | None = None,
+                  timeout: int = 120) -> list[dict[str, Any]]:
+    """预览静帧：渲这一镜的几帧小 JPEG → ``[{frame, jpeg_b64}]``。
+
+    成本约是整镜渲染的百分之一（打包 1~3 秒 + 每帧几百毫秒），用在渲染前的计划确认卡上
+    给人看——这是「抽几帧看」的主流验证方式，替代「整镜烧完再由机器判」。
+    """
+    payload = {"code": code, "input_props": input_props, "frames": list(frames),
+               "scale": scale}
+    status, j = _request("POST", "/render-stills", base=base, payload=payload,
+                         timeout=timeout)
+    if status != 200 or not j.get("ok"):
+        raise RemotionError(f"预览静帧失败：{j.get('error') or j}", status=status)
+    return list(j.get("stills") or [])
+
+
 def endpoints(*, base: str | None = None, health_timeout: int = 10,
               lint_timeout: int = 60, render_timeout: int = 900,
               fetch_timeout: int = 300, stage_timeout: int = 120) -> dict[str, Any]:
@@ -178,13 +209,15 @@ def endpoints(*, base: str | None = None, health_timeout: int = 10,
         "health": lambda: health(base=base, timeout=health_timeout),
         "lint": lambda code, declared_fields=None: lint(
             code, declared_fields=declared_fields, base=base, timeout=lint_timeout),
-        "render": lambda code, cache_key, input_props, declared_fields=None, assets=None: render_shot(
+        "render": lambda code, cache_key, input_props, declared_fields=None, assets=None, render=None: render_shot(
             code=code, cache_key=cache_key, input_props=input_props,
-            declared_fields=declared_fields, assets=assets, base=base,
+            declared_fields=declared_fields, assets=assets, render=render, base=base,
             timeout=render_timeout),
         "fetch": lambda artifact, dest: fetch_artifact(artifact, dest, base=base,
                                                        timeout=fetch_timeout),
         "stage_asset": lambda relpath, sha16, bytes_b64: stage_asset(
             relpath=relpath, sha16=sha16, bytes_b64=bytes_b64, base=base,
             timeout=stage_timeout),
+        "stills": lambda code, input_props, frames, scale=0.4: render_stills(
+            code=code, input_props=input_props, frames=frames, scale=scale, base=base),
     }

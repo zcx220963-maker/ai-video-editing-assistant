@@ -89,8 +89,8 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         **cspec.knob_props(),
         "bgm": {
             "type": "string",
-            "description": "背景音乐：消息附件/曲库歌曲的 material_id，或 select_bgm 返回的"
-                           " obj: 引用（覆盖 spec.bgm.ref）。传了就**必须**取得到字节，"
+            "description": "背景音乐：消息附件/曲库歌曲的 material_id、曲名（按文件名在曲库里匹配，"
+                           "如「We Never」），或 select_bgm 返回的 obj: 引用（覆盖 spec.bgm.ref）。传了就**必须**取得到字节，"
                            "取不到直接失败——用户点了某条 BGM 却静默出成无声片是骗人。"
                            "不传则按 spec.bgm.ref；两者都没有＝纯人声",
         },
@@ -115,8 +115,10 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         # 顶层开关并进来再过一次校验——与 plan_motion 入库前调的是同一个 validate_code_spec：
         # 越界的值不许走到烧像素。闸⑱（投递腿存在性）只有在这里才判：这个节点才持有
         # 渲染客户端，「缺 stage_asset 口」这句话也只有在这里是真的。
+        # 质检档：spec 没写就按产品缺省（MOTION_QC，缺省 preview——渲后像素闸只提醒）。
+        raw, _contrast_notes = cspec.autofix_ink_contrast(cspec.expand_code_refs(raw))
         spec, errors = cspec.validate_code_spec(
-            cspec.overlay_knobs(dict(raw), inputs),
+            cspec.overlay_knobs(cspec.with_default_qc(raw), inputs),
             has_stage_leg="stage_asset" in self._client())
         # 出处闸在代码链上的第二个调用点：闸的本体在 plan_motion（入库前），这里只兜住
         # 「没经过 plan_motion、直接塞 inline 代码分镜」那一路——判据仍是同一份 source_gate。
@@ -129,9 +131,12 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         row = await jobs.open(sess, artifact)
         attempt = str((row or {}).get("attempt") or "")
         try:
+            target = _resolve_target_duration(state, inputs, None)
+            if target is None and spec.get("target_duration_sec"):
+                target = float(spec["target_duration_sec"])
             out = await self._render(
                 state, spec, errors,
-                target=_resolve_target_duration(state, inputs, None),
+                target=target,
                 bgm_ref=str(inputs.get("bgm") or ""),
                 sess=sess, artifact=artifact, jobs=jobs, attempt=attempt)
         except Exception as exc:
@@ -156,18 +161,14 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                 + "\n".join(f"  · {e}" for e in errors[:12])
                 + (f"\n  · …另有 {len(errors) - 12} 条同类错误" if len(errors) > 12 else ""))
 
+        # 与 plan_motion 入库前同一套：无旁白先把驻留对齐到目标，再判偏离（同一个函数，
+        # 所以分镜轮过了的片子在这里一定也过——不会出现「确认之后才被拦」）。
+        spec, fit_notes = cspec.fit_duration(spec, target)
+        blocked = cspec.duration_block(spec, target, long_factor=BLOCK_LONG_FACTOR,
+                                       short_factor=BLOCK_SHORT_FACTOR)
+        if blocked:
+            raise ValueError(blocked + "改完先重调 plan_motion，再调本工具")
         low, high = cspec.estimate_sec(spec)
-        n = len(spec.get("shots") or [])
-        if target and (low > target * BLOCK_LONG_FACTOR or high < target * BLOCK_SHORT_FACTOR):
-            too_long = low > target * BLOCK_LONG_FACTOR
-            suggest = (f"删到约 {max(1, round(n * target / max(high, 0.1)))} 镜，"
-                       f"或把每镜文案缩短"
-                       if too_long else
-                       f"加到约 {max(n + 1, round(n * target / max(low, 0.1)))} 镜，"
-                       f"或放慢语速")
-            raise ValueError(
-                f"目标 {target:.0f}s，但这份分镜按字数估 {low:.0f}~{high:.0f}s（{n} 镜），"
-                f"偏离超过闸值——一镜一次整段渲染烧不起这一次：{suggest}。改完重调本工具")
 
         bgm_conf = spec.get("bgm") or {}
         ref = bgm_ref or str(bgm_conf.get("ref") or "")
@@ -189,7 +190,11 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
 
         async def on_event(ev: dict[str, Any]) -> None:
             pct = self._percent(ev, total)
-            if pct != done["pct"]:        # 心跳每 20 秒一次，同值不写库
+            # 心跳必须**无条件**写：这条链没有帧级进度，一镜跑到几分钟以上时能改
+            # `updated_at` 的只有它。同值去重只能用在逐镜跳变上——2026-10-15 真机
+            # 就是被这里吞掉的：一镜 3D 烧了 11 分钟，看门狗按 600s 无进度收了口，
+            # 而 remotion 那一侧 CPU 还顶着 1300%（成功却报失败那一族）。
+            if pct != done["pct"] or str(ev.get("stage") or "") == "rendering":
                 done["pct"] = pct
                 probe(str(ev.get("stage") or "motion"), pct)
 
@@ -237,6 +242,8 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             result["material_id"] = mat_id
         if mat_note:
             result.setdefault("notes", []).append(mat_note)
+        if fit_notes:
+            result.setdefault("notes", []).extend(fit_notes)
         await jobs.succeed(sess, artifact, object_key, float(out["duration"]),
                            result=result, attempt=attempt or None)
         return result
@@ -368,7 +375,8 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         # 打回那一份走不到这里（validate_code_spec 已经拦了），取的是拦完之后给人看的
         # 两栏：**提醒**与**未判**。两栏必须分家——T28 的全部意思就是这个（§0.5-P5）：
         # 「这一档没人量过」一旦混进提醒，回执上的读法就成了「量过、没问题，顺口提一句」。
-        _, style_warns, style_unjudged = cspec.whole_film_gate_results(spec["shots"])
+        _, style_warns, style_unjudged = cspec.whole_film_gate_results(
+            spec["shots"], strict=spec.get("qc") == cspec.QC_STRICT)
         ch_counts: dict[str, int] = {}
         for ch in facts["channels"].values():
             ch_counts[ch] = ch_counts.get(ch, 0) + 1
@@ -905,6 +913,10 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             "style_contrast": facts["contrast"],
             "style_contrast_unjudged": facts["contrast_unjudged"],
             "style_warnings": list(style_warns),
+            # 质检档与体检报告（预览档下像素闸没打回、只记下来的条目）。交付时照实转告用户，
+            # **不要**自己据此改码重渲——要不要改由用户看过成片再说。
+            "qc": out.get("qc") or spec.get("qc") or cspec.QC_STRICT,
+            "qc_warnings": list(out.get("qc_warnings") or [])[:20],
             # 未判档单列（T28）：与 style_warnings 分开是这一条的**全部意思**——
             # 看一眼这两个键的读者必须能立刻分出「不达标但出得来」与「没人量过」。
             "style_unjudged": list(style_unjudged),

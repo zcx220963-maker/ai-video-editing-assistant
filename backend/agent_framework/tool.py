@@ -277,6 +277,16 @@ class ToolRegistry:
 
         missing = [k for k in required if k not in params]
         if missing:
+            if list(params) == ["_raw"]:
+                # 整串参数没解析成对象（坏法清单见 llm_openai._parse_tool_args）。
+                # 这里必须说真话：报「缺 plans」是在指错方向——模型交的就是 plans，
+                # 只是串没闭合。真机它因此连吃两次同一个错，还因为每次参数字节不同
+                # 绕开了同参熔断，一路把规划轮的迭代预算烧到上限。
+                return (tool, params,
+                        "Error: 这次调用的参数**整串不是合法 JSON 对象**"
+                        f"（原文 {len(str(params['_raw']))} 字符，四种保守修复都没救回来）。"
+                        "不是你没填必填项——别换键名重试。请缩小单次提交的体积"
+                        "（只交一个方案、去掉可选开关）后再交一次。")
             return tool, params, f"Error: missing required params {missing}"
 
         casted: dict[str, Any] = {}

@@ -107,10 +107,16 @@ def make_llm_summarizer(llm: LLMClient, max_chars: int = 500) -> Summarizer:
 # ---------------------------------------------------------------------------
 
 #: 单条工具结果超过这个体积就截断（字节）。
-DEFAULT_RESULT_MAX_BYTES = 24_000
+#: 这个数按「一份 demo 源码要能整份进来」定：真机 run 97c1289eba35（2026-10-15）
+#: 闸⑫ 骨架相似度 9 镜未过（0.14~0.54 / 阈值 0.61），根因就是原先的 24,000 把每份
+#: demo 的尾部 50~110 行切掉了——而尾部正是主组件与 export，骨架比对最吃重的部分。
+DEFAULT_RESULT_MAX_BYTES = 60_000
 
 #: 活列表里全部工具结果的合计体积超过这个数，就开始折叠更早的那些（字节）。
-DEFAULT_FOLD_AT_BYTES = 96_000
+#: 原先的 96_000 比的是「单条的上限」：把单条改到 60_000 之后，两份完整 demo 就能把活列表撑过 96_000，
+#: 第二轮写码要用的那一批被折成 200 字符预览——模型又变回凭记忆手搓，闸⑫ 的相似度回到 0.14~0.54。
+#: 160_000 容得下十二份折半的 demo（约 120 KB）；真正的限制是模型窗口，不是这里。
+DEFAULT_FOLD_AT_BYTES = 160_000
 
 #: 最近这么多条工具结果永不折叠——模型当前正在用的那一批必须完整。
 DEFAULT_KEEP_RECENT_RESULTS = 3
@@ -391,7 +397,13 @@ class ContextCompressor:
             if cached:
                 return cached
         text = self.summarizer(dropped)
-        summary = await text if _is_awaitable(text) else str(text or "")
+        try:
+            summary = await text if _is_awaitable(text) else str(text or "")
+        except Exception:
+            # 摘要是尽力而为的降级通道，不是硬依赖：LLM 超时/额度失败只该让这段
+            # 历史摘要变粗，不该把整条 run 炸掉——炸在这里时用户消息都还没落库，
+            # 界面上看到的就是「发了没反应」。
+            summary = await default_summarizer(dropped)
         if self.summaries is not None and self._scope and summary.strip():
             await self.summaries.put(self._scope, key, summary, covered=len(dropped))
         return summary

@@ -64,6 +64,18 @@ TEMPLATE_FILE = Path(__file__).resolve().parent.parent / "data" / "templates.jso
 
 TRANSITION_STYLES = ["fade", "fadeblack", "dissolve", "wipeleft", "slideup", "circleopen"]
 TEXT_STYLES = ["subtitle_clean", "subtitle_bold", "花字_pop", "花字_neon"]
+#: 每档字幕样式的 (默认字色, 描边色, 描边宽)。原先只有 subtitle_bold 改了描边，
+#: 两档「花字」选了也和 clean 一模一样——模型在 text_rec 里认真选的是个假选项。
+#: 字号不在这里改：字号与编辑器命中表算框共用 `subtitle_font_size`，两处必须一致。
+TEXT_STYLE_LOOK = {
+    "subtitle_clean": ("white", "black", 1),
+    "subtitle_bold": ("white", "black", 2),
+    "花字_pop": ("#FFD54A", "#1A1A1A", 4),
+    "花字_neon": ("#7DF9FF", "#2A0A4A", 3),
+}
+#: 单条字幕的字数上限：caption 模式按 0.9 倍画宽自动折行，80 字大约三行。
+#: 原先硬截 40 字，超出部分直接丢掉，成片里一句话说一半。
+SUBTITLE_MAX_CHARS = 80
 
 
 def _obj(desc: str, props: dict[str, Any] | None = None,
@@ -559,7 +571,7 @@ class SpeechRoughCutNode(StoryNode):
         if _wants_highlight(state, inputs) and rough:
             raise ValueError(
                 "speech_rough_cut 高光精选模式需要你传入 keep_segments 参数。"
-                "请通读 ASR 全文后选出最有价值的段落，或向用户提问想保留哪些内容。"
+                "请通读 ASR 全文后选出最有价值的段落；用户没指定就按选题自己挑。"
             )
         return {"rough_clips": rough, "kept_sec": round(sum(
             r["end"] - r["start"] for r in rough), 2)}
@@ -722,7 +734,7 @@ class FilterClipsNode(StoryNode):
             raise ValueError(
                 "filter_clips 需要你传入 keep_clips 参数（clip ID 列表）。"
                 "请先读 understand_clips 的画面描述，按用户要求决定保留哪些片段，"
-                "或向用户提问要保留/排除哪些内容。"
+                "用户没指定就按选题与画面质量自己定。"
             )
         keep_set = set(keep_clips)
         kept = [c for c in caps if c.get("clip") in keep_set]
@@ -750,7 +762,7 @@ class GroupClipsNode(StoryNode):
         if not custom:
             raise ValueError(
                 "group_clips 需要你传入 custom_groups 参数（分组方案）。"
-                "请按叙事逻辑对片段分组，或向用户提问希望怎么组织内容顺序。"
+                "请按叙事逻辑对片段分组；用户没指定就按「开场抓人→展开→高潮→收尾」自己排。"
             )
         clip_map = {c.get("clip"): c for c in clips}
         groups = []
@@ -797,7 +809,7 @@ class ScriptTemplateRecNode(StoryNode):
         if not custom_tpl:
             raise ValueError(
                 "script_template_rec 需要你传入 template_id 参数。"
-                "请根据内容选择合适的脚本结构模板，或向用户提问希望什么叙事风格。"
+                "请根据内容选择合适的脚本结构模板；用户没指定就按选题自己选。"
             )
         tpl = next((t for t in templates if t["id"] == custom_tpl), None)
         if not tpl:
@@ -1220,13 +1232,27 @@ class GenerateVoiceoverNode(StoryNode):
 class GenerateAITransitionNode(StoryNode):
     name = "generate_ai_transition"
     display_name = "AI转场生成"
-    description = "AI 转场生成：在相邻分组之间生成转场效果片段"
+    description = ("AI 转场生成：在相邻分组之间生成转场效果片段。可传 styles 逐接缝指定样式"
+                   "（按氛围选；不传则在各接缝间轮换，不再全片同一种）")
     required_nodes = ["group_clips"]
+    input_schema = _obj("AI 转场", {
+        "styles": {
+            "type": "array", "items": {"type": "string", "enum": list(TRANSITION_STYLES)},
+            "description": "逐接缝的转场样式（第 i 项给第 i 处接缝；比接缝少时循环使用）",
+        },
+    })
 
     async def process(self, state, inputs):
         caps = self.settings.caps
         groups = inputs["group_clips"]["groups"]
-        style = random.choice(TRANSITION_STYLES)
+        picked = [str(x) for x in (inputs.get("styles") or []) if str(x) in TRANSITION_STYLES]
+        # 没指定时从随机起点开始逐接缝轮换：原先 random.choice 一次给全片同一种转场。
+        start = random.randrange(len(TRANSITION_STYLES))
+
+        def style_at(i: int) -> str:
+            if picked:
+                return picked[i % len(picked)]
+            return TRANSITION_STYLES[(start + i) % len(TRANSITION_STYLES)]
         # 逐对并发：每条转场是一次 ffmpeg xfade（走 to_thread，真进程级并行，
         # 抢的是 CPU），相邻对之间没有任何数据依赖。此前是 for 循环逐条 await，
         # N 个分组就白等 N 次编解码。
@@ -1235,9 +1261,10 @@ class GenerateAITransitionNode(StoryNode):
         sem = asyncio.Semaphore(max(1, int(getattr(
             caps, "transition_concurrency", 3))))
 
-        async def _one(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any] | None:
+        async def _one(i: int, a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any] | None:
             if not (a.get("clips") and b.get("clips")):
                 return None
+            style = style_at(i)
             tail, head = a["clips"][-1], b["clips"][0]
             dst = self._work(state, "ai_transitions") / \
                 f"{_safe(a['group_id'])}_{_safe(b['group_id'])}.mp4"
@@ -1258,7 +1285,7 @@ class GenerateAITransitionNode(StoryNode):
                 return None  # 转场缺失不阻断主链路
 
         pairs = list(zip(groups, groups[1:]))
-        done = await asyncio.gather(*[_one(a, b) for a, b in pairs])
+        done = await asyncio.gather(*[_one(i, a, b) for i, (a, b) in enumerate(pairs)])
         # 顺序照 pairs 保下来（缺的跳过）：下游按 between 找对应分组，
         # 顺序错乱会让「第几段用哪个转场」与编排对不上。
         transitions = [t for t in done if t is not None]
@@ -1284,7 +1311,7 @@ class TransitionRecNode(StoryNode):
         if not custom:
             raise ValueError(
                 "transition_rec 需要你传入 custom_transitions 参数。"
-                "请根据每组内容氛围选择转场样式，或向用户提问希望什么转场风格。"
+                "请根据每组内容氛围自己选择转场样式（用户没指定就由你定）。"
             )
         return {"transitions": custom, "source": "llm_custom_transitions"}
 
@@ -1308,7 +1335,7 @@ class TextRecNode(StoryNode):
         if not custom:
             raise ValueError(
                 "text_rec 需要你传入 custom_styles 参数。"
-                "请根据每组内容选择字幕样式，或向用户提问希望什么字幕风格。"
+                "请根据每组内容选择字幕样式；用户没指定就由你定。"
             )
         return {"text_effects": custom, "source": "llm_custom_styles"}
 
@@ -2310,13 +2337,13 @@ class RenderVideoNode(StoryNode):
         },
         "render_mode": {
             "type": "string",
-            "description": "渲染路径：auto（默认，先 MoviePy 失败再问用户）/ ffmpeg（直接用 ffmpeg 兜底渲染）/"
+            "description": "渲染路径：auto（默认，MoviePy 失败时自动依次降级为分段→降分辨率→ffmpeg 直出）/ ffmpeg（直接用 ffmpeg 兜底渲染）/"
                            "low_res（降分辨率重试 MoviePy）/"
                            "segments（按窗口渲染：每一窗的字节单独进会话缓存，改过的窗重烧、"
                            "没改的窗直接复用。第一次跑不比 auto 快——那时没有可复用的字节；"
                            "它的价值从第二版起，也是 patch_video「选区改」走的那一条）/"
-                           "segmented（按 60 秒切段渲染再拼接）。auto 模式下 MoviePy 失败会返回可选方案让用户选，"
-                           "不会静默兜底。",
+                           "segmented（按 60 秒切段渲染再拼接）。auto 模式下自动降级，用了哪一档写进返回的 notes；"
+                           "三档都失败才返回可选方案。",
         },
         "dry_run": {
             "type": "boolean",
@@ -2454,6 +2481,7 @@ class RenderVideoNode(StoryNode):
                                           self._work(state, "render", "src"))
             await _check_overlay_media(tl)
             moviepy_error = None
+            degrade_notes: list[str] = []
             if render_mode == "ffmpeg":
                 probe("ffmpeg_fallback", 60)
                 await asyncio.to_thread(_render_via_ffmpeg, tl, dst, probe)
@@ -2476,6 +2504,28 @@ class RenderVideoNode(StoryNode):
                     await asyncio.to_thread(_render_with_moviepy, tl, dst, self.settings, probe)
                 except Exception as e:
                     moviepy_error = e
+                # auto 档自动降级，不停下来让用户选：先保质量（分段，内存小），
+                # 再降分辨率，最后 ffmpeg 直出保证有片。用了哪一档写进 notes 如实交代。
+                # 三档全失败才回退方案（那时确实需要人来决定）。
+                if moviepy_error is not None:
+                    tl_low = {**tl, "width": (tl.get("width") or 1280) // 2,
+                              "height": (tl.get("height") or 720) // 2}
+                    ladder = [
+                        ("分段渲染", lambda: _render_segmented(tl, dst, self.settings, probe)),
+                        ("降分辨率重渲", lambda: _render_with_moviepy(
+                            tl_low, dst, self.settings, probe)),
+                        ("ffmpeg 简化直出（无转场/字幕）",
+                         lambda: _render_via_ffmpeg(tl, dst, probe)),
+                    ]
+                    for label, fn in ladder:
+                        try:
+                            await asyncio.to_thread(fn)
+                        except Exception:  # noqa: BLE001 - 换下一档
+                            continue
+                        degrade_notes.append(
+                            f"MoviePy 渲染失败（{str(moviepy_error)[:120]}），已自动改用{label}出片")
+                        moviepy_error = None
+                        break
             if moviepy_error is not None:
                 # 失败也把**回退方案**写进 render_jobs.result：渲染走的是「提交 + 轮询」，
                 # 模型的视图是从这一行拼出来的，只写 error 的话选项就到不了模型
@@ -2557,7 +2607,7 @@ class RenderVideoNode(StoryNode):
                 duration_sec=float(info["duration"] or 0.0))
             if mat_id:
                 out["material_id"] = mat_id
-            notes = [*overlay_notes, *seg_notes,
+            notes = [*degrade_notes, *overlay_notes, *seg_notes,
                      *((windowed or {}).get("degraded") or []),
                      *([mat_note] if mat_note else [])]
             if notes:
@@ -2796,11 +2846,13 @@ def _subtitle_layers(tl: dict[str, Any], size: tuple[int, int],
             fs = int(te.subtitle_font_size({"width": w, "height": h}, sub))
             # 入口只放行 #RRGGBB 与常见颜色名（见 timeline_edit._type_check），
             # 所以这里不需要再防注入；缺省仍是白字黑边。
-            color = str(sub.get("color") or "white")
+            look = TEXT_STYLE_LOOK.get(str(sub.get("style") or ""),
+                                       TEXT_STYLE_LOOK["subtitle_clean"])
+            color = str(sub.get("color") or look[0])
             where = str(sub.get("position") or "bottom")
             pos = {"top": ("center", "top"),
                    "center": ("center", "center")}.get(where, ("center", "bottom"))
-            tc = TextClip(font=font, text=text[:40], font_size=fs,
+            tc = TextClip(font=font, text=text[:SUBTITLE_MAX_CHARS], font_size=fs,
                           method="caption", size=(int(w * 0.9), None),
                           # moviepy 2.1.2 在 Pillow≥11 下反推 caption 高度时只取
                           # textbbox 的 bottom-top，比真实字形矮一个 descent：量出来
@@ -2809,8 +2861,8 @@ def _subtitle_layers(tl: dict[str, Any], size: tuple[int, int],
                           # 这一条垫的是**字形**，与摆在屏幕哪一头无关，所以三种位置都留。
                           margin=(0, 0, 0, fs // 2),
                           text_align="center",
-                          stroke_color="black",
-                          stroke_width=1 if sub.get("style") != "subtitle_bold" else 2,
+                          stroke_color=look[1],
+                          stroke_width=look[2],
                           color=color)
             layers.append(tc.with_start(sub["start"]).with_duration(
                 max(0.2, sub["end"] - sub["start"])).with_position(pos))

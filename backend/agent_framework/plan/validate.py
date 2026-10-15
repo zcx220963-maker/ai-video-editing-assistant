@@ -3,6 +3,8 @@
 
 跨步骤的结构判据（拓扑、显式依赖、跳过规则、重复步骤、重复开关、文案卫生）在
 ``structure.StructureChecks``——它拿的是一张完整的卡，不是单步。
+**单个取值**那一级的判据（候选值能不能反查回来、一个开关上的几处毛病怎么合成一句）
+在 ``switches``——它不认识步骤、节点与 tag，这一层只管逐步归一化并把意见汇总。
 
 事实一律问 ``PlanVocabulary``（什么节点存在、参数有哪些枚举源），这一层只管判。
 """
@@ -16,11 +18,8 @@ from .support import (PLAN_MAX_CANDIDATES, PLAN_STEPS_MAX, PlanIssues,
                       add_implicit_skills, as_card_value, clean, coerce_plans,
                       num, topology_view)
 from .structure import StructureChecks
+from .switches import USER_SAYS_MAX, switch_problems, value_rejected
 from .vocab import PlanVocabulary
-
-# ``user_says``（「这一项是用户在消息里指名要的」）的长度上限。卡上要原样显示这句话让
-# 用户核对，所以它得是**原话的一两个词**（「横屏」「15 帧」「we never」），不是整句转述。
-_USER_SAYS_MAX = 24
 
 
 class PlanValidator:
@@ -263,7 +262,7 @@ class PlanValidator:
             for opt in options:
                 value = opt.get("value") if isinstance(opt, Mapping) else opt
                 text = as_card_value(value)
-                reason = self._value_rejected(source, text)
+                reason = value_rejected(source, text)
                 if reason:
                     bad.append((text, reason))
                     continue
@@ -284,9 +283,7 @@ class PlanValidator:
             # 模型当时提的三个选项里，第一项正是这条错路（「把 aspect 从卡面开关里去掉，
             # 直接按横屏 16:9 执行」）。所以「用户已定」必须是**能上卡的合法形态**。
             user_says = clean(raw.get("user_says"))
-            # 这里要的是原话的一两个词（「横屏」「15 帧」），不是整句。**不静默截断**：
-            # 卡上显示的就是它写的这句话，截短了用户反而核不出对不上。
-            over_long = len(user_says) > _USER_SAYS_MAX
+            over_long = len(user_says) > USER_SAYS_MAX
             if over_long:
                 user_says = ""           # 不按「已定」算，退回普通开关那套判据
             # 这一个开关上的毛病**合成一条**：值反查不过 / 改完之后只剩一个候选 /
@@ -294,8 +291,8 @@ class PlanValidator:
             # 报就是把几行挤进了打回清单的窗口。真机第二轮打回列出的 8 条「只给了 1 个
             # 候选值」里，有两条正是被同一步骤的「值超过节点上界」引出来的：一个毛病
             # 报了两遍。措辞在有几种毛病时用顿分号串起来，每种都把具体取值点出来。
-            problems = self._switch_problems(bad, values, source,
-                                             user_says=user_says)
+            problems = switch_problems(bad, values, source,
+                                       user_says=user_says)
             if over_long:
                 problems.insert(0, f"user_says 太长（{len(clean(raw.get('user_says')))} 字）"
                                    f"：这里只写用户点名那一两个词的原话"
@@ -345,72 +342,3 @@ class PlanValidator:
                 issues.error(f"计划 {tag} 第 {index} 步（{norm['node']}）没有参数{names}"
                              f"（这一步一共造了 {len(unknown)} 个不存在的开关）："
                              f"不许在卡上造这些开关；{knobs}这类诉求请走「其他」。")
-
-    @staticmethod
-    def _switch_problems(bad: list[tuple[str, str]],
-                         values: list[dict[str, str]],
-                         source: tuple[str, Any], *,
-                         user_says: str = "") -> list[str]:
-        """同一个开关上的毛病 → 一串独立的分句（调用方决定怎么串成一句话）。
-
-        四处容易漏的：
-        - **每个被拒的值都要点名**（连原因）。原先一个开关列 5 个都不合法就是 5 条
-          几乎一样的话、每条还各带一遍可用清单——它们占的是**别的**判据的位置。
-        - 值被拒光时不再补一句「没得选」：那是同一个毛病的回声，判据是「这些取值
-          不合规」，不是「候选太少」。
-        - 只剩一个候选（数值区间/布尔/枚举这三类取值范围本来就存在的）才提「没有
-          选择余地」；`label`（曲库标签）给一个是对的，那是用户指名要的那一首。
-        - **用户已经指名要的那一项不算「没有选择余地」**（``user_says`` 是他那句原话）：
-          这一项的取值本来就是用户定的，卡上显示成「已定」让他核对，再凑一个他没提过
-          的候选反而是瞎编。真机那条 14 镜的 run 就是死在这一条上（见 ``_check_params``
-          里那段注释）。
-        """
-        out: list[str] = []
-        if bad:
-            if len(bad) == 1:
-                text, reason = bad[0]
-                out.append(f"的值「{text}」{reason}")
-            else:
-                pairs = "；".join(f"值「{text}」{reason}" for text, reason in bad)
-                out.append(f"有 {len(bad)} 个值反查不过：{pairs}")
-        if (values and len(values) < 2 and source[0] in ("number", "bool", "enum")
-                and not user_says):
-            hint = ""
-            if source[0] == "number":
-                low, high = source[1]
-                hint = (f"该参数是数值区间 "
-                        f"{'?' if low is None else f'{low:g}'}~"
-                        f"{'?' if high is None else f'{high:g}'}，"
-                        f"请给 2~4 个有真实差异的候选（如 0.1/0.2/0.3/0.5）")
-            elif source[0] == "bool":
-                hint = "给 true 与 false 两个候选，让用户自己选"
-            else:
-                hint = "请把该参数可用的取值多列几个，让用户有得挑"
-            # 出路写两条，各自说清代价：**从卡上删掉不等于「按用户的取值跑」**——
-            # compile 只把卡上列出的键传给节点，删了就按节点自己的默认值跑
-            # （aspect 的默认是 portrait 竖屏，正好与用户要的相反）。
-            out.append(f"只给了 1 个候选值「{values[0]['value']}」，用户没有选择余地。"
-                       f"{hint}；如果这一个值就是用户消息里指名要的，把用户的原话写进"
-                       f"这一项的 user_says——卡上会显示成「已定」让用户核对，也随时能改；"
-                       f"如果它是你替用户挑的、又不打算让他改，就别把它做成开关"
-                       f"（但**别从卡上删掉一个用户点名要的取值**：删了它就传不到执行，"
-                       f"节点会按自己的默认值跑）")
-        return out
-
-    @staticmethod
-    def _value_rejected(source: tuple[str, Any], text: str) -> str:
-        kind, data = source
-        if kind == "number":
-            value = num(text)
-            if value is None:
-                return "不是数值"
-            low, high = data
-            if low is not None and value < low:
-                return f"低于节点下界 {low:g}"
-            if high is not None and value > high:
-                return f"超过节点上界 {high:g}"
-            return ""
-        if text in data:
-            return ""
-        joined = ", ".join(sorted(data))
-        return f"反查不到枚举源（可用：{joined[:160] or '无'}）"

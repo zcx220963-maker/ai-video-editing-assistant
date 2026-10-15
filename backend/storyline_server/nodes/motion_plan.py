@@ -16,14 +16,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Mapping
 
 from agent_framework.designated_asset import check_shots_designated
-from agent_framework.orchestration import NodeState
+from agent_framework.orchestration import NodeState, _safe
 from agent_framework.retrieval import cite_fields, claims_verified, ledger, matches_ledger
 
+import os
+
+from ..motion import code_render as crender
 from ..motion import code_spec as cspec
+from ..motion import remotion_client as rc
 from .core_nodes import StoryNode, _obj, _resolve_target_duration
 
 #: 分镜卡上每镜文案最多显示这么多字——界面不是文稿编辑器，全文在 motion_spec 里。
@@ -164,8 +169,13 @@ class PlanMotionNode(StoryNode):
         **cspec.knob_props(),
         "target_duration_sec": {
             "type": "number",
-            "description": "用户要的目标秒数。只出提醒（估算偏离过大时建议删镜/加镜），"
-                           "本节点不会因此拒绝",
+            "description": "用户要的目标秒数（取材轮与写码轮都要带）。无旁白时系统按比例把各镜驻留"
+                           "对齐到它；偏离大到对不齐时在这里打回并给出镜数建议",
+        },
+        "shots_patch": {
+            "type": "array", "items": {"type": "object"},
+            "description": "只交要改的那几镜（按 id 替换上一版分镜里的同号镜，新 id 追加到末尾），"
+                           "不传 spec。上一版被打回后改几镜就用它，不必把几十镜代码整份重交",
         },
     })
 
@@ -183,12 +193,23 @@ class PlanMotionNode(StoryNode):
             raw = inputs
         if isinstance(raw, str) and raw.strip():
             raw = _try_rescue_json(raw) or raw
+        # 补丁轮：只交改过的那几镜，与本会话上一版分镜（不论那一版是否过了闸）按 id 合并。
+        patch = inputs.get("shots_patch")
+        if raw is None and isinstance(patch, list) and patch:
+            base = _DRAFTS.get(state.session_id)
+            if base is None:
+                raise ValueError(
+                    "plan_motion：shots_patch 找不到上一版分镜（服务重启过或本会话还没交过），"
+                    "这一次请交完整的 spec")
+            raw = merge_shots_patch(base, patch)
         if not isinstance(raw, Mapping) or not raw:
             raise ValueError(
                 "plan_motion：spec 必须是对象且非空——每镜至少交一句文案和一段真实代码")
         # 取材轮排在**一切校验之前**：它根本不是一份分镜（没有 code、没有 aspect），
         # 放进 validate_code_spec 只会得到一屏「code 为空」的清单。判定只看一件事——
         # 这一轮有没有交 code（见 cspec.forage_scan）。
+        # `code_from` 先展开：复用别镜代码的那一镜算「带了 code」，不该被判成取材/写码混交。
+        raw = cspec.expand_code_refs(raw)
         mode, forage = cspec.forage_scan(raw)
         if mode == "mixed":
             ids = "、".join(f"{r['id']}（{r['card'] or '未声明卡'}）" for r in forage)
@@ -207,15 +228,32 @@ class PlanMotionNode(StoryNode):
             return forage_payload(account)
         # 顶层开关先并进来再校验：卡上勾了 landscape 就得渲成横屏，模型在 spec 里写的
         # portrait 让位；并早并晚都要过校验器，越界照样回清单。
-        spec, errors = cspec.validate_code_spec(cspec.overlay_knobs(dict(raw), inputs))
+        # 质检档：spec 没写就按产品缺省（MOTION_QC，缺省 preview——见 cspec.QC_MODES）。
+        # 写码轮的这一版先记成草稿：被下面任何一道闸打回，下一次都可以只用 shots_patch 改那几镜。
+        _remember_draft(state.session_id, raw)
+        # 读不出的字色由系统就地修好（纯算术，不该为它打回重写整份分镜）。
+        raw, contrast_notes = cspec.autofix_ink_contrast(raw)
+        spec, errors = cspec.validate_code_spec(
+            cspec.overlay_knobs(cspec.with_default_qc(raw), inputs))
         if errors:
             # 带病入库比报错更贵：render_motion_code 读的就是这一份，
             # 于是错误会在**烧完像素之后**才现形。
             raise ValueError(
-                "代码分镜校验未通过，没有入库（照清单改完再调本工具）：\n"
+                "代码分镜校验未通过，没有入库（照清单改完再调本工具；只改了几镜就用"
+                " shots_patch 只交那几镜）：\n"
                 + "\n".join(f"  · {e}" for e in errors[:12])
                 + (f"\n  · …另有 {len(errors) - 12} 条同类错误" if len(errors) > 12 else ""))
+        # 目标时长：本次入参 > 会话 flags > spec 里写的那一份（模型常在取材轮带上、
+        # 写码轮漏掉——真机 run 79dcdc0ec0a8 就是写码轮 target=None，时长闸被推迟到确认之后）。
         target = _resolve_target_duration(state, inputs, None)
+        if target is None and raw.get("target_duration_sec"):
+            target = max(3.0, float(raw["target_duration_sec"]))
+        # 时长在**入库之前**对齐与把关：无旁白时系统自己把驻留算到目标上；
+        # 算不到（或有旁白偏离太多）就在这里打回——而不是等用户点了确认、渲染口才拦。
+        spec, duration_notes = cspec.fit_duration(spec, target)
+        blocked = cspec.duration_block(spec, target)
+        if blocked:
+            raise ValueError(blocked + "改完重调本工具（分镜没有入库）")
         spec["target_duration_sec"] = target
         cited, gate = await source_gate(state.session_id, spec["shots"])
         if cited:
@@ -243,8 +281,126 @@ class PlanMotionNode(StoryNode):
                 + "\n".join(f"  · {e}" for e in designated_errs[:12])
                 + (f"\n  · …另有 {len(designated_errs) - 12} 条同类错误"
                    if len(designated_errs) > 12 else ""))
-        return plan_payload(spec, target=target, gate=gate,
-                            designated_unjudged=designated_unjudged)
+        # 闸① 提前到入库前：原先 lint 只在渲染口里跑，一镜代码写错要等前面几镜都烧完、
+        # 渲到它才现形，然后整份重写重提。这里所有镜并行过一遍（不烧像素，每镜几百毫秒）。
+        # 渲染容器连不上时不拦——渲染口自己还会再 lint 一遍，那才是硬闸。
+        up = await _remotion_up()
+        lint_errs = await _prelint(spec["shots"]) if up else []
+        if lint_errs:
+            raise ValueError(
+                "闸① lint 未通过，分镜没有入库（只改报错的那几镜的 code，用 shots_patch "
+                "只交那几镜再调本工具）：\n"
+                + "\n".join(f"  · {e}" for e in lint_errs[:12])
+                + (f"\n  · …另有 {len(lint_errs) - 12} 条同类错误"
+                   if len(lint_errs) > 12 else ""))
+        payload = plan_payload(spec, target=target, gate=gate,
+                               designated_unjudged=designated_unjudged)
+        if duration_notes:
+            payload["duration_notes"] = duration_notes
+        if contrast_notes:
+            payload["autofix_notes"] = contrast_notes
+        # 预览静帧（主流的「抽几帧看」）：每镜一张小图，渲染前的计划确认卡上给人看。
+        # 容器不通、或关了这一档（MOTION_PREVIEW_STILLS=0）就没有图——卡照样弹。
+        if up and os.environ.get("MOTION_PREVIEW_STILLS", "1") not in ("0", "false", "no"):
+            refs, notes = await self._publish_previews(state, spec)
+            if refs:
+                payload["preview_frames"] = refs
+            if notes:
+                payload["preview_notes"] = notes[:12]
+        return payload
+
+    async def _publish_previews(self, state: NodeState, spec: dict[str, Any]
+                                ) -> tuple[dict[str, str], list[str]]:
+        """渲每镜预览静帧并发布到产物作用域 → ({镜号: 对象键}, 说明)。"""
+        sess = state.session_id
+        artifact = state.artifact_id or "_default"
+        files, notes = await crender.preview_stills(
+            spec, client=rc.endpoints(), work=self._work(state, "motion", "preview"),
+            storage=self.storage)
+        refs: dict[str, str] = {}
+        for sid, path in files.items():
+            key = f"renders/{_safe(sess)}/{_safe(artifact)}/preview/{_safe(sid)}.jpg"
+            try:
+                await self.storage.workspace.publish(str(path), key,
+                                                     content_type="image/jpeg")
+                refs[sid] = key
+            except Exception as exc:  # noqa: BLE001 - 缺一张预览不拦
+                notes.append(f"{sid}：预览图没发布（{type(exc).__name__}）")
+        return refs, notes
+
+
+#: 每个会话最近一版写码轮分镜（补丁轮的底稿）。进程内、有上限：重启后丢了就请模型交整份。
+_DRAFTS: dict[str, dict[str, Any]] = {}
+_DRAFTS_MAX = 64
+
+
+def _remember_draft(session_id: str, raw: Mapping[str, Any]) -> None:
+    _DRAFTS.pop(session_id, None)
+    _DRAFTS[session_id] = dict(raw)
+    while len(_DRAFTS) > _DRAFTS_MAX:
+        _DRAFTS.pop(next(iter(_DRAFTS)))
+
+
+def merge_shots_patch(base: Mapping[str, Any], patch: list[Any]) -> dict[str, Any]:
+    """按镜号把补丁并进底稿：同号整镜替换，新号追加；顶层开关沿用底稿。"""
+    shots = [dict(x) for x in (base.get("shots") or []) if isinstance(x, Mapping)]
+    pos = {str(x.get("id") or ""): i for i, x in enumerate(shots)}
+    for item in patch:
+        if not isinstance(item, Mapping) or not item.get("id"):
+            continue
+        sid = str(item["id"])
+        if sid in pos:
+            shots[pos[sid]] = {**shots[pos[sid]], **dict(item)}
+        else:
+            pos[sid] = len(shots)
+            shots.append(dict(item))
+    return {**dict(base), "shots": shots}
+
+
+async def _remotion_up() -> bool:
+    """渲染容器此刻通不通（3 秒探活）。不通时预检与预览都跳过，不拖慢分镜轮。"""
+    try:
+        got = await asyncio.to_thread(rc.health, timeout=3)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(isinstance(got, Mapping) and got.get("ok"))
+
+
+#: 入库前 lint 的并发路数（/lint 不进渲染串行链，只是起一次 eslint）。
+PRELINT_CONCURRENCY = 6
+#: 单镜预检超时（秒）：预检是增益不是硬闸，容器慢或不通时不该把分镜轮拖住。
+PRELINT_TIMEOUT = 20
+
+
+async def _prelint(shots: list[dict[str, Any]]) -> list[str]:
+    """所有镜的代码并行过闸① → 带镜号的错误清单；渲染容器不可达时返回空（不拦）。"""
+    def lint(code: str, names: list[str], assets: list[Any]) -> dict[str, Any]:
+        return rc.lint(code, declared_fields=names, assets=assets, timeout=PRELINT_TIMEOUT)
+    gate = asyncio.Semaphore(PRELINT_CONCURRENCY)
+
+    async def one(shot: Mapping[str, Any]) -> list[str]:
+        code = str(shot.get("code") or "")
+        if not code.strip():
+            return []
+        names = [str(f.get("name") or "") for f in (shot.get("fields") or [])
+                 if f.get("name")]
+        async with gate:
+            try:
+                got = await asyncio.to_thread(lint, code, names,
+                                              list(shot.get("assets") or []))
+            except Exception:  # noqa: BLE001 - 预检外呼失败不拦，渲染口兜底
+                return []
+        if not isinstance(got, Mapping) or got.get("ok", True):
+            return []
+        sid = str(shot.get("id") or "?")
+        errs = [e for e in (got.get("errors") or [])
+                if not (isinstance(e, Mapping) and e.get("rule") == "lint-crash")]
+        return [f"{sid}：{e.get('rule') or ''} 第 {e.get('line') or '?'} 行：{e.get('msg') or e}"
+                if isinstance(e, Mapping) else f"{sid}：{e}"
+                for e in errs]
+
+    results = await asyncio.gather(*(one(s) for s in shots))
+    return [e for r in results for e in r]
 
 
 def forage_payload(account: dict[str, Any]) -> dict[str, Any]:
@@ -351,7 +507,8 @@ def plan_payload(spec: dict[str, Any], *, target: float | None = None,
     # 打回那一份在 validate_code_spec 里拦过了；这里取**拦完之后给人看的**两栏——提醒一栏、
     # 未判一栏（T28）。两栏分家不是措辞讲究：计划卡上「提醒」读作「不改也能出」，
     # 「未判」读作「这一档没人量过」，合成一栏就等于把后者降级成了前者。
-    _, quota_warns, quota_undet = cspec.whole_film_gate_results(shots)
+    _, quota_warns, quota_undet = cspec.whole_film_gate_results(
+        shots, strict=spec.get("qc") == cspec.QC_STRICT)
 
     return {
         "motion_spec": spec,

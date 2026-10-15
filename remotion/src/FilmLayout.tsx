@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import {
   AbsoluteFill,
   Easing,
@@ -16,6 +16,9 @@ import '@dg/fonts';
 import {
   ASPECTS,
   ASSET_LOG_MARKER,
+  CAPTION_ANIMS,
+  CAPTION_POSITIONS,
+  SUBTITLE_MODES,
   FIELD_LOG_MARKER,
   FIELD_PROBE_TAIL,
   FILM_GEOMETRY,
@@ -26,7 +29,7 @@ import {
   TOKENS,
   TOKEN_LOG_MARKER,
 } from './tokens';
-import type { Aspect, FilmStyle, SubtitleMode } from './tokens';
+import type { Aspect, CaptionAnim, CaptionPosition, FilmStyle, SubtitleMode } from './tokens';
 
 /** 镜头代码能拿到的画面带：成片设备像素，左上角是 (0,0)。 */
 export interface BodyBox {
@@ -148,6 +151,9 @@ export interface FilmLayoutProps {
   /** 词级时间戳，由 Python 侧按真实语音时长算好后注入 */
   words?: WordTiming[];
   subtitleMode?: SubtitleMode;
+  /** 字幕位置 bottom/center/top 与入场动画 fade/rise/pop/karaoke（Python 侧注入）。 */
+  captionPosition?: CaptionPosition;
+  captionAnim?: CaptionAnim;
   aspect?: Aspect;
   /** R7-T22 整片进出场档名（none/fade/rise/drop/zoom），由整片开关注入 */
   entrance?: ShotMotionStyle;
@@ -191,7 +197,7 @@ export interface ShotMotion {
 /** 进度 → 这一档在这一刻的透明度与位移/缩放。纯函数，方便真渲夹具之外单独核。 */
 function motionAt(style: ShotMotionStyle, prog: number, entering: boolean,
                   shift: number): ShotMotion {
-  if (style === 'none' || prog <= 0) return { opacity: 1, transform: 'none' };
+  if (style === 'none') return { opacity: 1, transform: 'none' };
   const p = Math.min(1, Math.max(0, prog));
   const dy = style === 'rise' ? (entering ? (1 - p) * shift : -p * shift)
     : style === 'drop' ? (entering ? -(1 - p) * shift : p * shift) : 0;
@@ -203,7 +209,9 @@ function motionAt(style: ShotMotionStyle, prog: number, entering: boolean,
     scale !== 1 ? `scale(${Math.round(scale * 10000) / 10000})` : '',
   ].filter(Boolean);
   return {
-    opacity: style === 'fade' ? 1 - p : 1,
+    // 进出场方向必须分开：`fade` 从前写死成 `1 - p`，于是入场把这一镜淡**出**——
+    // 首帧亮、窗口末帧全透明，后面整镜都看不见（真机上表现为满屏纸底 + 闸⑭ 数不到动效）。
+    opacity: style === 'fade' ? (entering ? p : 1 - p) : 1,
     transform: parts.length ? parts.join(' ') : 'none',
   };
 }
@@ -1029,8 +1037,10 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   text,
   highlight = [],
   words,
-  subtitleMode = 'full',
-  aspect = 'portrait',
+  subtitleMode: subtitleModeProp,
+  captionPosition: captionPositionProp,
+  captionAnim: captionAnimProp,
+  aspect: aspectProp,
   // 这四条**不给默认值**：`resolveShotMotion` 要能分清「镜头代码没转交」与「转交了 none」，
   // 前者回退到注入的那一份（模板漏抄一行不该让整片静默地不演）。
   entrance,
@@ -1041,6 +1051,21 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
 }) => {
   const frame = useCurrentFrame();
   const { width, height, fps, durationInFrames } = useVideoConfig();
+  // 画幅 / 字幕档 / 字幕位置与动画：镜头代码转交了就用它给的，没转交就取 Python 注入的那份
+  // （与 resolveShotMotion 同一条回退）。原先 aspect 缺省写死 'portrait'：镜头代码漏传
+  // aspect 时，横屏片会套竖屏的字幕几何（44px 字、132 高的盒）。
+  const injected = getInputProps() as Record<string, unknown>;
+  const pick = <T extends string>(prop: T | undefined, key: string, allowed: readonly T[],
+                                  dflt: T): T => {
+    const v = prop ?? (injected[key] as T | undefined);
+    return v && allowed.includes(v) ? v : dflt;
+  };
+  const aspect = pick<Aspect>(aspectProp, 'aspect', Object.keys(ASPECTS) as Aspect[], 'portrait');
+  const subtitleMode = pick<SubtitleMode>(subtitleModeProp, 'subtitleMode',
+                                          SUBTITLE_MODES, 'torn_highlight');
+  const captionPosition = pick<CaptionPosition>(captionPositionProp, 'captionPosition',
+                                                CAPTION_POSITIONS, 'bottom');
+  const captionAnim = pick<CaptionAnim>(captionAnimProp, 'captionAnim', CAPTION_ANIMS, 'fade');
   // 闸⑧ 的扫描范围锚点：只扫画面带里面，母版自己的字幕带不算在镜头代码的账上。
   const bodyRef = React.useRef<HTMLDivElement>(null);
   // u 只管**字阶与配色**（横竖屏字号才跳不了位）；版面几何走 FILM_GEOMETRY 的设备像素，
@@ -1309,6 +1334,8 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
             geo={geo}
             bottom={captionBottom}
             tone={tone}
+            position={captionPosition}
+            anim={captionAnim}
           />
         ) : null}
       </AbsoluteFill>
@@ -1328,39 +1355,63 @@ const Caption: React.FC<{
   bottom: number;
   /** 字幕条的两个颜色，按这一镜底色亮度算（见 `captionTone`）。 */
   tone: { paper: string; ink: string };
-}> = ({ text, highlight, words, mode, opacity, geo, bottom, tone }) => {
+  /** 字幕位置（模型按构图选）：bottom 默认 / center 压在画面正中 / top 顶部安全区。 */
+  position?: CaptionPosition;
+  /** 字幕入场动画（模型按片子气质选）：fade / rise / pop / karaoke（逐字随语音点亮）。 */
+  anim?: CaptionAnim;
+}> = ({ text, highlight, words, mode, opacity, geo, bottom, tone,
+        position = 'bottom', anim = 'fade' }) => {
   const frame = useCurrentFrame();
-  const { width } = useVideoConfig();
+  const { width, height, fps } = useVideoConfig();
   const cap = geo.caption;
 
-  // fitText：用 Noto CJK 实测字宽，按可用宽度自适应字号。
-  // 母版原来用固定 cap.fontSize，长文案撑破字幕盒、短文案字偏小——闸⑧ 叠字的根因。
+  // 字号：按「最多两行」求，并夹在 [0.62, 1.25] × 几何表字号之间。
+  // 原先 fitText 直接取「整句塞进一行」的字号且不设上下限：60 字的句子缩到 14px 看不清，
+  // 四五个字的短句放到 150px+ 撑破字幕盒。两行容量正是 MAX_TEXT_CHARS 的前提。
   const availW = width - 2 * cap.side - 2 * cap.padX;
   let fontSize = cap.fontSize;
   try {
     const ft = remotionFitText({
       text,
-      maxWidth: availW,
+      withinWidth: availW,
       fontFamily: '"Noto Sans CJK SC", sans-serif',
-      fontWeight: 400,
-      maxLines: 2,
-      maxFontSize: cap.fontSize,
-      minFontSize: Math.round(cap.fontSize * 0.6),
+      fontWeight: 500,
     });
-    fontSize = ft.fontSize;
+    const oneLine = ft.fontSize;
+    // 单行放得下且不超上限 → 单行；否则按两行（单行字号 ×2 再留 8% 断行余量）。
+    fontSize = oneLine >= cap.fontSize ? oneLine : oneLine * 2 * 0.92;
   } catch {
     // lint / 构建期没有浏览器环境，退回固定字号
   }
+  fontSize = Math.round(Math.min(cap.fontSize * 1.25, Math.max(cap.fontSize * 0.62, fontSize)));
 
-  const lit = (piece: string) => {
-    const hit = highlight.find((h) => h && piece.includes(h));
-    if (!hit) return null;
-    if (!words?.length) return true;
-    const w = words.find((x) => x.text && hit.includes(x.text));
-    return w ? frame >= w.startFrame : false;
-  };
+  // 逐字时间：把 TTS 词按出现顺序对到字符区间上，得到每个字被读到的那一帧。
+  // 原先拿「片段序号」去取「词序号」的时间（words[i]），片段与词不是一回事；
+  // 高亮也要求 TTS 词是高亮词的子串，TTS 分得比高亮词长时整镜不亮。
+  const charFrames = useMemo(() => charStartFrames(text, words), [text, words]);
+  const timed = charFrames !== null;
+  const reached = (at: number) => !timed || frame >= (charFrames as number[])[at];
 
   const pieces = splitByHighlights(text, highlight);
+  let cursor = 0;
+  const spans = pieces.map((p) => {
+    const start = cursor;
+    cursor += p.length;
+    return { p, start };
+  });
+
+  // 入场动画（整条字幕）：只在前 0.3 秒内生效，之后静止，不抢画面。
+  const t = Math.min(1, frame / Math.max(1, Math.round(0.3 * fps)));
+  const ease = 1 - Math.pow(1 - t, 3);
+  const enterStyle: React.CSSProperties =
+    anim === 'rise' ? { transform: `translateY(${(1 - ease) * cap.fontSize * 0.8}px)` }
+      : anim === 'pop' ? { transform: `scale(${0.86 + 0.14 * ease})` }
+        : {};
+
+  const place: React.CSSProperties =
+    position === 'center' ? { top: 0, bottom: 0 }
+      : position === 'top' ? { top: geo.topSafe + Math.round(height * 0.02) }
+        : { bottom };
 
   return (
     <div
@@ -1368,8 +1419,9 @@ const Caption: React.FC<{
         position: 'absolute',
         left: cap.side,
         right: cap.side,
-        bottom,
-        height: cap.height,
+        ...place,
+        // 盒高是下限不是定值：两行字时盒子长高，不再溢出到盒外。
+        minHeight: position === 'center' ? undefined : cap.height,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -1384,32 +1436,37 @@ const Caption: React.FC<{
           borderRadius: cap.radius,
           color: tone.ink,
           fontSize: fontSize,
+          fontWeight: 500,
           lineHeight: 1.35,
           textAlign: 'center',
+          ...enterStyle,
         }}
       >
-        {pieces.map((p, i) => {
-          const on = lit(p);
-          const shown = !words?.length || frame >= (words[i]?.startFrame ?? 0);
+        {spans.map(({ p, start }, i) => {
+          const isHl = highlight.some((h) => h && h === p);
+          const on = isHl && reached(start);
           // 高亮词整体占一块粉色：中文可任意断行，「一座城市」被劈成两行时行尾会留下
           // 一个只包着「一」字的孤立色块。短词锁住不拆；长片段照旧折行，免得撑破字幕盒。
-          const keep = p.length <= 12 && highlight.some((h) => h && h === p);
+          const keep = p.length <= 12 && isHl;
+          const hlStyle: React.CSSProperties = {
+            whiteSpace: keep ? 'nowrap' : undefined,
+            background: on ? TOKENS.hl : 'transparent',
+            // torn_highlight：词点亮后留一条下划红线，逐词「撕开」的观感。
+            // 粗细跟字号走，三种画幅下才是同一条线。
+            borderBottom:
+              on && mode === 'torn_highlight'
+                ? `${Math.max(2, Math.round(fontSize / 26))}px solid ${TOKENS.accent}`
+                : 'none',
+          };
+          if (anim !== 'karaoke' || !timed) {
+            return <span key={i} style={hlStyle}>{p}</span>;
+          }
+          // karaoke：未读到的字淡显，读到就实显——整句一直在，眼睛能提前扫读。
           return (
-            <span
-              key={i}
-              style={{
-                opacity: shown ? 1 : 0,
-                whiteSpace: keep ? 'nowrap' : undefined,
-                background: on ? TOKENS.hl : 'transparent',
-                // torn_highlight：词点亮后留一条下划红线，逐词「撕开」的观感。
-                // 粗细跟字号走，三种画幅下才是同一条线。
-                borderBottom:
-                  on && mode === 'torn_highlight'
-                    ? `${Math.max(2, Math.round(fontSize / 26))}px solid ${TOKENS.accent}`
-                    : 'none',
-              }}
-            >
-              {p}
+            <span key={i} style={hlStyle}>
+              {Array.from(p).map((ch, j) => (
+                <span key={j} style={{ opacity: reached(start + j) ? 1 : 0.38 }}>{ch}</span>
+              ))}
             </span>
           );
         })}
@@ -1417,6 +1474,32 @@ const Caption: React.FC<{
     </div>
   );
 };
+
+/** 每个字符被读到的起始帧；没有词时间轴（或一个词都对不上）返回 null。
+ *  词按出现顺序从游标往后找，找不到的词跳过；词之间的标点沿用前一个词的帧。 */
+export function charStartFrames(text: string, words?: WordTiming[]): number[] | null {
+  if (!words?.length || !text) return null;
+  const n = text.length;
+  const frames: (number | null)[] = new Array(n).fill(null);
+  let cursor = 0;
+  let matched = 0;
+  for (const w of words) {
+    if (!w.text) continue;
+    const at = text.indexOf(w.text, cursor);
+    if (at < 0) continue;
+    for (let k = at; k < at + w.text.length; k++) frames[k] = w.startFrame;
+    cursor = at + w.text.length;
+    matched++;
+  }
+  if (!matched) return null;
+  const out: number[] = new Array(n);
+  let last = 0;
+  for (let k = 0; k < n; k++) {
+    if (frames[k] !== null) last = frames[k] as number;
+    out[k] = last;
+  }
+  return out;
+}
 
 /** 按高亮词把整句切成片段；高亮词本身单独成段，才能一块一块点亮。 */
 export function splitByHighlights(text: string, highlight: string[]): string[] {

@@ -64,7 +64,24 @@ export type Aspect = keyof typeof ASPECTS;
  * `caption.fontSize` 沿用等比缩放原本的观感（横屏 44×1.7778≈78），所以
  * **只有画面带变大了，字幕没变样**。
  */
-export const FILM_GEOMETRY = {
+export interface CaptionGeometry {
+  height: number;
+  fontSize: number;
+  side: number;
+  radius: number;
+  padX: number;
+  padY: number;
+}
+
+export interface FilmGeometry {
+  topSafe: number;
+  bottomSafe: number;
+  gutter: number;
+  caption: CaptionGeometry;
+  bleedCaptionBottom: number;
+}
+
+export const FILM_GEOMETRY: Record<Aspect, FilmGeometry> = {
   portrait: {
     topSafe: 96, bottomSafe: 300, gutter: 72,
     caption: { height: 132, fontSize: 44, side: 72, radius: 14, padX: 34, padY: 18 },
@@ -90,6 +107,13 @@ export const FILM_GEOMETRY = {
  *  `full`/`torn_highlight` 都是母版在画面带下方那条固定白底圆角条里画，
  *  `none` 是整片没有字幕。`inline` 是唯一能让「这一镜的字压在画面上」成立的档。 */
 export const SUBTITLE_MODES = ['full', 'torn_highlight', 'none', 'inline'] as const;
+
+/** 字幕位置与入场动画：模型按构图与片子气质逐镜选（整片给默认值）。
+ *  与 `code_spec.CAPTION_POSITIONS / CAPTION_ANIMS` 是同一份枚举，两处一起改。 */
+export const CAPTION_POSITIONS = ['bottom', 'center', 'top'] as const;
+export type CaptionPosition = (typeof CAPTION_POSITIONS)[number];
+export const CAPTION_ANIMS = ['fade', 'rise', 'pop', 'karaoke'] as const;
+export type CaptionAnim = (typeof CAPTION_ANIMS)[number];
 
 /** 闸⑤ 回读行的行首标记。server.mjs 里是同名字面量，两处必须一起改。 */
 export const TOKEN_LOG_MARKER = 'DG_TOKENS:';

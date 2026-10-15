@@ -1496,11 +1496,25 @@ class AssetLibraryRepo(_Repo):
                                     order_by=["-created_at"], limit=limit * 3)
         if query:
             q = query.lower()
+            def _tags_match(r: dict[str, Any]) -> bool:
+                t = r.get("tags") or ""
+                if t.startswith("["):
+                    try:
+                        import json
+                        arr = json.loads(t)
+                        if isinstance(arr, list):
+                            return any(q in str(x).lower() for x in arr)
+                    except Exception:
+                        pass
+                return q in t.lower()
             pool = [r for r in rows
                     if q in (r.get("caption") or "").lower()
                     or q in (r.get("subject") or "").lower()
                     or q in (r.get("src_id") or "").lower()
-                    or _grams(q) & _grams((r.get("caption") or "").lower())]
+                    or _tags_match(r)
+                    or _grams(q) & _grams((r.get("caption") or "").lower())
+                    or _grams(q) & _grams((r.get("subject") or "").lower())
+                    or _grams(q) & _grams((r.get("tags") or "").lower())]
         else:
             pool = rows
         return rank_by_request(pool, query, field="caption")[:limit]
@@ -1513,7 +1527,9 @@ class AssetLibraryRepo(_Repo):
         return len(rows)
 
     async def set_facts(self, asset_id: str, *, asset_role: str = "",
-                        scale_facts: dict[str, Any] | None = None) -> None:
+                        scale_facts: dict[str, Any] | None = None,
+                        width: int | None = None,
+                        height: int | None = None) -> None:
         """把机器算出来的两格（角色 / 最细笔画）写回已有行（R11-T53/T54 的补标路径）。
 
         与 ``add`` 分开是为了让「补标」不必重走一次入库：入库那一路要 MinIO 里真有字节，
@@ -1522,9 +1538,18 @@ class AssetLibraryRepo(_Repo):
 
         `scale_safe` 同样**没有入参**（T54）：它是 `scale_facts['verdict']` 的投影，
         人填不进一个与实测无关的布尔值。
+
+        `width`/`height` 是补标时**从字节里量出来**的那一格：判角色要读尺寸，量完却不
+        落库，于是「库里尺寸全空」这件事在补标之后仍然成立，下一趟判角色还是没得读。
+        传 0/None 表示「这一趟没量出来」——不写这一栏，而不是把已有值抹成 NULL。
         """
-        await self.db.update(self.table, {
+        patch: dict[str, Any] = {
             "asset_role": asset_role,
             "scale_safe": scale_verdict_from(scale_facts),
             "scale_facts": json.dumps(scale_facts or {}, ensure_ascii=False),
-        }, where={"id": asset_id})
+        }
+        if width:
+            patch["width"] = int(width)
+        if height:
+            patch["height"] = int(height)
+        await self.db.update(self.table, patch, where={"id": asset_id})

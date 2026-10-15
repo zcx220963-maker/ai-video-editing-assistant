@@ -177,22 +177,25 @@ POPUP_NUDGE_FILE = "popup_nudge.md"
 POPUP_NUDGE_PLANNING_FILE = "popup_nudge_planning.md"
 NO_POPUP_NOTE_FILE = "no_popup_note.md"
 PLAN_CARD_NUDGE_FILE = "plan_card_nudge.md"
+AUTO_PROCEED_NUDGE_FILE = "auto_proceed_nudge.md"
 
 POPUP_NUDGE = read_prompts_file(POPUP_NUDGE_FILE)
 POPUP_NUDGE_PLANNING = read_prompts_file(POPUP_NUDGE_PLANNING_FILE)
 NO_POPUP_NOTE = read_prompts_file(NO_POPUP_NOTE_FILE)
 PLAN_CARD_NUDGE = read_prompts_file(PLAN_CARD_NUDGE_FILE)
+AUTO_PROCEED_NUDGE = read_prompts_file(AUTO_PROCEED_NUDGE_FILE)
 
 
 def refresh_prompt_texts(library: Any) -> None:
     """按提示词库刷新本模块的打回文案（就地改模块全局）。同 ``agent._refresh_prompt_texts``。"""
     if library is None:
         return
-    global POPUP_NUDGE, POPUP_NUDGE_PLANNING, NO_POPUP_NOTE, PLAN_CARD_NUDGE
+    global POPUP_NUDGE, POPUP_NUDGE_PLANNING, NO_POPUP_NOTE, PLAN_CARD_NUDGE, AUTO_PROCEED_NUDGE
     POPUP_NUDGE = prompt_text(library, POPUP_NUDGE_FILE)
     POPUP_NUDGE_PLANNING = prompt_text(library, POPUP_NUDGE_PLANNING_FILE)
     NO_POPUP_NOTE = prompt_text(library, NO_POPUP_NOTE_FILE)
     PLAN_CARD_NUDGE = prompt_text(library, PLAN_CARD_NUDGE_FILE)
+    AUTO_PROCEED_NUDGE = prompt_text(library, AUTO_PROCEED_NUDGE_FILE)
 
 
 def popup_nudge(planning: bool) -> str:
@@ -200,9 +203,13 @@ def popup_nudge(planning: bool) -> str:
     return POPUP_NUDGE_PLANNING if planning else POPUP_NUDGE
 
 
-def plan_card_nudge() -> str:
-    """「该出卡却写了散文」的打回文案（调用时读全局，理由同 popup_nudge）。"""
-    return PLAN_CARD_NUDGE
+def plan_card_nudge(planning: bool = True) -> str:
+    """「该出卡却写了散文」的打回文案（调用时读全局，理由同 popup_nudge）。
+
+    规划轮里出路是 submit_plan；执行轮（自主模式的默认入口）手里没有 submit_plan，
+    出路是直接往下做——渲染前确认门会统一弹计划确认卡。
+    """
+    return PLAN_CARD_NUDGE if planning else AUTO_PROCEED_NUDGE
 
 
 def no_popup_note() -> str:

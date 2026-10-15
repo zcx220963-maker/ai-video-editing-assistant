@@ -70,3 +70,27 @@ def record_failure(source: str, stage: str, exc: BaseException, *,
     print(f"[{source}] {stage}失败{tail}: {rec['error']} — {rec['advice']}",
           file=sys.stderr)
     return rec
+
+
+def record_parse_failure(source: str, stage: str, *, url: str = "",
+                         detail: str = "", advice: str = "") -> dict:
+    """**站回来了 200、这条腿却一条都没解析出来**——单独一档，不并进上面两类。
+
+    为什么不复用 `record_failure`：那个函数接的是异常，而这里没有异常，
+    `classify_failure(ValueError(...))` 会给出「未分类异常、代码修不了」——那两句都是错的：
+    ① 源是通的（它回了 200），建议「换源」是冤枉它；② 缺的是这个源里的件吗？不是，
+    列表页有件，是**腿读不懂现在的站点**（字段改名、页面改成异步加载、URL 从相对变绝对），
+    这**恰恰是改代码能救的那一档**。
+
+    T52 的判据原话是「0 行且无失败不算绿」：那条判据今天要能判红，靠的就是这里。
+    没有它，三条读错的腿会一直表现成「跑完了，总计入库 0 个素材」，看上去像「这个源没货」。
+    """
+    rec = {"source": source, "stage": stage, "url": url, "detail": detail,
+           "ok": False, "kind": "EmptyParse", "http_code": 200, "fixable": True,
+           "advice": advice or ("站点回了 200 但这条腿解析出 0 件：源是通的、货也在，"
+                               "缺的是腿对站点现状的读法（字段名/页面结构/URL 形态），改代码能救"),
+           "error": f"200 但 0 件（{detail or stage}）"}
+    FAILURES.append(rec)
+    print(f"[{source}] {stage} 解析出 0 件（源可达 200）: {detail} — {rec['advice']}",
+          file=sys.stderr)
+    return rec

@@ -38,7 +38,7 @@
 | 抖音 观机社（dy09） | 抖音账号"观机社"发布的荣耀 AI 概念片剪辑（约 22.6s） | 转载剪辑；底层为品牌向概念内容（涉及荣耀/Honor 品牌元素） | 手法参考，重新实现；品牌字标已替换为中性占位词 |
 | 抖音 江经怜（dy08，个别卡） | 抖音账号"江经怜"公开发布的作品（约 19.4s 竖屏） | 个人作品（公开发布，未获复刻许可） | 手法参考，重新实现；无原素材 |
 | reference/brand-scan | 用户提供的参考图定制 | 内部需求 | 原创实现 |
-| science 科普向补卡（cross-section-reveal / map-terrain-build / process-diagram-flow / metaphor-bridge / compare-duel / timeline-evolution / exploded-assembly / growth-morph） | 本项目内部需求：补科普向卡库缺口，脱离产品宣传片语汇 | 原创实现 | 从零撰写，**无任何外部参考片**；不含 ShotcraftMark、功能导航或产品截图 |
+| science 科普向补卡（cross-section-reveal / map-terrain-build / process-diagram-flow / metaphor-bridge / compare-duel / timeline-evolution / exploded-assembly / growth-morph / curve-function-trace） | 本项目内部需求：补科普向卡库缺口，脱离产品宣传片语汇 | 原创实现 | 从零撰写，**无任何外部参考片**；不含 ShotcraftMark、功能导航或产品截图 |
 
 > 已知精确度限制：X / 抖音来源当时以账号主页为单位记录，未逐条留存
 > 具体帖子 URL（原片仅在研究期间本地留存，未入库）。表中已尽量补充
@@ -61,4 +61,4 @@
 | x.com/tvnxty（Firecrawl 宣传片） | `product-card-progressive-assemble`、`research-card-stack-scroll` |
 | 抖音 观机社 | `logo-shrink-wordmark-lockup`、`white-flash-logo-simplify-cut` |
 | 用户参考图定制（brand-scan） | `assemble-then-type-flyin`、`scanline-annotate-focus`、`scanline-assemble-flyin` |
-| 科普向补卡（science，原创实现） | `cross-section-reveal`、`map-terrain-build`、`process-diagram-flow`、`metaphor-bridge`、`compare-duel`、`timeline-evolution`、`exploded-assembly`、`growth-morph` |
+| 科普向补卡（science，原创实现） | `cross-section-reveal`、`map-terrain-build`、`process-diagram-flow`、`metaphor-bridge`、`compare-duel`、`timeline-evolution`、`exploded-assembly`、`growth-morph`、`curve-function-trace` |

@@ -155,7 +155,7 @@ class MotionRenderBase(StoryNode):
                 + (f"\n  · …另有 {len(cited) - 12} 条同类错误" if len(cited) > 12 else ""))
 
     async def _bgm_ref(self, state: NodeState, value: str) -> str:
-        """bgm 入参 → 能取到字节的引用。两种写法都收：``obj:`` 引用、素材 material_id。
+        """bgm 入参 → 能取到字节的引用。三种写法都收：``obj:`` 引用、素材 material_id、曲名。
 
         为什么必须收 material_id：随消息附上的曲库歌曲，模型手里只有 material_id
         （附件事实行不含对象键），而唯一能把歌曲换成 ``obj:`` 引用的 select_BGM 绑在
@@ -167,7 +167,16 @@ class MotionRenderBase(StoryNode):
         got, _denied = await self.storage.materials.resolve(
             [value], user_id=state.user_id, conv_id=state.conversation_id or None)
         if not got:
-            raise ValueError(f"没有这条配乐素材：{value}")
+            # 用户说的常常是曲名（「背景音乐用 We Never」），模型就原样填进来——
+            # 按文件名在本人可见的音频里找一首最像的（与 search_media 同一个检索口）。
+            # 真机 run 79dcdc0ec0a8 传的就是 bgm="We Never"，曲库里那首叫
+            # 「DJariium, DJAQ - We Never (高燃鼓點版).mp3」。
+            hits = await self.storage.materials.search(
+                state.user_id, value, conv_id=state.conversation_id or None,
+                kinds=("audio",), limit=3)
+            if hits:
+                return to_ref(hits[0]["object_key"])
+            raise ValueError(f"没有这条配乐素材：{value}（按 material_id 与曲名都没找到）")
         return to_ref(got[0]["object_key"])
 
     async def _publish_frames(self, out: dict[str, Any], *,

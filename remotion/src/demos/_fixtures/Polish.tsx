@@ -87,19 +87,16 @@ export const fitText = (opts: {
   maxLines?: number;
   maxFontSize?: number;
   minFontSize?: number;
-}): { fontSize: number; width: number; height: number } => {
+}): { fontSize: number } => {
   try {
     return remotionFitText({
       text: opts.text,
-      maxWidth: opts.maxWidth,
+      withinWidth: opts.maxWidth,
       fontFamily: opts.fontFamily ?? FONT.sans,
       fontWeight: opts.fontWeight ?? 400,
-      maxLines: opts.maxLines ?? 1,
-      maxFontSize: opts.maxFontSize ?? 200,
-      minFontSize: opts.minFontSize ?? 10,
     });
   } catch {
-    return { fontSize: opts.maxFontSize ?? 48, width: opts.maxWidth, height: 48 };
+    return { fontSize: opts.maxFontSize ?? 48 };
   }
 };
 

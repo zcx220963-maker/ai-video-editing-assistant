@@ -45,6 +45,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
@@ -53,6 +54,7 @@ from agent_framework.designated_asset import check_shots_designated
 from .. import mediaops
 from ..mediaops import MediaError
 from ..providers import Providers
+from . import beats as beat_mod
 from . import code_spec as cspec
 from . import remotion_client as rc
 from . import render as rpipe
@@ -212,11 +214,36 @@ async def narration_for(shot: Mapping[str, Any], spec: Mapping[str, Any],
         rpipe._pad_audio(speech_src, sec, voice_file)
     frames = max(2, int(round(sec * fps)))
     return {"timed": timed, "speech": speech, "sec": sec, "frames": frames,
-            "voice": voice_file, "degrade": degrade}
+            "voice": voice_file, "degrade": degrade,
+            "src": str(speech_src) if speech_src is not None else None}
+
+
+def _extend_narration(narr: dict[str, Any], pad: float, *, fps: int) -> dict[str, Any]:
+    """卡拍补长：把这一镜往后补 pad 秒（只补不裁），声轨同步补齐静音。→ 新的 narr。"""
+    if pad <= 0:
+        return narr
+    sec = float(narr["sec"]) + pad
+    voice = Path(narr["voice"])
+    if narr.get("src"):
+        rpipe._pad_audio(Path(narr["src"]), sec, voice)
+    else:
+        mediaops.silent_wav(voice, duration=sec)
+    return {**narr, "sec": sec, "frames": max(2, int(round(sec * fps))), "beat_pad": pad}
+
+
+def _seam_overlaps(spec: Mapping[str, Any], shots: Sequence[Mapping[str, Any]]) -> list[float]:
+    """每处接缝的交叠秒数（与拼接那一趟同一份 transition_plan）。"""
+    plan = cspec.transition_plan(spec)
+    base = float(plan["duration"]) if str(plan["style"]) not in ("", "none") else 0.0
+    over = {str(x.get("after")): (0.0 if str(x.get("style") or "none") == "none"
+                                  else float(x.get("duration") or 0.0))
+            for x in plan.get("seams") or []}
+    return [over.get(str(s.get("id") or ""), base) for s in shots[:-1]]
 
 
 def _check_frame_account(sid: str, *, planned_frames: int, fps: int,
-                         info: dict[str, Any], expected_size: tuple[int, int]) -> None:
+                         info: dict[str, Any], expected_size: tuple[int, int],
+                         size_tolerance: int = 0) -> None:
     """闸③：本地 ffprobe 的读数 vs 分镜账。**不静默截帧、不静默补帧**。
 
     对账在 Python 侧而不是只信容器回读的 `probed`：回读发生在**另一台机器的另一份文件**
@@ -232,10 +259,11 @@ def _check_frame_account(sid: str, *, planned_frames: int, fps: int,
             f"切片实测 {got} 帧，差 {abs(got - planned_frames)} 帧 > 1——不截不补，"
             "这一镜退回。先查是不是 durationInFrames 被镜头代码自己改了（母版不该有这权力）")
     w, h = int(info.get("width") or 0), int(info.get("height") or 0)
-    if (w, h) != tuple(expected_size):
+    if abs(w - expected_size[0]) > size_tolerance or abs(h - expected_size[1]) > size_tolerance:
         raise MediaError(
             f"闸③ {sid}：成片尺寸 {w}×{h} 与分镜账 {expected_size[0]}×{expected_size[1]} "
-            "不一致——拼接会把不同尺寸的切片一起缩放，画面会糊，这里先拦下")
+            f"不一致（容差 {size_tolerance} px）——拼接会把不同尺寸的切片一起缩放，"
+            "画面会糊，这里先拦下")
 
 
 def _frame_diff_stats(clip: Path, at_sec: float, *, bg_hex: str,
@@ -327,9 +355,26 @@ def _bg_of(tokens: Mapping[str, Any] | None) -> str:
     return bg
 
 
+def qc_strict(spec: Mapping[str, Any]) -> bool:
+    """这条片子是不是严格质检档（缺省严格：没经过产品节点注入的 spec 保持旧语义）。"""
+    return str(spec.get("qc") or cspec.QC_STRICT) == cspec.QC_STRICT
+
+
+def _qc_gate(spec: Mapping[str, Any], warns: list[str], msg: str) -> None:
+    """像素闸的出口：严格档照旧打回（抛 MediaError）；预览档记一条提醒、继续出片。
+
+    预览档是主流做法：渲染前人在计划确认卡上看过预览静帧，渲后的机器读数只当体检报告，
+    不再触发「整镜退回 → 模型改码 → 重烧」那一圈。
+    """
+    if qc_strict(spec):
+        raise MediaError(msg)
+    warns.append(msg)
+
+
 async def _empty_check(sid: str, clip: Path, *, bg_hex: str, size: tuple[int, int],
                        duration: float, shot_work: Path,
-                       band: tuple[int, int, int, int] | None = None) -> dict[str, Any]:
+                       band: tuple[int, int, int, int] | None = None,
+                       warns: list[str] | None = None) -> dict[str, Any]:
     """闸④：三帧取样，判「这一镜到底画了东西没有、画的东西铺开了没有」。
 
     → ``{ratio, span, note}``。两个读数各自取的方向不一样，是判过的：
@@ -364,8 +409,14 @@ async def _empty_check(sid: str, clip: Path, *, bg_hex: str, size: tuple[int, in
     low = min(ratios)
     span = max(s[1] for s in stats)
     where = f"{'带内' if band else '整帧'}"
+    def _fail(msg: str) -> None:
+        # warns 给了＝预览档：记提醒不打回（见 `_qc_gate`）。
+        if warns is None:
+            raise MediaError(msg)
+        warns.append(msg)
+
     if low < EMPTY_MIN_RATIO and span < SPAN_MIN:
-        raise MediaError(
+        _fail(
             f"闸④ {sid}：画面里几乎是空的（{where}三帧非底色像素占比最低 "
             f"{low * 100:.2f}% < {EMPTY_MIN_RATIO * 100:.0f}%，且内容只铺开带短边的 "
             f"{span * 100:.0f}% < {SPAN_MIN * 100:.0f}%）"
@@ -373,8 +424,8 @@ async def _empty_check(sid: str, clip: Path, *, bg_hex: str, size: tuple[int, in
             "镜头代码跑起来了但没画出东西（当年卡片链那种「字段写了、这张卡不认」的静默空壳，"
             "在这条链由像素判）。修法：把母题按 useBody() 铺满、线条加粗到 3px 以上、"
             "或给主体块加一层够重的底色（opacity ≥ 0.5）")
-    if span < TIGHT_MIN:
-        raise MediaError(
+    elif span < TIGHT_MIN:
+        _fail(
             f"闸④ {sid}：内容挤成一团（{where}非底色像素的外接盒只占带短边 "
             f"{span * 100:.0f}% < {TIGHT_MIN * 100:.0f}%，三帧像素占比最低 "
             f"{low * 100:.2f}%）——画了东西，但那一小块不是画面，是贴纸。"
@@ -390,14 +441,17 @@ async def _empty_check(sid: str, clip: Path, *, bg_hex: str, size: tuple[int, in
 #: 等于把新能力判死——「这镜满幅、那镜有安全区」会被报成「母版的常量每镜不同」，
 #: 而那恰恰是这一版**要**的行为。
 #:
-#: 白名单只有这三项：`bodyWidth`/`bodyHeight`/`topSafe`/`gutter` 仍在比对面里，
-#: 因为它们报的是**画幅级**几何（满幅时 bodyWidth 才等于宽），逐镜不同只可能来自
-#: `bleed`——那件事已经由 `bleed` 这一栏自己表达了。两条一起看才判得准：
-#: 「bleed 一样而 bodyWidth 不同」是真漂移，仍然会红。
+#: 白名单只有这三项。几何四项（`bodyWidth`/`bodyHeight`/`topSafe`/`gutter`）**仍在比对面
+#: 里，但不是全片一把比**：满幅镜的带子等于整帧，跨 `bleed` 比它就是把「这镜满幅、那镜
+#: 留安全区」判成漂移，所以按 `bleed` 分桶（见 :data:`GEOMETRY_TOKEN_KEYS` 与
+#: :func:`check_token_drift`）——「bleed 一样而 bodyWidth 不同」仍然是真漂移，仍然会红。
 #:
 #: R19 加第三项 `subtitleMode`：层E2 让字幕档可以**逐镜覆盖**（整片 `torn_highlight`、
 #: 某几镜 `inline`），而它同样是「这一镜的观感决定」，不是母版常量漂移。
 TOKEN_PER_SHOT_KEYS = frozenset({"bg", "bleed", "subtitleMode"})
+
+#: 报**画幅级**几何的四个键：逐镜不同只可能来自 `bleed`，故闸⑤ 按 `bleed` 分桶比它们。
+GEOMETRY_TOKEN_KEYS = frozenset({"bodyWidth", "bodyHeight", "topSafe", "gutter"})
 
 
 def check_token_drift(ledger: list[dict[str, Any]]) -> list[str]:
@@ -410,25 +464,29 @@ def check_token_drift(ledger: list[dict[str, Any]]) -> list[str]:
     陪葬，但那条落空必须已经在账上——静默跳过才是这个函数最该避免的失败模式。
 
     `TOKEN_PER_SHOT_KEYS` 里那几个键跳过比对（理由见那份注释）。
+    几何四项（:data:`GEOMETRY_TOKEN_KEYS`）**按 `bleed` 分桶**比：满幅镜的带子本来就
+    等于整帧，跨 bleed 比它等于把「这镜满幅、那镜留安全区」判成漂移；同桶内不等才红。
     """
     errs: list[str] = []
-    seen: dict[str, tuple[Any, str]] = {}     # token 名 → (值, 首个镜号)
+    seen: dict[tuple[str, bool], tuple[Any, str]] = {}     # (键, 几何桶) → (值, 首个镜号)
     for rec in ledger:
         toks = rec.get("tokens") or {}
         sid = str(rec.get("id") or "?")
         if not toks:
             errs.append(f"闸⑤ {sid}：没读到母版 token，这一镜没参与跨镜一致性比对")
             continue
+        bleed = bool(toks.get("bleed"))
         for name, value in toks.items():
             if name in TOKEN_PER_SHOT_KEYS:
                 continue
-            first = seen.get(name)
+            key = (name, bleed if name in GEOMETRY_TOKEN_KEYS else False)
+            first = seen.get(key)
             if first is None:
-                seen[name] = (value, sid)
+                seen[key] = (value, sid)
             elif first[0] != value:
                 errs.append(
                     f"闸⑤：{name} 在 {first[1]} 是 {first[0]!r}、在 {sid} 是 {value!r}"
-                    "——母版的常量不该每镜不同")
+                    f"——母版的常量不该每镜不同（两镜同为 bleed={bleed}）")
     return errs
 
 
@@ -861,7 +919,12 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
         # 母版那侧读的还是同一个 `subtitleMode` 键，所以它不必知道「逐镜」这件事：
         # 「整片一档」与「逐镜覆盖」在母版看来是同一件事，区别只在注入时谁赢。
         "subtitleMode": str(shot.get("subtitle_mode")
-                            or spec.get("subtitle_mode") or "full"),
+                            or spec.get("subtitle_mode") or "torn_highlight"),
+        # 字幕位置 / 入场动画：镜级覆盖优先，没有才回落整片（与 subtitleMode 同一条）。
+        "captionPosition": str(shot.get("caption_position")
+                               or spec.get("caption_position") or "bottom"),
+        "captionAnim": str(shot.get("caption_anim")
+                           or spec.get("caption_anim") or "fade"),
         "fields": cspec.field_values(shot),
         # 母版进出场（T22）：档名 + 窗口帧数。`none` 或者窗口不足 2 帧时是 0/0，
         # 母版据此完全不套那层动画（于是「不选进出场」的片子逐帧与从前一致）。
@@ -1071,13 +1134,23 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
                            client: dict[str, Any],
                            storage: Any = None,
                            cache: "rpipe.ShotCache | None" = None,
-                           progress: Progress | None = None) -> dict[str, Any]:
+                           progress: Progress | None = None,
+                           draft: Mapping[str, Any] | None = None,
+                           narration: "asyncio.Future[dict[str, Any]] | None" = None,
+                           budget: "FrameBudget | None" = None
+                           ) -> dict[str, Any]:
     """一镜（代码）→ 带声切片 + 记账。八道闸里属于这一镜的那几道都在这条路上。
 
     判红的是 ②（帧预算，进来之前）③（帧账）④（画面判两半）⑥（字段对账）；① 判在容器侧、
     这一层只把它的错误原文搬回来，⑤ 比的是**跨镜**所以落在拼接前，⑧ 只记账不设红。
 
     `identities` 是 /healthz 现报的 `master_hash` / `lockfile_hash`，缓存键要它们。
+
+    `draft` 是**草稿档**（`{scale, image_format, crf, concurrency}`）：给「改一镜 → 数一遍闸」
+    这个验收循环用的低像素档。它只换像素档，**不换判据**，也不改写任何一道闸的读数口径
+    （⑭ 读 64 px 宽的灰度差，⑥⑧⑲-a/⑳/㉕ 读比例盒），所以草稿档绿了不等于成片档免检——
+    成片那一次照烧。三条硬性区别：不查缓存、不写缓存、不补质感滤镜；产物键与服务端成片档
+    不同名（`<key>.draft.mp4`），就是为了不让缩过的片子占住成片缓存键去冒充成片。
     """
     fps = int(spec["fps"])
     size = (int(spec["width"]), int(spec["height"]))
@@ -1088,7 +1161,19 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
     key = cspec.shot_cache_key(dict(shot), film=spec,
                                master_hash=str(identities["master_hash"]),
                                lockfile_hash=str(identities["lockfile_hash"]))
-    if cache is not None:
+    # 草稿档：换像素档不换判据，也**换一个键**。缩过的片子若占住成片缓存键，下一次
+    # 命中缓存就是在拿 0.4 倍的片冒充成片——服务端落盘名同理带 `.draft` 后缀。
+    draft_scale = 1.0
+    render_payload: dict[str, Any] | None = None
+    render_key = key
+    if draft is not None:
+        draft_scale = float(draft.get("scale") or 1.0)
+        render_payload = {"draft": True,
+                          **{k: v for k, v in draft.items()
+                             if k in ("scale", "image_format", "jpeg_quality", "crf",
+                                      "concurrency")}}
+        render_key = hashlib.sha256(f"draft|{draft_scale}|{key}".encode()).hexdigest()[:40]
+    if cache is not None and draft is None:
         got = await cache.fetch(key, shot_work)
         if got:
             try:
@@ -1096,15 +1181,20 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
                 hits = json.loads(got["hitmap.json"].read_text(encoding="utf-8"))
             except (KeyError, OSError, ValueError):
                 meta = None            # 读不成不是事故：这一镜照实重渲一遍
+            # 预览档烧出来、带着提醒进缓存的切片，严格档不认（它在严格档下本该被退回）。
+            if meta and meta.get("qc_warnings") and qc_strict(spec):
+                meta = None
             if meta and all(k in meta for k in META_FIELDS):
                 rec = {k: v for k, v in meta.items() if k in META_FIELDS}
+                cached_qc: list[str] = list(meta.get("qc_warnings") or [])
                 # 命中缓存也要过闸⑭：判据的阈值（段数、间隔）**不在缓存键里**，
                 # 所以缓存里的那一镜只证明「按当时的判据它是绿的」。阈值一改，
                 # 复用切片的那几镜就会带着旧判据的读数直接进母带——这里补一刀，
                 # 拒因与现渲的那一路同源（同一个 `motion_error`）。
                 cached_reject = motion_error(sid, rec.get("motion"))
-                if cached_reject:
-                    raise MediaError(f"{cached_reject}（这一镜来自缓存，按当前判据重判不过）")
+                if cached_reject and cached_reject not in cached_qc:
+                    _qc_gate(spec, cached_qc,
+                             f"{cached_reject}（这一镜来自缓存，按当前判据重判不过）")
                 # 闸㉑ 同理，而且理由更硬：**申报（`shot["motion"]`）压根不进缓存键**
                 # ——它不改变任何像素，改它不该重烧。但判据读的正是申报，于是命中缓存的
                 # 那一镜必须拿**当前的**申报重判一次，否则回执上会挂着一份按旧申报算出来
@@ -1116,7 +1206,7 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
                         word_frames=rec.get("motion_anchor_frames") or [], fps=fps,
                         beats=None)
                 if cached_anchor_errs:
-                    raise MediaError("\n".join(
+                    _qc_gate(spec, cached_qc, "\n".join(
                         f"{e}（这一镜来自缓存，按当前申报重判不过）"
                         for e in cached_anchor_errs))
                 rec["motion_anchors"] = {"warnings": cached_anchor_warns,
@@ -1129,14 +1219,21 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
                     frame=got["frame.png"])
                 rec.update({"id": sid, "clip": clip, "hits": hits,
                             "cached": True, "frame": frame, "chain": "remotion",
-                            "texture": kind, "texture_filter": chain})
+                            "texture": kind, "texture_filter": chain,
+                            "qc_warnings": cached_qc,
+                            "beat_pad": float(shot.get("_beat_pad") or 0.0)})
                 return rec
 
-    narr = await narration_for(shot, spec, providers, shot_work)
+    # 旁白可能已由 `_render_shots` 提前并行合成好（TTS 预取）；没有就当场合成。
+    narr = (await narration if narration is not None
+            else await narration_for(shot, spec, providers, shot_work))
     sec, frames = float(narr["sec"]), int(narr["frames"])
     frame_budget = rpipe.max_frames_total(
         fps, spec.get("target_duration_sec"))
-    if frames_used + frames > frame_budget:
+    if budget is not None:
+        # 并发烧镜时帧预算按「预约」记：哪一镜先到先占，总数仍是同一道闸②。
+        budget.reserve(sid, frames)
+    elif frames_used + frames > frame_budget:
         raise MediaError(
             f"闸② 帧预算用尽：到 {sid} 需要 {frames_used + frames} 帧，上限 "
             f"{frame_budget}。降 fps（{fps}→10）或缩短片子再来——"
@@ -1152,8 +1249,8 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
     resp = await _await_heartbeat(
         progress, sid=sid, index=index, total=len(spec.get("shots") or []),
         awaitable=asyncio.to_thread(
-            client["render"], str(shot.get("code") or ""), key, props,
-            None, shot.get("assets") or []))
+            client["render"], str(shot.get("code") or ""), render_key, props,
+            None, shot.get("assets") or [], render_payload))
     await _emit(progress, {"stage": "rendered", "shot": sid, "done": index + 1,
                            "total": len(spec.get("shots") or []),
                            "cache_key": key, "frames": frames})
@@ -1162,14 +1259,20 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
     art = str(resp.get("artifact") or f"/artifact/{key}")
     got_bytes = await asyncio.to_thread(client["fetch"], art, raw)
     info = await asyncio.to_thread(mediaops.probe, raw)
+    # 期望尺寸按档折算：草稿档的产物是 `成片尺寸 × scale`，编码器要求偶数边，
+    # 取整方式由容器那侧决定，所以草稿档给 2 px 容差——这不是放水，是**换档以后
+    # 尺寸本来就该变小**；成片档 (size_tolerance=0) 仍然逐像素严格。
+    exp_size = (round(size[0] * draft_scale / 2) * 2,
+                round(size[1] * draft_scale / 2) * 2)
     _check_frame_account(sid, planned_frames=frames, fps=fps, info=info,
-                         expected_size=size)
+                         expected_size=exp_size, size_tolerance=2 if draft else 0)
     # 闸⑥ 排在闸④ 之前：它只是比对这一次响应里已经带回来的数据，一次 ffmpeg 都不开。
     # 值对不上时没必要再花几秒去判这张片的空不空——反正这一镜一定要退回。
+    qc_warns: list[str] = []
     field_errs, field_checks = check_field_reconcile(
         sid, shot=shot, fields_used=resp.get("fields_used"))
     if field_errs:
-        raise MediaError(
+        _qc_gate(spec, qc_warns,
             f"闸⑥ 字段级对账未通过，{sid} 退回（切片没进缓存、母带没开始）：\n"
             + "\n".join(f"  · {e}" for e in field_errs[:10]))
     # 闸⑭ 排在闸④ 之前，与闸⑥ 同一条理由：读数就在这次响应里，一次 ffmpeg 都不开。
@@ -1178,7 +1281,7 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
     motion = summarize_motion(sid, resp.get("motion"))
     motion_err = motion_error(sid, motion)
     if motion_err:
-        raise MediaError(motion_err)
+        _qc_gate(spec, qc_warns, motion_err)
     # 闸㉑ 的后半段（T33）紧挨着闸⑭：它读的就是 ⑭ 刚数出来的那几段（触发帧），
     # 与这份词表。**同样排在切片进缓存之前**——理由与 ⑭ 一字不差：退回去的一镜
     # 不许在缓存里留一份「锚不上任何数据」的切片。
@@ -1187,11 +1290,22 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
         word_frames=[int(w["startFrame"]) for w in frame_words],
         fps=fps, beats=None)
     if anchor_errors:
-        raise MediaError("\n".join(anchor_errors))
+        _qc_gate(spec, qc_warns, "\n".join(anchor_errors))
     tokens = resp.get("tokens") or None
+    # 取样几何折算：母版回读的带子是合成器像素（1080×1920 空间），而草稿档的切片是
+    # 成片尺寸 × scale，直接拿它去 crop 会越界（ffmpeg 报 Parsed_crop_1 配不起来）。
+    # 闸④/㉗ 判的都是**比例**，分子分母一起缩，结论不随档位移动；代价是像素基数变小、
+    # 草稿档的 jpeg 噪声让非底色占比略偏高——所以草稿档只用来快速数动效，成片档仍严格重判。
+    gate_size = (int(info["width"]), int(info["height"]))
+    gs = gate_size[0] / size[0] if size[0] else 1.0
+    band_full = _band_of(tokens, size)
+    gate_band = None if band_full is None else (
+        int(band_full[0] * gs), int(band_full[1] * gs),
+        max(2, int(band_full[2] * gs)), max(2, int(band_full[3] * gs)))
     fill = await _empty_check(sid, raw, bg_hex=_bg_of(tokens),
-                              size=size, duration=float(info["duration"]),
-                              shot_work=shot_work, band=_band_of(tokens, size))
+                              size=gate_size, duration=float(info["duration"]),
+                              shot_work=shot_work, band=gate_band,
+                              warns=None if qc_strict(spec) else qc_warns)
 
     # 闸㉗ 揭示-时序像素一致（R12-T61，见 `reveal_gate` 的模块 docstring）：
     # 这一族唯一**只吃像素、不吃申报**的判据——满幅插画下 ⑲-a 的 `subject_share`
@@ -1207,10 +1321,10 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
     # 重判一次。㉗ 读的申报是 `shot["reveal"]`，它**在缓存键里**（母版要按它逐帧算掩码，
     # 改它就换像素），于是命中缓存 ⇒ 申报逐字节相同 ⇒ 这份裁决仍然成立，照搬即可。
     reveal_errors, reveal_undet = await reveal_gate.check_reveal(
-        sid, shot, gate=resp, band=_band_of(tokens, size), clip=raw, size=size,
+        sid, shot, gate=resp, band=gate_band, clip=raw, size=gate_size,
         fps=fps, frames=frames, storage=storage, work=shot_work)
     if reveal_errors:
-        raise MediaError("\n".join(reveal_errors))
+        _qc_gate(spec, qc_warns, "\n".join(reveal_errors))
 
     clip = shot_work / "clip.mp4"
     # 哑片 + 旁白 → 带声切片（视频流直接 copy：切片已经编过一次，再编一遍只掉画质）
@@ -1264,9 +1378,24 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
         "lint_warnings": [str(w)[:200] for w in (resp.get("warnings") or [])][:8],
         "bytes": int(got_bytes),
         "hits": _shot_table(sid, index, size, shot=shot, checks=field_checks),
+        # 预览档下没打回、只记下来的像素闸读数（严格档这里恒为空：红了早就抛了）。
+        "qc_warnings": qc_warns,
+        "beat_pad": float(shot.get("_beat_pad") or 0.0),
     }
+    if draft is not None:
+        # 草稿档不进缓存：缓存的字节身份是「这一 cache_key 的这一份成片像素」，
+        # 缩过的片子进去就等于让下一次命中拿草稿冒充成片。质感同理跳过——那是
+        # 缓存之后的一整代重编码，验收循环不需要它，成片那一次会补上。
+        rec["draft"] = {"scale": draft_scale,
+                        "render": render_payload or {},
+                        "cache_key": key}
+        return rec
+
     if cache is not None and narr["degrade"] is None:
         meta = {k: rec[k] for k in META_FIELDS}
+        if qc_warns:
+            # 不进 META_FIELDS（那张表缺一栏就整份缓存作废）；单独带着，严格档据此不认这份缓存。
+            meta["qc_warnings"] = qc_warns
         (shot_work / "meta.json").write_text(json.dumps(meta, ensure_ascii=False),
                                              encoding="utf-8")
         (shot_work / "hitmap.json").write_text(json.dumps(rec["hits"], ensure_ascii=False),
@@ -1343,12 +1472,95 @@ def _shot_table(sid: str, index: int, size: tuple[int, int], *,
             "entries": entries}
 
 
+#: 预览静帧：取这一镜的哪个位置（入场动画已落定、内容基本铺开），以及同时在飞的镜数
+#: （容器那侧打包串行、渲染 2 路，3 路在飞正好让一镜打包时另两镜在渲）。
+PREVIEW_AT = 0.7
+PREVIEW_PARALLEL = 3
+
+
+def _preview_frames(shot: Mapping[str, Any], spec: Mapping[str, Any]) -> int:
+    """预览用的估算帧数：没有真实语音时长，按字数估（与整片估算同一把尺的中值）。"""
+    text = str(shot.get("text") or "")
+    if spec.get("narration") and text:
+        sec = 0.6 + len(text) * 0.25 + rpipe.BREATH_LEAD_SEC + rpipe.BREATH_TAIL_SEC
+    else:
+        sec = rpipe.DEFAULT_SHOT_SEC + len(text) * 0.16
+    sec = max(float(shot.get("min_duration_sec") or 0.0), sec)
+    return max(2, int(round(sec * int(spec["fps"]))))
+
+
+async def preview_stills(spec: Mapping[str, Any], *, client: dict[str, Any],
+                         work: Path, storage: Any = None) -> tuple[dict[str, Path], list[str]]:
+    """每镜渲一张预览静帧（小 JPEG）→ ({镜号: 文件}, 没出成的说明)。
+
+    这是渲染前计划确认卡上的那几张图：人看一眼就知道画面对不对，成本约是整镜渲染的
+    百分之一。任何一镜失败只记一句说明、不拦——预览是增益，硬闸在渲染那一趟。
+    """
+    out: dict[str, Path] = {}
+    notes: list[str] = []
+    gate = asyncio.Semaphore(PREVIEW_PARALLEL)
+    work.mkdir(parents=True, exist_ok=True)
+
+    async def one(i: int, shot: Mapping[str, Any]) -> None:
+        sid = str(shot.get("id") or f"s{i + 1:02d}")
+        code = str(shot.get("code") or "")
+        if not code.strip():
+            return
+        frames = _preview_frames(shot, spec)
+        props = shot_input_props(shot, spec, frames=frames, frame_words=[])
+        async with gate:
+            try:
+                if storage is not None:
+                    await _stage_shot_assets(shot, sid=sid, storage=storage, client=client)
+                stills = await asyncio.to_thread(
+                    client["stills"], code, props, [int(frames * PREVIEW_AT)])
+            except Exception as exc:  # noqa: BLE001 - 预览缺一张不拦
+                notes.append(f"{sid}：预览静帧没出成（{type(exc).__name__}: {str(exc)[:120]}）")
+                return
+        b64 = str((stills[0] if stills else {}).get("jpeg_b64") or "")
+        if not b64:
+            notes.append(f"{sid}：预览静帧是空的")
+            return
+        dst = work / f"preview_{sid}.jpg"
+        dst.write_bytes(base64.b64decode(b64))
+        out[sid] = dst
+
+    await asyncio.gather(*(one(i, s) for i, s in enumerate(spec.get("shots") or [])))
+    return out, notes
+
+
+class FrameBudget:
+    """闸② 的并发版：多镜同时烧时共用一本帧数账。超额的那一镜当场抛（与串行版同一句话）。"""
+
+    def __init__(self, *, used: int, limit: int) -> None:
+        self.used = int(used)
+        self.limit = int(limit)
+
+    def reserve(self, sid: str, frames: int) -> None:
+        if self.used + frames > self.limit:
+            raise MediaError(
+                f"闸② 帧预算用尽：到 {sid} 需要 {self.used + frames} 帧，上限 "
+                f"{self.limit}。降 fps（→10）或缩短片子再来——"
+                "不静默砍镜，也不静默截帧")
+        self.used += frames
+
+
+#: 同时在烧的镜数。渲染容器那侧打包串行、逐帧渲染按 DG_RENDER_SLOTS 路并发，
+#: 这一侧并发提交才吃得到那几路（串行提交时容器的多路永远只用上一路）。
+RENDER_PARALLEL = max(1, int(os.environ.get("MOTION_RENDER_PARALLEL", "2") or 2))
+
+
+#: TTS 预取的并发路数：配音是网络请求，开太多会被 TTS 服务限流，4 路足够跑在渲染前面。
+TTS_PREFETCH = 4
+
+
 async def _render_shots(shots: list[dict[str, Any]], *, spec: Mapping[str, Any],
                         providers: Providers, work: Path, client: dict[str, Any],
                         identities: Mapping[str, str], storage: Any = None,
                         cache: "rpipe.ShotCache | None" = None,
                         progress: Progress | None = None,
-                        frames_used: int = 0
+                        frames_used: int = 0,
+                        beats: Sequence[float] | None = None
                         ) -> tuple[list[Path], list[dict[str, Any]],
                                    dict[str, dict[str, Path]], dict[str, Any], int]:
     """**逐镜那一趟**：烧每一镜 → (clips, ledger, files, hitmaps, 帧预算计数)。
@@ -1363,20 +1575,84 @@ async def _render_shots(shots: list[dict[str, Any]], *, spec: Mapping[str, Any],
     ledger: list[dict[str, Any]] = []
     files: dict[str, dict[str, Path]] = {}
     hitmaps: dict[str, Any] = {}
-    for i, shot in enumerate(shots):
-        rec = await render_code_shot(shot, spec=spec, providers=providers, work=work,
-                                     index=i, frames_used=frames_used,
-                                     identities=identities, client=client,
-                                     storage=storage,
-                                     cache=cache, progress=progress)
-        hitmaps[rec["id"]] = rec.pop("hits", None) or {}
-        files[rec["id"]] = {"clip": rec["clip"], "frame": rec["frame"]}
-        if not rec.get("cached"):
-            frames_used += int(rec["planned_frames"])
-        clips.append(rec["clip"])
-        ledger.append({k: v for k, v in rec.items() if k not in ("clip", "frame")})
-        await _emit(progress, {"stage": "shot", "shot": rec["id"], "done": i + 1,
-                         "total": len(shots), "frames_total": frames_used})
+    # TTS 预取：渲染容器一次只烧一镜（串行是为了不 OOM），但配音与它无关——
+    # 开头就把所有镜的旁白并行合成（限 TTS_PREFETCH 路并发），烧到哪一镜时它的配音
+    # 多半已经好了，不再「合成一句 → 烧一镜 → 再合成下一句」地干等。
+    # 命中缓存的镜用不上它（切片自带音轨），白合成一次的代价是一次 TTS 网络请求。
+    gate = asyncio.Semaphore(TTS_PREFETCH)
+
+    async def _narr(i: int, shot: Mapping[str, Any]) -> dict[str, Any]:
+        async with gate:
+            return await narration_for(shot, spec, providers, work / f"shot{i:02d}")
+
+    prefetch = ([asyncio.ensure_future(_narr(i, shot)) for i, shot in enumerate(shots)]
+                if spec.get("narration") or beats else [None] * len(shots))
+    # 卡拍：先等齐每镜的真实时长，再按拍点算每镜该往后补多少（只补不裁，最多半拍左右），
+    # 补长进缓存键——同一段代码、补长不同就是不同的切片（帧数变了）。
+    shots = list(shots)
+    if beats:
+        narrs = list(await asyncio.gather(*prefetch))
+        pads = beat_mod.snap_pads([float(n["sec"]) for n in narrs],
+                                  _seam_overlaps(spec, shots), beats)
+        fps_i = int(spec["fps"])
+        for i, pad in enumerate(pads):
+            if pad > 0:
+                narrs[i] = await asyncio.to_thread(_extend_narration, narrs[i], pad, fps=fps_i)
+                shots[i] = {**shots[i], "_beat_pad": pad}
+        loop = asyncio.get_running_loop()
+        prefetch = []
+        for n in narrs:
+            fut = loop.create_future()
+            fut.set_result(n)
+            prefetch.append(fut)
+    # 多镜并发烧（RENDER_PARALLEL 路）。结果按镜号顺序装配；某一镜红了，还没开始的镜
+    # 不再开（与串行版「红在第 k 镜、后面不渲」同语义），已在烧的照常烧完进缓存。
+    budget = FrameBudget(used=frames_used, limit=rpipe.max_frames_total(
+        int(spec["fps"]), spec.get("target_duration_sec")))
+    slots = asyncio.Semaphore(RENDER_PARALLEL)
+    stop = asyncio.Event()
+    done_n = 0
+
+    async def _one(i: int, shot: Mapping[str, Any]) -> dict[str, Any] | None:
+        nonlocal done_n
+        async with slots:
+            if stop.is_set():
+                return None
+            try:
+                rec = await render_code_shot(shot, spec=spec, providers=providers, work=work,
+                                             index=i, frames_used=frames_used,
+                                             identities=identities, client=client,
+                                             storage=storage,
+                                             cache=cache, progress=progress,
+                                             narration=prefetch[i], budget=budget)
+            except BaseException:
+                stop.set()
+                raise
+        done_n += 1
+        await _emit(progress, {"stage": "shot", "shot": rec["id"], "done": done_n,
+                               "total": len(shots), "frames_total": budget.used})
+        return rec
+
+    try:
+        results = await asyncio.gather(*(_one(i, s) for i, s in enumerate(shots)),
+                                       return_exceptions=True)
+        for got in results:
+            if isinstance(got, BaseException):
+                raise got
+        for rec in results:
+            if rec is None:
+                continue
+            hitmaps[rec["id"]] = rec.pop("hits", None) or {}
+            files[rec["id"]] = {"clip": rec["clip"], "frame": rec["frame"]}
+            clips.append(rec["clip"])
+            ledger.append({k: v for k, v in rec.items() if k not in ("clip", "frame")})
+        frames_used = budget.used
+    finally:
+        # 某一镜红了提前抛出时，没轮到的预取不能留成孤儿任务（也别吞掉它们的异常告警）。
+        for t in prefetch:
+            if t is not None and not t.done():
+                t.cancel()
+        await asyncio.gather(*(t for t in prefetch if t is not None), return_exceptions=True)
     return clips, ledger, files, hitmaps, frames_used
 
 
@@ -1533,14 +1809,23 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
                 "闸㉛ 指名权未通过，一帧都没开始渲（用户上传的图只有用户指名才能用）：\n"
                 + "\n".join(f"  · {e}" for e in des_errs[:10]))
 
+    # 配乐卡拍：有配乐且没关 beat_sync 时，先检一遍拍点（几百毫秒的 numpy），
+    # 逐镜往后补到最近的拍上再烧。检不出稳定的拍就不卡（beats 为空）。
+    beat_info: dict[str, Any] = {"beats": [], "bpm": None, "reason": "没有配乐"}
+    if bgm is not None and Path(bgm).exists() and spec.get("beat_sync", True):
+        beat_info = await asyncio.to_thread(beat_mod.detect_beats, bgm, work=work / "beats")
+    beats = beat_info["beats"] or None
+
     clips, ledger, files, hitmaps, frames_used = await _render_shots(
         shots, spec=spec, providers=providers, work=work, client=client,
-        identities=identities, storage=storage, cache=cache, progress=progress)
+        identities=identities, storage=storage, cache=cache, progress=progress,
+        beats=beats)
 
+    film_qc: list[str] = []
     drift = check_token_drift(ledger)
     if drift:
-        raise MediaError("闸⑤ 跨镜一致性未通过，母带还没开始（一帧不拼接）：\n"
-                         + "\n".join(f"  · {e}" for e in drift[:10]))
+        _qc_gate(spec, film_qc, "闸⑤ 跨镜一致性未通过，母带还没开始（一帧不拼接）：\n"
+                 + "\n".join(f"  · {e}" for e in drift[:10]))
 
     # ---- 闸㉖ 回看环（R11-T56）：红/未判的镜先走一趟回看，改完**只重烧那一镜** ----
     # 位置是这里，不是更后面：回看改的是某一镜的**代码**，改完那一镜的切片、
@@ -1549,13 +1834,16 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
     # 这些判据之前，它们判的就一定是回看之后的那一版；放在后面就变成「判旧的、
     # 拼新的」，那是最坏的一种账（两个版本各占一半）。
     review_receipt: dict[str, Any] | None = None
+    # 回看环要 fps（按帧换算锚点）；原先 fps 到拼接那段才赋值，review=true 时必抛
+    # UnboundLocalError——回看环一开就崩。
+    fps = int(spec["fps"])
     if review_enabled is not False:
         async def _reburn(new_spec: dict[str, Any]) -> dict[str, Any]:
             """再烧一次**逐镜**那一趟（不走拼接/混音）：只有代码变了的镜是缓存未命中。"""
             c2, l2, f2, h2, n2 = await _render_shots(
                 list(new_spec.get("shots") or []), spec=new_spec, providers=providers,
                 work=work, client=client, identities=identities, storage=storage,
-                cache=cache, progress=progress)
+                cache=cache, progress=progress, beats=beats)
             return {"shots": l2, "shot_files": f2, "clips": c2, "hitmaps": h2,
                     "frames_used": n2}
 
@@ -1654,7 +1942,7 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
         overlap_secs=seam_secs,
         voice_tails=voice_tails, fps=fps)
     if av_errors:
-        raise MediaError("闸⑰ 声画对账未通过，母带还没开始（一帧都没拼）：\n"
+        _qc_gate(spec, film_qc, "闸⑰ 声画对账未通过，母带还没开始（一帧都没拼）：\n"
                          + "\n".join(f"  · {e}" for e in av_errors))
 
     # ---- 闸⑲-a 画面主体在场（R8-T30）：也是判在拼接之前 ----
@@ -1665,7 +1953,7 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
     sub_errors, sub_warns, sub_undet = cspec.check_subject_present(
         spec["shots"], scanned=subject_scanned)
     if sub_errors:
-        raise MediaError("闸⑲-a 画面主体在场未通过，母带还没开始（一帧都没拼）：\n"
+        _qc_gate(spec, film_qc, "闸⑲-a 画面主体在场未通过，母带还没开始（一帧都没拼）：\n"
                          + "\n".join(f"  · {e}" for e in sub_errors))
     # 回执上的读数：逐镜三个原始值（母版量的），取证要的是数不是「过了」。
     subject_readings: dict[str, dict[str, Any]] = {}
@@ -1686,7 +1974,7 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
     deg_errors, deg_warns, deg_undet = cspec.check_degenerate_forms(
         spec["shots"], scanned=subject_scanned)
     if deg_errors:
-        raise MediaError("闸⑳(c) 画面同构未通过，母带还没开始（一帧都没拼）：\n"
+        _qc_gate(spec, film_qc, "闸⑳(c) 画面同构未通过，母带还没开始（一帧都没拼）：\n"
                          + "\n".join(f"  · {e}" for e in deg_errors))
     degenerate_readings: dict[str, dict[str, Any]] = {}
     for i, s in enumerate(spec["shots"]):
@@ -1709,7 +1997,7 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
     badge_errors, badge_warns, badge_undet = cspec.check_badge_composition(
         spec["shots"], scanned=subject_scanned)
     if badge_errors:
-        raise MediaError("闸㉕ 徽章构图未通过，母带还没开始（一帧都没拼）：\n"
+        _qc_gate(spec, film_qc, "闸㉕ 徽章构图未通过，母带还没开始（一帧都没拼）：\n"
                          + "\n".join(f"  · {e}" for e in badge_errors))
     badge_readings: dict[str, dict[str, Any]] = {}
     for i, s in enumerate(spec["shots"]):
@@ -1732,7 +2020,7 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
                                               duration=plan["duration"], fps=fps,
                                               seams=seam_secs)
     if not_taken:
-        raise MediaError("\n".join(f"  · {e}" for e in not_taken))
+        _qc_gate(spec, film_qc, "\n".join(f"  · {e}" for e in not_taken))
 
     texture_by_shot = {str(r["id"]): str(r.get("texture") or "none") for r in ledger}
     texture_filter = next((str(r.get("texture_filter") or "") for r in ledger
@@ -1755,8 +2043,17 @@ async def render_code_motion(spec: dict[str, Any], *, providers: Providers, work
     # （非底色占比 / 填充度）是机器判据、红了出不了片；这一半是**提醒**，永远不打回。
     still_receipt = await _still_review(spec, ledger, files, scanned=subject_scanned)
 
+    # 预览档的体检报告：逐镜 + 整片没打回、只记下来的那几条（严格档恒为空）。
+    qc_report = [*film_qc, *(w for r in ledger for w in (r.get("qc_warnings") or []))]
     return {"video": out, "duration": info["duration"], "width": info["width"],
             "height": info["height"], "fps": info["fps"], "shots": ledger,
+            "qc": str(spec.get("qc") or cspec.QC_STRICT),
+            "qc_warnings": qc_report,
+            # 卡拍的账：检到的速度、拍数、实际补过的镜（补长秒数）；检不出时 reason 说为什么。
+            "beat_sync": {"bpm": beat_info.get("bpm"), "beats": len(beat_info.get("beats") or []),
+                          "reason": beat_info.get("reason") or "",
+                          "padded": {str(r["id"]): r.get("beat_pad")
+                                     for r in ledger if r.get("beat_pad")}},
             "shot_files": files,
             "cached_shots": sum(1 for r in ledger if r.get("cached")),
             "hitmap": hitmaps, "hitmap_errors": [],

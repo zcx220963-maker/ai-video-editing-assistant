@@ -170,6 +170,7 @@ def preview_summary(preview: Mapping[str, Any] | None) -> dict[str, str]:
 #: 为什么不在这里 import 那个模块：主服务不装配剪辑服务端的实现，而这里读错的后果
 #: 只是摘要少显示一个字段——它不参与任何执行判定。
 MOTION_KNOBS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode",
+                "caption_position", "caption_anim",
                 "texture", "transition", "transition_sec", "entrance", "exit")
 
 #: 卡面要给人看的词，不是枚举字面量（用户不需要背 portrait / torn_highlight）。
@@ -179,6 +180,10 @@ MOTION_KNOBS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode",
 _ASPECT_LABELS = {"portrait": "竖屏", "landscape": "横屏", "square": "方屏"}
 _SUBTITLE_LABELS = {"torn_highlight": "撕纸条·逐词点亮", "full": "整句字幕",
                     "none": "不上字幕"}
+_CAPTION_POSITION_LABELS = {"bottom": "底部字幕条", "center": "压在画面正中",
+                            "top": "顶部安全区"}
+_CAPTION_ANIM_LABELS = {"fade": "淡入", "rise": "上浮入场", "pop": "弹出放大",
+                        "karaoke": "逐字随语音点亮"}
 _TEXTURE_LABELS = {"none": "不加（原片直出）", "film": "老胶片·颗粒与暗角",
                    "tv": "老电视·扫描线与色偏", "glow": "柔光·高光处泛开",
                    "bleach": "漂白·硬对比低饱和"}
@@ -270,7 +275,9 @@ def motion_summary(source: Mapping[str, Any] | None,
             out["声音"] = "无旁白（按阅读节奏驻留）"
     sub = word("subtitle_mode", src.get("subtitle_mode"), _SUBTITLE_LABELS)
     if sub:
-        out["字幕"] = sub
+        pos = word("caption_position", src.get("caption_position"), _CAPTION_POSITION_LABELS)
+        anim = word("caption_anim", src.get("caption_anim"), _CAPTION_ANIM_LABELS)
+        out["字幕"] = "，".join(x for x in (sub, pos, anim) if x)
     texture = word("texture", src.get("texture"), _TEXTURE_LABELS)
     # 逐镜点名（B6）：整片那一档只是**默认**，一镜能点一档、也能点名不要。确认卡不许把
     # 「整片不加、第 3 镜老电视」显示成「没加质感」——那是用户正要批准的一个观感决定。
@@ -307,6 +314,40 @@ def motion_summary(source: Mapping[str, Any] | None,
     bgm = src.get("bgm") if isinstance(src.get("bgm"), Mapping) else {}
     ref = str(bgm.get("ref") or "") if bgm else ""
     out["配乐"] = Path(ref).name[:18] if ref else "纯人声（无配乐）"
+    return out
+
+
+#: 确认卡上逐镜列出的最大镜数与每镜字数：卡是给人扫一眼的，不是分镜脚本全文。
+STORYBOARD_MAX_SHOTS = 40
+STORYBOARD_TEXT_CHARS = 40
+
+
+def motion_storyboard(source: Mapping[str, Any] | None) -> list[dict[str, str]]:
+    """渲染前计划卡的逐镜清单：镜号 + 这一镜说的话 + 一句画法备注。
+
+    认两种来路（与 ``motion_summary`` 同）：分镜产物的 ``plan_table``（已截好的预览文字、
+    读出来的画法通道），或手写 spec 的 ``shots``。拿不到就空表——卡上少一块，门照样拦。
+    """
+    if not isinstance(source, Mapping):
+        return []
+    rows = source.get("plan_table") if isinstance(source.get("plan_table"), list)         else source.get("shots")
+    thumbs = source.get("preview_frames") if isinstance(source.get("preview_frames"),
+                                                        Mapping) else {}
+    out: list[dict[str, str]] = []
+    for r in (rows or [])[:STORYBOARD_MAX_SHOTS]:
+        if not isinstance(r, Mapping):
+            continue
+        text = str(r.get("text") or "")
+        if len(text) > STORYBOARD_TEXT_CHARS:
+            text = text[:STORYBOARD_TEXT_CHARS] + "…"
+        note = "·".join(str(x) for x in (r.get("card") or r.get("subject"), r.get("style"))
+                        if x)
+        sid = str(r.get("id") or len(out) + 1)
+        row = {"id": sid, "text": text, "note": note}
+        if thumbs.get(sid):
+            # 对象键；调用方（agent）现签成可直接展示的 URL 写进 thumb。
+            row["thumb_key"] = str(thumbs[sid])
+        out.append(row)
     return out
 
 
@@ -378,6 +419,9 @@ def build_render_ask(preview: Mapping[str, Any] | None, *,
     summary = preview_summary(preview) or motion_summary(motion, labels)
     if summary:
         ask["preview"] = summary
+    board = motion_storyboard(motion) if motion else []
+    if board:
+        ask["storyboard"] = board
     return ask
 
 
@@ -398,13 +442,14 @@ def decision_text(decision: str, custom: str = "") -> str:
     d = str(decision or "").strip()
     if custom.strip():
         return (f"用户对编排结果提出修改：{custom.strip()}\n"
-                f"请不要渲染，先按这个要求重做编排（必要时重新出计划卡），"
-                f"做完再把新的编排结果给用户确认。")
+                f"请不要渲染，先按这个要求重做编排（没说到的地方保持原样），"
+                f"做完再发起渲染——系统会再弹一次计划确认卡给用户过目。")
     if decision_is_confirm(d):
         return "用户已确认编排结果，可以开始渲染。"
     if d == ADJUST_OPTION:
-        return ("用户选择「我还要改」，尚未确认渲染。请不要渲染，"
-                "先问清楚要改什么（用选项式提问），再重做编排。")
+        return ("用户选择「我还要改」，尚未确认渲染。请不要渲染；"
+                "用户没写具体要改什么，就用 ask_user 问一句要改哪方面"
+                "（给几个常见方向：文案、画面风格、时长、配音、字幕），拿到答复再重做编排。")
     if d == KEEP_FULL_OPTION:
         return ("用户要求**保内容完整**：不要把话截断。请把成片时长放宽到能容纳全部内容"
                 "（约到那条内容的结束时间），重做时间线让画面补足，"

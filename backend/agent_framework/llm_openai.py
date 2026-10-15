@@ -67,6 +67,36 @@ def _is_retryable(err: Exception) -> bool:
     return code >= 500         # 5xx 服务端错误可重试；4xx 一律不重试
 
 
+#: 429 的退避为什么要单独定档：TPM 限流的恢复粒度是「一分钟」，2 秒后立刻重试必然再撞
+#: 一次。真机 2026-10-15 一整轮就是这个形状——两次尝试在 8 秒内烧完，然后整条 run 报错，
+#: 用户在界面上看到的是「发了没反应」。分档等满才谈得上「重试」。
+_MAX_ATTEMPTS = 3
+_RETRY_DELAYS = (10.0, 30.0, 60.0)
+
+
+def _retry_delay(err: Exception, attempt: int) -> float:
+    """这次失败之后该等多久：429 先听上游自己给的 Retry-After，读不到才按分档等。"""
+    code = getattr(err, "status_code", None)
+    if code == 429:
+        raw = None
+        resp = getattr(err, "response", None)
+        try:
+            raw = resp.headers.get("retry-after") if resp is not None else None
+        except Exception:  # noqa: BLE001  头结构各家不一样，读不到就走分档
+            raw = None
+        if raw is not None:
+            try:
+                return max(1.0, min(float(raw), 120.0))
+            except (TypeError, ValueError):
+                pass
+    delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
+    text = str(getattr(err, "message", "") or "")
+    if code == 429 and ("分钟" in text or "per-minute" in text.lower()
+                        or "minute" in text.lower()):
+        delay = max(delay, 60.0)
+    return delay
+
+
 def _parse_tool_args(raw: str) -> dict[str, Any]:
     """工具调用参数串 → dict，并对**流式拼接产生的尾部垃圾**做保守修复。
 
@@ -80,6 +110,9 @@ def _parse_tool_args(raw: str) -> dict[str, Any]:
        不捏造内容：截断丢的是尾部数据，补上括号后解析出的部分仍可用。
     3. **双重编码**：某些模型把 arguments 整体当一个字符串值再 JSON 编码一次，
        ``json.loads`` 成功但返回 ``str`` 而非 ``dict``。再 loads 一次即可。
+    4. **中间提前闭合**：长数组写到一半就把最外层 ``}`` 吐了，后面还拖着一段
+       （真机 ``submit_plan`` 交两个方案时踩过两次）。这种串 ``{``/``}`` 数量是平的、
+       错又不在末尾，上面三路全落空 → 取**头部第一个合法文档**，尾部如实报丢弃字数。
 
     修不好就退回 ``{"_raw": …}``，由工具层如实报错。
     """
@@ -123,6 +156,20 @@ def _parse_tool_args(raw: str) -> dict[str, Any]:
                 return doc
         except json.JSONDecodeError:
             pass
+    # 中间提前闭合：模型在长数组写到一半时就把最外层 } 吐了，后面还拖着一段。
+    # 上面三路都治不了它（错不在末尾，括号栈又是平的），真机 run c364585634f2 的
+    # 12 镜计划就是这么整包落进 _raw 的——而 _raw 里前 2850 字符是一份完整可用的计划。
+    # 这一路只取**头部第一个合法文档**，尾巴如实报长度，不静默吞。
+    try:
+        doc, end = json.JSONDecoder().raw_decode(text.lstrip())
+    except json.JSONDecodeError:
+        doc = None
+    if isinstance(doc, dict):
+        dropped = len(text.lstrip()) - end
+        if dropped > 0:
+            logger.warning("工具参数在第 %d 字符后提前闭合，已取第一个合法文档，"
+                           "丢弃尾部 %d 字符", end, dropped)
+        return doc
     return {"_raw": text}
 
 
@@ -267,7 +314,7 @@ class OpenAICompatClient:
     ) -> LLMResponse:
         client, model = await self._resolve_request()
         last_err: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(_MAX_ATTEMPTS):
             try:
                 resp = await client.chat.completions.create(
                     **{**self._kwargs(messages, tools), "model": model}, timeout=60
@@ -277,10 +324,10 @@ class OpenAICompatClient:
                 last_err = e
                 if not _is_retryable(e):
                     raise RuntimeError(_describe_error(e)) from e
-                if attempt < 1:
-                    await asyncio.sleep(2)
+                if attempt < _MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(_retry_delay(e, attempt))
         raise RuntimeError(
-            f"LLM 调用 2 次重试均失败：{_describe_error(last_err)}") from last_err
+            f"LLM 调用 {_MAX_ATTEMPTS} 次重试均失败：{_describe_error(last_err)}") from last_err
 
     def _kwargs(
         self,
@@ -316,7 +363,7 @@ class OpenAICompatClient:
         client, model = await self._resolve_request()
         stream = None
         last_err: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(_MAX_ATTEMPTS):
             try:
                 stream = await client.chat.completions.create(
                     **{**self._kwargs(messages, tools, stream=True), "model": model},
@@ -327,11 +374,12 @@ class OpenAICompatClient:
                 last_err = e
                 if not _is_retryable(e):
                     raise RuntimeError(_describe_error(e)) from e
-                if attempt < 1:
-                    await asyncio.sleep(2)
+                if attempt < _MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(_retry_delay(e, attempt))
         if stream is None:
             raise RuntimeError(
-                f"LLM 流式调用 2 次重试均失败：{_describe_error(last_err)}") from last_err
+                f"LLM 流式调用 {_MAX_ATTEMPTS} 次重试均失败："
+                f"{_describe_error(last_err)}") from last_err
         acc: dict[int, dict[str, str]] = {}  # index -> {id, name, args}
         usage: dict[str, int] | None = None
         async for event in stream:

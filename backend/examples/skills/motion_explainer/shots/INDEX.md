@@ -1,4 +1,4 @@
-# shot 卡索引（132 张，按类别）
+# shot 卡索引（133 张，按类别）
 
 每行：`<类别>/<卡名>` [能量] 时长 — 一句话描述 | 适用 | demo 文件 relpath + 字节数
 
@@ -95,7 +95,7 @@
 - `rhythm/speed-ramp-freeze` [中高] — 帧号非线性 remap 的节奏手法——定格标注（流动→定格圈注→解冻） | 时长 定格标注全程 158f（≈5.3s，定格段… | 适用 卡片流/长横移中把一个重点"停下给人看"；教学解说、评审语境 | demo `rhythm/speed-ramp-freeze/FreezeAnnotateReal.tsx` 15,887 B
 - `rhythm/trailer-grammar-moves` [A 高] — 预告片语法一式——trailer-bumper 前置速剪钩子：三镜 9f 速剪 + 黑场静默一拍，再开场标题 | 时长 A ~4.7s（140f） | 适用 预告片的开场钩子（cold open）：正片前先塞三个最抓眼的镜头… | demo `rhythm/trailer-grammar-moves/TrailerBumper.tsx` 6,332 B
 
-## science（8 张）
+## science（9 张）
 
 - `science/cross-section-reveal` [中高] — 剖面揭示——一片剖切面自左向右扫过球体，扫到哪层显影哪层（地壳→地幔→外核→内核），标签带引线在该层被扫过 55% 时画入，收尾 30f 真静止 | 时长 150f（5s）；扫过全程 108f + … | 适用 讲"一个东西里面是什么"：地球内部、细胞结构、引擎剖面、地层、脑区… | demo `science/cross-section-reveal/CrossSectionReveal.tsx` 11,360 B
 - `science/map-terrain-build` [中] — 地图地形——等高线自谷底向山顶逐条立起（scale+上移+淡入，顺序=高程），一条河用 dasharray 把自己画出来并带跟随亮点，三个地名… | 时长 158f（5.3s）；等高线 7 条 ×1… | 适用 讲地理/地质/流域/气候：一座山怎么长出来、水往哪走、地形如何决定… | demo `science/map-terrain-build/MapTerrainBuild.tsx` 12,648 B
@@ -105,6 +105,7 @@
 - `science/timeline-evolution` [中高] — 演化时间轴——水平轴按真实年代比例定位，视口沿轴行进，节点滚到中心时卡片交替弹出并带引线，顶部年份读数随帧真实跳动，末节点急停推近 | 时长 276f（约 9.2s）；入场 20f + 5 段滚动（每段 20f + 节点 hold 24f）+ 推近与静止 36f | 适用 讲"这件事是怎么一步步变成这样的"：生命演化、恒星一生、元素发现史、气候变迁、技术演进 | demo `science/timeline-evolution/TimelineEvolution.tsx` 11,074 B
 - `science/exploded-assembly` [中高] — 拆解合体——整体先合体呈现，各构件沿半径方向撑开（轨道半径 ×1.45、核 ×1.18），每一件的引线标签在它到位时画入，电子始终绕核旋转，合回后末 30f 真静止 | 时长 180f（6s）；合体 24f + 炸开 34f + 悬停 62f + 合回 30f + 静止 30f | 适用 讲"一个东西由哪些部分组成、各部分在哪"：原子结构、细胞器、引擎拆解、心脏四腔、机械传动 | demo `science/exploded-assembly/ExplodedAssembly.tsx` 10,140 B
 - `science/growth-morph` [中高] — 生长变形——形态按阶段逐个构件长出（stagger 4f），阶段切换交叉淡入 + 微移，底部生长轴四节点连线并显示真实天数，末阶段成虫翅膀展开并持续扇动 | 时长 224f（约 7.5s）；每阶段 44f（构件生长 20f + 驻留 24f）+ 过渡 8f + 收尾 24f | 适用 讲"这个东西是怎么一步步长成的"：完全变态、生命周期、恒星演化、材料的相变 | demo `science/growth-morph/GrowthMorph.tsx` 13,622 B
+- `science/curve-function-trace` [中高] — 函数曲线逐笔绘制——坐标轴与网格先淡入，包络线（虚线）先画入，主曲线用 clipPath 从左到右逐笔绘制，关键点在曲线"画到"该点时弹出标注，底部函数式逐字打出 | 时长 198f（6.6s）；轴 18f + 包络 22f + 绘制 120f + 标注滞后 8f + 收尾 30f | 适用 讲"这个函数长什么样"：阻尼振荡、抛物线、指数衰减、波形演化、数学/物理/数据可视化 | demo `science/curve-function-trace/CurveFunctionTrace.tsx` 11,398 B
 
 ## transition（15 张）
 

@@ -284,11 +284,16 @@ def build_runtime(
     prompts_dir: str | Path | bool | None = None,
     use_checkpoint: bool = True,                       # False = 关闭崩溃恢复快照
     heartbeat_interval: int = 30,
-    max_iterations: int = 40,
+    # 12 镜代码链一轮就要 12 次取 demo 全文 + 逐镜重写 + plan_motion 打回重交，实测
+    # 40 轮在半路耗尽（run b0b16f5b1506 停在第 40 轮、正在写 s2，零条渲染任务）。
+    max_iterations: int = 120,
     # 渲染前确认门：编排就绪、即将渲染时先把编排结果给用户看，确认后才渲。
     # 用户明确要求「不确认绝不渲染」，所以默认为 True。置 False 即回到直接渲染的老行为
     # （不是砍功能——是给「我已经确认过、别再问我」留一条明确的路）。
     gate_render: bool = True,
+    # 消息默认入口：auto = 一句话直接执行到出片（渲染前确认门是唯一的强制确认点）；
+    # plan = 老行为，先出计划卡等用户点选再执行。单条消息可用 /chat 的 mode 覆盖。
+    entry_mode: str = "auto",
     observability: bool = True,
     static_dir: str | Path | None = None,
     mcp_config: str | Path | bool | None = None,     # None=存在即当种子入库；False=关闭这条路
@@ -784,6 +789,7 @@ def build_runtime(
         agent,
         mq,
         topic=topic,
+        entry_mode=entry_mode,
         heartbeat=heartbeat,
         static_dir=static_dir,
         on_startup=_startup,
@@ -879,15 +885,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-context-tokens", type=int, default=DEFAULT_MAX_CONTEXT_TOKENS,
                    help="上下文压缩阈值 token（<=0 表示不压缩）")
     p.add_argument("--heartbeat-interval", type=int, default=30)
-    # 默认值与 build_runtime 的 max_iterations=40 对齐：原先这里是 20、build_runtime 是 40，
+    # 默认值与 build_runtime 的 max_iterations=120 对齐：原先这里是 20、build_runtime 是 40，
     # 而 main() 用 args 覆盖 → 实际永远跑 20，比函数默认值更小。整链剪辑（切镜头 → 理解 →
     # 筛选 → 分组 → 文案 → 配音 → 时间线 → 渲染，再加轮询与纠错）十几步工具调用、每步一轮
     # LLM，20 轮必然在半路耗尽，用户看到的是「[已达最大迭代次数 20，提前结束]」。
-    p.add_argument("--max-iterations", type=int, default=40,
+    p.add_argument("--max-iterations", type=int, default=120,
                    help="单次请求内 Agent 的最大迭代轮数；整链剪辑（十余次工具调用）需调大")
     p.add_argument("--no-render-gate", dest="gate_render", action="store_false",
                    help="关掉「渲染前确认」：编排完直接渲染，不再先给用户看编排结果")
     p.set_defaults(gate_render=True)
+    p.add_argument("--entry", dest="entry_mode", choices=("auto", "plan"), default="auto",
+                   help="消息默认入口：auto=一句话直接执行到出片、渲染前弹确认卡（默认）；"
+                        "plan=先出计划卡等确认再执行")
     p.add_argument("--max-upload-mb", type=int, default=1024,
                    help="单条素材大小上限（MB）：/upload 与分片续传（/upload/init·complete）都按它拒")
     p.add_argument("--upload-ttl-sec", type=float, default=uploads.DEFAULT_SESSION_TTL_SEC,
@@ -933,6 +942,8 @@ def main() -> None:
         max_context_tokens=args.max_context_tokens,
         heartbeat_interval=args.heartbeat_interval,
         max_iterations=args.max_iterations,
+        gate_render=args.gate_render,
+        entry_mode=args.entry_mode,
         static_dir=args.static_dir or None,
         max_upload_mb=args.max_upload_mb,
         upload_ttl_sec=args.upload_ttl_sec,

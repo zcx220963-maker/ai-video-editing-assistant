@@ -254,9 +254,42 @@ class SkillLoader:
         row = await self._skills.get(name)
         return self._to_skill(row) if row else None
 
+    def _find_file(self, skill: Skill, relpath: str) -> dict | None:
+        """技能附件的寻址：正文里的裸 relpath 也能命中登记在 `demos/` 下的那份。
+
+        `shots/INDEX.md` 的 demo 栏写的是 `rhythm/panel-grid-moves/X.tsx`，而
+        `skill_files` 登记的是 `demos/rhythm/panel-grid-moves/X.tsx`——照抄索引就
+        取不到附件（真机 run 97c1289eba35：三镜连试两次被拒后停手）。
+        """
+        files = skill.files
+        rel = str(relpath or "").strip().lstrip("./").replace("\\", "/")
+        bare = rel[len("demos/"):] if rel.startswith("demos/") else rel
+        for cand in (rel, f"demos/{bare}", bare):
+            entry = next((f for f in files if f["relpath"] == cand), None)
+            if entry is not None:
+                return entry
+        low = {f["relpath"].lower(): f for f in files}
+        for cand in (rel.lower(), f"demos/{bare}".lower()):
+            if cand in low:
+                return low[cand]
+        # 文件名拼错了目录、或拿卡名拼了文件名：按文件名唯一命中，再按「这张卡的目录里
+        # 只有一份 .tsx」唯一命中。都不唯一就不猜（猜错比报错更难查）。
+        base = bare.rsplit("/", 1)[-1].lower()
+        by_base = [f for f in files if f["relpath"].lower().rsplit("/", 1)[-1] == base]
+        if len(by_base) == 1:
+            return by_base[0]
+        folder = bare.rsplit("/", 1)[0].lower() if "/" in bare else ""
+        if folder:
+            in_dir = [f for f in files
+                      if f["relpath"].lower().startswith(f"demos/{folder}/")
+                      and f["relpath"].lower().endswith(".tsx")]
+            if len(in_dir) == 1:
+                return in_dir[0]
+        return None
+
     async def read_attachment(self, skill: Skill, relpath: str) -> bytes:
         """按 skill_files 登记的 object_key 取附件字节——只认表里在案的 relpath。"""
-        entry = next((f for f in skill.files if f["relpath"] == relpath), None)
+        entry = self._find_file(skill, relpath)
         if entry is None:
             raise KeyError(f"技能 {skill.name} 无附件 {relpath!r}")
         data = b""
@@ -266,7 +299,9 @@ class SkillLoader:
 
     async def attachment_url(self, skill: Skill, relpath: str, ttl_sec: int = 3600) -> str:
         """非文本附件给一个临时读链接，而不是把字节塞回上下文。"""
-        entry = next(f for f in skill.files if f["relpath"] == relpath)
+        entry = self._find_file(skill, relpath)
+        if entry is None:
+            raise KeyError(f"技能 {skill.name} 无附件 {relpath!r}")
         return await self._objects.presign_get(entry["object_key"], ttl_sec=ttl_sec)
 
     async def sync_from_dir(self, skills_dir: str | Path,
@@ -657,7 +692,10 @@ class LoadSkillTool(Tool):
             return (f"[skill:{skill.name} location={skill.location}]"
                     f"{self._outline(skill.body)}\n{skill.body}"
                     + self._paging_note(skill.name, skill.body))
-        if not any(f["relpath"] == rel for f in skill.files):
+        found = self._loader._find_file(skill, rel) if hasattr(self._loader, "_find_file")             else next((f for f in skill.files if f["relpath"] == rel), None)
+        if found is not None:
+            rel = found["relpath"]          # 按在案的真名读，回执里写的也是真名
+        if found is None:
             # 附件清单**只报一小截**：真机实测这份技能有两百多个附件，全倒出来是十几 KB
             # 的一团路径（还多半会被闸从中间切掉），而模型此刻只想知道「我写的那个名字
             # 错在哪」。完整清单本来就在整份加载的那一段里给过。

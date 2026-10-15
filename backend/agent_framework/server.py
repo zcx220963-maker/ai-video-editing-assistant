@@ -129,6 +129,7 @@ class ChatRequest(BaseModel):
     message: str
     attachments: list[str] = []   # 已上传素材的 material_id 列表（/upload 返回值）
     resume: bool = False          # True = 续跑本会话在途的 run，而不是开新 run
+    mode: str = ""                # "auto" 直接执行 / "plan" 先出计划卡；空 = 用服务端默认入口
 
 
 class RunForkRequest(BaseModel):
@@ -782,8 +783,9 @@ def create_app(
     broadcast_client_factory: Any | None = None,  # 假 redis 客户端入口（离线单测用）
     quota_limit: int = 0,                  # 启动参数层：页面/env 都没填时的回落上限
     quota_window: int = 86400,             # 同上，窗口秒数
+    entry_mode: str = "auto",              # 消息默认入口（auto 直接执行 / plan 先出计划卡）
 ) -> FastAPI:
-    consumer = SessionConsumer(agent, mq, topic=topic)
+    consumer = SessionConsumer(agent, mq, topic=topic, default_entry=entry_mode)
     connections = ConnectionManager(mq)
     broadcaster = (
         OutboundBroadcaster(
@@ -1289,6 +1291,7 @@ def create_app(
                 "run_id": run_id,
                 "attachments": req.attachments,
                 "resume": req.resume,
+                "mode": req.mode,
             },
         )
         return ChatQueuedResponse(run_id=run_id, status="queued")

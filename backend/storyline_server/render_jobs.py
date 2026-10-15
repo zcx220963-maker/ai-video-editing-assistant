@@ -195,7 +195,9 @@ def tool_view(snap: dict[str, Any] | None, *, node: str = "render_video") -> dic
     if snap is None:
         return {"node": node, "artifact_id": "", "output": None,
                 "render": {"status": "none"},
-                "hint": f"这个作用域还没有 {node} 任务：先调用 {node} 提交渲染"}
+                "hint": (f"这个作用域还没有 {node} 任务：先调用 {node} 提交渲染。"
+                         "注意 render_web 是同步出片——成片就在它自己的回执里，"
+                         "不进这张任务表，别拿 render_status 去等它")}
     render = {k: snap.get(k) for k in
               ("status", "stage", "percent", "seconds_since_update", "error")
               if snap.get(k) is not None}

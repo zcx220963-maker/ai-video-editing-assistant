@@ -27,7 +27,7 @@
     },
     "editing_round": {
       "file": "editing_round.md", "phase": "editing", "kind": "conditional",
-      "referenced_by": ["assembly"], "fixed": false, "max_bytes": 1531,
+      "referenced_by": ["assembly"], "fixed": false, "max_bytes": 1800,
       "desc": "剪辑副链的系统提示内核（副链与主链共用提示词库）。"
     },
     "subagent_system": {
@@ -84,6 +84,11 @@
       "file": "plan_card_nudge.md", "phase": "guard", "kind": "conditional",
       "referenced_by": ["submit_plan"], "fixed": false, "max_bytes": 655,
       "desc": "把整套方案写成正文、要用户打字确认时的打回（该出卡却出了散文）。"
+    },
+    "auto_proceed_nudge": {
+      "file": "auto_proceed_nudge.md", "phase": "guard", "kind": "conditional",
+      "referenced_by": ["assembly"], "fixed": false, "max_bytes": 560,
+      "desc": "执行轮把方案写成正文、等用户打字确认时的打回：直接执行，渲染前统一弹确认卡。"
     },
     "polish_system": {
       "file": "polish_system.md", "phase": "skill_flow", "kind": "on_demand",

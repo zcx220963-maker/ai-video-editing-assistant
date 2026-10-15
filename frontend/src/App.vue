@@ -329,6 +329,16 @@ function toggleRail() {
   railOpen.value = !railOpen.value;
   localStorage.setItem("ca.railOpen", railOpen.value ? "1" : "0");
 }
+// 预览缩略图点开看大图（新标签页，不打断确认卡）
+function openThumb(url) {
+  if (url) window.open(url, "_blank", "noopener");
+}
+// —— 入口模式：auto 一句话直接做到出片（渲染前弹计划确认卡）；plan 先出计划卡再执行 ——
+const entryMode = ref(localStorage.getItem("ca.entryMode") === "plan" ? "plan" : "auto");
+function toggleEntryMode() {
+  entryMode.value = entryMode.value === "auto" ? "plan" : "auto";
+  localStorage.setItem("ca.entryMode", entryMode.value);
+}
 const drawerW = ref(Number(localStorage.getItem("ca.drawerW")) || 380);
 const resizing = ref(false);
 function startResize(ev) {
@@ -1611,6 +1621,8 @@ function openQuestionCard(pages, meta = {}) {
     answers: {},                        // pageIndex -> 选中的 key
     customAnswers: {},                  // pageIndex -> 自定义文本
     previewSummary: meta.previewSummary || null,
+    warnings: meta.warnings || [],
+    storyboard: meta.storyboard || [],
     // 审批类弹窗（ask_user / 渲染确认 / 兜底选项）要把服务端那份 approval 带在身上：
     // qSubmit 提交时取的就是它，缺了这个字段，点「确认」会抛
     // 「Cannot set properties of undefined」，审批请求根本发不出去。
@@ -1778,6 +1790,11 @@ function askQuestionCard(src, runId, frameRunId) {
     run_id: runId || frameRunId || src.plan_run_id || src.run_id || "",
     reason: src.reason || "", approval: src,
     submitLabel: pages.length > 1 ? "全部确认" : "确认",
+    // 渲染确认门就是「渲染前的计划卡」：摘要、提醒与逐镜分镜都要摆在题面上，
+    // 否则用户只看到一句「确认开始渲染吗」，等于闭眼批准。
+    previewSummary: a.preview || null,
+    warnings: Array.isArray(a.warnings) ? a.warnings : [],
+    storyboard: Array.isArray(a.storyboard) ? a.storyboard : [],
   });
 }
 
@@ -2385,6 +2402,7 @@ async function send() {
       body: JSON.stringify({
         conversation_id: cid, message: text,
         attachments: atts0.map((a) => a.material_id),
+        mode: entryMode.value,
       }),
     });
     const j = await r.json().catch(() => ({}));
@@ -3922,6 +3940,24 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                 <em>{{ k }}</em>{{ v }}
               </span>
             </div>
+            <div v-if="(questionCard.warnings || []).length" class="pc-warn">
+              <div v-for="(w, i) in questionCard.warnings" :key="i">⚠ {{ w }}</div>
+            </div>
+            <div v-if="(questionCard.storyboard || []).some((sb) => sb.thumb)" class="qc-thumbs">
+              <figure v-for="sb in questionCard.storyboard" :key="sb.id" class="qc-thumb">
+                <img v-if="sb.thumb" :src="sb.thumb" :alt="sb.id" loading="lazy"
+                     @click="openThumb(sb.thumb)" />
+                <div v-else class="qc-thumb-none">无预览</div>
+                <figcaption><b>{{ sb.id }}</b> {{ sb.text || "（无字幕）" }}</figcaption>
+              </figure>
+            </div>
+            <ol v-else-if="(questionCard.storyboard || []).length" class="qc-board">
+              <li v-for="sb in questionCard.storyboard" :key="sb.id">
+                <b>{{ sb.id }}</b>
+                <span class="qc-board-text">{{ sb.text || "（无字幕）" }}</span>
+                <em v-if="sb.note">{{ sb.note }}</em>
+              </li>
+            </ol>
             <ul class="qc-options">
               <li v-for="o in qCurrentPage().options" :key="o.key"
                   class="qc-opt"
@@ -4039,6 +4075,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           {{ cancelling ? "取消中…" : "取消上传" }}
         </button>
         <button class="clip" :class="{ busy: fetchingLink, on: linkOpen }" title="按链接取素材" @click="toggleLink">＋链接</button>
+        <button class="clip" :class="{ on: entryMode === 'plan' }"
+                :title="entryMode === 'auto'
+                  ? '全自动：一句话直接做到出片，没提到的由助手自己定，渲染前弹一张计划确认卡'
+                  : '先出计划：先给计划卡逐项确认，再开始执行'"
+                @click="toggleEntryMode">{{ entryMode === "auto" ? "全自动" : "先出计划" }}</button>
         <textarea
           v-model="draft"
           rows="1"
@@ -6264,6 +6305,22 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   letter-spacing: 0.5px; line-height: 1.6; color: var(--ink);
 }
 .qc-preview { display: flex; flex-wrap: wrap; gap: 6px; }
+.qc-board { margin: 8px 0; padding-left: 0; list-style: none; max-height: 220px; overflow-y: auto;
+  font-size: 13px; border: 1px solid var(--line, #e5e1d8); border-radius: 8px; }
+.qc-board li { display: flex; gap: 8px; align-items: baseline; padding: 5px 10px;
+  border-bottom: 1px solid var(--line, #eee); }
+.qc-board li:last-child { border-bottom: none; }
+.qc-board b { flex: none; color: var(--ink-soft); font-weight: 600; min-width: 2.4em; }
+.qc-board-text { flex: 1; }
+.qc-thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px;
+  margin: 8px 0; max-height: 340px; overflow-y: auto; }
+.qc-thumb { margin: 0; font-size: 11px; line-height: 1.35; }
+.qc-thumb img, .qc-thumb-none { width: 100%; height: 150px; object-fit: contain; border-radius: 6px;
+  border: 1px solid var(--line, #e5e1d8); cursor: zoom-in; background: #f3efe6; }
+.qc-thumb-none { display: flex; align-items: center; justify-content: center; color: var(--ink-soft); cursor: default; }
+.qc-thumb figcaption { margin-top: 3px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; }
+.qc-board em { flex: none; font-style: normal; color: var(--ink-soft); font-size: 12px; }
 .qc-pv {
   font-size: 11.5px; color: var(--ink); padding: 2px 8px;
   border: 1px solid var(--line); border-radius: 10px; background: #fffdf7;

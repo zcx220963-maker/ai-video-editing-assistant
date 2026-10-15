@@ -222,6 +222,10 @@ MOTION_ANCHOR_TOLERANCE_DIV = 3
 #: 能做到「这一镜的字压在画面上、随构图摆」——参考片普遍这么做，而这也是
 #: 成片不再长得像 PPT 的关键一档（每镜一条同款字幕带正是那个观感的来源）。
 SUBTITLE_MODES = ("full", "torn_highlight", "none", "inline")
+#: 字幕位置与入场动画（2026-10-15）：模型按构图与片子气质选，整片一档 + 逐镜可覆盖。
+#: 与 remotion/src/tokens.ts 的 CAPTION_POSITIONS / CAPTION_ANIMS 同一份枚举。
+CAPTION_POSITIONS = ("bottom", "center", "top")
+CAPTION_ANIMS = ("fade", "rise", "pop", "karaoke")
 
 #: 一段镜头代码的体积上限。lint 与 bundle 都按字节走，超了不是"风格问题"而是
 #: 一次请求把容器内存吃掉一截——这条链一镜一次浏览器，宁可在这里拦。
@@ -491,7 +495,7 @@ SHOT_KNOBS = ("text", "highlight", "min_duration_sec", "fields")
 #: 进键的代价是「整片把淡出换成擦除」要重烧 20 镜的 Remotion 帧，而它本来只是一趟
 #: 拼接。tests/test_code_transition.py 对这两侧各有一支断言（在键 / 不在键）。
 FILM_KNOBS = ("fps", "aspect", "narration", "voice", "rate", "subtitle_mode",
-              "entrance", "exit")
+              "entrance", "exit", "caption_position", "caption_anim")
 
 #: 选区改（P3）对代码镜只开这五条指针。`code` 的改动必须重过闸① 才允许落盘；
 #: `fields/{name}/value` 不动代码字节，改的是注入母版的值，所以不重跑 lint，
@@ -752,6 +756,17 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         _err(errors, f"{sid}：subtitle_mode={sub!r} 不支持"
                      f"（母版只认：{', '.join(SUBTITLE_MODES)}）")
         sub = ""
+    # 逐镜字幕位置 / 入场动画：省略＝跟整片那一档。与 subtitle_mode 同族，覆盖了才进缓存键。
+    cap_pos = str(raw.get("caption_position") or "").strip().lower()
+    if cap_pos and cap_pos not in CAPTION_POSITIONS:
+        _err(errors, f"{sid}：caption_position={cap_pos!r} 不支持"
+                     f"（可用：{', '.join(CAPTION_POSITIONS)}）")
+        cap_pos = ""
+    cap_anim = str(raw.get("caption_anim") or "").strip().lower()
+    if cap_anim and cap_anim not in CAPTION_ANIMS:
+        _err(errors, f"{sid}：caption_anim={cap_anim!r} 不支持"
+                     f"（可用：{', '.join(CAPTION_ANIMS)}）")
+        cap_anim = ""
 
     # R1: card / derived_from 契约栏
     card, derived_from = _norm_cite(raw, sid, errors)
@@ -773,6 +788,8 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         # 是同一件事（都落整片档），但在**账面**上要分得开——回执与补丁链读的是这里。
         "transition": seam or None,
         "subtitle_mode": sub or None,
+        "caption_position": cap_pos or None,
+        "caption_anim": cap_anim or None,
         "source": {str(k): str(v) for k, v in src.items()},
         "card": card,
         "derived_from": derived_from,
@@ -801,6 +818,37 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
     }
 
 
+def expand_code_refs(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """`code_from`：一镜复用另一镜的代码（只换文案 / 字段 / 色板）→ 展开后的 spec 副本。
+
+    为什么要有：长片（有旁白的 4 分钟要四十多镜）每镜都交一整段 TSX，一次工具调用装不下，
+    模型只能「说加到 46 镜」却原样重交 14 镜（真机 run 79dcdc0ec0a8）。版式本来就该复用——
+    十几种版式撑几十镜，靠 `fields` 与 `text` 换内容。展开在校验之前做，下游（lint、缓存键、
+    渲染）看到的都是完整代码，与手写一份没有区别。`card` / `derived_from` 没写就跟着源镜。
+    引用不存在或源镜也没代码时原样留着，由校验报「这一镜没有代码」。
+    """
+    shots = raw.get("shots")
+    if not isinstance(shots, list):
+        return dict(raw)
+    by_id = {str(s.get("id") or ""): s for s in shots if isinstance(s, Mapping)}
+    out: list[Any] = []
+    for s in shots:
+        if not isinstance(s, Mapping) or s.get("code") or not s.get("code_from"):
+            out.append(s)
+            continue
+        src = by_id.get(str(s.get("code_from")))
+        if not src or not src.get("code"):
+            out.append(s)
+            continue
+        row = {k: v for k, v in s.items() if k != "code_from"}
+        row["code"] = src["code"]
+        for k in ("card", "derived_from", "subject_channel"):
+            if not row.get(k) and src.get(k):
+                row[k] = src[k]
+        out.append(row)
+    return {**raw, "shots": out}
+
+
 def validate_code_spec(raw: dict[str, Any], *,
                        has_stage_leg: bool | None = None) -> tuple[dict[str, Any], list[str]]:
     """→ (规范化后的 spec, 错误清单)。错误清单非空即**不可渲染**。
@@ -818,6 +866,7 @@ def validate_code_spec(raw: dict[str, Any], *,
     errors: list[str] = []
     if not isinstance(raw, dict):
         return {}, ["spec 必须是对象"]
+    raw = expand_code_refs(raw)
 
     aspect = str(raw.get("aspect") or "portrait")
     if aspect not in ASPECTS:
@@ -852,6 +901,17 @@ def validate_code_spec(raw: dict[str, Any], *,
     if sub_mode not in SUBTITLE_MODES:
         _err(errors, f"subtitle_mode={sub_mode!r} 不支持（母版只认：{', '.join(SUBTITLE_MODES)}）")
         sub_mode = "torn_highlight"
+
+    caption_position = str(raw.get("caption_position") or "bottom").strip().lower()
+    if caption_position not in CAPTION_POSITIONS:
+        _err(errors, f"caption_position={caption_position!r} 不支持"
+                     f"（可用：{', '.join(CAPTION_POSITIONS)}）")
+        caption_position = "bottom"
+    caption_anim = str(raw.get("caption_anim") or "fade").strip().lower()
+    if caption_anim not in CAPTION_ANIMS:
+        _err(errors, f"caption_anim={caption_anim!r} 不支持"
+                     f"（可用：{', '.join(CAPTION_ANIMS)}）")
+        caption_anim = "fade"
 
     texture = str(raw.get("texture") or "none").strip().lower()
     if texture not in TEXTURES:
@@ -913,8 +973,12 @@ def validate_code_spec(raw: dict[str, Any], *,
     # render_motion_code 烧像素前、patch_motion_code 落盘前——调的都是这一个函数，
     # 规则因此不可能只在一路上生效。
     # 提醒那一份从这里单独取（见 style_facts）。
+    qc = str(raw.get("qc") or QC_STRICT).strip().lower()
+    if qc not in QC_MODES:
+        _err(errors, f"qc={qc!r} 不支持（可用：{', '.join(QC_MODES)}）")
+        qc = QC_STRICT
     for checker in WHOLE_FILM_GATES:
-        errors.extend(checker(shots)[0])
+        errors.extend(run_film_gate(checker, shots, strict=qc == QC_STRICT)[0])
     # 闸㉑ 的**闸前**那一半（R8-T33）：动效事件的锚是纯契约，判它一次 ffmpeg 都不用开，
     # 所以它跟上面那批整片闸并排放在这里，三个调用点（plan 入库前 / 烧像素前 / 落盘前）
     # 一起生效。「事件触发帧在不在窗口里」那一半要像素，在 code_render 逐镜那一段。
@@ -947,6 +1011,11 @@ def validate_code_spec(raw: dict[str, Any], *,
         "voice": voice,
         "rate": rate,
         "subtitle_mode": sub_mode,
+        "qc": qc,
+        # 有配乐时把镜头切点卡到拍上（缺省开；没有配乐或检不出稳定的拍时什么都不做）。
+        "beat_sync": raw.get("beat_sync") is not False,
+        "caption_position": caption_position,
+        "caption_anim": caption_anim,
         "texture": texture,
         "transition": transition,
         "transition_sec": span_text,
@@ -1041,6 +1110,12 @@ def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
     sub_override = str(shot.get("subtitle_mode") or "")
     if sub_override:
         payload["subtitle_mode"] = sub_override
+    # 卡拍补长改的是帧数（像素与声轨都变了），只在真补了时进键。
+    if shot.get("_beat_pad"):
+        payload["beat_pad"] = round(float(shot["_beat_pad"]), 3)
+    for k in ("caption_position", "caption_anim"):
+        if shot.get(k):
+            payload[k] = str(shot[k])
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -2688,13 +2763,13 @@ def check_av_accounting(*, narration: bool, film_sec: float, clip_db: float | No
     if bgm_sec is not None:
         need = film_sec * AV_BGM_MIN_SHARE
         if bgm_sec < need:
+            # 2026-10-15 起降为提醒：配乐多半是用户自己指定的那一首，为它短了几秒
+            # 就把整片打回、让模型去换曲，等于否掉用户的选择；循环混音本身能出片。
             times = film_sec / bgm_sec if bgm_sec > 0 else float("inf")
-            errors.append(
-                f"闸⑰ BGM 太短：素材 {bgm_sec:.2f}s 不够成片 {film_sec:.2f}s 的"
-                f" {AV_BGM_MIN_SHARE:g} 倍（要 ≥ {need:.2f}s）。混音那趟把 BGM 喂给"
-                f" `-stream_loop -1`，短了**不报错而是从头反复**——这条片子会把这支曲子"
-                f"循环约 {times:.1f} 遍，听感是「这段音乐怎么又来了」。换一支够长的，"
-                "或者让成片短下来（这一条判的是素材与片长的关系，不是音质）")
+            warns.append(
+                f"闸⑰ BGM 偏短：素材 {bgm_sec:.2f}s 不够成片 {film_sec:.2f}s 的"
+                f" {AV_BGM_MIN_SHARE:g} 倍，混音会把这支曲子循环约 {times:.1f} 遍"
+                "（交付时如实告诉用户）")
 
     # ② 旁白到底在不在。两个方向都判，缺一条就会有半边永远没人看：
     #    关着却有声 → 有东西混进了旁白轨（旧轨残留、静音垫片被换成了真音）；
@@ -2968,6 +3043,12 @@ def check_derived_similarity(shots: list[dict[str, Any]]
         sid = str(shot.get("id") or "")
         code = str(shot.get("code") or "")
         derived = shot.get("derived_from") or []
+        if isinstance(derived, str):
+            # 模型把这一栏写成裸字符串（``derived_from: "demos/x/Y.tsx"``）而不是列表时，
+            # 下面那个 for 会**逐字符**遍历它：每个字符都当成一个 relpath 去读，全部读不到，
+            # 于是每一镜都得到「最高 0.000（全部读不到）」的假打回——真机 run 97c1289eba35
+            # 里骨架相似度实测 0.780/0.809/0.645 的三镜也被这一条打回。这里按字面归一。
+            derived = [derived]
         if [str(d) for d in derived] == [ORIGINAL_SENTINEL]:
             continue
         if not code or not derived:
@@ -3017,9 +3098,11 @@ def check_derived_similarity(shots: list[dict[str, Any]]
 #: ``forage_oversize`` 名单（点名 + 字节数），让模型用 ``load_skill(name, path=…)``
 #: 逐件取回；**每一份要么全文要么不在**，这条不变式由 ``collect_demos`` 保证。
 #:
-#: 取值理由：语料里最大的一份约 36 KB，一镜引用两份的中位片约 30 KB。120 KB 装得下
-#: 3~8 份（多数片子用不完），又不至于把一轮上下文顶穿。
-FORAGE_MAX_BYTES = 120_000
+#: 取值理由：必须**装得进主服务的单条工具结果闸**（`compress.DEFAULT_RESULT_MAX_BYTES`，
+#: 60 KB）并给计划行与提示留出余量——原先是 120 KB，回执在主服务那一侧被从中间截掉，
+#: 「要么全文要么不在」这条不变式在真机上破了（run d27b37bf1419：20 份 demo 落在被截的
+#: 那一段里，模型只能逐件去取）。超线的照旧点名，用 load_skill 逐件取回（每件十几 KB）。
+FORAGE_MAX_BYTES = 48_000
 
 #: 取材轮判据的三种结果（外加「不像取材轮」）。做成常量是为了让「三态分清」这件事
 #: 在测试里按**集合**断言，而不是在断言里再抄一遍字符串。
@@ -3464,6 +3547,74 @@ def check_ink_contrast(shots: list[dict[str, Any]]
     return errors, warns, undetermined
 
 
+#: 自动修字色时的两个候选：白与近黑。不取色板里的 `text`——那正是这类错的来源
+#: （深色板的 text 是浅色，模型把它写到浅底上就糊了）。
+_AUTOFIX_INKS = ("#ffffff", "#141414")
+
+
+def autofix_ink_contrast(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """闸⑩ 的机械修复：读不出的字色就地换成白或近黑（哪个在这一镜的底上更清楚换哪个）。
+
+    → (修过的 spec 副本, 逐镜说明)。只动**字色那几个位置**（与闸⑩ 认字色是同一套规则：
+    `color:` 一类、`<text>`/`<tspan>` 上的 `fill`，材质色不算），底色与图形的填色一个不碰。
+    为什么由系统修而不是打回：这是纯算术——真机 run d27b37bf1419 为了「浅底白字 / 深底深字」
+    来回改了三轮、每轮重交 220 KB 代码，最后整条通道被熔断；而正确答案机器一步就算得出。
+    """
+    shots = raw.get("shots")
+    if not isinstance(shots, list):
+        return dict(raw), []
+    notes: list[str] = []
+    out: list[Any] = []
+    for i, shot in enumerate(shots):
+        if not isinstance(shot, Mapping) or not shot.get("code"):
+            out.append(shot)
+            continue
+        code = str(shot["code"])
+        c = shot_colors(code)
+        if not c["surfaces"] or not c["inks"]:
+            out.append(shot)
+            continue
+        bad: dict[str, str] = {}
+        for ink in c["inks"]:
+            if max(contrast_ratio(ink, bg) for bg in c["surfaces"]) >= CONTRAST_MIN:
+                continue
+            fix = max(_AUTOFIX_INKS,
+                      key=lambda cand: max(contrast_ratio(cand, bg) for bg in c["surfaces"]))
+            if max(contrast_ratio(fix, bg) for bg in c["surfaces"]) >= CONTRAST_MIN:
+                bad[ink] = fix
+        if not bad:
+            out.append(shot)
+            continue
+        palette_name = c["palette"]
+        spans: list[tuple[int, int, str]] = []
+        for m in _INK_PROP_RE.finditer(code):
+            grp = 1 if m.group(1) else 2
+            token = m.group(grp)
+            if token is None:
+                continue
+            start, end = m.start(grp), m.end(grp)
+            tag = _enclosing_tag(code, start)
+            if _MATERIAL_TAG_RE.search(tag):
+                continue
+            if grp == 2 and not _TEXT_TAG_RE.match(tag):
+                continue
+            got = resolve_color(token, palette_name)
+            if got not in bad:
+                continue
+            quoted = start > 0 and code[start - 1] in "'\"`"
+            spans.append((start, end, bad[got] if quoted else f'"{bad[got]}"'))
+        if not spans:
+            out.append(shot)
+            continue
+        for start, end, rep in sorted(spans, reverse=True):
+            code = code[:start] + rep + code[end:]
+        sid = str(shot.get("id") or f"s{i + 1:02d}")
+        notes.append(f"{sid}：字色在本镜底色上读不出，已自动换成 "
+                     + "、".join(f"{k}→{v}" for k, v in bad.items()))
+        out.append({**shot, "code": code})
+    return {**raw, "shots": out}, notes
+
+
 #: 整片层的八道判据（闸⑦ 风格配额 / 闸⑲ 风格丰富度 / 闸⑫ 与 demo 骨架同构 /
 #: 闸⑳ 原创配额 / 闸⑨ 跨镜同构 / 闸⑩ 文字对比度 / 闸⑮ 版式族配额 / 闸⑯ 主体具名）。
 #: **三处调用点**（plan_motion 入库前、render 烧像素前、patch 落盘前）与**两处报账**
@@ -3480,8 +3631,52 @@ WHOLE_FILM_GATES = (check_style_quota, check_style_variety,
                     check_shot_structure, check_ink_contrast,
                     check_layout_family, check_subject_named)
 
+#: 只提醒、不打回的那几道（2026-10-15）：色板多样⑲、卡族多样⑮、原创占比⑳。
+#: 它们逼的是「多样」，但同时把「整片统一风格 / 统一色调 / 更多原创镜」这类有意为之的
+#: 选择一并打回，换来的是整份分镜重写重提。降为建议后照样出现在渲染前的计划确认卡上
+#: （style_warnings），由用户在那一眼里决定要不要改。
+#: ⑦（画法通道 + 纯文字镜占比）**仍是硬闸**：它挡的是「一整条 PPT 配旁白」这种质量
+#: 底线问题，不是风格偏好。对比度、结构、主体具名同样仍是硬闸。
+SOFT_GATES = frozenset({check_style_variety, check_layout_family, check_original_share})
+#: 预览档（qc=preview）再多放软的四道「品味型」契约闸：画法通道⑦、跨镜同构⑨、
+#: 派生相似⑫、主体具名⑯。预览档的前提是**渲染前有人看静帧**（计划确认卡上的预览图），
+#: 人眼替掉了这几道机器判据；无人值守的严格档（qc=strict）照旧硬拦。
+#: 对比度⑩ 与结构合法性在两档都是硬闸。
+PREVIEW_SOFT_GATES = SOFT_GATES | frozenset({check_style_quota, check_shot_structure,
+                                             check_derived_similarity, check_subject_named})
+SOFT_PREFIX = "（建议）"
 
-def whole_film_gate_results(shots: list[dict[str, Any]]
+#: 质检档：preview＝主流做法（渲染前人看预览静帧，渲后像素闸只提醒、不打回重烧）；
+#: strict＝无人值守（机器判据全部硬拦，换「没人看也敢出片」的保证）。
+#: 库层缺省是 strict（既有判据语义不变）；产品节点按 `default_qc()` 注入（缺省 preview）。
+QC_PREVIEW = "preview"
+QC_STRICT = "strict"
+QC_MODES = (QC_PREVIEW, QC_STRICT)
+
+
+def default_qc() -> str:
+    """产品入口的质检档：环境变量 MOTION_QC（preview/strict），缺省 preview。"""
+    v = os.environ.get("MOTION_QC", QC_PREVIEW).strip().lower()
+    return v if v in QC_MODES else QC_PREVIEW
+
+
+def with_default_qc(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """spec 副本；没写 qc（或写了空值）时补上产品缺省档。"""
+    out = dict(raw)
+    if not str(out.get("qc") or "").strip():
+        out["qc"] = default_qc()
+    return out
+
+
+def run_film_gate(gate: Any, shots: list[dict[str, Any]], *, strict: bool = True) -> tuple:
+    """跑一道整片闸；软闸的打回项降为提醒（加「（建议）」前缀），其余原样返回。"""
+    got = gate(shots)
+    if gate not in (SOFT_GATES if strict else PREVIEW_SOFT_GATES):
+        return got
+    return ([], [f"{SOFT_PREFIX}{e}" for e in got[0]] + list(got[1]), *got[2:])
+
+
+def whole_film_gate_results(shots: list[dict[str, Any]], *, strict: bool = True
                             ) -> tuple[list[str], list[str], list[str]]:
     """把整片八道闸的三个出口合成一份：``(打回, 提醒, 未判)``。
 
@@ -3494,7 +3689,7 @@ def whole_film_gate_results(shots: list[dict[str, Any]]
     warns: list[str] = []
     undetermined: list[str] = []
     for gate in WHOLE_FILM_GATES:
-        got = gate(shots)
+        got = run_film_gate(gate, shots, strict=strict)
         errors.extend(got[0])
         warns.extend(got[1])
         if len(got) > 2:
@@ -3521,6 +3716,7 @@ def whole_film_gate_results(shots: list[dict[str, Any]]
 #: 它们都在计划卡上（用户在批准之前就看得到「镜间怎么接、每镜怎么进」），
 #: 而卡面的每一项都要能反查到来源 + 有中文标签，所以档位全是枚举（见 TRANSITION_SEC_CHOICES）。
 KNOB_FIELDS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode",
+               "caption_position", "caption_anim",
                "texture", "transition", "transition_sec", "entrance", "exit")
 
 _VOICE_RE = re.compile(r"^[a-z]{2}(-[A-Za-z]{2,})?-[A-Za-z]+Neural$")
@@ -3564,6 +3760,10 @@ KNOB_VALUE_LABELS: dict[str, dict[str, str]] = {
     "subtitle_mode": {"torn_highlight": "撕纸条·逐词点亮", "full": "整句字幕",
                       "none": "不上字幕",
                       "inline": "文字进画面（母版不画，随构图摆）"},
+    "caption_position": {"bottom": "底部字幕条", "center": "压在画面正中",
+                         "top": "顶部安全区"},
+    "caption_anim": {"fade": "淡入", "rise": "上浮入场", "pop": "弹出放大",
+                     "karaoke": "逐字随语音点亮"},
     # 质感每一镜都能带一档（顶层是整片默认），标签要说清「加的是哪种观感」，不然选的人只能猜
     "texture": {"none": "不加（原片直出）", "film": "老胶片·颗粒与暗角",
                 "tv": "老电视·扫描线与色偏", "glow": "柔光·高光处泛开",
@@ -3641,6 +3841,14 @@ def knob_props() -> dict[str, Any]:
         "subtitle_mode": {
             "type": "string", "enum": list(SUBTITLE_MODES), "default": "torn_highlight",
             "description": "字幕形态。inline=母版不画、文字交回镜头代码排进画面",
+        },
+        "caption_position": {
+            "type": "string", "enum": list(CAPTION_POSITIONS), "default": "bottom",
+            "description": "字幕位置（整片默认，每镜可覆盖）：底部/画面正中/顶部",
+        },
+        "caption_anim": {
+            "type": "string", "enum": list(CAPTION_ANIMS), "default": "fade",
+            "description": "字幕入场动画（整片默认，每镜可覆盖）；karaoke=逐字随语音点亮",
         },
         "texture": {
             "type": "string", "enum": list(TEXTURES), "default": "none",
@@ -3782,6 +3990,11 @@ def spec_schema() -> dict[str, Any]:
         "type": "object",
         "properties": {
             **knob_props(),
+            "qc": {"type": "string", "enum": list(QC_MODES),
+                   "description": "质检档：preview（缺省，渲染前人看预览静帧，渲后像素闸只提醒）/ "
+                                  "strict（无人值守，机器判据全部硬拦）"},
+            "beat_sync": {"type": "boolean", "default": True,
+                          "description": "有配乐时把镜头切点卡到拍上（只往后补、最多约半拍）"},
             "title": {"type": "string", "maxLength": 80,
                       "description": "片子标题（出现在界面与素材库，不进画面）"},
             "bgm": {
@@ -3808,6 +4021,10 @@ def spec_schema() -> dict[str, Any]:
                                "description": "镜号，省略则按顺序补 s01/s02…"},
                         "code": {"type": "string", "maxLength": MAX_CODE_BYTES,
                                  "description": _CODE_DOC},
+                        "code_from": {"type": "string",
+                                      "description": "复用另一镜的代码（填那一镜的 id，本镜不写 code），"
+                                                     "只换 text / fields / 色板。长片用它：十几种版式"
+                                                     "撑几十镜，不必每镜交一整段代码"},
                         "text": {"type": "string", "maxLength": MAX_TEXT_CHARS_WIDE,
                                  "description": f"这一镜要说的一句话，只进母版字幕带。"
                                                 f"容量按画幅：竖屏 ≤{MAX_TEXT_CHARS} 字、"
@@ -4123,6 +4340,14 @@ def spec_schema() -> dict[str, Any]:
                                                          "要 `none`（整屏插画，不想压字）。"
                                                          "**它与整片那一档都会进缓存键**"
                                                          "（字幕带是母版画进切片里的）"},
+                        "caption_position": {"type": "string",
+                                             "enum": list(CAPTION_POSITIONS),
+                                             "description": "**这一镜**的字幕位置（可省略＝跟整片）。"
+                                                            "主体在下半屏时放 top，整屏插画留白在中间时放 center"},
+                        "caption_anim": {"type": "string",
+                                         "enum": list(CAPTION_ANIMS),
+                                         "description": "**这一镜**的字幕入场动画（可省略＝跟整片）。"
+                                                        "金句/结论镜用 pop 或 karaoke 加强"},
                         "source": {"type": "object",
                                    "description": "出处 {\"标题\": …, \"链接\": …}。机器不判真伪，"
                                                   "它如实出现在分镜卡与逐镜账上（不进画面）。"
@@ -4163,28 +4388,133 @@ def overlay_knobs(spec: dict[str, Any], inputs: Mapping[str, Any]) -> dict[str, 
     return out
 
 
-def estimate_sec(spec: dict[str, Any]) -> tuple[float, float]:
-    """按字数估总时长区间（低, 高），用于出片前判断是否偏离目标。
+#: 无旁白时一镜的时长**不是估算**：渲染层按 `max(min_duration_sec, 2.6 + 0.16 × 字数)` 定
+#: （`render.DEFAULT_SHOT_SEC` 与 `code_render.narration_for` 那一行；两处漂移由
+#: tests/test_code_spec.py 拦）。原先这里按「有旁白」的口径只数字数、完全不看
+#: `min_duration_sec`——真机 run 79dcdc0ec0a8：模型给 14 镜写了合计 164 秒的驻留，
+#: 估算却报 73~112 秒，把一条本来合格的片子打回去要它「加到 46 镜、放慢语速」。
+NO_NARRATION_BASE_SEC = 2.6
+NO_NARRATION_SEC_PER_CHAR = 0.16
+#: 自动对齐目标时长时，一镜最多驻留多久（再长观众就开始等了，宁可加镜）。
+MAX_DWELL_SEC = 20.0
 
-    这是**估算**，只用来在计划阶段提示「比目标长一倍，删几镜吧」；真正落地的每镜
-    时长由 TTS 实测回填。无旁白时按阅读速度（每字 0.16 秒 + 0.8 秒驻留）另算。
-    """
-    shots = spec.get("shots") or []
-    chars = sum(len(str(s.get("text") or "")) for s in shots)
-    if spec.get("narration"):
-        rate_pct = 0
+
+def shot_sec_bounds(shot: Mapping[str, Any], spec: Mapping[str, Any]) -> tuple[float, float]:
+    """一镜的时长区间（低, 高）。无旁白时低＝高＝渲染层那条确定的算式。"""
+    text = str(shot.get("text") or "")
+    floor = float(shot.get("min_duration_sec") or 0.0)
+    if spec.get("narration") and text:
         try:
             rate_pct = int(str(spec.get("rate") or "+0%")[:-1])
         except ValueError:
             rate_pct = 0
-        speed = 1.0 + rate_pct / 100.0          # 语速越快，秒数越少
-        factor = max(0.4, speed)
-        low = chars * SEC_PER_CHAR_LOW / factor + 0.6 * len(shots)
-        high = chars * SEC_PER_CHAR_HIGH / factor + 1.2 * len(shots)
+        factor = max(0.4, 1.0 + rate_pct / 100.0)      # 语速越快，秒数越少
+        low = len(text) * SEC_PER_CHAR_LOW / factor + 0.6
+        high = len(text) * SEC_PER_CHAR_HIGH / factor + 1.2
+        return max(floor, low), max(floor, high)
+    sec = max(floor, NO_NARRATION_BASE_SEC + len(text) * NO_NARRATION_SEC_PER_CHAR)
+    return sec, sec
+
+
+def _overlap_total(spec: Mapping[str, Any]) -> float:
+    """所有接缝转场交叠掉的秒数（拼接那一趟会从总长里减掉）。"""
+    shots = list(spec.get("shots") or [])
+    if len(shots) < 2:
+        return 0.0
+    try:
+        plan = transition_plan(spec)
+    except Exception:  # noqa: BLE001 - 估算不该因为转场档名写坏而炸
+        return 0.0
+    base = float(plan["duration"]) if str(plan["style"]) not in ("", "none") else 0.0
+    over = {str(x.get("after")): (0.0 if str(x.get("style") or "none") == "none"
+                                  else float(x.get("duration") or 0.0))
+            for x in plan.get("seams") or []}
+    return sum(over.get(str(s.get("id") or ""), base) for s in shots[:-1])
+
+
+def estimate_sec(spec: dict[str, Any]) -> tuple[float, float]:
+    """总时长区间（低, 高），用于出片前判断是否偏离目标。
+
+    逐镜求和再减掉转场交叠；每镜都尊重 `min_duration_sec`。有旁白时是估算（真实时长由
+    TTS 实测回填），无旁白时是确定值（低＝高）。
+    """
+    shots = spec.get("shots") or []
+    pairs = [shot_sec_bounds(s, spec) for s in shots]
+    lap = _overlap_total(spec)
+    low = sum(p[0] for p in pairs) - lap
+    high = sum(p[1] for p in pairs) - lap
+    return round(max(0.0, low), 1), round(max(0.0, high), 1)
+
+
+def fit_duration(spec: dict[str, Any], target: float | None) -> tuple[dict[str, Any], list[str]]:
+    """无旁白时把各镜驻留按比例拉长/压短到目标时长 → (新 spec, 说明)。
+
+    无旁白的时长完全由 `min_duration_sec` 决定，系统能精确算出来，就不该把「改几个秒数」
+    这种纯算术丢回给模型重写整份分镜。拉长时每镜封顶 `MAX_DWELL_SEC`，压短时不低于
+    这一镜字幕的阅读下限。有旁白时时长归声音，这里不动（由 `duration_block` 给建议）。
+    """
+    if not target or target <= 0 or spec.get("narration"):
+        return spec, []
+    shots = [dict(x) for x in spec.get("shots") or []]
+    if not shots:
+        return spec, []
+    lap = _overlap_total(spec)
+    secs = [shot_sec_bounds(x, spec)[0] for x in shots]
+    total = sum(secs) - lap
+    if total <= 0 or abs(total - target) <= target * 0.05:
+        return spec, []
+    floors = [NO_NARRATION_BASE_SEC + len(str(x.get("text") or "")) * NO_NARRATION_SEC_PER_CHAR
+              for x in shots]
+    want = target + lap
+    new = list(secs)
+    # 迭代按比例分配：封顶/触底的镜固定下来，剩余差额摊给其余镜
+    for _ in range(8):
+        diff = want - sum(new)
+        # 只把差额摊给还能往那个方向动的镜：拉长时没封顶的，压短时没触底的
+        free = [i for i in range(len(new))
+                if (new[i] < MAX_DWELL_SEC - 1e-6 if diff > 0 else new[i] > floors[i] + 1e-6)]
+        if abs(diff) < 0.05 or not free:
+            break
+        base = sum(new[i] for i in free) or 1.0
+        for i in free:
+            new[i] = min(MAX_DWELL_SEC, max(floors[i], new[i] + diff * new[i] / base))
+    for x, sec in zip(shots, new):
+        x["min_duration_sec"] = round(sec, 2)
+    out = dict(spec, shots=shots)
+    got = sum(new) - lap
+    note = (f"无旁白：已把各镜驻留按比例从合计 {total:.0f}s 调到 {got:.0f}s 以对齐目标 "
+            f"{target:.0f}s（每镜 {min(new):.1f}~{max(new):.1f}s）")
+    if got < target * 0.9:
+        note += f"；每镜最多驻留 {MAX_DWELL_SEC:.0f}s，仍短于目标——要更长就加镜"
+    return out, [note]
+
+
+def duration_block(spec: dict[str, Any], target: float | None, *,
+                   long_factor: float = 1.6, short_factor: float = 0.5) -> str | None:
+    """估算整体偏离目标到不值得开烧时 → 一句带具体改法的拒因；否则 None。
+
+    改法按有无旁白分开给：无旁白说「加镜 / 加长驻留」（没有语速可调），有旁白说
+    「加镜加文案 / 放慢语速」。镜数建议按**每镜平均时长**折算，而不是按字数。
+    """
+    if not target or target <= 0:
+        return None
+    low, high = estimate_sec(spec)
+    n = len(spec.get("shots") or [])
+    if n == 0 or not (low > target * long_factor or high < target * short_factor):
+        return None
+    too_long = low > target * long_factor
+    per = max(0.5, (low + high) / 2 / n)
+    if too_long:
+        fix = (f"删到约 {max(1, round(target / per))} 镜，或把每镜文案缩短"
+               + ("" if spec.get("narration") else "、驻留调短"))
+    elif spec.get("narration"):
+        fix = f"加到约 {max(n + 1, round(target / per))} 镜（每镜文案也可加长），或放慢语速"
     else:
-        low = chars * 0.16 + 0.8 * len(shots)
-        high = chars * 0.24 + 1.4 * len(shots)
-    return round(low, 1), round(high, 1)
+        need = max(n + 1, round(target / min(MAX_DWELL_SEC, max(per, 12.0))))
+        fix = (f"加到约 {need} 镜（每镜最多驻留 {MAX_DWELL_SEC:.0f}s 也只够 "
+               f"{n * MAX_DWELL_SEC:.0f}s）")
+    return (f"目标 {target:.0f}s，但这份分镜{'估' if spec.get('narration') else '算'}下来 "
+            f"{low:.0f}~{high:.0f}s（{n} 镜），偏离超过闸值：{fix}。")
 
 
 def check_target(spec: dict[str, Any], target_sec: float | None) -> list[str]:

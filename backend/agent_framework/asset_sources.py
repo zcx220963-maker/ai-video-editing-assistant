@@ -119,61 +119,96 @@ ASSET_SOURCES: tuple[SourceLeg, ...] = (
         license_url="https://iconify.design/docs/icons/",
     ),
     SourceLeg(
-        name="polyhaven", ingest="ingest_polyhaven", state=STATE_PENDING,
-        license_posture="CC0（全站）",
+        name="polyhaven", ingest="ingest_polyhaven", state=STATE_LIVE,
+        license_posture="CC0（全站），许可从站上声明页读出来再写进行里",
         attribution_required=False,
-        decision="Q107/T52：腿已写（取 API 列表 + thumbnail），**没跑过**→ 活库 0 行。"
-                 "声明了却拿不到字节，对模型就是撒谎，所以先不进 schema；T52 跑完这条腿"
-                 "（或 T52 记未跑、把行数写进回执）再把它翻成 live。不摘除，因为它的"
-                 "问题只是「没跑」而不是「取不到」。",
+        decision="Q107/T52 → **2026-10-14 翻 live**：这条腿的问题原来不是「取不到」，"
+                 "是**读法写错了却没回执**——代码认 `thumbnail`/`title`，API 给的是 "
+                 "`thumbnail_url`/`name`，于是跑完打「入库 0 个」，看着像源里没货。"
+                 "现在的取法：`api.polyhaven.com/assets`（2387 项）→ 把缩略图的 CDN 查询"
+                 "改成 1024 jpg；type=1（质感）那类改取 `/files/<id>` 里的真实 Diffuse 图，"
+                 "不是渲染预览。许可那一栏**不再写死**：`LICENSE_STATEMENTS` 去 "
+                 "`polyhaven.com/license` 读，读不到标记整条腿不收（回执 `EmptyParse`）。"
+                 "活库回执（同一天，容器内）：**20 行**、MinIO 20 个对象、"
+                 "`asset_role='scene'`（长边实测 394–1024px，够一整幅画面、不够铺底）。"
+                 "**这条腿治不好的那一格**：收的是**预览栅格图**，不是 .hdr/.glb 原件——"
+                 "`scale_safe` 的判据是「最细笔画 ≥2px」，对栅格**无定义**，"
+                 "所以这 20 行全是未判（不是不合格，是没量）；要 3D 场景件，仍然只有 "
+                 "quaternius 那条被 Q110 判为射程外的路。",
         probe=(("api", "https://api.polyhaven.com/assets"),),
-        subject_hints=("3d-model",), role_hint="scene",
+        subject_hints=("hdri", "texture", "3d-model"), role_hint="scene",
         license_url="https://polyhaven.com/license",
     ),
     SourceLeg(
-        name="ambientcg", ingest="ingest_ambientcg", state=STATE_PENDING,
-        license_posture="CC0（全站）",
+        name="ambientcg", ingest="ingest_ambientcg", state=STATE_LIVE,
+        license_posture="CC0（全站），许可从 /license 页读出来再写进行里",
         attribution_required=False,
-        decision="Q107/T52：同 polyhaven，腿已写、没跑过 → 先不进 schema。它的产物是"
-                 "**质感底**（`asset_role='texture'`），刚好是部件档与背景档都要用的那一格，"
-                 "所以 T52 优先跑它。",
-        probe=(("index", "https://ambientcg.com/get?category=2-Pass&format=jpg&size=2048"),),
+        decision="Q107/T52 → **2026-10-14 翻 live**：这条腿以前恒为 0 件，两个原因都不在"
+                 "「源里没货」上——① `/list` 是 htmx 壳，件在 `/hx/asset-list` 里，而那个端点"
+                 "**不带 `HX-Request: true` 就只回推广块**（同一 URL 实测 23889B 带件 / "
+                 "3416B 无件）；② 只有 `*-WEBP` 那一档缩略图存在，`256-JPG/512-JPG/1024-PNG` "
+                 "全 404。现在的取法：`sitemap.xml` 读出 45 个分类（分类清单不写死）→ 逐类 "
+                 "`/hx/asset-list` → 取 `1024-WEBP`。许可同 polyhaven：读不到「CC0」标记"
+                 "整条腿不收。活库回执：**20 行**、MinIO 20 个对象、"
+                 "`asset_role='texture'`、尺寸实测 1024×1024。"
+                 "探测条目也跟着改：旧的 `/get?category=…` 那一条**一次下 11.6MB 的整包 zip**，"
+                 "拿它量「这个源通不通」等于用下载整库来证明网络活着，现在探 `sitemap.xml`。"
+                 "**这条腿治不好的那一格**：收的是 1024 缩略图，不是站上那些 8K 原件；"
+                 "而且 `asset_role='texture'` 不等于「能铺底」——长边 1024 < 1600，"
+                 "`bg` 那一档它够不着（库里 `bg` 至今 0 行），栅格件同样 `scale_safe` 未判。",
+        probe=(("list", "https://ambientcg.com/sitemap.xml"),),
         subject_hints=("texture",), role_hint="texture",
         license_url="https://ambientcg.com/license",
     ),
     SourceLeg(
-        name="open-peeps", ingest="ingest_openpeeps", state=STATE_PENDING,
-        license_posture="CC0（全站），人物手绘 SVG",
+        name="open-peeps", ingest="ingest_openpeeps", state=STATE_LIVE,
+        license_posture="CC0（全站），人物手绘 SVG，许可从首页读出来再写进行里",
         attribution_required=False,
-        decision="Q107/T52：腿已写（抓站内 .svg 链接）、没跑过 → 先不进 schema。"
-                 "它是**部件档**（`asset_role='part'`）唯一的现成来源，T52 三腿里它的优先级"
-                 "与 ambientcg 并列第一。",
+        decision="Q107/T52 → **2026-10-14 翻 live**：0 件的成因是**抓法**——旧正则找的是站内"
+                 "相对路径的 .svg，而首页给的是 Webflow CDN 的**绝对 URL**，一条都匹配不上。"
+                 "现在按绝对 href 抓、只留名字里带 `peep` 的（首页 93 个人物 SVG），"
+                 "字节不是 SVG 的当场记 `EmptyParse` 回执。许可同前两条腿：读首页那句"
+                 "「CC0 License.」，读不到就不收。"
+                 "活库回执：**40 行**、MinIO 40 个对象、`asset_role='part'`。"
+                 "**这条腿没治好它要治的那一格，这句必须写在 live 的同一行上**："
+                 "那 40 件**全部 `scale_safe=false`**——实测 `stroke-width=\"1\"`、"
+                 "viewBox 240×324，缩到部件档（画布短边 1080 × 0.18 = 194px）时最细笔画 "
+                 "0.60px，判据要 ≥2px。于是 `select_illustration` 会把这 40 件全打回"
+                 "（角色是 part，就走部件那一关）。所以「部件档唯一的现成来源」这句"
+                 "旧话现在要说准：**它是唯一一条能自动取件的人物部件腿，但今天取回来的"
+                 "那批按现有判据一件都不能当部件用**。要么把它们按 scene 放大用（打回话术"
+                 "里给的就是这条路），要么补真正的拼图部件源——两条都不在本卷射程内，"
+                 "但「live」不等于「这一档有货」这一条，已经从这行的回执里钉住了。",
         probe=(("site", "https://openpeeps.com"),),
         subject_hints=("person",), role_hint="part",
         license_url="https://openpeeps.com",
     ),
     SourceLeg(
-        name="humaaans", ingest="", state=STATE_PENDING,
-        license_posture="署名制（非 CC0）：CC-BY 一类，**必须**带署名才能用",
-        attribution_required=True,
-        decision="Q108：**收，但有前置**。前置两条——① 库里要有安放许可/署名的栏位；"
-                 "② 入库真写了值。今天 ① 成立（`asset_library.license` + "
-                 "`attribution_required` + `license_url` 三栏都在，见 storage/schema.sql），"
-                 "② **证不了**（没有腿、没有一份入库过的样本可查），而 §5.2 的硬约束是"
-                 "「需署名的不进检索结果」——`AssetLibraryRepo.search()` 那一行 "
-                 "`where['attribution_required']=False` 是同一件事的另一半。"
-                 "② 未证 → 按 Q108 的「缺一即摘除」处理：**先不进 schema**，"
-                 "等它的取件包 + 署名落在回执里再翻 live。摘除写在**这里**（有编号、有理由），"
-                 "不是为了让哪条断言闭嘴。"
-                 "T51 的探测回执：2026-10-13 宿主与容器两次都 200/8192B——**它通**，"
-                 "所以「不收」的理由是许可前置未证，不是取不到。"
-                 "另一条硬事实：`AssetLibraryRepo.search()` 只返回 "
-                 "`attribution_required=False` 的行，所以按今天的口径，署名制素材"
-                 "**入了库也搜不到**——真要收它，得先有一条「署名随件回执」的通道，"
-                 "那是另一件事，本卷不做。",
+        name="humaaans", ingest="", state=STATE_OFFLINE,
+        license_posture="CC0（公有领域）：**站首页自己写的**——「CC0 Free for commercial or "
+                        "personal use」+ 指向 `creativecommons.org/share-your-work/"
+                        "public-domain/cc0/` 的 `rel=\"license\"` 链接（2026-10-14 实测）",
+        attribution_required=False,
+        decision="Q165（**订正 Q108 的事实前提**）：这一行原来写着「署名制（非 CC0）、"
+                 "`attribution_required=True`」，那句是**抄来的假设，不是读来的**。今天去它"
+                 "首页读了——满页都是 CC0，没有一句要署名。这条错不是笔误级的："
+                 "`AssetLibraryRepo.search()` 里那一行 `where['attribution_required']=False` "
+                 "是 §5.2「需署名的不进检索结果」的另一半，于是**只要这一栏是 true，"
+                 "这个源将来入库的每一行都永远搜不到**——一个 CC0 源被我们自己的许可账"
+                 "判成了隐形。所以 `attribution_required` 改成 `False`，许可姿态按页上"
+                 "那句写。Q108 那两条前置（栏位存在 / 入库真写值）到这里已经**不再是它"
+                 "不收的理由**：①②都成立，缺的换成了第三件事——"
+                 "**没有在线腿可写**：首页 0 条指向人物件的 `.svg` href（页面里那 8 次 "
+                 "`.svg` 全是图标/装饰），一条腿要能把「取哪个文件」写成 URL，这里写不出。"
+                 "所以状态走 `offline-only`（与 Q109 的 kenney 同一档、同一个理由），"
+                 "**不是「禁止」，是「缺那份取件包」**：包进来以后 `--offline-dir` 那条路"
+                 "今天就是现成的，`manifest.jsonl` 里给它写 license=CC0、"
+                 "attribution_required=false 即可，届时再翻 live。"
+                 "T51 的探测回执照留：2026-10-13 宿主与容器两次都 200/8192B——站是通的，"
+                 "2026-10-14 这次读许可也是 200。",
         probe=(("site", "https://humaaans.com"),),
         subject_hints=("person",), role_hint="part",
-        license_url="https://humaaans.com",
+        license_url="https://creativecommons.org/share-your-work/public-domain/cc0/",
     ),
     SourceLeg(
         name="kenney", ingest="", state=STATE_OFFLINE,

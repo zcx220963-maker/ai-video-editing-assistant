@@ -60,7 +60,8 @@ from . import hitmap as m_hit
 #: 逐条校验，写坏的档名会被点名打回。
 EDITABLE_SHOT_FIELDS = ("code", "text", "highlight", "fields",
                         "min_duration_sec", "texture", "source", "bleed", "bg",
-                        "subtitle_mode", "transition")
+                        "subtitle_mode", "caption_position", "caption_anim",
+                        "transition")
 
 #: 白名单五条的**人话形状**。指针被拒时把这行交给用户——他能改的就这五样，
 #: 猜第六样（比如 `/shots/0/fields/radius/min`）只会得到另一条错误。

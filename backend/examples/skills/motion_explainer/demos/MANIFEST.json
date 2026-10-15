@@ -388,6 +388,10 @@
     "bytes": 13622
   },
   {
+    "relpath": "science/curve-function-trace/CurveFunctionTrace.tsx",
+    "bytes": 11398
+  },
+  {
     "relpath": "science/timeline-evolution/TimelineEvolution.tsx",
     "bytes": 11074
   },
