@@ -2,6 +2,7 @@
   "name": "creation-remotion",
   "version": "1.0.0",
   "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
   "description": "图形科普片的代码渲染链：模型逐镜交 React/TSX，本服务用 Remotion 逐帧渲成镜粒度切片",
   "scripts": {

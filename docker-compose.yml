@@ -89,6 +89,10 @@ services:
       # 图形科普片的代码渲染链（独立容器）。editor 与 app 都要能摸到：
       # 出片节点跑在 editor，选区改的补丁口跑在 app。
       REMOTION_URL: ${REMOTION_URL:-http://remotion:8010}
+      # 图形科普片的出片调优（说明见 .env.example 末段）
+      MOTION_QC: ${MOTION_QC:-preview}
+      MOTION_PREVIEW_STILLS: ${MOTION_PREVIEW_STILLS:-1}
+      MOTION_RENDER_PARALLEL: ${MOTION_RENDER_PARALLEL:-2}
     volumes:
       - whisper-cache:/root/.cache
       - app-runtime:/app/.runtime
@@ -110,6 +114,9 @@ services:
     image: creation-remotion:latest
     container_name: creation-remotion
     # 不映射宿主端口：只给应用容器在 compose 网络内用（remotion:8010）。
+    environment:
+      # 同时逐帧渲染的镜数（软件 WebGL 吃内存，16 GB 机器 2 路稳妥）
+      DG_RENDER_SLOTS: ${DG_RENDER_SLOTS:-2}
     healthcheck:
       # 镜像里没有 curl,用 node 自带的全局 fetch 真打一次 /healthz
       # （端口开着不等于服务应答，探针要问同一个口）。

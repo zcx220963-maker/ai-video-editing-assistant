@@ -102,3 +102,22 @@ openchatcut-src/
 /outputs/
 # 开发合同与其增补卷：全项目零代码引用，是给人看的内部文档
 /REMOVIDE_*.md
+
+# ---- 启动用不到的部分（2026-10-15：仓库只留「克隆下来能构建、能启动」所需的文件）----
+# 文档：README 之外的设计文档本地保留
+/docs/
+# 素材入库与巡检脚本、素材供给探活记录：运行时代码与镜像都不用它们
+/scripts/
+/assets/
+# remotion 示例镜头：后端用的是技能语料里那一份（backend/examples/skills/motion_explainer/demos），
+# 渲染时镜头代码只能经别名引到 _fixtures/、lib/、themes/——其余 demo 目录运行时一个都不读
+/remotion/src/demos/*
+!/remotion/src/demos/_fixtures/
+# remotion 测试：镜像构建期只跑下面放回来的四件（见 remotion/Dockerfile），其余是探针与本地夹具
+/remotion/tests/*
+!/remotion/tests/gate1-lint.mjs
+!/remotion/tests/gate13-assets.mjs
+!/remotion/tests/fixtures-gate13.mjs
+!/remotion/tests/shipped-namespace.mjs
+/remotion/src/user-shots/fixture-*.tsx
+/remotion/src/lib/helpers/__tests__/

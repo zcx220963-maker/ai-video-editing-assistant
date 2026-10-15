@@ -61,18 +61,6 @@ COPY remotion/src/themes/palettes.json /app/remotion/src/themes/palettes.json
 COPY remotion/lint-rules.mjs remotion/package.json remotion/server.mjs \
      remotion/assetgate.mjs remotion/imagecheck.mjs remotion/tsconfig.json /app/remotion/
 COPY remotion/public/assets/.gitkeep /app/remotion/public/assets/
-# 仓库根那份 `scripts/`（素材摄取/巡检那几件）也带一份，**落在 `/scripts`**——不是
-# `/app/scripts`（那是 backend 自己的脚本目录，两份同名文件会互相盖住）。
-# 理由是同一件事：`tests/test_asset_sources.py` 与 `tests/test_asset_gc_report.py`
-# 的被测对象就是这几个脚本，而镜像里 `WORKDIR /app` 就等于 backend——宿主布局
-# 「<仓库根>/backend + <仓库根>/scripts」在容器里只剩前半截，这两份用例于是以
-# `ModuleNotFoundError: asset_common` 的样子红（不像代码坏了，像环境不对，最容易
-# 被当成「容器里跑不了，跳过」）。`/scripts` 让 `Path(__file__).resolve().parents[2]`
-# 这条锚点在两个布局里都指得对：宿主是 <仓库根>，容器里就是 `/`。
-# 这几个模块只连标准库 + `agent_framework.storage`（后者已在 /app），纯离线，
-# 全套 104 KB。带一份的副作用只有一个：改了根 `scripts/` 没重烤镜像，这一条会变旧——
-# 变旧报红，不静默过。
-COPY scripts/ /scripts/
 # 前端产物放进 REPO_ROOT/frontend/dist(run_server 的静态目录锚点在容器内=/frontend/dist)
 COPY --from=web /web/dist /frontend/dist
 
