@@ -9,6 +9,11 @@
 在**同一份**逐镜版面回读上跑一遍，红了或未判的镜就是目标（Q115：判据重合处**只读**它们的
 输出，不实现第二份）。也就是说：这一条不可能比既有闸更严或更松，它的账与它们的账**同源**。
 
+**两个红源，一条修复的路。** 逐镜身份（⑲-b「画面上那个东西是不是文案说的那个」，见
+``identity_targets``，**单独一个开关**，2026-10-17）是第二个红源：它判的是几何闸问不出的
+那一格（「必需像」）。它算出来的红镜与几何闸的红镜合到同一份 ``targets``，走同一个「看帧 →
+改代码 → 只重烧该镜 → 回闸」，**不为它另开一条修复的路**——那正是 Q115 点名的清单漂移。
+
 **它也不发明第二条提交路。** 模型改出来的代码走 `code_patch.plan_code_patch` → 与
 `patch_motion_code` 用的**同一个** `edits[{pointer:"/shots/i/code"}]` 形状落盘。于是
 「回看改的镜」与「人改的镜」在库里长成同一个样子；`shot_cache_key` 的输入含那一镜的
@@ -31,9 +36,11 @@
 通过，回执上明写「这趟没开回看」。开关打开而裁决/帧通道缺一半时是 ``undetermined``
 **并阻断出片**（Q113 原文：绝不静默放行，也不许降级成「就当没这步」）。
 
-**依赖如实写：T31（⑲-b 的盲测通道）未落地时，本模块只能走到 ``undetermined``。**
-帧通道（把 `frame.png` 变成一次可裁决的输入）是 T31 的交付件；本模块**明写它的调用形状并
-探测它**，但不自己起一个 judge 客户端——那正是主合同反复点的清单漂移（Q90/Q91）。
+**依赖如实写：帧通道不在时，本模块只能走到 ``undetermined``。**
+帧通道（把 `frame.png` 变成一次可裁决的输入）由 ``judge_channel`` 交付；本模块**明写它的
+调用形状并探测它**，但不自己起一个 judge 客户端——那正是主合同反复点的清单漂移（Q90/Q91）。
+2026-10-17 起那两半都落地了：``judge_frame``（改代码）与 ``judge_identity``（⑲-b 的身份
+裁决）在同一个模块里，探测各问各的名字（``FRAME_CHANNEL_ENTRY`` / ``IDENTITY_ENTRY``）。
 """
 
 from __future__ import annotations
@@ -54,8 +61,11 @@ GATE = "26"
 #: 不许「看过了就算过」——那会把这条环变成一张免责单。
 MAX_ROUNDS = 2
 
-#: 整片开关的名字。进 `spec`、可从计划卡顶层入参覆盖（与 `texture`/`transition` 同一套
-#: `overlay_knobs` 机制）。为什么**默认关**：这一档每镜一次带帧的多模态调用，是这条链上最贵
+#: 整片开关的名字。进 `spec` 并且**活着穿过校验**（`code_spec.SWITCH_KNOBS`，2026-10-17：
+#: 在这之前 `validate_code_spec` 会把这一栏静默删掉，于是「谁写的都不生效」）；开它的写法
+#: 是写进 ``args["spec"]``，与自由色 `highlight_color` 同一条路。**计划卡上没有它的位置**：
+#: 卡面那排 radio 回答「片子长什么样」，这一档回答「愿不愿意按镜付钱」。
+#: 为什么**默认关**：这一档每镜一次带帧的多模态调用，是这条链上最贵
 #: 的调用；它救的是「已经红了」的镜，而「红镜本来就出不了片」这一点没变——开关关着只是少一条
 #: 自动修复的路，不会让问题片子溜出去。反过来默认开会**替所有人花掉这笔钱**，而本仓的规矩是
 #: 「花钱的能力必须能被人关掉」（BGM/质感/转场的先例），不是「必须默认省钱」。
@@ -75,7 +85,27 @@ FRAME_CHANNEL_ENTRY = "judge_frame"
 #: ⑲-b 的词族栏名（T31 往 schema 里加的镜级栏）。**今天它不在 schema 里**
 #: （见主合同 §9-Q106④ 与 T36 的落地记录），所以这一栏只能来自镜级申报；缺了就是缺了，
 #: 不允许在这里编一份词族替模型填。
+#:
+#: 2026-10-17：⑲-b **落地了，但没有用它**。它落的是**盲描述**那条路
+#: （``judge_channel.judge_identity``：先只问「你看见了什么」，再拿申报的 ``subject``
+#: 去比）——那条路一个词族也不需要，而「别写 `subject_terms`」这句话在技能正文与
+#: 回执措辞里都还挂着。所以这一栏**保持不在 schema 里**，`ask_frame` 仍照它取镜级申报。
 SUBJECT_TERMS_FIELD = "subject_terms"
+
+#: ⑲-b 的整片开关（2026-10-17）。读法与 :data:`REVIEW_KNOB` 完全一致（``spec`` 里那一栏，
+#: 同样在 `code_spec.SWITCH_KNOBS` 里活着穿过校验），**默认关**，
+#: 而且是**两层开关里的里面那层**：整片开关 ``review`` 没开时这一条压根不跑
+#: （回看环本身没开，算出来的红镜无从处置，那些钱等于白花）。
+#:
+#: 为什么单独立一个而不是并进 ``review``：并进去会让「打开回看」这件事偷偷把开销从
+#: 「每红镜一次」抬到「每镜一次」——一条 20 镜片子里红镜通常三五条。**改一个已有开关的
+#: 价钱，比多一个开关危险得多**：用户按旧印象按下那一枚，账却是新的。
+#: 每镜一次带图调用的能力在本仓一律有自己的开关（BGM / 质感 / 静帧评审都是先例）。
+IDENTITY_KNOB = "identity"
+
+#: ⑲-b 的入口名（与 ``judge_channel.IDENTITY_ENTRY`` 逐字相等，``test_motion_judge_channel.py``
+#: 按此断言）。名字写在这里而不是散在调用点：探测与调用必须问同一个名字。
+IDENTITY_ENTRY = "judge_identity"
 
 
 class ReviewBlocked(Exception):
@@ -279,6 +309,12 @@ def collect_targets(shots: Sequence[Mapping[str, Any]], *,
         bump(sid, "19a", list(e) + list(u))
         e, _w, u = cspec.check_badge_composition([s], scanned=rows_map)
         bump(sid, "25", list(e) + list(u))
+        # ⑧ 字压图（2026-10-16 新增的那一类命中）：这一镜的字幕压在画出来的图形上。
+        # 归到回看环是因为它的改法是**局部**的（把这块字挪开 / 给它一条衬底），
+        # 正是回看环这套「只重烧这一镜」的机器擅长的活；而它读的是同一条版面回读，
+        # 与 ⑲-a 共用 `rows_map`，不需要任何新的数据通路。
+        e, _w, u = cspec.check_text_over_subject([s], scanned=rows_map)
+        bump(sid, "8t", list(e) + list(u))
         # ㉑：判据要的两个输入都在账里（缓存命中也带着它们，见 META_FIELDS 那条注释）。
         row = led.get(sid) or {}
         events = ((row.get("motion") or {}).get("events") or []) \
@@ -346,13 +382,19 @@ def receipt(*, enabled: bool, cap: Mapping[str, Any], targets: Sequence[Target],
             after: Mapping[str, Mapping[str, Any]],
             all_sids: Sequence[str],
             rounds: Sequence[Round] = (),
-            self_check: Mapping[str, Any] | None = None) -> dict[str, Any]:
+            self_check: Mapping[str, Any] | None = None,
+            identity: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """㉖ 的回执：三出口逐个写明理由，**缺席单独列一栏**。
 
     为什么把「缺席」也显式列出来：三出口那张表容易读成「没有 reviewed 的就是 not_run」，
     而过了所有闸的镜**根本不在射程里**。列出来之后，「这一镜为什么没有那一栏」在回执上
     有唯一答案：它在缺席名单里，还是在三出口里——两句话不能混。
+
+    ``identity`` 是 ⑲-b 那一栏（画面上那个东西是不是文案说的那个）。它**另起一格**而不是
+    并进 ``shots``：那一格讲的是「这一镜改没改、重烧没重烧」，⑲-b 讲的是「画得像不像」，
+    两件事各有各的证据面（缓存键 vs 盲描述）。混成一格后，「改过了」会被读成「现在像了」。
     """
+    ident = dict(identity) if isinstance(identity, Mapping) else None
     tids = {t.sid for t in targets}
     shots: dict[str, Any] = {}
     for t in targets:
@@ -377,6 +419,8 @@ def receipt(*, enabled: bool, cap: Mapping[str, Any], targets: Sequence[Target],
         "enabled": bool(enabled),
         "judge": dict(cap),
         "self_check": dict(self_check) if self_check else None,
+        # ⑲-b 那一栏。「没开」在它自己的 `why` 里明写，这里不替它翻译。
+        "identity": ident,
         "rounds_max": MAX_ROUNDS,
         "rounds": [{"index": r.index, "asked": list(r.asked),
                     "changed": list(r.changed), "reburned": list(r.reburned),
@@ -456,12 +500,124 @@ async def cached_frame(cache: Any, key: str, dst: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# ⑲-b：画面上那个东西是文案说的那个吗（逐镜一次带图调用，单独开关）
+# ---------------------------------------------------------------------------
+
+async def _ask_identity(mod: Any, *, sid: str, frame: Any,
+                        shot: Mapping[str, Any]) -> dict[str, Any]:
+    """一次 ⑲-b 调用 → 同 ``judge_identity`` 的形状，另加 ``ok``。
+
+    调用形状是契约（与 ``ask_frame`` 同规）：``shot`` 里有 ``subject`` 与 ``text``，
+    那两样就是这一条要的全部输入。**不传词族**——盲描述那条路不需要它
+    （见 :data:`SUBJECT_TERMS_FIELD` 那段注释）。
+    """
+    fn = getattr(mod, IDENTITY_ENTRY)
+    try:
+        got = await fn(shot=dict(shot), image=frame)
+    except Exception as exc:      # noqa: BLE001 —— 一次调用炸了不该带塌整条片子
+        return {"ok": False, "verdict": None, "reason": "", "subject": "", "by": "",
+                "blind": None, "confidence": 0.0,
+                "why": f"⑲-b 调用失败（{type(exc).__name__}: {str(exc)[:200]}）"}
+    if not isinstance(got, Mapping):
+        return {"ok": False, "verdict": None, "reason": "", "subject": "", "by": "",
+                "blind": None, "confidence": 0.0,
+                "why": f"⑲-b 返回的不是一条裁决（{type(got).__name__}）"}
+    blind = got.get("blind")
+    return {"ok": True, "verdict": got.get("verdict"),
+            "reason": str(got.get("reason") or ""),
+            "subject": str(got.get("subject") or ""),
+            "by": str(got.get("by") or ""),
+            "blind": dict(blind) if isinstance(blind, Mapping) else None,
+            "confidence": float(got.get("confidence") or 0.0),
+            "why": str(got.get("why") or "")}
+
+
+async def identity_targets(shots: Sequence[Mapping[str, Any]], *, enabled: bool = False,
+                           cache: Any = None, keys: Mapping[str, Any] | None = None,
+                           work: Any = None,
+                           ask: Callable[..., Awaitable[dict[str, Any]]] | None = None
+                           ) -> dict[str, Any]:
+    """⑲-b 逐镜身份裁决 → ``{"knob", "enabled", "why", "shots", "targets", "counts"}``。
+
+    它补的是 ``collect_targets`` **进不去**的那一格：几何闸只看「有没有、多大、压没压住」，
+    没有一条判据问得出「画面上那个东西是不是文案说的那个」。所以它是**第二个红源**，
+    它的红镜与几何闸的红镜合到同一份 ``targets`` 里、走同一个回看环
+    （不许为它另开一条修复的路——那正是 Q115 点名的清单漂移）。
+
+    **开关关着就一声不响**：``enabled=False`` 时一条调用都不发，``why`` 里明写
+    「这趟没开」，``counts.not_run`` 记满——「没开」不是「缺席」（缺席＝压根不需要），
+    更不是「像」。回执上这三句话必须分得开（P5 / D-未判不绿）。
+
+    **未判不进红镜名单**：几何闸的未判进名单是因为「没量到版面」值得看一眼；⑲-b 的未判
+    是「这一趟没问出结论」，拿它当红镜会让模型在**没有任何理由**的情况下改代码，
+    那正是回看环最贵的浪费。所以未判只落回执那一栏，如实写着「没量到」。
+    """
+    out: dict[str, Any] = {"knob": IDENTITY_KNOB, "enabled": bool(enabled), "why": "",
+                           "shots": {}, "counts": {"unlike": 0, "like": 0,
+                                                   "undetermined": 0, "not_run": 0}}
+    targets: list[Target] = []
+    if not shots:
+        return {**out, "targets": targets}
+    if not enabled:
+        out["why"] = (f"⑲-b 这趟没开（`{IDENTITY_KNOB}` 没开，或整片开关 `{REVIEW_KNOB}` "
+                      "没开）——这一栏对每一镜都**没有结论**，不许读成「画得像」")
+        out["counts"]["not_run"] = len(shots)
+        return {**out, "targets": targets}
+    mod, why = frame_channel()
+    if mod is None or not callable(getattr(mod, IDENTITY_ENTRY, None)):
+        out["why"] = (why or f"帧通道 `{FRAME_CHANNEL_MODULE}` 没有 ⑲-b 入口 "
+                             f"`{IDENTITY_ENTRY}`——「画面上那个东西是不是它」这句话今天"
+                             "没人问过")
+        for i, s in enumerate(shots):
+            out["shots"][cp.shot_id(s, i)] = {"verdict": None, "why": out["why"]}
+            out["counts"]["undetermined"] += 1
+        return {**out, "targets": targets}
+    for i, s in enumerate(shots):
+        sid = cp.shot_id(s, i)
+        subject = str(s.get("subject") or "").strip()
+        if not subject:
+            out["shots"][sid] = {
+                "verdict": None, "subject": "",
+                "why": "这一镜没申报 `subject`——⑲-b 无从比「像不像」（闸⑯ 会拦这一格）"}
+            out["counts"]["undetermined"] += 1
+            continue
+        # 帧从**缓存**里取（与回看环同一处取法）：这一镜这一版的 `clip.mp4` 与
+        # `frame.png` 是同一次切片一起存进去的，取帧不会多烧一帧。
+        key = str((keys or {}).get(sid) or "")
+        dst = (work / "identity" / sid) if work is not None else None
+        frame = await cached_frame(cache, key, dst)
+        if frame is None:
+            out["shots"][sid] = {
+                "verdict": None, "subject": subject,
+                "why": ("这一镜的 `frame.png` 没取到（缓存里没有这一版，或这趟没挂缓存）"
+                        "——身份没量过，记未判（**不**回落到「只看代码就说像」）")}
+            out["counts"]["undetermined"] += 1
+            continue
+        got = await (ask or _ask_identity)(mod, sid=sid, frame=frame, shot=s)
+        out["shots"][sid] = {"verdict": got.get("verdict"), "subject": subject,
+                             "reason": got.get("reason"), "by": got.get("by"),
+                             "blind": got.get("blind"),
+                             "confidence": got.get("confidence"), "why": got.get("why")}
+        if got.get("verdict") is True:
+            out["counts"]["unlike"] += 1
+            targets.append(Target(sid=sid, gates=("19b",), reasons=(
+                f"闸⑲-b 画得像不像：{sid}：" + (got.get("reason")
+                 or f"画面上那个东西不是文案说的「{subject}」"),)))
+        elif got.get("verdict") is False:
+            out["counts"]["like"] += 1
+        else:
+            out["counts"]["undetermined"] += 1
+    return {**out, "targets": targets}
+
+
+# ---------------------------------------------------------------------------
 # 编排
 # ---------------------------------------------------------------------------
 
 async def run(*, spec: dict[str, Any], first: Mapping[str, Any],
               render_fn: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
               cache: Any = None, work: Any = None, enabled: bool = False,
+              identity: bool | None = None,
               fps: int | None = None, apply_patch: bool = True,
               ask: Callable[..., Awaitable[dict[str, Any]]] | None = None
               ) -> dict[str, Any]:
@@ -477,9 +633,14 @@ async def run(*, spec: dict[str, Any], first: Mapping[str, Any],
     ② 改动走 `code_patch` 那条腿（不许直接写 `spec["shots"][i]["code"]`）；
     ③ 只有**别的镜**被重烧时**阻断**（T56-②：「局部改只重烧受影响镜」不许被这条环弄回去）；
     ④ 裁决/帧通道缺一半时**阻断且出可读回执**（Q113），不许静默放行、不许降级成「就当没这步」。
+
+    ``identity`` 是 ⑲-b 那一层开关（2026-10-17）：``None`` = 看 ``spec["identity"]``，
+    显式 True/False 压过它；**而且 `enabled` 为假时它一律为假**（外层的 `review` 关着，
+    就不存在「红镜能被处置」这件事）。回执 ``["identity"]["enabled"]`` 如实记最终取值。
     """
     fps = int(fps or spec.get("fps") or 30)
     shots_spec = list(spec.get("shots") or [])
+    identity_on = bool(spec.get(IDENTITY_KNOB)) if identity is None else bool(identity)
     all_sids = [cp.shot_id(s, i) for i, s in enumerate(shots_spec)]
     rows: dict[str, Mapping[str, Any]] = {}
     for i, s in enumerate(shots_spec):
@@ -493,6 +654,21 @@ async def run(*, spec: dict[str, Any], first: Mapping[str, Any],
     cap = await capability()
     self_check = (await self_test()) if cap["available"] else {
         "ok": None, "why": cap["why"], "detail": None}
+    # ⑲-b：第二个红源。它必须在 `if not targets` 那条早退**之前**跑——一镜的几何闸全绿、
+    # 画的那个东西却根本不是文案说的那个，正是这一条要抓的形状。开关是两层的：
+    # 整片开关没开时这一条压根不发调用（算出来的红镜也无从处置，那笔钱等于白花）。
+    ident: dict[str, Any] = await identity_targets(
+        shots_spec, enabled=bool(enabled and identity_on), cache=cache,
+        keys={sid: (orig_before.get(sid) or {}).get("cache_key") for sid in all_sids},
+        work=work)
+    if ident["targets"]:
+        merged = {t.sid: t for t in targets}
+        for t in ident["targets"]:
+            prev = merged.get(t.sid)
+            merged[t.sid] = (t if prev is None else
+                             Target(sid=t.sid, reasons=prev.reasons + t.reasons,
+                                    gates=tuple(sorted(set(prev.gates) | set(t.gates)))))
+        targets = [merged[sid] for sid in all_sids if sid in merged]
     outcomes: dict[str, dict[str, Any]] = {}
     rounds: list[Round] = []
 
@@ -501,7 +677,7 @@ async def run(*, spec: dict[str, Any], first: Mapping[str, Any],
                spec_out: dict[str, Any] | None = None) -> dict[str, Any]:
         r = receipt(enabled=enabled, cap=cap, targets=targets, outcomes=outcomes,
                     before=orig_before, after=versions(ret or first), all_sids=all_sids,
-                    rounds=rounds, self_check=self_check)
+                    rounds=rounds, self_check=self_check, identity=ident)
         if extra:
             r.update(dict(extra))
         return {"receipt": r, "spec": spec_out if spec_out is not None else spec,
@@ -511,7 +687,10 @@ async def run(*, spec: dict[str, Any], first: Mapping[str, Any],
 
     if not targets:
         # 没有红/未判的镜：这一条**不进射程**，回执里那一栏对每一镜都缺席。
-        return finish({"absent_reason": "本轮没有 ⑲-a/⑳(c)/㉕/㉑ 报红或未判的镜"})
+        return finish({"absent_reason": ("本轮没有 ⑲-a/⑳(c)/㉕/㉑ 报红或未判的镜"
+                                         + ("，⑲-b 也没判出不像的镜"
+                                            if ident["enabled"] else
+                                            "（⑲-b 这趟没开，它那一栏没有结论）"))})
 
     if not enabled:
         # 开关没开：三出口里的 `not_run`——明写「这趟没开回看」。**不是**缺席
@@ -650,11 +829,47 @@ async def run(*, spec: dict[str, Any], first: Mapping[str, Any],
     # 覆盖成「上一轮之后」的样子，两轮下来首尾变成同一次读数，「缓存键变过没有」这件事在
     # 账上就消失了——而它正是 `reviewed` 与 `not_run` 的唯一分界。
     after = versions(result)
+    # ⑲-b 复判：**改过的那几镜要再问一次**。没有这一步，一条 ⑲-b 红镜改完之后，回执上
+    # 能说的只有「几何闸过了」——可那句话是关于尺寸与落位的，不是关于「像」的。
+    # 拿它当 ⑲-b 的结论，就是一次「没量过写成量过」（D-未判不绿）。只复判**重烧过**的镜：
+    # 没重烧的镜画面没变，再问一次只会得到一个一模一样的答案。
+    ident_red = [t.sid for t in ident["targets"]]
+    if ident_red:
+        changed = [sid for sid in ident_red
+                   if bool((after.get(sid) or {}).get("cache_key"))
+                   and (after.get(sid) or {}).get("cache_key")
+                       != (orig_before.get(sid) or {}).get("cache_key")
+                   and not (after.get(sid) or {}).get("cached")]
+        again = await identity_targets(
+            [s for i, s in enumerate(shots_now) if cp.shot_id(s, i) in set(changed)],
+            enabled=bool(changed), cache=cache,
+            keys={sid: (after.get(sid) or {}).get("cache_key") for sid in all_sids},
+            work=work) if changed else {"shots": {}, "counts": None}
+        for sid, got in dict(again.get("shots") or {}).items():
+            slot = ident["shots"].get(sid)
+            if isinstance(slot, dict):
+                slot["after"] = {"verdict": got.get("verdict"),
+                                 "reason": got.get("reason"), "by": got.get("by"),
+                                 "why": got.get("why")}
+        for sid in ident_red:
+            slot = ident["shots"].get(sid)
+            if isinstance(slot, dict) and sid not in changed:
+                slot["after"] = None
+        ident["recheck"] = {"asked": changed, "counts": again.get("counts"),
+                            "not_asked": [sid for sid in ident_red if sid not in changed],
+                            "why": ("没被重烧的红镜不复发问：画面没变，再问一次只会得到"
+                                    "同一个答案。「改过了」与「现在像了」是两句话，"
+                                    "这一栏只在前者成立时才敢说后者。")}
     for sid in tids:
         b, a = orig_before.get(sid) or {}, after.get(sid) or {}
         reburned = bool(a) and a.get("cache_key") != b.get("cache_key") \
             and not a.get("cached")
-        still = sid in live
+        # ⑲-b 没复判出「像」的镜**不许被写成过了**：False 才清，True/None 都留在红里
+        # （未判不绿——「没问出来」与「问出来是」是两句话）。
+        after_v = ((ident["shots"].get(sid) or {}).get("after") or {}).get("verdict")
+        still = (sid in live) or (sid in set(ident_red) and after_v is not False)
+        why_ident = "" if sid not in set(ident_red) else (
+            "；⑲-b 改后复判：" + {True: "仍不像", False: "已像"}.get(after_v, "未判（不许当像）"))
         if reburned:
             outcomes[sid] = {
                 "status": "reviewed",
@@ -663,6 +878,7 @@ async def run(*, spec: dict[str, Any], first: Mapping[str, Any],
                 "why": (f"改过代码并**只**重烧了这一镜：缓存键 {str(b.get('cache_key'))[:12]}…"
                         f" → {str(a.get('cache_key'))[:12]}…，切片 "
                         f"{b.get('clip_bytes')} → {a.get('clip_bytes')} 字节"
+                        + why_ident
                         + ("；回闸仍红，按主合同打回该镜（不许「看过了就算过」）" if still
                            else "；回闸已过")),
             }
@@ -672,7 +888,8 @@ async def run(*, spec: dict[str, Any], first: Mapping[str, Any],
                 "still_red": True,
                 "why": ("回看跑了，但这一镜账上**没有第二次切片**"
                         f"（缓存键仍是 {str(b.get('cache_key'))[:12]}…、"
-                        f"或第二次仍是命中缓存）——「回看过」这句话没有产物撑着，记 not_run"),
+                        f"或第二次仍是命中缓存）——「回看过」这句话没有产物撑着，记 not_run"
+                        + why_ident),
             }
     return finish(result, spec_out=current)
 

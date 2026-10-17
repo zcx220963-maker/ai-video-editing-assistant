@@ -96,7 +96,7 @@ export const alpha = (hex: string, a: number) => `rgba(${rgbOf(hex)},${a})`;
 
 export const TYPE = { mega: 260, display: 180, h1: 120, h2: 84, h3: 60, body: 40, small: 32, label: 22 } as const;
 
-export const SERIF = '"Iowan Old Style", "Palatino Linotype", Palatino, "Songti SC", Georgia, serif';
+export const SERIF = '"Noto Serif CJK SC", serif';
 
 // 一行写出标题样式：字号 + 字重 + 按字号的字距 + 行高
 export const type = (size: number, weight = 650, opts: { caps?: boolean; serif?: boolean; mono?: boolean } = {}): React.CSSProperties => ({

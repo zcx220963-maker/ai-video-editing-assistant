@@ -317,6 +317,58 @@ class MCPError(RuntimeError):
     pass
 
 
+class MCPSessionGone(MCPError):
+    """服务端说「你这个 mcp-session-id 已经不存在了」——**不是这次调用本身有问题**。
+
+    单独立一个类，是因为它与「服务端回绝了这次请求」在处置上完全相反：
+
+        回绝（参数不对/工具禁用）      → 如实上报，重发一百次也是同样的回绝
+        会话没了（服务端重启过）        → **重建会话重发一次**，多半就通过了
+
+    真机代价（2026-10-16，run 9272c7f59501）：那轮修复里编辑器容器被重建了两次，
+    正在跑的会话随之失效，模型随后拿到的每个调用都是
+    `调用 check_shot_code 被服务端回绝：code=32600 message='Session terminated'`
+    ——试了两次 `check_shot_code`、再试一次 `plan_motion`，全部同一个错，整条创作链
+    就此停死。而 32600 的语义**恰恰**是「请重新 initialize」：SDK 的 streamable-http
+    客户端在收到 HTTP 404 时发的就是这个（`mcp/client/streamable_http.py` 的
+    `_send_session_terminated_error`）。上一版把它按普通回绝上报（见 `_SDKTransport`），
+    于是**只有重启 app 才能把这条链救回来**——前端刷新、等多久都没用，因为死的是
+    app↔editor 那条会话，不是前端的连接。
+    """
+
+
+#: 「会话已被终止」在协议里的码。MCP 的 streamable-http 服务端在 session id 认不出来时
+#: 回 HTTP 404，SDK 把它翻成这个码。
+_SESSION_GONE_CODE = 32600
+
+
+def _is_session_gone(exc: BaseException) -> bool:
+    """这个 ``McpError`` 是不是「会话已被终止」。
+
+    认码为主、认措辞为辅：码是协议里写死的，措辞会随 SDK 版本改。两条都留着是因为
+    这一条判错的方向是不对称的——错认成「会话没了」只是多重连一次（幂等，代价一次握手），
+    错认成「普通回绝」则是整条链停死到重启为止。
+    """
+    err = getattr(exc, "error", None)
+    if err is None:
+        return False
+    if getattr(err, "code", None) == _SESSION_GONE_CODE:
+        return True
+    return "session terminated" in str(getattr(err, "message", "") or "").lower()
+
+
+def _refused(exc: McpError, what: str) -> MCPError:
+    """服务端的 JSON-RPC 回绝 → 本仓异常，措辞与改动前逐字一致（调用方与用例都按它读）。
+
+    唯一的商量之处：会话没了走 :class:`MCPSessionGone`，让 ``MCPClient`` 认得出该重连。
+    """
+    if _is_session_gone(exc):
+        return MCPSessionGone(
+            f"{what}：{exc.error}——这是**会话 id 失效**（服务端重启过），不是这次调用"
+            f"本身有问题：重建会话后重发一次。")
+    return MCPError(f"{what}：{exc.error}")
+
+
 def _is_timeout(exc: BaseException) -> bool:
     """这个异常是不是「等超时了」而不是「连接断了」。
 
@@ -500,7 +552,7 @@ class _SDKTransport:
         try:
             result = await asyncio.wait_for(session.list_tools(), timeout=timeout)
         except McpError as exc:
-            raise MCPError(f"{self.label} 列工具被服务端回绝：{exc.error}") from exc
+            raise _refused(exc, f"{self.label} 列工具被服务端回绝") from exc
         return [_tool_def(t) for t in result.tools]
 
     async def call_tool(self, name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
@@ -511,7 +563,10 @@ class _SDKTransport:
         except McpError as exc:
             # 服务端以 JSON-RPC error 明确回绝（不是工具自己报的 isError）→ 如实上报，
             # 别当断线去重连重发。``McpError`` 是 SDK 的协议级异常类型。
-            raise MCPError(f"调用 {name} 被服务端回绝：{exc.error}") from exc
+            # **例外**：`Session terminated` 也是「协议级 error」，但它的语义是
+            # 「会话 id 失效、请重新 initialize」，处置与回绝正相反——`_refused`
+            # 把它分成 `MCPSessionGone`，交由 `MCPClient` 重连重发一次。
+            raise _refused(exc, f"调用 {name} 被服务端回绝") from exc
         # 超时（TimeoutError）与其它异常**原样放行**：MCPClient 靠这个区别决定
         # 「重连重试一次」还是「如实上报」。在这里提前翻译会把那个区别抹掉。
         return _result_dict(result)
@@ -598,9 +653,12 @@ class MCPClient:
     """对一个 MCP Server 的轻量客户端，只依赖注入的 transport。
 
     T44 之后这一层**更薄**了：握手、会话头、SSE 解析都沉到了 transport 底下的官方客户端。
-    留在这儿的只剩两条**本仓的业务语义**，它们与用哪个库无关：
+    留在这儿的只剩三条**本仓的业务语义**，它们与用哪个库无关：
       1. **超时不重发**（``_is_timeout``）——见 ``call_tool`` 里的长注释；
-      2. 只有真·断线才重建会话重试一次。
+      2. 真·断线重建会话重试一次；
+      3. **会话被服务端终止也重建重试一次**（``MCPSessionGone``）——它长得像「回绝」
+         但语义是「重新 initialize」。少了这条，编辑器一重启整条创作链就停死到
+         app 重启为止（真机 run 9272c7f59501）。
     """
 
     def __init__(self, server: str, transport: MCPTransport) -> None:
@@ -617,11 +675,35 @@ class MCPClient:
 
     async def list_tools(self, timeout: float = CONNECT_TIMEOUT) -> list[dict[str, Any]]:
         await self.initialize(timeout)
-        return await self._transport.list_tools(timeout)
+        try:
+            return await self._transport.list_tools(timeout)
+        except MCPSessionGone:
+            # 与 call_tool 同一条：会话没了就重建一次再问。注册表刷新那条路
+            # （`register_mcp_tools` 的动态重连）也走这儿，不修就等于「服务端重启之后
+            # 工具表永远刷不回来」。
+            await self._reopen(timeout)
+            return await self._transport.list_tools(timeout)
+
+    async def _reopen(self, timeout: float) -> None:
+        """丢掉死会话、重建一条。`_initialized` 必须一起清——不清的话下面的
+        `initialize()` 会因为「已经初始化过」直接返回，重建就白做了。"""
+        await self._transport.reset()
+        self._initialized = False
+        await self.initialize(timeout)
 
     async def call_tool(self, name: str, arguments: dict[str, Any], timeout: float) -> Any:
         await self.initialize(timeout)
         try:
+            return await self._transport.call_tool(name, arguments, timeout)
+        except MCPSessionGone:
+            # **会话被终止 ≠ 这次调用错了。** 服务端重启过（编辑器容器被重建、
+            # 空闲回收）时，SDK 回 HTTP 404 + `Session terminated`，语义就是
+            # 「请重新 initialize」——重建会话后原样重发一次，与真·断线那一路合流。
+            #
+            # 与下面「超时不重发」那条不冲突：超时时服务端**还在算**，重发等于让它整段
+            # 重跑；会话没了时服务端**根本没收到**这次调用，重发是把它送到。
+            # 真机代价见 `MCPSessionGone` 的类注释（run 9272c7f59501）。
+            await self._reopen(timeout)
             return await self._transport.call_tool(name, arguments, timeout)
         except MCPError:
             raise
@@ -701,10 +783,11 @@ def compose_description(body: str, tail: str = "") -> tuple[str, bool]:
     """排一份描述并截到 ``DESC_MAX_BYTES``，返回 ``(文本, 是否截过)``。
 
     优先丢正文的**尾部**，两样东西必须留下：
-    1. ``tail``（「必须先显式调用谁」）——少一句就是一次白跑的调用；
+    1. ``tail``（「哪个前置的选择权还在你手里」）——少一句就是几处创作决策由默认值
+       悄悄定下来，模型自己都不知道；
     2. ``_DESC_POINTER``——被截掉的那半句去哪了，只有这里说得出来。
     指针一行自己都放不下时（正文长到 600 B 装不下任何东西）先丢指针、只保 ``tail``：
-    宁可少一句「去哪找」，也不能少一句「必须先调谁」。
+    宁可少一句「去哪找」，也不能少一句「哪几步没自己定」。
     """
     if _bytes(body) + _bytes(tail) <= DESC_MAX_BYTES:
         return body + tail, False
@@ -743,8 +826,8 @@ class MCPTool(Tool):
         self._schema = tool_def.get("inputSchema") or {"type": "object", "properties": {}}
         self._timeout = timeout
         self._contract = contract
-        # 契约里 require_explicit_call 的节点名 → 它**不允许被自动补齐**的下游集合。
-        # 用来在工具说明里提前写清「哪些前置必须你自己显式调用」——见 description 的说明。
+        # 契约里 require_explicit_call 的节点名 → 它下游那些「会被按默认参数补齐」的节点。
+        # 用来在工具说明里提前写清「哪些前置的选择权还在你手里」——见 description 的说明。
         self._explicit_deps = explicit_deps or {}
         annotations = tool_def.get("annotations") or {}
         self._read_only = bool(annotations.get("readOnlyHint", False))
@@ -769,21 +852,25 @@ class MCPTool(Tool):
 
     @property
     def _desc_tail(self) -> str:
-        """截不动的那一段——「必须先显式调用谁」。
+        """截不动的那一段——「哪个前置的选择权还没定」。
 
-        为什么它比正文末尾那句话更该留下：这几个前置**不会被服务端自动补齐**，
-        模型不知道就会先撞一次错、再回头补（真机实测白烧一轮）。正文末尾多半是
-        渲染耗时这类提醒，少一句不致命；这条少一句就是一次白跑的调用。
+        为什么它比正文末尾那句话更该留下：这几个前置**会被服务端按默认参数补齐**
+        （拦截器递归补依赖，照文档），模型不知道有这回事，就可能整片拿到一份参数
+        从来没人挑过的成片，却以为自己什么都定了。正文末尾多半是渲染耗时这类提醒，
+        少一句不致命；这条少一句就是几处创意决策由默认值说了算。
+
+        口径**不是**「必须显式调用」：那几步不写进计划卡不是错误，只是写法之一。
         """
         blocking = self._explicit_deps.get(self._raw_name) or ()
         if not blocking:
             return ""
-        return (f"[必须显式调用] 这些前置节点不会被自动补齐，请在你真正调用本节点之前"
-                f"先逐个调用它们（并传入创意决策参数）：{'、'.join(blocking)}。")
+        return (f"[可以自己定的前置] 这些前置不写进你的流程也会被自动补齐，但会**用默认"
+                f"参数**跑——想自己挑（它们正是创意决策所在），就在调本节点之前先逐个"
+                f"调用它们：{'、'.join(blocking)}。")
 
     @property
     def description(self) -> str:
-        """工具说明（**已按 ``DESC_MAX_BYTES`` 截过**）；剪辑节点额外附一行「必须先显式调用谁」。
+        """工具说明（**已按 ``DESC_MAX_BYTES`` 截过**）；剪辑节点额外附一行「可以自己定的前置」。
 
         为什么非截不可：执行轮整批 schema 真机实测 54,140 B，其中最长四份描述合计
         6.1 KB，而它们说的每一句在各自技能正文里都有更完整的一份——描述是**另一次**
@@ -903,14 +990,15 @@ async def register_mcp_tools(
 
 
 def _explicit_deps_map(contract: EditingContract | None) -> dict[str, list[str]]:
-    """节点 → 「它依赖的、且不允许被自动补齐」的那些前置节点名。
+    """节点 → 「它依赖的、且选择权值得留给模型」的那些前置节点名。
 
     只用于把这件事写进工具说明（见 ``MCPTool.description``），不改变任何执行语义：
-    拦截器该拒绝还是拒绝，只是模型现在**提前**知道了。
+    拦截器该补齐还是补齐（照文档递归补依赖），只是模型现在**提前**知道了
+    ——哪几步不自己调就会按默认参数定下来。
 
     遍历每个节点的依赖闭包，因为 model 直接调的是下游（如 ``select_BGM``），
-    而挡住它的是再上一层（``generate_script`` → ``script_template_rec``）。
-    只写直接依赖会让模型仍然撞墙。
+    而它想让位的是再上一层（``generate_script`` → ``script_template_rec``）。
+    只写直接依赖会让模型以为「上一层没人管」。
     """
     if contract is None:
         return {}
@@ -930,7 +1018,7 @@ def _explicit_deps_map(contract: EditingContract | None) -> dict[str, list[str]]
             seen.add(dep)
             if dep in explicit:
                 found.append(dep)
-                continue                     # 它本身就要显式调用，不必再往下挖
+                continue                     # 它就是那个「决策该由模型给」的节点，不必再往下挖
             dc = nodes.get(dep)
             if dc is not None:
                 stack.extend(getattr(dc, "requires", ()) or ())

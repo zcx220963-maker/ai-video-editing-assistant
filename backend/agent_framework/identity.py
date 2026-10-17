@@ -24,12 +24,31 @@ class Identity:
 
     @property
     def session_id(self) -> str:
-        return f"{self.user_id}:{self.conversation_id}"
+        return session_key(self.user_id, self.conversation_id)
 
     @property
     def storyline_session(self) -> str:
         """剪辑服务端为这次会话建的 Store 作用域键（见 ``storyline_session_id``）。"""
         return storyline_session_id(self.user_id, self.conversation_id)
+
+
+def session_key(user_id: str, conversation_id: str) -> str:
+    """**Agent 侧**的会话键：``{user_id}:{conversation_id}``。全仓只此一处拼它。
+
+    这一个串是好几张表的键，也是好几层的路由依据：
+      · Agent 侧的表：``checkpoints`` / ``token_usage`` / 协作状态（任务板、子 Agent
+        登记按这个 scope 划）；
+      · MQ：``publish(topic, key=session_key(...))`` 的分区 key——同键必落同一分区，
+        「同会话有序、异会话并行」全靠它（mq.py / consumer.py）；
+      · Web 侧：按会话查产物、查快照、查未完成 run。
+
+    原先这个拼法散在四处（``Identity.session_id``、``Session.session_id``、
+    ``SessionManager`` 的缓存键、``consumer.session_key``），改一处漏一处时的表现是
+    「查不到产物 / 历史」而**没有任何报错**——同一类事故在剪辑侧的
+    ``storyline_session_id`` 上已经发生过一次，所以两副面孔现在各只有一个出处
+    （这一条 + ``storyline_session_id``；两副面孔的互换见 ``parse_session``）。
+    """
+    return f"{user_id}:{conversation_id}"
 
 
 def storyline_session_id(user_id: str, conversation_id: str) -> str:
@@ -58,9 +77,9 @@ def parse_session(sid: str) -> tuple[str, str]:
     """拆**任一**拼法回 (user_id, conversation_id)，拆不开回 ``("", "")``。
 
     库里同一个会话有两副面孔：Agent 侧（``checkpoints`` / ``token_usage``）用
-    ``Identity.session_id`` 的 ``{user}:{conv}``，剪辑侧（``artifacts`` /
-    ``render_jobs`` 与对象键）用 ``u:{user}:c:{conv}``。按会话回收必须两副都认得，
-    否则只会清掉一半账。
+    ``session_key`` 的 ``{user}:{conv}``，剪辑侧（``artifacts`` / ``render_jobs``
+    与对象键）用 ``storyline_session_id`` 的 ``u:{user}:c:{conv}``。按会话回收必须
+    两副都认得，否则只会清掉一半账。
     """
     user_id, conv_id = parse_storyline_session(sid)
     if user_id:
@@ -76,7 +95,7 @@ def session_forms(sid: str) -> list[str]:
     user_id, conv_id = parse_session(sid)
     if not user_id:
         return [sid]
-    return sorted({f"{user_id}:{conv_id}", storyline_session_id(user_id, conv_id)})
+    return sorted({session_key(user_id, conv_id), storyline_session_id(user_id, conv_id)})
 
 
 _current: ContextVar[Identity | None] = ContextVar("creation_assistant_identity",

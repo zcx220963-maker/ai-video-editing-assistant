@@ -48,19 +48,26 @@ COPY remotion/src/tokens.ts remotion/src/FilmLayout.tsx /app/remotion/src/
 # 闸⑪ 要把代码里的 `palettes["deep-ocean"].text` 解析成真实色号才能算对比度：没有这份
 # 色板，凡是从 palette 取色的镜只能记成「未判」，那一条就只剩字面十六进制颜色能判。
 COPY remotion/src/themes/palettes.json /app/remotion/src/themes/palettes.json
-# server.mjs 与 public/assets/ 也带一份（R1-T5/T4）：它们不参与后端运行，但
+# 「文字库」面板的字幕样张底稿：`code_spec.sample_shot_code()` 读它，渲预览图时
+# 当画面底稿（母版照旧画字幕条）。它不参与镜像里的打包，但确实是一份镜头代码——
+# 读不到时预览不出图（不报错、不影响出片），所以少 COPY 这一行的表现是「预览一直是空的」。
+COPY remotion/src/preview/caption-sample.tsx /app/remotion/src/preview/caption-sample.tsx
+# server.mjs 也带一份（R1-T5/T4）：它不参与后端运行，但
 # `tests/test_delivery_hygiene.py` 的「孤儿判据」要先认「这是一棵完整源码树」
 # （`src/FilmLayout.tsx` + `server.mjs` 两个哨兵）才肯判——只 COPY 一半，那几条
 # 会记成「未验证」。未验证在一处**合理**（本地没这棵树），但 sanctioned 环境
 # （就是本镜像）本该能判却判不了，于是「styles.json 还在不在」这类问题永远没人回答。
-# 两个文件加起来 56 KB，比一次人肉体检便宜。
-# `assetgate.mjs` 与 `imagecheck.mjs` 是 `server.mjs` 的 import：COPY 过来一份
-# server.mjs 而不带它们，镜像里就躺着一段**连 import 都过不了**的 server.mjs，
-# 而它正是「这是一棵完整源码树」的哨兵之一。tsconfig.json 带上是给 T9 的
-# `@dg/themes/*` → `src/themes/*` 那一条在 sanctioned 环境里判得动（纯文本比对）。
-COPY remotion/lint-rules.mjs remotion/package.json remotion/server.mjs \
-     remotion/assetgate.mjs remotion/imagecheck.mjs remotion/tsconfig.json /app/remotion/
-COPY remotion/public/assets/.gitkeep /app/remotion/public/assets/
+# 几十 KB，比一次人肉体检便宜。
+# `lint.mjs` 与 `motionsample.mjs` 是 `server.mjs` 的 import（`lint.mjs` 自己再
+# import `lint-rules.mjs`）：COPY 过来一份 server.mjs 而不带它们，镜像里就躺着
+# 一段**连 import 都过不了**的 server.mjs，而它正是「这是一棵完整源码树」的哨兵
+# 之一。tsconfig.json 带上是给 T9 的 `@dg/themes/*` → `src/themes/*` 那一条在
+# sanctioned 环境里判得动（纯文本比对）。
+# 2026-10-16：`assetgate.mjs` / `imagecheck.mjs` 随闸⑬ 与投递腿一起删了，
+# `public/assets/.gitkeep` 那一条 COPY 也删了（供图通道撤掉后 `public/` 里
+# 只剩随镜像发出去的 `fonts/`）。
+COPY remotion/lint-rules.mjs remotion/lint.mjs remotion/motionsample.mjs \
+     remotion/package.json remotion/server.mjs remotion/tsconfig.json /app/remotion/
 # 前端产物放进 REPO_ROOT/frontend/dist(run_server 的静态目录锚点在容器内=/frontend/dist)
 COPY --from=web /web/dist /frontend/dist
 

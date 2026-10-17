@@ -10,7 +10,7 @@
 
 这个文件负责的是**只有这一条链才有**的四件事：
 * **契约**：``code_spec``（一镜只剩 code/text/highlight/source/min_duration_sec + fields）
-  ——画面在代码里，版式与字幕带在母版里，所以没有「选一个内置版式」那一栏；
+  ——画面在代码里、整片底色与字幕那一档在 spec 顶层，所以没有「选一个内置版式」那一栏；
 * **出画面的执行层**：``code_render.render_code_motion``，一镜一次 HTTP 到渲染容器，
   闸①②③④⑤⑥ 在那一层落地（闸⑦ 不在这层——它是整片一层的判据，在 ``code_spec``
   的契约校验里就红了，一轮像素都不烧）；
@@ -18,7 +18,7 @@
   pointer 指向 ``/shots/i/fields/{name}/value``）——可改字段不是固定清单，
   数据来源是这一镜自己交出来的 ``fields``；
 * **证据**：闸③ 帧数、闸④ 两半（非底色占比 **与** 带内填充度）、闸⑤ token 逐键等、
-  闸⑥ 注入值与画面自报值逐字段等、闸⑦ 整片画法通道分布，机器量得到的都上账，
+  闸⑥ 注入值与画面自报值逐字段等、闸⑦ 逐镜用代码画了东西没有，机器量得到的都上账，
   并把「审美一致」这条如实标成闸⑤ 管不到的 UNVERIFIED。
 
 基类继承来的那几件（``_bgm_ref`` 的归属判定、``_spotcheck`` 的像素级证据、``_publish_frames``
@@ -40,7 +40,6 @@ from ..motion import code_patch as mcode
 from ..motion import code_render
 from ..motion import code_spec as cspec
 from ..motion import hitmap as mhit
-from ..motion import reveal_gate
 from ..motion import remotion_client as rc
 from .core_nodes import (SYNC_TOLERANCE_SEC, _JobProgress, _ev, _obj,
                          _resolve_target_duration)
@@ -80,7 +79,7 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                            "这里会就地补走一次**出处闸**）。每一镜都必须交一段真实代码——"
                            "这条链没有默认版式可退。"
                            "**别写每镜时长**：时钟归声音，min_duration_sec 只当下限。"
-                           "aspect/fps/narration/voice/rate/subtitle_mode/texture 也能走下面的"
+                           "aspect/fps/narration/voice/rate/caption_style/highlight_style/texture 也能走下面的"
                            "顶层开关，顶层的优先（用户在计划卡上勾的那一份）。"
                            "texture 是**整片默认档**，每一镜能用他自己的 texture 覆盖；"
                            "滤镜跑在切片之后的那一趟上、不在缓存键里，所以换档"
@@ -113,13 +112,11 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                 "render_motion_code：没有 spec 参数，Store 里也没有 plan_motion 产物——"
                 "先调 plan_motion 出代码分镜，或把 spec 直接传进来")
         # 顶层开关并进来再过一次校验——与 plan_motion 入库前调的是同一个 validate_code_spec：
-        # 越界的值不许走到烧像素。闸⑱（投递腿存在性）只有在这里才判：这个节点才持有
-        # 渲染客户端，「缺 stage_asset 口」这句话也只有在这里是真的。
+        # 越界的值不许走到烧像素。
         # 质检档：spec 没写就按产品缺省（MOTION_QC，缺省 preview——渲后像素闸只提醒）。
         raw, _contrast_notes = cspec.autofix_ink_contrast(cspec.expand_code_refs(raw))
         spec, errors = cspec.validate_code_spec(
-            cspec.overlay_knobs(cspec.with_default_qc(raw), inputs),
-            has_stage_leg="stage_asset" in self._client())
+            cspec.overlay_knobs(cspec.with_default_qc(raw), inputs))
         # 出处闸在代码链上的第二个调用点：闸的本体在 plan_motion（入库前），这里只兜住
         # 「没经过 plan_motion、直接塞 inline 代码分镜」那一路——判据仍是同一份 source_gate。
         await self._gate_inline(state, inputs, spec, errors)
@@ -367,25 +364,23 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                  if r.get("fill_span") is not None}
         tight = sorted(sid for sid, v in spans.items() if v < code_render.FILL_TARGET)
         tokened = [r for r in ledger if r.get("tokens")]
-        # 整片层三道闸（⑦ 配额 / ⑨ 跨镜同构 / ⑩ 文字对比度）都判在契约层
-        # （validate_code_spec，烧像素之前），到这里的这一份只报账：打回的那一路根本
-        # 走不完这次渲染，所以三道都取 [1]（提醒）而不是 [0]（错误）。三道的提醒合成
-        # 一份，和计划卡上看到的是同一串。
-        facts = cspec.style_facts(spec["shots"])
-        # 打回那一份走不到这里（validate_code_spec 已经拦了），取的是拦完之后给人看的
-        # 两栏：**提醒**与**未判**。两栏必须分家——T28 的全部意思就是这个（§0.5-P5）：
-        # 「这一档没人量过」一旦混进提醒，回执上的读法就成了「量过、没问题，顺口提一句」。
-        _, style_warns, style_unjudged = cspec.whole_film_gate_results(
-            spec["shots"], strict=spec.get("qc") == cspec.QC_STRICT)
+        # 整片判据（⑦ 每镜必画 / ⑨ 跨镜同构 / ⑩ 文字对比度 / ㉑ 动效锚…）从这一个出口取，
+        # **三个出口都出账**。并档前打回那一栏是空的（`validate_code_spec` 拦在前面，
+        # 走得到这里的片子本来就"没有打回项"）；现在拦的位置撤了（2026-10-16），
+        # 所以打回那一栏也会非空——它不再是"根本走不到渲染"的证据，而是
+        # 「模型交活时撞上了这几条、片子还是烧出来了，请你看着办」的账。
+        # 三栏必须分家——T28 的全部意思就是这个（§0.5-P5）：「这一档没人量过」一旦混进
+        # 提醒，回执上的读法就成了「量过、没问题，顺口提一句」。
+        facts = cspec.style_facts(spec["shots"], film=spec)
+        style_finds, style_warns, style_unjudged = cspec.whole_film_gate_results(
+            spec["shots"])
         ch_counts: dict[str, int] = {}
         for ch in facts["channels"].values():
             ch_counts[ch] = ch_counts.get(ch, 0) + 1
-        # 闸⑦ 的档位从 CHANNEL_QUOTA 现算，报告层不另写一份数字（两处各写一遍就会出现
-        # 「契约改了配额、回执还在报旧数」）；镜数不到最低档时 quota_want=0，意思是
-        # 「这一档不判」，账上照实这么说，不许显示成「已通过」。
-        quota_want = (max(k for limit, k in cspec.CHANNEL_QUOTA
-                          if len(spec["shots"]) >= limit)
-                      if len(spec["shots"]) >= cspec.MIN_SHOTS_FOR_QUOTA else 0)
+        # 闸⑦ 的账从 style_facts 里现取，报告层不另走一遍判据（两处各写一遍就会出现
+        # 「契约改了判法、回执还在报旧结论」）：`facts["text_only"]` 那一栏用的就是 ⑦ 的
+        # 谓词（`shot_drawn`），一个没画画的镜都没漏。
+        bare = facts["text_only"]
         # 闸⑥ 的三份汇总：摊平成 (镜号, 字段名, 结论)，好让「几个字段」与「几个镜的字段」
         # 这两种问法都能从同一份账上答出来（缓存镜的 field_checks 从 meta 还原，同一形状）
         checked = [(str(r.get("id")), name, check) for r in ledger
@@ -402,16 +397,9 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                           if (r.get("layout") or {}).get("status") == "scanned"]
         layout_missing = sorted(str(r.get("id")) for r in ledger
                                 if (r.get("layout") or {}).get("status") != "scanned")
-        # 闸⑬ 的整片账：逐件点名的措辞由 code_render.describe_assets 单源产出。
-        # 「未判」的镜必须单独点名——把「没判」混进「没问题」是这一族最坏的写法。
-        assets_ok = [r for r in ledger if (r.get("assets") or {}).get("status") == "ok"]
-        assets_undet = sorted(str(r.get("id")) for r in ledger
-                              if (r.get("assets") or {}).get("status") == "undetermined")
-        assets_warns = [w for r in ledger
-                        for w in code_render.describe_assets(str(r.get("id")), r.get("assets"))]
         # 闸⑭ 的整片账：措辞同样单源（code_render.describe_motion）。`ok` 的镜不占行，
         # 「没看出先后动」与「压根没判过」各一条且说法不同——未判单独点名，
-        # 理由与 layout_unscanned / assets_unjudged 同：两者在回执上必须是两句话。
+        # 理由与 layout_unscanned 同：两者在回执上必须是两句话。
         motion_shot = [r for r in ledger
                        if isinstance(r.get("motion"), dict)
                        and r["motion"].get("status") == "ok"]
@@ -444,26 +432,6 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             str(r.get("id")) for r in ledger
             if (r.get("motion_anchors") or {}).get("undetermined"))
         anchor_tol = max(1, int(out["fps"]) // cspec.MOTION_ANCHOR_TOLERANCE_DIV)
-        # 闸㉗ 的整片账（T61）：与 ㉑ 同规——这一道红了根本出不了片（渲染口就 raise 了），
-        # 报告层只**摊开**渲染层带回来的那串理由，不重算。
-        #
-        # 「申报了揭示」同样读 **spec 里那一栏**（`s.get("reveal")`），不读账里的
-        # `r["reveal"]`：后者每一镜都有（`META_FIELDS` 里那一栏），拿它当「申报」
-        # 会把「每一镜都申报了揭示」写进回执——而这条链上**绝大多数镜根本没有揭示**，
-        # ㉗ 对它们连不适用都算不上，只是没事。
-        reveal_declared = [str(s.get("id")) for s in spec["shots"] if s.get("reveal")]
-        reveal_undet = [u for r in ledger
-                        for u in ((r.get("reveal") or {}).get("undetermined") or [])]
-        reveal_undet_shots = sorted(str(r.get("id")) for r in ledger
-                                    if (r.get("reveal") or {}).get("undetermined"))
-        # 「判完了」只在**申报过**、且账上**确有这一栏**的镜里数：没申报的镜没有「判完了」
-        # 这回事（它们那一栏是空的，不是绿的）；账上根本没这一栏的（旧缓存、或这一镜没走到
-        # 那一步）也不许算进「判完了」——数多了就是把「没判过」报成「判过」。
-        reveal_rows = {str(r.get("id")): r.get("reveal") for r in ledger
-                       if isinstance(r.get("reveal"), Mapping)}
-        reveal_clear = [sid for sid in reveal_declared
-                        if sid in reveal_rows
-                        and not (reveal_rows[sid].get("undetermined") or [])]
         # 闸⑰ 的整片账（T23）：这一道判在拼接之前（红了根本出不了片），所以它的读数由
         # 渲染层带回来（`code_render` 的 `av_accounting`），报告层只**摊开**不重算——
         # 重算就会出现「判的时候 0.97、报的时候 0.99」这种两把尺。
@@ -495,6 +463,13 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                        if r.get("grid_text") is not None and not r.get("colors")]
         per_shot_ms = [float((r.get("render_timings") or {}).get("per_frame_ms") or 0.0)
                        for r in burned]
+        # 闸⑤ 只对**套了母版**的镜成立：自包含镜（代码里没有 `<FilmLayout`）本来就不回读
+        # token，把它们记进「缺回读」等于把一种合法写法记成坏账。所以分母是「该回读的镜」
+        # 而不是全部镜；一整片都是自包含时这一条**未判**，不是通过。
+        # （要在 `evidence` 那个列表**之前**算好——列表里只放 `_ev(...)` 表达式。）
+        _self_contained = code_render.masterless_ids(spec["shots"])
+        _comparable = {str(r["id"]) for r in ledger} - _self_contained
+        _missing = sorted(_comparable - {str(r["id"]) for r in tokened})
 
         evidence = [
             _ev(f"成片字节量到的：{got[0]}x{got[1]}@{got[2]:g}fps、{out['duration']:.1f}s、"
@@ -520,20 +495,24 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                 + (f"；复用切片的 {len(cached)} 镜判的是当初烧它的那一次"
                    if cached else ""),
                 "machine", verified=bool(ratios) and bool(spans),
-                proof="每帧裁到母版回读的画面带（字幕带在外，不参与判空），与母版实际底色"
-                      "逐通道求差、按 24 级差二值化后逐字节数非零像素——基准色来自 token "
-                      "回读，不是猜的 #fff。两半的分工：**空壳**要占比与小气度同时低才打回"
+                proof="每帧裁到母版回读的画面带（字幕带在外，不参与判空；自包含镜没有带子"
+                      "可裁，退回整帧），与实际底色逐通道求差、按 24 级差二值化后逐字节数"
+                      "非零像素——基准色按「token 回读 → 这一镜申报的 bg → TOKENS.bg」"
+                      "三级取，不是猜的 #fff。两半的分工：**空壳**要占比与小气度同时低才打回"
                       "（线条画/细网格本来就只有 1~3% 像素，只看占比会把合法风格判成空画面），"
                       "**小气**（内容只挤在带子中间一小块）占比够也拦。到这一行说明每一镜"
                       "两半都过了——打回的那一路带镜号退回，不会出现在这份账里"
                 if spans else "没有一次真渲（整片命中缓存），这一条没有本次数值"),
-            _ev(f"闸⑤ 跨镜一致性：{len(tokened)}/{len(ledger)} 镜读回母版 token，"
-                f"{len(tokened[0]['tokens']) if tokened else 0} 个键逐镜比对**容差 0** 全等",
-                "machine", verified=bool(tokened) and len(tokened) == len(ledger),
+            _ev(f"闸⑤ 跨镜一致性：{len(tokened)}/{len(_comparable)} 镜读回母版 token，"
+                f"{len(tokened[0]['tokens']) if tokened else 0} 个键逐镜比对**容差 0** 全等"
+                + ("" if _comparable else "（这一片没有一镜套母版，跨镜一致性没有可比的回读）"),
+                "machine", verified=bool(tokened) and not _missing,
                 proof="字号/字幕带/边距/安全区是母版常量，两镜取值不等就带镜号退回；"
                       "这条保证的是**数值一致**"
-                if len(tokened) == len(ledger) else
-                f"缺回读：{sorted({str(r['id']) for r in ledger} - {str(r['id']) for r in tokened})}"),
+                if _comparable and not _missing else
+                f"缺回读：{_missing}" if _missing else
+                f"整片自包含（{len(_self_contained)} 镜都不套母版）——没有 token 回读可"
+                f"比，这一条对本片**不适用**（记未判，不记通过）"),
             _ev(f"闸⑥ 字段级对账：{len(checked)} 个声明字段里 {len(matched)} 个"
                 f"**画面上自报的值与注入的值逐字相等**"
                 f"（其中 {len(boxed)} 个还量到了像素盒，可供点元素反查字段）",
@@ -544,18 +523,19 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                       "没自报（unreported）与量不到盒（no_geometry）照实记在这一行"
                 if checked else
                 "这份分镜没交出可改的旋钮（每镜 fields 全空），闸⑥ 没有可对账的东西"),
-            _ev(f"闸⑦ 风格配额：{len(spec['shots'])} 镜用了 {len(facts['variety'])} 种画法通道（"
-                + "、".join(f"{ch}×{k}" for ch, k in sorted(ch_counts.items())) + "）"
-                + (f"，这一档要求 ≥{quota_want} 种" if quota_want else "，镜数没到最低档 "
-                   f"{cspec.MIN_SHOTS_FOR_QUOTA}，这一档不判配额")
-                + (f"；纯文字/纯色块镜 {len(facts['text_only'])} 个"
-                   f"（{'、'.join(facts['text_only'])}）" if facts["text_only"] else ""),
+            _ev(f"闸⑦ 每镜必画：{len(spec['shots']) - len(bare)}/{len(spec['shots'])} 镜用"
+                f"代码画了图形（通道共用了 "
+                + "、".join(f"{ch}×{k}" for ch, k in sorted(ch_counts.items()))
+                + ("）" if ch_counts else "0 种）")
+                + (f"；{len(bare)} 镜一条画法通道都没用上：{'、'.join(bare)}" if bare else ""),
                 "machine",
-                verified=bool(quota_want) and len(facts["variety"]) >= quota_want,
-                proof="通道按**代码字节里的 import** 归类（roughjs / three+@react-three/fiber / "
-                      "katex / @remotion 的 paths·shapes 或裸 SVG 标记 / 只剩文字色块），"
-                      "判在 validate_code_spec 里、烧像素之前；这里报的是同一份账。"
-                      "quota_want=0 时这一条是**未判**不是通过——短片子照样能全是文字"
+                verified=bool(ch_counts) and not bare,
+                proof="判据是**逐镜**看代码里真用上的那条通道（roughjs / "
+                      "three+@react-three/fiber / katex / @remotion 的 paths·shapes 或裸 SVG "
+                      "标记），判在 validate_code_spec 里、烧像素之前；这里报的是同一份账。"
+                      "只 import 不调用的那一行不算通道。没画的镜逐个点名，"
+                      "缺口不为 0 就是打回——**preview 档也打回**，不是「建议」："
+                      "图形片的画面只有这一路，一镜没画就没有画面"
                 if ch_counts else "这份分镜没有镜头"),
             _ev(f"闸⑧ 版面回读：{len(layout_scanned)}/{len(ledger)} 镜在探针帧真扫过画面带，"
                 f"命中 {len(layout_warns)} 条告警（叠字 / 被画面带切 / 引线悬空三类，"
@@ -569,17 +549,6 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                       "误报的代价是整条通道"
                       "没人再看。扫过的镜 findings 为空才是「干净」；没扫的镜单独点名，"
                       "不混进 0 告警里"
-                if ledger else "这份分镜没有镜头"),
-            _ev(f"闸⑬ 资产存在且非纯色：{len(assets_ok)}/{len(ledger)} 镜的投递素材都真在盘上、"
-                f"sha16 对得上、且至少两档主色（1×1 与纯色占位在这一档打回）"
-                + (f"；**未判**的镜：{'、'.join(assets_undet)}（未判 ≠ 通过）"
-                   if assets_undet else ""),
-                "machine", verified=bool(ledger) and len(assets_ok) == len(ledger),
-                proof="判在**盘上的字节**：容器把 `public/assets/<镜号>/` 下每一件的 sha16 "
-                      "现算一遍与 manifest 对账（写进账的和落到盘的不是同一份字节就报），"
-                      "再解码取主色——PNG 走 zlib 全解，JPEG 走基线 DC 级（只取每 8×8 块的"
-                      "均值），SVG 按它声明的颜色计。解不出主色的格式（渐进式 JPEG、隔行 "
-                      "PNG）记 undetermined 并在这里点名，不许静默放行"
                 if ledger else "这份分镜没有镜头"),
             _ev(f"闸⑭ 动效事件密度：{len(motion_shot)}/{len(ledger)} 镜在**渲出来的像素**上"
                 f"数得出 ≥2 段先后变化"
@@ -616,31 +585,6 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                       f"就注进去了）、`beat:<n>` 这条链没有节拍表；申报条数与像素段数不等也"
                       f"落未判（对不齐就说不清哪条对哪段）。**所以「锚到必然存在字段上」这条"
                       f"绕法今天只被闸前那一半挡着**，见 §9-Q98，不许被说成「㉑ 已完全挡住」"
-                if ledger else "这份分镜没有镜头"),
-            _ev(f"闸㉗ 揭示时序（画面上什么时候该露出哪一块，按像素判）："
-                + (f"{len(reveal_declared)}/{len(ledger)} 镜申报了分区揭示，其中 "
-                   f"{len(reveal_clear)} 镜在各自的开演时刻上逐点比过色"
-                   if reveal_declared else "这份分镜一镜都没申报分区揭示（这一档不存在）")
-                + (f"；**未判**的镜：{'、'.join(reveal_undet_shots)}"
-                   f"（未判 ≠ 通过——底色取样失败、母版没回读分区、画面带原点读不到的"
-                   f"都落这一档；具体理由见下）"
-                   if reveal_undet_shots else "")
-                + ("；" + "；".join(reveal_undet) if reveal_undet else ""),
-                "machine",
-                verified=(bool(reveal_declared)
-                          and len(reveal_clear) == len(reveal_declared)
-                          and not reveal_undet),
-                proof="三样东西都不经过模型：① 母版在它自己算出的允许掩码上回读矩形"
-                      "（`DG_REVEAL:` 行，**只有母版一处实现**——画布像素换算成元素内坐标"
-                      "这件事不能有第二把尺）；② ffmpeg 抽那一帧的 RGB24，在掩码内按 3×3 "
-                      f"网格取点（全程 ffmpeg + 纯 Python，**不引图像库**）；③ 与「插画原图"
-                      "四角内缩取样量出来的纸底色」比 CIE76 的 ΔE。判据两句话："
-                      f"`start_ms` 还没到的块，掩码里必须**全是纸底**（ΔE ≤ "
-                      f"{reveal_gate.PAPER_DELTA_E_MAX:g}）；已经画完的块，掩码里必须"
-                      "**不全是纸底**。这一条是这族风格唯一吃像素的判据——满幅插画下"
-                      "⑲-a 的主体占比天然 ≈1、㉕ 的徽章四条也不触发。"
-                      "**基准从不写死常量**（只能从原图量，量不到就未判），"
-                      "所以「把基准换成纯白就全绿」这条绕法没有入口"
                 if ledger else "这份分镜没有镜头"),
             _ev(f"闸⑰ 音画数据对账："
                 + (f"BGM {av['bgm_sec']}s / 成片 {av['film_sec_planned']}s"
@@ -876,8 +820,8 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             _ev("画面好不好看：代码写出来的构图、留白、动效节奏", "eyeball",
                 verified=False,
                 proof="闸④ 只证明画面上有东西、闸⑤ 只证明数值一致，两者都读不出审美——"
-                      "这条链的版式统一在母版一层，构图与动效节奏由每镜代码自写，"
-                      "没有模板替它兜底"),
+                      "这条链只统一了底色与字幕那一档（spec 顶层），构图与动效节奏由每镜"
+                      "代码自写，没有模板替它兜底"),
             _ev("内容对不对题、史实与数字准不准", "eyeball", verified=False,
                 proof="spec.shots[].source 记了出处，但机器不判真伪"),
             _ev("代码里那一镜该不该用 3D/公式：选错表达手段不报错，只是慢或难看",
@@ -908,6 +852,14 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             # 文字压在什么底色上」。两份读的是同一个 style_facts，所以不会出现计划卡说
             # 两种画法、回执说三种。
             "style_channels": facts["channels"],
+            # 打回档（闸⑦ 每镜必画、⑩ 字色对比度、㉑ 动效锚…）：与计划卡上
+            # `style_findings` 是同一串。**非空不等于这次出片没成**——这部分判据
+            # 从 2026-10-16 起只报不拦（拦的位置撤了，模型交活前可自查 `check_film`），
+            # 所以见到非空时该做的是转告用户「这几条它交活时就没过」。
+            "style_findings": list(style_finds),
+            # 一镜一条画法通道都没用上的名单（闸⑦ 的账，与闸同一个谓词现取）。
+            # 每镜必画之下这一栏理想上空数组；非空即「有镜没画面」，那一镜的镜号
+            # 同时会出现在上面 style_findings 里。
             "style_text_only": facts["text_only"],
             "style_same_shape": facts["same_shape_groups"],
             "style_contrast": facts["contrast"],
@@ -943,11 +895,6 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             # 因为「这一镜没扫」与「这一镜扫了且干净」在回执上必须是两句话。
             "layout_warnings": layout_warns,
             "layout_unscanned": layout_missing,
-            # 闸⑬：`ok` 的镜不占行；被判据拒或被记成未判的镜逐条点名（describe_assets
-            # 单源措辞）。`assets_unjudged` 单独一栏的理由与 layout_unscanned 同：
-            # 「这件素材没人验过」与「验过且没问题」在回执上必须是两句话。
-            "assets_warnings": assets_warns,
-            "assets_unjudged": assets_undet,
             # 闸⑭ 同规：`ok` 不占行；`rejected`（退回的那一档，正常走不到这里）与
             # `undetermined`（这一镜的动效没人判过）各一条。`motion_unjudged` 单独一栏，
             # 理由与上面两栏一样：「没判」和「判过且没问题」在回执上必须是两句话。
@@ -959,13 +906,6 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             # 把「动效密度过了」当成「动效锚定过了」，那正是未判不许绿的那条口径要防的。
             "motion_anchor_warnings": anchor_warns,
             "motion_anchor_unjudged": anchor_undet,
-            # 闸㉗（T61）同规：**指标栏与未判栏都要另起**，不许并进上面那两栏。
-            # ㉑ 判的是「动效为哪条数据服务」、㉗ 判的是「画面上什么时候该露出哪一块」，
-            # 一镜完全可能 ㉑ 过、㉗ 未判（母版没回读分区）或反过来。
-            # 没有任何镜申报揭示时 `reveal_declared` 是空的——那一档在回执上写「不存在」，
-            # 不是写「通过了」。
-            "reveal_declared_shots": reveal_declared,
-            "reveal_unjudged": reveal_undet,
             "master_hash": out["master_hash"],
             "lockfile_hash": out["lockfile_hash"],
             "gl": out["gl"],

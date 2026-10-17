@@ -157,6 +157,39 @@ class ConversationsRepo(_Repo):
         await self.db.update(self.table, {"updated_at": _now()},
                              where={"id": conv_id, "user_id": user_id})
 
+    async def prefs(self, conv_id: str) -> dict[str, Any]:
+        """这个对话里用户显式挑过的整片开关（「文字库」那几维）。→ 空表 = 一维都没挑。
+
+        读不到行（对话还没建、或者 id 是别的用户的）一律回空表：偏好是**加成**，
+        缺了它出片照走「归模型定」那条老路，不该让调用方去区分「没挑过」与「读不到」。
+        """
+        got = await self.get(conv_id)
+        raw = (got or {}).get("prefs") if isinstance(got, Mapping) else None
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return {}
+        return dict(raw) if isinstance(raw, Mapping) else {}
+
+    async def set_prefs(self, conv_id: str, patch: Mapping[str, Any]) -> dict[str, Any]:
+        """合并写：只覆盖 ``patch`` 里出现的键，返回合并后的全表。
+
+        **合并而不是整份替换**，因为前端那几个控件各自独立——整份替换的话，用户在
+        文字库里换个音色就会把之前挑的字幕形态一起抹掉，而界面上那两个选择都还亮着。
+        值为 ``None`` 表示**取消这一维**（回到「交给模型定」），这也是面板上
+        「恢复默认」那个按钮唯一的写入口。
+        """
+        cur = await self.prefs(conv_id)
+        for key, value in patch.items():
+            if value is None:
+                cur.pop(str(key), None)
+            else:
+                cur[str(key)] = value
+        await self.db.update(self.table, {"prefs": cur, "updated_at": _now()},
+                             where={"id": conv_id})
+        return cur
+
     async def drop(self, user_id: str, conv_id: str) -> int:
         return await self.db.delete(self.table, where={"id": conv_id, "user_id": user_id})
 
@@ -1393,8 +1426,13 @@ class AssetLibraryRepo(_Repo):
     """``asset_library``：全局共享的内置素材库，不属任何用户。
 
     与 ``MaterialsRepo`` 的区别：materials 是用户上传/产出的素材（属用户），
-    asset_library 是从外部 CC0/PD 源批量入库的素材（全局共享）。检索时
-    ``search_illustration`` 走这里，``search_media`` 走 materials。
+    asset_library 是从外部 CC0/PD 源批量入库的素材（全局共享）。
+
+    2026-10-16 起**没有运行期读者**（检索节点 `search_illustration` 已删，取材那三条路
+    整条拿掉）。这个类留着不删，与表同一条理由：`schema.sql` 那张表一个字都不动，
+    那么它的 Python 面也该是同一份形状——半删一半（留表删类）只会让下一个读代码的人
+    以为「表还在用、只是类找不到了」。会话回收那条守则（`assets/` 命名空间不在回收网里）
+    也还指着这里。
     """
 
     table = "asset_library"
@@ -1413,7 +1451,8 @@ class AssetLibraryRepo(_Repo):
         """入库一行素材。每行必须带 license（§5.2 硬约束）。
 
         ``enabled`` 默认 True（入库即启用，策展库的常规路径）。出图产物走
-        ``enabled=False``（见 ``imagegen_library``）：它需要的是「按 sha 找得到字节」
+        ``enabled=False``（见 ``imagegen_library``，该模块 2026-10-16 已删，这里留的是它的
+        口径）：它需要的是「按 sha 找得到字节」
         ——``get_by_sha`` 不看这一列——但**不该进** ``search()`` 的检索面，否则别人在
         自己会话里会搜到用户 A 刚生成的图。
         """
@@ -1455,8 +1494,9 @@ class AssetLibraryRepo(_Repo):
         ``offset`` 在**内存里**切，不透传给 ``Datastore.select``——它的签名里没有这一位
         （``db.py`` 只有 ``where/order_by/limit``），透传的后果是**每一次调用都
         ``TypeError``**。这个洞长期没暴露，是因为唯一一个带偏移的调用方
-        （``asset_sources.live_source_counts``）把异常吞成了 ``None``，于是 ㉔ 供给面那道闸
-        的读数一直是「未判」——一条闸静默失效了而回执上看不出原因。
+        （``asset_sources.live_source_counts``，该模块 2026-10-16 已删）把异常吞成了
+        ``None``，于是 ㉔ 供给面那道闸的读数一直是「未判」——一条闸静默失效了而回执上看不出
+        原因。今天没有调用方了，这一句留着是给下一个想传 ``offset`` 的人看的。
         """
         where: dict[str, Any] = {"enabled": enabled}
         if source:
@@ -1479,7 +1519,8 @@ class AssetLibraryRepo(_Repo):
 
         只返回 ``attribution_required=false`` 的资产（§5.2：需署名的不进检索结果）。
         ``asset_role``（R11-T53）按「素材在片子里的角色」过滤，取值见
-        ``agent_framework.asset_sources.ASSET_ROLES``；**不传＝不过滤**（未判的那些件
+        ``agent_framework.asset_sources.ASSET_ROLES``（该模块 2026-10-16 已删，那张表
+        是 `icon`/`part`/`scene`/`texture`/`bg` 五档）；**不传＝不过滤**（未判的那些件
         只在不传时才进结果——按角色找件的人本来就不该拿到未判件，但「随便搜搜」
         不该因为这一栏空着就搜不到东西）。
         """

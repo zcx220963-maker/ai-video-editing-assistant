@@ -35,8 +35,10 @@ SESSION_TABLES = ("artifacts", "render_jobs", "checkpoints", "token_usage")
 #:
 #: 这张表里**永远不列 `assets/`**（T14；测试见 tests/test_session_gc.py ⑤）。
 #: `assets/` 是内置素材库的命名空间，全局共享、不属任何会话——一条字节可能被几十个
-#: 会话引用过，按会话回收一旦误判就是不可逆损失。它自己不归这里管：会不会越攒越多由
-#: `scripts/asset_gc_report.py` 巡检报给人看，删不删人工定（§9-Q26：不做自动删除）。
+#: 会话引用过，按会话回收一旦误判就是不可逆损失。§9-Q26 定的是**不做自动删除**，
+#: 这一条与「图形片不再有取材通道」（2026-10-16）无关：表与命名空间都留着（§6 零迁移），
+#: 只是从今往后不再有新字节写进去。（原来这里还点了一句巡检脚本；那个脚本已随取材
+#: 那三条路一起出库，故不再点名。）
 OBJECT_PREFIXES = ("renders/", "derived/", "motion-shots/", "render-windows/")
 
 

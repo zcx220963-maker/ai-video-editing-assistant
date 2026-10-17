@@ -36,8 +36,8 @@ from . import hitmap as m_hit
 #: **这份名单比「归一之后的全部镜头键」窄，而且是故意窄的**——它是「这一镜**长什么样**」
 #: 那一组（文案 / 代码 / 时长 / 质感 / 构图 / 字幕形态 / 接缝），不包含那几栏**申报**：
 #: ``card``（闸⑮ 拿它数版式族）、``derived_from``（闸⑫ 拿它比骨架）、``subject`` 与
-#: ``subject_channel``（闸⑯ 拿它们与代码对账）、``assets``（闸⑪）、``motion``（闸㉑）、
-#: ``reveal``（闸㉗）。那七栏各自有一道闸在读，**改申报而不改代码＝让闸读到假的**：
+#: ``subject_channel``（闸⑯ 拿它们与代码对账）、``motion``（闸㉑）。那五栏各自有一道闸在读，
+#: **改申报而不改代码＝让闸读到假的**：
 #: 把 ``card`` 从 A 换成 B 而代码还是 A 的形状，闸⑮ 会以为这一族又多了一镜。
 #: 改它们只有一条正路——回 SKILL「局部改」第 2 条：重新选卡 / 适配那一段代码，
 #: 再连同 ``code`` 一起交上来（``card`` 与 ``code`` 同批落，闸读到的是自洽的一对）。
@@ -50,17 +50,17 @@ from . import hitmap as m_hit
 #: 判——落笔之后照样过 `validate_code_spec`，`_norm_shot` 会把非布尔 `bleed` 与非法
 #: `bg` 逐条打回（打回不钳值，钳了就是账面一档、画面另一档）。
 #: R19（层E）再加两栏，理由与 R14 那两条同源——**新能力没有编辑入口 = 等于没这个能力**：
-#: ``subtitle_mode``（层E2）改的是这一镜的**字幕形态**（`inline` 那一档母版不画字幕带，
-#: 文字交给镜头代码排进构图），是「这一镜该长什么样」的一部分。
+#: ``caption_style`` / ``highlight_style``（层E2；2026-10-16 由「字幕形态 + 位置 + 动画」
+#: 三栏并成两栏）改的是这一镜的**字幕长什么样**，是「这一镜该长什么样」的一部分。
 #: ``transition``（层E1）改的是**这一镜之后那处接缝**（`transition_plan` 只遍历
 #: `shots[:-1]`，所以末镜这一栏写了也不生效——`validate_code_spec` 不打回它，
 #: 但账面与画面都不会变）。它跑在拼接那一趟，改它 0 镜重烧，正是层E1 最想要的那个
 #: 「便宜地反复调」——没有一个入口的话，那条成本优势就只能靠重交整份分镜来兑现。
-#: 两栏的取值都不在这里判：`_norm_shot` 按 `SUBTITLE_MODES` / `TRANSITION_STYLES`
-#: 逐条校验，写坏的档名会被点名打回。
+#: 三栏的取值都不在这里判：`_norm_shot` 按 `CAPTION_STYLES` / `HIGHLIGHT_STYLES` /
+#: `TRANSITION_STYLES` 逐条校验，写坏的档名会被点名打回。
 EDITABLE_SHOT_FIELDS = ("code", "text", "highlight", "fields",
                         "min_duration_sec", "texture", "source", "bleed", "bg",
-                        "subtitle_mode", "caption_position", "caption_anim",
+                        "caption_style", "highlight_style",
                         "transition")
 
 #: 白名单五条的**人话形状**。指针被拒时把这行交给用户——他能改的就这五样，

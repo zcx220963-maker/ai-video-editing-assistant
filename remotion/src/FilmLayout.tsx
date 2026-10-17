@@ -15,21 +15,30 @@ import { fitText as remotionFitText } from '@remotion/layout-utils';
 import '@dg/fonts';
 import {
   ASPECTS,
-  ASSET_LOG_MARKER,
-  CAPTION_ANIMS,
-  CAPTION_POSITIONS,
-  SUBTITLE_MODES,
+  CAPTION_STYLES,
+  HIGHLIGHT_STYLES,
   FIELD_LOG_MARKER,
   FIELD_PROBE_TAIL,
   FILM_GEOMETRY,
   FILM_STYLE_DEFAULT,
-  LAYOUT_LOG_MARKER,
-  LAYOUT_PROBE,
-  REVEAL_LOG_MARKER,
   TOKENS,
   TOKEN_LOG_MARKER,
 } from './tokens';
-import type { Aspect, CaptionAnim, CaptionPosition, FilmStyle, SubtitleMode } from './tokens';
+import type { Aspect, CaptionStyle, FilmStyle, HighlightStyle } from './tokens';
+// 版面那一套（判据 + 阈值 + 那一行 JSON 的形状）2026-10-16 整体搬到 `./lib/LayoutProbe`：
+// `LAYOUT_PROBE` / `LAYOUT_LOG_MARKER` 不再从这里 import——母版与新测量壳共用同一份，
+// 免得「母版改了阈值、壳还在用旧的」这种一比就分叉的两把尺。
+import { emitLayout, emitLayoutMissing, liveBand, measureBox, toCodeSpace } from './lib/LayoutProbe';
+import type { Convert, PxBox } from './lib/LayoutProbe';
+
+/** 高亮词的**显示方式**（`HIGHLIGHT_LOOK` 的值域，也是 `<CaptionText emphasis/>` 的值域）。
+ *  - `'block'`：一块底色（`hl`）；
+ *  - `'color'`：**关键词换色**——不给底，高亮词的字色换成 `accent`。字压在画面上、与图
+ *    共用一块底色时用这一档：一块色块压在图上是「贴纸」，换字色才是「强调」；
+ *  - `'ink'`：词后一条纸感笔触（`accent` 原色），无底——「撕纸高亮」；
+ *  - `'none'`：不强化，整句一个样。
+ */
+export type CaptionEmphasis = 'block' | 'color' | 'ink' | 'none';
 
 /** 镜头代码能拿到的画面带：成片设备像素，左上角是 (0,0)。 */
 export interface BodyBox {
@@ -81,7 +90,7 @@ export function filmBody(width: number, height: number, aspect?: Aspect,
 }
 
 /**
- * R14 风格档的注入解析 —— 与 :func:`resolveReveal` / `resolveShotMotion` 同一套写法。
+ * R14 风格档的注入解析 —— 与 :func:`resolveShotMotion` 同一套写法。
  *
  * 认不出的写法一律挡回缺省值，**不抛也不猜**：风格档的每个字段都有「不设 = 今天」
  * 的语义，一个写坏的 `bg` 不该让整镜渲不出来，而应该退回母版原本的底色。
@@ -93,10 +102,21 @@ export function resolveFilmStyle(injected: unknown): FilmStyle {
   const raw = src.film_style;
   const s = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
   const bg = String(s.bg ?? '').trim();
-  return {
+  const hex = (v: unknown) => {
+    const t = String(v ?? '').trim().toLowerCase();
+    return /^#[0-9a-f]{6}$/.test(t) ? t : undefined;
+  };
+  const paper = hex(s.paper);
+  const ink = hex(s.ink);
+  const style: FilmStyle = {
     bleed: s.bleed === true,
     bg: /^#[0-9a-fA-F]{6}$/.test(bg) ? bg.toLowerCase() : FILM_STYLE_DEFAULT.bg,
   };
+  // paper/ink 成对才收：只来一半时字幕条退回按亮度二档，不出「浅底浅字」这种读不出来的组合。
+  if (paper && ink) { style.paper = paper; style.ink = ink; }
+  const accent = hex(s.accent);
+  if (accent) style.accent = accent;
+  return style;
 }
 
 /** `#rrggbb` → 相对亮度 0~1（sRGB 加权）。够用来判「这个底是深的还是浅的」。 */
@@ -119,6 +139,183 @@ function captionTone(bg: string): { paper: string; ink: string } {
   return luma(bg) < 0.5
     ? { paper: 'rgba(16,14,12,0.72)', ink: '#f4f1ea' }
     : { paper: TOKENS.paper, ink: TOKENS.ink };
+}
+
+/**
+ * 「镜头代码转交了就用它给的，没转交就取 Python 注入的那份」——母版与字幕元件
+ * （`CaptionLayer` / `CaptionText`）共用这一条回退。
+ *
+ * 为什么提成模块级：元件也要读注入（`<CaptionLayer/>` 不带 props 就该等于母版那一档）。
+ * 各写一份回退，就会有「母版认 `captionAnim`、元件认 `caption_anim`」这种只在没人转交时
+ * 才发作的漂移——而这类漂移渲出来之前没人看得见。
+ */
+function pickInjected<T extends string>(prop: T | undefined, key: string,
+                                        allowed: readonly T[], dflt: T): T {
+  const v = prop ?? ((getInputProps() as Record<string, unknown>)[key] as T | undefined);
+  return v && allowed.includes(v) ? v : dflt;
+}
+
+/** 注入里的画幅，只认 `ASPECTS` 里的那三个；认不出一律竖屏（与母版同一条回退）。 */
+function injectedAspect(prop?: Aspect): Aspect {
+  return pickInjected(prop, 'aspect', Object.keys(ASPECTS) as Aspect[], 'portrait');
+}
+
+/** 注入里的布尔开关。缺省 `false`——「没申报」与「申报了关」在像素上同一件事。 */
+function injectedFlag(key: string): boolean {
+  return (getInputProps() as Record<string, unknown>)[key] === true;
+}
+
+/**
+ * 注入里的强调色（`highlightColor`，来自用户在「文字库」里钉的「强调色」那一维）：
+ * 只认一条合法 `#rrggbb`，其余（空串、`rgb()`、命名色、写歪的值）一律 `undefined`
+ * ＝**没钉**，跟着这一镜的色板走。
+ *
+ * 认不出就不猜、不换一个近似色：它是用户按下的一枚颜色，一个他没按过的颜色比缺省色
+ * 更糟——缺省色至少有「我没设过」这个解释。
+ */
+function injectedAccent(): string | undefined {
+  const raw = String((getInputProps() as Record<string, unknown>).highlightColor ?? '')
+    .trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(raw) ? raw : undefined;
+}
+
+/** 一条字幕的配方：**底**、**站在哪**、**怎么进场**、**多大**、**有没有描边**。
+ *
+ *  这是「字幕样式」这一维的**唯一一处**落点——`caption_style` 的七个取值到这里各自
+ *  收成一组数，`<Caption>` 照着排。为什么要有这张表而不是在 `<Caption>` 里写七个
+ *  `if`：样张、母版壳、镜头代码自己摆的 `<CaptionLayer/>` 三处都调同一个 `<Caption>`，
+ *  配方散成条件分支之后，「这一档到底长什么样」就没有一处能读完了。 */
+export interface CaptionStyleLook {
+  /** 有没有那张纸条底。`false` = 字直接压在画面上（`background: transparent`）。 */
+  band: boolean;
+  /** 站在哪：`bottom` 下安全区 / `center` 画面正中 / `top` 顶部安全区。 */
+  position: 'bottom' | 'center' | 'top';
+  /** 整条入场：`fade` 淡入 / `rise` 浮上 / `pop` 弹出。 */
+  anim: 'fade' | 'rise' | 'pop';
+  /** 字号系数：乘在 `fitCaptionFontSize` 求出来的那个值上（只改字的大小，不改求法）。 */
+  size: number;
+  /** 字重与行距。纸条底那一档字轻、行紧；压屏大字那一档字重、行松。 */
+  weight: number;
+  lineHeight: number;
+  /** 有值 = 白字黑边那一档：八向描边用这个颜色，底上再压一层渐隐。 */
+  outline?: string;
+  /** 字色。不填 = 跟着这一镜的纸条字色（`tone.ink`，色板命中时是色板的 `text`）。 */
+  ink?: string;
+}
+
+export const CAPTION_LOOK: Record<CaptionStyle, CaptionStyleLook> = {
+  // 用户否掉纸条之后的缺省：无底、下沿、淡入。字与画面共用一块底。
+  on_picture: { band: false, position: 'bottom', anim: 'fade', size: 1, weight: 700, lineHeight: 1.35 },
+  // 白字黑边：亮底上也读得出来。底压一层下深上透的渐隐（不是纸条：没边界、不是色块）。
+  outlined: { band: false, position: 'bottom', anim: 'fade', size: 1, weight: 800, lineHeight: 1.3,
+              outline: '#000000', ink: '#ffffff' },
+  // 老观感，留成选项、不当缺省。
+  paper: { band: true, position: 'bottom', anim: 'fade', size: 1, weight: 500, lineHeight: 1.35 },
+  // 整句电影感：字号略小、行距松、慢淡入。
+  film_line: { band: false, position: 'bottom', anim: 'fade', size: 0.9, weight: 500, lineHeight: 1.62 },
+  // 大字压屏：画面正中、字号放大、pop 入场。
+  big_center: { band: false, position: 'center', anim: 'pop', size: 1.34, weight: 700, lineHeight: 1.24 },
+  // 顶部横幅：纸条挪到顶部安全区、rise 入场。
+  top_banner: { band: true, position: 'top', anim: 'rise', size: 1, weight: 500, lineHeight: 1.35 },
+  // 不上字幕：母版与 `<CaptionLayer/>` 都自守不画（见闸㉜）。仍旧给一份配方——
+  // `Record` 要铺满，取值取最素的那一档。
+  none: { band: false, position: 'bottom', anim: 'fade', size: 1, weight: 500, lineHeight: 1.35 },
+};
+
+/** 被点名的词怎么被点出来（「高亮样式」那一维的落点，与字幕样式**正交**）。 */
+export interface HighlightLook {
+  emphasis: CaptionEmphasis;
+  /** 逐字点亮：未读到的字淡显，读到就实显。 */
+  karaoke: boolean;
+}
+
+export const HIGHLIGHT_LOOK: Record<HighlightStyle, HighlightLook> = {
+  color: { emphasis: 'color', karaoke: false },
+  // 逐词点亮与换色并不冲突：念到的词实显、还没念到的淡显，点名的词仍是强调色。
+  karaoke: { emphasis: 'color', karaoke: true },
+  block: { emphasis: 'block', karaoke: false },
+  ink: { emphasis: 'ink', karaoke: false },
+  plain: { emphasis: 'none', karaoke: false },
+};
+
+/** 八向描边：一像素一圈黑，字形自己一个像素都不吃。
+ *
+ *  为什么不用 `-webkit-text-stroke`：它的描边是**居中**画的，宽度吃掉的是字形自己的肉
+ *  ——中文细笔画（一、十、人）描粗了会断成黑块；textShadow 只能往外长，字形不变。
+ *  宽度按**字号**给、不用 `em`：字号是 `fitCaptionFontSize` 按可用宽度求出来的，
+ *  `em` 在外层先解析成外层的字号，求出来多大跟写的不是一回事。（搬自
+ *  `demos/typography/outline-caption`，那份 demo 现在调 `outline` prop，不再自己画。） */
+function ring(color: string, w: number): string {
+  const d = [[-w, 0], [w, 0], [0, -w], [0, w], [-w, -w], [w, -w], [-w, w], [w, w]];
+  return d.map(([x, y]) => `${x}px ${y}px 0 ${color}`).join(', ');
+}
+
+/**
+ * 字幕条的三色：条底/字色（`tone`）、高亮块（`hl`）、撕纸下划线（`accent`）。
+ *
+ * 母版与字幕元件共用。元件自己再算一遍的话，「同一条字幕在母版里和在镜头代码摆的位置
+ * 上不是同一个颜色」就是两处各取一次色的必然结果——而这两条字幕常常同屏。
+ */
+function captionLook(style: FilmStyle, bg: string):
+    { tone: { paper: string; ink: string }; hl: string; accent: string } {
+  // 强调色：**用户钉的那一枚赢过色板那一色**。用户钉的是一个明确的决定（面板上
+  // 「强调色」那一行），而 `style.accent` 是色板（或镜头代码申报的底色反查）带出来的
+  // 默认。没钉就走原路，一个字节都不变。
+  //
+  // 只管这三处用途（换色的字色 / 底色块 / 撕纸下划线），**不动条底与字色**——
+  // 用户说的是「高亮词的颜色」。
+  //
+  // 钉住的那一枚**连 `accent` 那一栏也盖过**（`CaptionText`/`CaptionLayer` 里它排在
+  // 最前）：照 SKILL 的推荐写法 `accent={palette.accent}` 写的镜是多数，若只赢在
+  // 「没传 prop」时才生效，用户钉了色而绝大多数镜一点不变——比不提供这一维更坏。
+  // 代价说清楚：用 `accent` 给画面图形换色的地方不受影响（Python 侧注入的
+  // `film_style.accent` 仍是那一镜色板的），钉住的是**字幕**那个色。
+  const accent = injectedAccent() ?? style.accent;
+  return {
+    tone: style.paper && style.ink ? { paper: style.paper, ink: style.ink } : captionTone(bg),
+    hl: accent ? `${accent}66` : TOKENS.hl,
+    accent: accent || TOKENS.accent,
+  };
+}
+
+/** 字幕条底边到画面底的距离：满幅时叠在画面上（没有下安全区可站），位置由几何表给。 */
+function captionBottomOf(geo: (typeof FILM_GEOMETRY)[Aspect], bleed: boolean): number {
+  return bleed ? geo.bleedCaptionBottom : (geo.bottomSafe - geo.caption.height) / 2;
+}
+
+/** 字幕条的整条淡入（0.25 秒）。母版那条与镜头代码摆的那条共用同一条曲线。 */
+function captionFadeIn(frame: number, fps: number): number {
+  return interpolate(frame, [0, 0.25 * fps], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+}
+
+/**
+ * 字幕字号：按「最多两行」求，并夹在 [0.62, 1.25] × 几何表字号之间。
+ *
+ * 原先 fitText 直接取「整句塞进一行」的字号且不设上下限：60 字的句子缩到 14px 看不清，
+ * 四五个字的短句放到 150px+ 撑破字幕盒。两行容量正是 MAX_TEXT_CHARS 的前提。
+ * 母版与字幕元件共用——元件自己再求一遍，就会出现「镜头代码摆的那条字比母版那条小一号」。
+ */
+function fitCaptionFontSize(text: string, cap: { fontSize: number; side: number; padX: number },
+                            width: number, fitWidth?: number): number {
+  const availW = fitWidth ?? width - 2 * cap.side - 2 * cap.padX;
+  let fontSize = cap.fontSize;
+  try {
+    const ft = remotionFitText({
+      text,
+      withinWidth: availW,
+      fontFamily: '"Noto Sans CJK SC", sans-serif',
+      fontWeight: 500,
+    });
+    const oneLine = ft.fontSize;
+    // 单行放得下且不超上限 → 单行；否则按两行（单行字号 ×2 再留 8% 断行余量）。
+    fontSize = oneLine >= cap.fontSize ? oneLine : oneLine * 2 * 0.92;
+  } catch {
+    // lint / 构建期没有浏览器环境，退回固定字号
+  }
+  return Math.round(Math.min(cap.fontSize * 1.25, Math.max(cap.fontSize * 0.62, fontSize)));
 }
 
 /** 从成片像素尺寸反推画幅：表以三种标准尺寸为准则，取最接近的那个。 */
@@ -150,10 +347,10 @@ export interface FilmLayoutProps {
   highlight?: string[];
   /** 词级时间戳，由 Python 侧按真实语音时长算好后注入 */
   words?: WordTiming[];
-  subtitleMode?: SubtitleMode;
-  /** 字幕位置 bottom/center/top 与入场动画 fade/rise/pop/karaoke（Python 侧注入）。 */
-  captionPosition?: CaptionPosition;
-  captionAnim?: CaptionAnim;
+  /** 字幕样式（贴画面 / 白字黑边 / 纸条底 / …）。不传＝注入那一档。 */
+  captionStyle?: CaptionStyle;
+  /** 高亮样式（关键词换色 / 逐词点亮 / 底色块 / 撕纸高亮 / 不强化）。不传＝注入那一档。 */
+  highlightStyle?: HighlightStyle;
   aspect?: Aspect;
   /** R7-T22 整片进出场档名（none/fade/rise/drop/zoom），由整片开关注入 */
   entrance?: ShotMotionStyle;
@@ -339,684 +536,6 @@ export const F: React.FC<FieldMarkProps> = ({ name, value, children }) => {
   );
 };
 
-// ---------------------------------------------------------------------------
-// R12-T60 分区揭示：**逐区域 mask**（闸㉘ 的申报 → 闸㉗ 判它）
-//
-// 这一族的画法是「把画面当纸，一块一块按顺序画出来」。母版负责的是最后一步：
-// 按 `reveal.regions[]` 逐帧算出**每一块此刻允许被看见的那部分**，把它当作剪切路径
-// 套到这一镜的插画（`<img>`）上。
-//
-// 三条设计决定，逐条都有理由：
-//
-// 1. **坐标只在母版里换算一次**。区域的四栏是「插画原图像素」（`canvas`），母版按
-//    这张图**这一帧的实况盒**折算成成片像素——它是唯一拿得到那个盒的一侧。Python 侧
-//    （㉗）不自己算这套换算：算第二遍就是两把尺，而母版算的是实况、Python 算的是估算，
-//    两把尺迟早对不上。所以母版把算出来的结果**逐帧报出去**（`DG_REVEAL:` 行），
-//    ㉗ 采样的就是这份账。
-// 2. **允许掩码 = 块 − 后续块 − 受保护的块**（闸㉘ 的原话）。「后续块」扣掉是因为
-//    后面那一块到点才该画：不扣的话，一块的推进会先把后面那块的位置刷出来，
-//    画面上提前露出——正是 ㉗ 要抓的那件事。
-// 3. **读同一帧时钟**：进度按下式算，`frame` 就是 `useCurrentFrame()`。
-//    `code_render.py` 那条「命中的盒与代表帧说同一时刻」是同一句话。
-// ---------------------------------------------------------------------------
-
-/** 分区揭示的最小输入（与 Python `code_spec.check_reveal_regions` 的栏位同名）。 */
-export interface RevealRegion {
-  id: string;
-  sequence: number;
-  region: { x: number; y: number; w: number; h: number };
-  direction: 'ltr' | 'rtl' | 'ttb' | 'btt' | 'whole';
-  start_ms: number;
-  duration_ms: number;
-  protected?: string[];
-  label?: string;
-}
-
-export interface RevealSpec {
-  canvas: { w: number; h: number };
-  scene_duration_ms?: number;
-  regions?: RevealRegion[];
-}
-
-/** 一带内的一个矩形（成片像素，左上角）。与 `region` 同形，单独起名只为读起来清楚。 */
-export interface RevealRect {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-
-const REVEAL_DIRECTIONS = new Set(['ltr', 'rtl', 'ttb', 'btt', 'whole']);
-
-/** 注入的 props → 分区揭示的输入（把认不出的写法挡在外面，与母版别的回退同规）。
- *
- *  `revealProbeFrames` 是 Python 点名要账的那几帧（㉗ 的采样时刻）。**它不是画法的
- *  一部分**：不进缓存键（键在 Python 侧按 `reveal` 算），也不改变任何像素——它只决定
- *  母版在哪几帧多发一行 console.log。所以故意做成与 `reveal` 并列的第二个注入项，
- *  不塞进 `reveal` 里：塞进去的话「同一份申报、不同的采样时刻」会变成两份不同的申报。 */
-export function resolveReveal(injected: unknown):
-{ spec: RevealSpec | null; probeFrames: number[] } {
-  const src = (injected && typeof injected === 'object' ? injected : {}) as Record<string, unknown>;
-  const rawReveal = src.reveal;
-  let spec: RevealSpec | null = null;
-  if (rawReveal && typeof rawReveal === 'object') {
-    const r = rawReveal as RevealSpec;
-    const canvas = r.canvas;
-    const okCanvas = !!canvas && Number(canvas.w) > 0 && Number(canvas.h) > 0;
-    const regions = Array.isArray(r.regions) ? r.regions : [];
-    if (okCanvas && regions.length) {
-      spec = {
-        canvas: { w: Number(canvas.w), h: Number(canvas.h) },
-        scene_duration_ms: Number(r.scene_duration_ms ?? 0),
-        regions: regions.filter((g) => !!g && !!g.region && REVEAL_DIRECTIONS.has(g.direction)),
-      };
-      if (!spec.regions!.length) spec = null;
-    }
-  }
-  const rawFrames = Array.isArray(src.revealProbeFrames) ? src.revealProbeFrames : [];
-  const probeFrames = rawFrames
-    .map((v) => Number(v))
-    .filter((v) => Number.isFinite(v) && v >= 0)
-    .map((v) => Math.round(v));
-  return { spec, probeFrames };
-}
-
-/** 这一块在 `progress`（0~1）时**已经被画到**的那部分；`whole` 只有全有全无。
- *
- *  推进方向是**这一块的 mask 前沿往哪走**，不是画面往哪移。四种都按同一份 region 盒
- *  切一刀：左→右就是「已画宽度 = w×进度」。 */
-export function sweepRect(region: RevealRect, direction: string, progress: number): RevealRect {
-  const p = Math.min(1, Math.max(0, progress));
-  if (direction === 'whole') return { ...region };
-  if (direction === 'rtl') return { x: region.x + region.w * (1 - p), y: region.y, w: region.w * p, h: region.h };
-  if (direction === 'ttb') return { x: region.x, y: region.y, w: region.w, h: region.h * p };
-  if (direction === 'btt') return { x: region.x, y: region.y + region.h * (1 - p), w: region.w, h: region.h * p };
-  return { x: region.x, y: region.y, w: region.w * p, h: region.h };
-}
-
-/** `a` 减去若干矩形 → 剩下的矩形清单（可能 0 片）。
- *
- *  一进一出的扣法（每次切最多成 4 片：上/下/左/右），所以 n 次扣除最多 4n 片。
- *  为什么不用「多边形布尔运算」：这一族只需要矩形，而一个多边形裁剪库引进来是给整个
- *  渲染容器加一条依赖——这四行算术自己就是它的全部用处。小数坐标一路留着，
- *  取整只发生在最后写进 `clip-path` 那一刻（中途取整会在扣出的小片上积累缝隙）。 */
-export function subtractRects(a: RevealRect, others: RevealRect[]): RevealRect[] {
-  let pieces: RevealRect[] = [a];
-  for (const o of others) {
-    const next: RevealRect[] = [];
-    for (const p of pieces) {
-      const ix = Math.max(p.x, o.x);
-      const iy = Math.max(p.y, o.y);
-      const ir = Math.min(p.x + p.w, o.x + o.w);
-      const ib = Math.min(p.y + p.h, o.y + o.h);
-      if (ir <= ix || ib <= iy) { next.push(p); continue; }   // 不相交：原样留下
-      const pr = p.x + p.w;
-      const pb = p.y + p.h;
-      if (iy > p.y) next.push({ x: p.x, y: p.y, w: p.w, h: iy - p.y });            // 上
-      if (ib < pb) next.push({ x: p.x, y: ib, w: p.w, h: pb - ib });              // 下
-      if (ix > p.x) next.push({ x: p.x, y: iy, w: ix - p.x, h: ib - iy });        // 左
-      if (ir < pr) next.push({ x: ir, y: iy, w: pr - ir, h: ib - iy });           // 右
-    }
-    pieces = next;
-  }
-  return pieces.filter((p) => p.w > 0.5 && p.h > 0.5);
-}
-
-/** 一块在时刻 `tMs` 的进度（线性，无缓动）。
- *
- *  为什么**不加缓动**：㉗ 判的是「到点的那一刻画满了没有」，缓动只会让「到点」这个
- *  时刻在画面上变得更模糊（末端仍在慢慢逼近）。这一族的观感来自区域划分，不来自
- *  这一条的缓动曲线——要缓动是母版 `entrance` 那一档的事。
- *  `duration_ms=0` 定义为「瞬时」（t ≥ start 就整块可见），不做除零。 */
-export function revealProgress(region: RevealRegion, tMs: number): number {
-  if (region.direction === 'whole' || !region.duration_ms) return tMs >= region.start_ms ? 1 : 0;
-  if (tMs <= region.start_ms) return 0;
-  return Math.min(1, (tMs - region.start_ms) / region.duration_ms);
-}
-
-/** 某一帧、每一块**允许被看见**的那部分，单位是**画布像素**（＝申报的坐标系）。
- *
- *  刻意留在画布像素里：换算是**两个不同的去处**（`clip-path` 要元素本地像素、
- *  `DG_REVEAL:` 那一行要成片像素），在这里乘上任何一个比例都会让另一个去处拿错尺。
- *  于是这一层只算「哪一块、到点没有、被扣成哪几片」，换算是调用方两行乘法的事。
- *
- *  返 `{id, sequence, rects}`——按 sequence 升序，**没到点的块也在**（`rects: []`）：
- *  「这一块此刻什么都不该显示」与「这一块不在这次申报里」在 ㉗ 的账上是两件事。 */
-export function revealMasks(spec: RevealSpec, frame: number, fps: number):
-Array<{ id: string; sequence: number; rects: RevealRect[] }> {
-  const regions = (spec.regions ?? []).slice().sort((a, b) => a.sequence - b.sequence);
-  const tMs = fps > 0 ? (frame / fps) * 1000 : 0;
-  const byId = new Map(regions.map((r) => [r.id, r]));
-  return regions.map((r) => {
-    if (tMs < r.start_ms) return { id: r.id, sequence: r.sequence, rects: [] };
-    const drawn = sweepRect(r.region, r.direction, revealProgress(r, tMs));
-    const cut: RevealRect[] = [];
-    for (const later of regions) {
-      if (later.sequence > r.sequence) cut.push(later.region);
-    }
-    for (const pid of r.protected ?? []) {
-      const g = byId.get(String(pid));
-      if (g && g.id !== r.id) cut.push(g.region);
-    }
-    const rects = subtractRects(drawn, cut).filter((p) => p.w > 0 && p.h > 0);
-    // 一片都没被扣掉时**原样返回推进到哪**，不走减法：减法里的浮点误差会让「画满了」
-    // 少掉最后一根发丝（w 从 808 变成 807.99999），而 ㉗ 的采样网格是贴着这条边排的。
-    if (!cut.length) return { id: r.id, sequence: r.sequence, rects: [drawn] };
-    return { id: r.id, sequence: r.sequence, rects };
-  });
-}
-
-/** 画布像素 → 另一套坐标（`sx`/`sy` 是「一个画布像素跨几个目标像素」，`ox`/`oy` 是原点）。
- *  两个去处共用这一行乘法，两处各写一遍就会在某一处漏掉原点。 */
-export function mapRects(rects: RevealRect[], sx: number, sy: number,
-                         ox = 0, oy = 0): RevealRect[] {
-  const q = (n: number) => Math.round(n * 100) / 100;
-  return rects.map((r) => ({ x: q(ox + r.x * sx), y: q(oy + r.y * sy),
-                             w: q(r.w * sx), h: q(r.h * sy) }));
-}
-
-/** 一帧的允许掩码（元素本地像素）→ `clip-path` 的路径串（多子路径＝并集）。
- *
- *  为什么用 `path()` 而不是几个 `inset()`：并集没法用一条 `inset()` 表达（它只切一个
- *  矩形），而 `mask-image` + `mask-composite` 在 headless Chrome 里各版本行为不一。
- *  `clip-path: path()` 是同一份几何的最简表达，且它在 SVG/HTML 上是同一套规则。
- *  **空清单返回 `'none'`（不裁）而不是空串**：空串是非法值，浏览器整条忽略——
- *  于是「本该全是纸底」的一帧反而全显示，而这一族唯一的验收靠的就是那一帧。 */
-export function clipPathOf(rects: RevealRect[]): string {
-  if (!rects.length) return 'none';
-  const seg = rects.map((r) => (`M${r.x},${r.y} H${r.x + r.w} V${r.y + r.h} H${r.x} Z`));
-  return `path("${seg.join(' ')}")`;
-}
-
-/** 成片像素坐标系里的一个盒，左上角 (x,y)。 */
-interface PxBox {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-
-/** 一个标注元素在成片像素坐标系里的盒；量不到返回 null（不是 0×0）。 */
-function measureBox(el: Element): PxBox | null {
-  const round = (n: number) => Math.round(n * 100) / 100;
-  const own = el.getBoundingClientRect();
-  let rects: DOMRect[] = own.width > 0 || own.height > 0 ? [own] : [];
-  if (!rects.length) {
-    // display:contents 的退化写法：自己不成盒，量它内容区间的每一段
-    try {
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      rects = Array.from(range.getClientRects());
-    } catch {
-      rects = [];
-    }
-  }
-  if (!rects.length) return null;
-  const x = Math.min(...rects.map((r) => r.left));
-  const y = Math.min(...rects.map((r) => r.top));
-  const right = Math.max(...rects.map((r) => r.right));
-  const bottom = Math.max(...rects.map((r) => r.bottom));
-  return { x: round(x), y: round(y), w: round(right - x), h: round(bottom - y) };
-}
-
-/**
- * 屏幕盒 → **成片像素坐标**（`useBody()` 报的那一套：画面带左上角在 (gutter, topSafe)）。
- *
- * 为什么要有这一步：R7-T22 的进出场是母版套在整帧上的一层 `transform`，
- * 而 `getBoundingClientRect()` 量出来的是**变换之后**的屏幕盒。不折回去的话，
- * 一个「整片淡入 + 上浮」的片子会让闸⑧ 报一片「文字被画面带裁掉」（其实是被那层
- * 变换推出去了）、闸⑪ 把一张**静态**图判成「参与动效」（两帧的盒差了那点位移）——
- * 两条都是假读数，而它们读的是同一个 DOM。
- *
- * 折法：同一帧里量一次画面带自己的盒（`live`），再按它的缩放 `s = live.w / 静态宽`
- * 把子元素的盒还原。带子与子元素被同一个变换影响，所以相除之后剩下的就是**代码写下的
- * 那个位置**——「整片有进出场」于是对这两条判据完全透明。没有进出场的片子
- * `live` 就等于静态盒、`s = 1`，这一步是恒等变换（老片子的读数一个字节不变）。
- *
- * 结果是四舍五入到 0.01px 的，而 ⑪ 是**逐字节**比两帧的盒：两帧的 `s` 不同，浮点尾数
- * 就可能落在舍入边界的两侧（量级 1e-7/盒），那是噪声不是位移——真动起来的东西两帧差的是
- * 若干个像素。这一层不做「容差比对」是有意的：容差会把「静态图在动与不动的边界上」这件事
- * 一起放宽，而 ⑪ 要判的正是那个边界（`server.mjs` 的 `boxSame && transformSame &&
- * opacitySame`）。
- */
-function toCodeSpace(box: PxBox, live: PxBox, base: PxBox): PxBox {
-  const s = base.w > 0 && live.w > 0 ? live.w / base.w : 1;
-  const round = (n: number) => Math.round(n * 100) / 100;
-  return {
-    x: round((box.x - live.x) / s + base.x),
-    y: round((box.y - live.y) / s + base.y),
-    w: round(box.w / s),
-    h: round(box.h / s),
-  };
-}
-
-/** 画面带这一帧**实测**的盒（含母版进出场那层 transform）。量不到给 null，
- *  调用方按「这一帧没有变换」处理（等于退回静态盒，宁可少折一次也不要报假读数）。 */
-function liveBand(el: HTMLElement | null): PxBox | null {
-  if (!el) return null;
-  const r = el.getBoundingClientRect();
-  if (!(r.width > 0) || !(r.height > 0)) return null;
-  return { x: r.left, y: r.top, w: r.width, h: r.height };
-}
-
-// ---------------------------------------------------------------------------
-// 闸⑧ 版面回读：叠字 / 被画面带裁掉 / 引线指向空白
-//
-// 这三条都是「抽帧看得出来、生成时看不出来」的画质账：镜头代码是模型现写的，
-// 它排版时手里只有坐标，没有像素。母版是这一镜唯一既有 DOM 又有真像素的地方，
-// 所以判据放在这里；判据本身是纯几何（盒与盒相交、端点离东西多远），不猜语义。
-//
-// 输出是**记账不拦截**的 findings（与闸⑦ 同一档）：这一层只交事实（判据命中的条目）、
-// 扫描条数与本次实际编译进去的阈值；逐条人话的单源在 Python 侧
-// `code_render.describe_layout`，`server.mjs` 只搬回结构化读数——措辞写两遍迟早不一样。
-// ---------------------------------------------------------------------------
-
-/**
- * 一条版面发现。`kind` 是给下游分档用的，`texts` 是给人看的证据（截断过的原文）。
- *
- * 坐标口径：`box` / `at` 都是**带内坐标**（画面带左上角是 (0,0)），不是成片像素。
- * 理由很直接——镜头代码写的就是这个系（`useBody()` 报的 `body.w/body.h` 是它的画布），
- * 报成片像素的话模型还得自己减掉 gutter，而减错方向就是另一处版面问题。
- * 闸⑥ 的字段盒用的是成片像素，那是 Python 侧归一化要点用的，两个口径各有归口。
- */
-interface LayoutFinding {
-  kind: 'overlap' | 'clipped' | 'dangling';
-  texts: string[];
-  box: PxBox | null;
-  /** overlap 的交叠比例 / clipped 的边与像素 / dangling 的空端坐标 */
-  ratio?: number;
-  side?: string;
-  px?: number;
-  at?: { x: number; y: number };
-}
-
-const areaOf = (b: PxBox) => b.w * b.h;
-
-/** 两个盒的相交面积；不相交给 0。 */
-function interArea(a: PxBox, b: PxBox): number {
-  const w = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
-  const h = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
-  return w > 0 && h > 0 ? w * h : 0;
-}
-
-/** 点到盒的距离（盒内为 0）。 */
-function distToBox(p: { x: number; y: number }, b: PxBox): number {
-  const dx = Math.max(b.x - p.x, 0, p.x - (b.x + b.w));
-  const dy = Math.max(b.y - p.y, 0, p.y - (b.y + b.h));
-  return Math.hypot(dx, dy);
-}
-
-/**
- * 这一路只扫「画得出东西」的元素：从自己往上到画面带，任一层透明或隐藏就跳过。
- *
- * 为什么要往上查而不是只看自己：动效几乎都写在祖先 `<g>`/容器上（整块淡入），
- * 只查自己会把「此刻还没亮」的标签当成叠字报出去。
- * `opacity` 用 <0.08 而不是 ===0：淡入到 3% 的东西肉眼本来也看不见，
- * 而它的盒已经完整存在，不躲就会误报。
- */
-function paintedWithin(root: Element, el: Element): boolean {
-  for (let cur: Element | null = el; cur && root.contains(cur); cur = cur.parentElement) {
-    const s = getComputedStyle(cur);
-    if (s.visibility === 'hidden' || s.visibility === 'collapse') return false;
-    if (s.display === 'none') return false;
-    const o = Number(s.opacity === '' ? 1 : s.opacity);
-    if (!Number.isNaN(o) && o < 0.08) return false;
-  }
-  return true;
-}
-
-/** 屏幕像素 → 成片像素的换算（见 :func:`toCodeSpace`）；纯点也走它，
- *  所以「盒」与「引线端点」不会各折一次、折出两个口径。 */
-type Convert = (box: PxBox) => PxBox;
-
-/** 元素自己直接挂着的非空文本（不含子元素的文本，于是父子盒不会重复计）。 */
-function ownText(el: Element): string {
-  return Array.from(el.childNodes)
-    .filter((n) => n.nodeType === 3 && (n.textContent ?? '').trim().length > 0)
-    .map((n) => (n.textContent ?? '').trim())
-    .join(' ')
-    .trim();
-}
-
-/**
- * 「有可见画法」的叶子图元盒 —— 引线另一端的落点就拿这些判。
- *
- * 只收叶子：`<g>` 的盒是子元素的外接盒，收进来等于把整组都算成落点，
- * 悬空判据会永远不响（漏报到无用，不如不判）。
- * SVG 图元看 fill/stroke 是否真画得出；HTML 看有没有背景或描边——
- * 透明div 的盒是布局用的，不是画面。
- *
- * 结果带元素身份（而不只是盒）：判引线悬空时**必须把这条线自己剔掉**——线的端点天然
- * 落在自己的外接盒上，不剔就成了「另一端挨着画得出的东西」，dangling 这一路恒不响应。
- */
-function drawnBoxes(root: Element, convert: Convert): { el: Element; box: PxBox }[] {
-  const out: { el: Element; box: PxBox }[] = [];
-  const svgTags = new Set(['path', 'rect', 'circle', 'ellipse', 'polygon', 'polyline', 'line', 'image', 'text', 'tspan']);
-  for (const el of Array.from(root.querySelectorAll('*'))) {
-    if (el.childElementCount > 0) continue;
-    const s = getComputedStyle(el);
-    const painted = svgTags.has(el.tagName.toLowerCase())
-      ? (s.fill !== 'none' && s.fill !== 'transparent')
-        || (s.stroke !== 'none' && s.stroke !== 'transparent')
-      : (s.backgroundColor !== 'transparent' && s.backgroundColor !== 'rgba(0, 0, 0, 0)')
-        || parseFloat(s.borderTopWidth) > 0
-        || parseFloat(s.borderLeftWidth) > 0;
-    if (!painted) continue;
-    if (!paintedWithin(root, el)) continue;
-    const box = measureBox(el);
-    if (box && box.w >= 1 && box.h >= 1) out.push({ el, box: convert(box) });
-  }
-  return out;
-}
-
-/**
- * 引线端点，屏幕像素。
- *
- * 三种写法覆盖模型实际会画的引线：`<line>`（直）、`<polyline>`（折）、`<path>`（弧）。
- * 属性值与 `getPointAtLength` 都在**元素自己的 user space**，`getScreenCTM()`
- * 正是从这个空间映到屏幕，所以 `<g transform>` / viewBox 缩放都跟着走 ——
- * 这条映射由 tests/layout-probe.mjs 拿一支带 transform 的夹具钉住。
- */
-function lineEnds(el: Element): [{ x: number; y: number }, { x: number; y: number }] | null {
-  const svgEl = el as SVGGraphicsElement & SVGGeometryElement;
-  const ctm = typeof svgEl.getScreenCTM === 'function' ? svgEl.getScreenCTM() : null;
-  if (!ctm) return null;
-  const toScreen = (x: number, y: number) => {
-    try {
-      const p = new DOMPoint(x, y).matrixTransform(ctm as unknown as DOMMatrix);
-      return { x: Math.round(p.x * 100) / 100, y: Math.round(p.y * 100) / 100 };
-    } catch {
-      return null;
-    }
-  };
-  const num = (name: string) => Number(svgEl.getAttribute(name) ?? 0) || 0;
-
-  let pair: { x: number; y: number }[] | null = null;
-  if (svgEl.tagName.toLowerCase() === 'line') {
-    pair = [{ x: num('x1'), y: num('y1') }, { x: num('x2'), y: num('y2') }];
-  } else if (svgEl.tagName.toLowerCase() === 'polyline') {
-    const pts = String(svgEl.getAttribute('points') ?? '')
-      .trim().split(/[\s,]+/).map(Number).filter((n) => !Number.isNaN(n));
-    if (pts.length >= 4) {
-      pair = [
-        { x: pts[0], y: pts[1] },
-        { x: pts[pts.length - 2], y: pts[pts.length - 1] },
-      ];
-    }
-  } else if (typeof svgEl.getTotalLength === 'function') {
-    // path（以及任何有长度可求的图元）：起终点是引线的两端
-    try {
-      const total = svgEl.getTotalLength();
-      if (total > 0) {
-        const a = svgEl.getPointAtLength(0);
-        const b = svgEl.getPointAtLength(total);
-        pair = [{ x: a.x, y: a.y }, { x: b.x, y: b.y }];
-      }
-    } catch {
-      pair = null;
-    }
-  }
-  if (!pair) return null;
-  const p0 = toScreen(pair[0].x, pair[0].y);
-  const p1 = toScreen(pair[1].x, pair[1].y);
-  return p0 && p1 ? [p0, p1] : null;
-}
-
-/** 闸⑲-a 的**主体件**：画得出**图形**的那几类元素（SVG 形状 / 位图 / 三维画布）。
-
- *  纯 `<div>` 加背景色**不算**，这一条是判据的命门：卡片就是一张涂了底色的 div，
- *  把 div 算进主体，等于这条闸自己把要拦的东西放行（「卡片+文字」镜会绿得非常稳）。
- *  同一口径也写在 Python 侧（`code_spec._VECTOR_MARKUP_RE` 那句「色块不是图形主体」）。
- *  这里只报**读数**（个数与包围盒占比），阈值归 Python——这条链的规矩是「母版报原始
- *  读数、判据与数字在 Python 一处」，两边各写一个 0.18 就会出现两把尺。
- */
-const SUBJECT_TAGS = new Set([
-  'path', 'rect', 'circle', 'ellipse', 'polygon', 'polyline', 'line',
-  'canvas', 'img', 'video',
-]);
-
-function subjectBoxes(root: Element, convert: Convert): PxBox[] {
-  const out: PxBox[] = [];
-  for (const el of Array.from(root.querySelectorAll('*'))) {
-    if (!SUBJECT_TAGS.has(el.tagName.toLowerCase())) continue;
-    if (!paintedWithin(root, el)) continue;
-    const raw = measureBox(el);
-    if (!raw || raw.w < 1 || raw.h < 1) continue;
-    out.push(convert(raw));
-  }
-  return out;
-}
-
-/** 闸⑳(c) 的**画面指纹**：把画面带切成 6×6 的粗网格，记下文字盒与图元盒各压到哪些格。
-
- *  为什么是「哪几格」而不是精确坐标：⑳(c) 要判的是「**画面上**是不是同一张卡，只是代码
- *  写法不同」——同一张卡换个写法，坐标会差几个像素、格子在不在还是会一样。反过来精确坐标
- *  会让一条 3px 的位移把两组判成不同，判据就成了「代码像不像」的另一个马甲。
- *  闸⑨ 比代码骨架且要 ≥3 镜才定罪；⑳(c) 比**画面**且两镜即算——两个问题的答案不一样，
- *  所以两条闸并存（这也是「不许合并、不许重复实现」那句话的落点）。
- */
-const DEGEN_GRID = 6;
-
-function gridSignature(boxes: PxBox[], band: PxBox): number {
-  if (band.w <= 0 || band.h <= 0) return 0;
-  let bits = 0;
-  const cw = band.w / DEGEN_GRID;
-  const ch = band.h / DEGEN_GRID;
-  for (const b of boxes) {
-    const x0 = Math.floor((b.x - band.x) / cw);
-    const x1 = Math.floor((b.x + b.w - band.x) / cw);
-    const y0 = Math.floor((b.y - band.y) / ch);
-    const y1 = Math.floor((b.y + b.h - band.y) / ch);
-    for (let gy = Math.max(0, y0); gy <= Math.min(DEGEN_GRID - 1, y1); gy++) {
-      for (let gx = Math.max(0, x0); gx <= Math.min(DEGEN_GRID - 1, x1); gx++) {
-        bits |= 1 << (gy * DEGEN_GRID + gx);
-      }
-    }
-  }
-  return bits;
-}
-
-/** 闸⑳(c) 的**主色直方图**：这一镜画面上真声明了哪些颜色，按出现次数从多到少取前几个。
-
- *  说清楚它量的是什么：**不是**对像素做直方图，而是把 DOM 里画得出来的元素身上声明的
- *  颜色（`background-color`/`fill`/`stroke`/`color`，以及 SVG 属性写法）收起来数频次。
- *  两者在「同一张卡换个写法」这件事上等价（卡的颜色是写出来的），而它不需要读像素——
- *  省一整趟解码，也就能在探针那一帧顺手算完。渐变与位图在这条判据里认不出颜色：那种镜
- *  的这一栏是空的，而空栏**不参与**判定（见 Python 侧 `check_degenerate_forms`：颜色
- *  认不出时只按网格判，并把「颜色没量到」如实记在账上）。
- *
- *  `color`（文字色）也在里面，而且**必须**在：⑳(c) 要抓的那张丑卡恰恰是「一块底板 + 几
- *  行字、一个 SVG 形状都没有」，那种镜除了文字色之外一个声明的颜色都没有——不收它，
- *  这一栏就是空的，而空栏落「未判」，这条闸就恰好在它该响的地方闭嘴。
- *  收的是**声明值**，所以 `color` 会沿继承链在每个元素上各记一次——那正好是「这镜的墨色
- *  是什么」的频次，判据那边按**集合**比，不看谁排第一。
- */
-function colorHistogram(root: Element): string[] {
-  const count = new Map<string, number>();
-  const bump = (raw: string) => {
-    if (!raw) return;
-    const v = raw.trim().toLowerCase();
-    if (!v || v === 'transparent' || v === 'none' || v.startsWith('url(')) return;
-    if (v.startsWith('rgba(0, 0, 0, 0)')) return;
-    count.set(v, (count.get(v) || 0) + 1);
-  };
-  const SVG_NS = 'http://www.w3.org/2000/svg';
-  for (const el of Array.from(root.querySelectorAll('*'))) {
-    const s = getComputedStyle(el);
-    // `fill`/`stroke` **只对 SVG 元素收**：CSS 里这两个属性的初值就是黑色，于是每一个
-    // 普通 div 都会贡献一次 `rgb(0, 0, 0)`——真机实测那一栏会变成「所有颜色都被黑色挤掉
-    // 前四名里的一半」，而这条读数要回答的是「这镜画了什么颜色」。
-    if (el.namespaceURI === SVG_NS) {
-      bump(s.fill);
-      bump(s.stroke);
-      bump(el.getAttribute('fill') || '');
-      bump(el.getAttribute('stroke') || '');
-    }
-    bump(s.backgroundColor);
-    bump(s.color);
-    bump(el.getAttribute('color') || '');
-  }
-  return Array.from(count.entries())
-    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
-    .slice(0, 4)
-    .map(([c]) => c);
-}
-
-/** 一组盒的**并集外接盒**与画面带相交之后，占带面积的比例（0~1）。
- *
- *  为什么取并集外接盒而不是并集面积：判据问的是「主体件铺开了多大一片画面」，
- *  而不是「主体的墨水占了多少面积」——一只描边的圆，墨水占比接近 0，但它确实
- *  占了画面里很大一块。两条口径给出的数差一个数量级，取哪个必须先说清楚。
- */
-function shareOfBoxes(boxes: PxBox[], band: PxBox): number {
-  if (!boxes.length || band.w <= 0 || band.h <= 0) return 0;
-  const x = Math.max(band.x, Math.min(...boxes.map((b) => b.x)));
-  const y = Math.max(band.y, Math.min(...boxes.map((b) => b.y)));
-  const right = Math.min(band.x + band.w, Math.max(...boxes.map((b) => b.x + b.w)));
-  const bottom = Math.min(band.y + band.h, Math.max(...boxes.map((b) => b.y + b.h)));
-  if (right <= x || bottom <= y) return 0;
-  return ((right - x) * (bottom - y)) / (band.w * band.h);
-}
-
-/** 母版在探针帧上做一次版面回读。
- *
- *  `convert` 把这一帧量到的屏幕盒折回**成片像素**（见 :func:`toCodeSpace`）：
- *  母版那层进出场变换是整帧一起动的，折回去之后三条判据读到的还是「代码写下的版面」。
- *  没有进出场的片子 `convert` 是恒等变换，读数与从前逐字节相同。
- */
-function probeLayout(root: Element, band: PxBox, convert: Convert) {
-  const findings: LayoutFinding[] = [];
-  let dropped = 0;
-  const push = (f: LayoutFinding) => {
-    if (findings.length < LAYOUT_PROBE.max_findings) findings.push(f);
-    else dropped++;
-  };
-  const round = (n: number) => Math.round(n * 100) / 100;
-  /** finding 里的盒一律换成**带内坐标**——镜头代码写的就是那个系（`useBody()` 报的
-   *  `body.w/body.h`），报屏幕像素等于让模型自己减 gutter，减错方向又是一处版面问题。
-   *  三条判据共用这一个换算，别出现「只有 dangling 减了」那种分裂口径。 */
-  const toBand = (b: PxBox): PxBox => ({
-    x: round(b.x - band.x), y: round(b.y - band.y), w: b.w, h: b.h,
-  });
-
-  // 1) 文字盒
-  const texts: { text: string; box: PxBox; el: Element }[] = [];
-  for (const el of Array.from(root.querySelectorAll('*'))) {
-    const text = ownText(el);
-    if (!text) continue;
-    if (!paintedWithin(root, el)) continue;
-    const raw = measureBox(el);
-    if (!raw || raw.w < LAYOUT_PROBE.min_box_px || raw.h < LAYOUT_PROBE.min_box_px) continue;
-    texts.push({ text: text.slice(0, 24), box: convert(raw), el });
-  }
-
-  // 2) 叠字：两处各写各的文字压在一起
-  for (let i = 0; i < texts.length; i++) {
-    for (let j = i + 1; j < texts.length; j++) {
-      const a = texts[i];
-      const b = texts[j];
-      // 父子不重复报：容器盒本来就罩住自己的文字，那不是「两处标签互相盖」
-      if (a.el.contains(b.el) || b.el.contains(a.el)) continue;
-      const smaller = Math.max(1, Math.min(areaOf(a.box), areaOf(b.box)));
-      const ratio = interArea(a.box, b.box) / smaller;
-      if (ratio < LAYOUT_PROBE.overlap_ratio) continue;
-      push({ kind: 'overlap', texts: [a.text, b.text], box: toBand(b.box), ratio: round(ratio) });
-    }
-  }
-
-  // 3) 被画面带裁掉：母版那层是 overflow:hidden，越界就是真被切
-  for (const t of texts) {
-    const over = {
-      left: band.x - t.box.x,
-      top: band.y - t.box.y,
-      right: t.box.x + t.box.w - (band.x + band.w),
-      bottom: t.box.y + t.box.h - (band.y + band.h),
-    };
-    const side = (['left', 'top', 'right', 'bottom'] as const)
-      .find((k) => over[k] > LAYOUT_PROBE.clip_px);
-    if (!side) continue;
-    push({ kind: 'clipped', texts: [t.text], box: toBand(t.box), side,
-           px: Math.round(over[side]) });
-  }
-
-  // 4) 引线悬空：一端挨着文字，另一端既不挨文字也不挨任何画得出的东西
-  const anchor = Math.max(
-    LAYOUT_PROBE.anchor_min_px,
-    Math.round(LAYOUT_PROBE.anchor_ratio * Math.min(band.w, band.h)),
-  );
-  const drawn = drawnBoxes(root, convert);
-  // 闸⑲-a / ⑳(a) 的两个读数（T30）：主体件占带多少、文字占带多少。判据在 Python，
-  // 这里只把这一帧量到的两个数如实报上去（量不到就是 0，别编一个「差不多」的数）。
-  const subject = subjectBoxes(root, convert);
-  const nearText = (p: { x: number; y: number }) => texts.find((t) => distToBox(p, t.box) <= anchor) ?? null;
-  /** 落点判「挨着画得出的东西」——**这条线自己不算**：它的端点天然落在自己的盒上。 */
-  const nearDrawn = (p: { x: number; y: number }, self: Element) =>
-    drawn.some((d) => d.el !== self && distToBox(p, d.box) <= anchor);
-
-  /** 端点也走同一个换算：`getScreenCTM()` 给的是屏幕像素，判据的容差全是成片像素。 */
-  const convPoint = (p: { x: number; y: number }) => {
-    const c = convert({ x: p.x, y: p.y, w: 0, h: 0 });
-    return { x: c.x, y: c.y };
-  };
-
-  let leaders = 0;
-  for (const el of Array.from(root.querySelectorAll('line, polyline, path'))) {
-    const s = getComputedStyle(el);
-    const strokeWidth = Number(s.strokeWidth === '' ? 1 : parseFloat(s.strokeWidth)) || 0;
-    if (s.stroke === 'none' || s.stroke === 'transparent' || strokeWidth <= 0) continue;
-    if (!paintedWithin(root, el)) continue;
-    const screen = lineEnds(el);
-    if (!screen) continue;
-    const ends: [{ x: number; y: number }, { x: number; y: number }] =
-      [convPoint(screen[0]), convPoint(screen[1])];
-    if (Math.hypot(ends[0].x - ends[1].x, ends[0].y - ends[1].y) < LAYOUT_PROBE.leader_min_px) continue;
-    leaders++;
-    // 只报「一端明确是标签、另一端明确是空白」这一种：两端都空的是装饰线，
-    // 两端都不空的是接好的线，两端都挨文字的也不该响——判据越窄越不会误报。
-    const hits = ends.map((p) => ({ p, text: nearText(p), drawn: nearDrawn(p, el) }));
-    const anchored = hits.filter((h) => h.text);
-    const free = hits.filter((h) => !h.text && !h.drawn);
-    if (anchored.length === 1 && free.length === 1) {
-      push({
-        kind: 'dangling',
-        texts: [anchored[0].text!.text],
-        box: null,
-        at: { x: round(free[0].p.x - band.x), y: round(free[0].p.y - band.y) },
-      });
-    }
-  }
-
-  return {
-    findings,
-    scanned: {
-      texts: texts.length,
-      leaders,
-      drawn: drawn.length,
-      band: { w: Math.round(band.w), h: Math.round(band.h) },
-      dropped,
-      // 闸⑲-a / ⑳(a)：主体件个数与两个占比（原始读数，阈值在 Python）。
-      subjects: subject.length,
-      subject_share: Math.round(shareOfBoxes(subject, band) * 10000) / 10000,
-      text_share: Math.round(shareOfBoxes(texts.map((t) => t.box), band) * 10000) / 10000,
-      // 闸⑳(c)：这一镜的**画面指纹**（粗网格上文字/图元各压到哪些格 + 主色前四）。
-      // 判据在 Python：两条指纹撞上就是「代码不同、画面上是同一张卡」。
-      grid_text: gridSignature(texts.map((t) => t.box), band),
-      grid_drawn: gridSignature(drawn.map((d) => d.box), band),
-      colors: colorHistogram(root),
-      // 闸㉕ 徽章构图（R11）：**逐件**主体包围盒的原始读数，带内坐标、整数像素。
-      // 为什么要逐件而不是复用上面那两个数：`subjects` 只有**个数**、`subject_share` 只有
-      // **并集外接盒**的占比——「一枚圆形徽章铺满画面」与「两个部件左上一个右下」这两件
-      // 事，在「个数 1 / 占比 0.28」这栏里长得很像，只有拿到件本身的盒（宽高比、离带中心
-      // 多远）才分得开。判据（`BADGE_MIN_SHARE` / 居中容差 / 近方形容差）**全在 Python**
-      // ——母版只报量到了什么，两处各写一个 0.25 就会出现两把尺（同 ⑲-a 那条规矩）。
-      subject_boxes: subject.map((b) => {
-        const t = toBand(b);
-        return { x: Math.round(t.x), y: Math.round(t.y), w: Math.round(t.w), h: Math.round(t.h) };
-      }),
-    },
-  };
-}
-
 /**
  * 母版 Composition —— 新链里唯一有排版权的东西。
  *
@@ -1037,9 +556,8 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   text,
   highlight = [],
   words,
-  subtitleMode: subtitleModeProp,
-  captionPosition: captionPositionProp,
-  captionAnim: captionAnimProp,
+  captionStyle: captionStyleProp,
+  highlightStyle: highlightStyleProp,
   aspect: aspectProp,
   // 这四条**不给默认值**：`resolveShotMotion` 要能分清「镜头代码没转交」与「转交了 none」，
   // 前者回退到注入的那一份（模板漏抄一行不该让整片静默地不演）。
@@ -1052,20 +570,21 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   const frame = useCurrentFrame();
   const { width, height, fps, durationInFrames } = useVideoConfig();
   // 画幅 / 字幕档 / 字幕位置与动画：镜头代码转交了就用它给的，没转交就取 Python 注入的那份
-  // （与 resolveShotMotion 同一条回退）。原先 aspect 缺省写死 'portrait'：镜头代码漏传
-  // aspect 时，横屏片会套竖屏的字幕几何（44px 字、132 高的盒）。
-  const injected = getInputProps() as Record<string, unknown>;
-  const pick = <T extends string>(prop: T | undefined, key: string, allowed: readonly T[],
-                                  dflt: T): T => {
-    const v = prop ?? (injected[key] as T | undefined);
-    return v && allowed.includes(v) ? v : dflt;
-  };
-  const aspect = pick<Aspect>(aspectProp, 'aspect', Object.keys(ASPECTS) as Aspect[], 'portrait');
-  const subtitleMode = pick<SubtitleMode>(subtitleModeProp, 'subtitleMode',
-                                          SUBTITLE_MODES, 'torn_highlight');
-  const captionPosition = pick<CaptionPosition>(captionPositionProp, 'captionPosition',
-                                                CAPTION_POSITIONS, 'bottom');
-  const captionAnim = pick<CaptionAnim>(captionAnimProp, 'captionAnim', CAPTION_ANIMS, 'fade');
+  // （与 resolveShotMotion 同一条回退，写法见模块级的 `pickInjected`，字幕元件也走它）。
+  // 原先 aspect 缺省写死 'portrait'：镜头代码漏传 aspect 时，横屏片会套竖屏的字幕几何
+  // （44px 字、132 高的盒）。
+  const aspect = injectedAspect(aspectProp);
+  // 字幕两维（2026-10-16）：整片一档、逐镜可覆盖，注入时已经合成好（`shot_input_props`）。
+  // 母版这边只是照着画——它不必知道「逐镜」这件事。
+  const captionStyle = pickInjected<CaptionStyle>(captionStyleProp, 'captionStyle',
+                                                  CAPTION_STYLES, 'on_picture');
+  const highlightStyle = pickInjected<HighlightStyle>(highlightStyleProp, 'highlightStyle',
+                                                      HIGHLIGHT_STYLES, 'color');
+  // 这一镜的字幕由**镜头代码自己摆**（代码里有 `<CaptionLayer/>`，Python 侧扫出来注入）。
+  // 母版据此让位——否则同屏两条字幕，而那种错只在成片上才看得见。让位是不必的猜测：
+  // 裸 `<CaptionLayer/>` 回落到同一份几何、同一档配方，所以「谁来摆」不影响那条字幕
+  // 长什么样，闸⑤ 的跨镜一致照旧成立。
+  const captionFromCode = injectedFlag('captionFromCode');
   // 闸⑧ 的扫描范围锚点：只扫画面带里面，母版自己的字幕带不算在镜头代码的账上。
   const bodyRef = React.useRef<HTMLDivElement>(null);
   // u 只管**字阶与配色**（横竖屏字号才跳不了位）；版面几何走 FILM_GEOMETRY 的设备像素，
@@ -1073,31 +592,28 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   const u = width / 1080;
   const geo = FILM_GEOMETRY[aspect];
   // R14：风格档（底色 / 满幅）与字幕形态。三件事都从注入里取，镜头代码碰不到——
-  // 与 `reveal`/`entrance` 同一条回退逻辑。不传 `film_style` 时 `style` 就是缺省值，
+  // 与 `entrance` 同一条回退逻辑。不传 `film_style` 时 `style` 就是缺省值，
   // `bg` 落回 `TOKENS.bg`、`bleed` 为 false，于是老片子的读数一个字节都不变。
   const style = resolveFilmStyle(getInputProps());
   const bg = style.bg || TOKENS.bg;
-  const tone = captionTone(bg);
+  // 字幕条配色：Python 侧认出这一镜的色板时（认的是代码里那句 `palettes["…"]` 绑定，
+  // 与申没申报底色无关），条底/字色/强调色全部跟色板走；认不出退回按亮度二档——
+  // 那一档是今天的行为，老片子一个字节不变。三色由 `captionLook` 一处给出，
+  // 镜头代码用 `<CaptionLayer/>` 摆的那条也从它取——同屏两条字幕不会各是各的色。
+  // 用户在「文字库」钉过「强调色」时，`captionLook` 里那一枚盖过色板的 accent
+  // （只管强调色，条底与字色照旧）。
+  const { tone, hl: hlColor, accent: accentColor } = captionLook(style, bg);
   const body = filmBody(width, height, aspect, style.bleed);
-  // 满幅时字幕条**叠在画面上**（没有下安全区可站），位置由几何表给；
-  // 非满幅时仍旧站在下安全区正中——今天的行为逐字不变。
-  const captionBottom = style.bleed
-    ? geo.bleedCaptionBottom
-    : (geo.bottomSafe - geo.caption.height) / 2;
+  // 满幅时字幕条**叠在画面上**，非满幅时仍旧站在下安全区正中——今天的行为逐字不变。
+  const captionBottom = captionBottomOf(geo, style.bleed);
 
-  const captionIn = interpolate(frame, [0, 0.25 * fps], [0, 1], {
-    extrapolateLeft: 'clamp',
-    extrapolateRight: 'clamp',
-  });
+  const captionIn = captionFadeIn(frame, fps);
 
   // R7-T22 整片进出场：画面带与字幕带一起动（整帧的一个观感决定），背景留在外面。
   // 窗口帧数由 Python 侧算好注入 —— 这里再算一遍那条 10%/15 帧的算术就有了第二个出处。
   // 四条取值走 `resolveShotMotion`：镜头代码转交了就用它给的，没转交就取注入的那份。
   const motionIn = resolveShotMotion({ entrance, exit, entranceFrames, exitFrames },
                                      getInputProps());
-  // R12-T60：分区揭示的申报（母版按它逐帧算 mask）。与上面那条同一条回退逻辑：
-  // 镜头代码转交不了它（它本来就不是代码的数据），一律读注入的那一份。
-  const revealIn = resolveReveal(getInputProps());
   const motion = composeMotion(
     shotMotion(motionIn.entrance, motionIn.entranceFrames, frame, durationInFrames, height, true),
     shotMotion(motionIn.exit, motionIn.exitFrames, frame, durationInFrames, height, false),
@@ -1106,8 +622,8 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   /**
    * 这一帧的「屏幕 → 成片像素」换算（见 :func:`toCodeSpace`）。
    *
-   * 闸⑥ 的字段盒、闸⑧ 的版面盒、闸⑪ 的资产盒**共用这一份**：三条判据读的是同一帧的
-   * 同一个 DOM，各量一次画面带就可能量出三个口径。量不到画面带时退回恒等变换
+   * 闸⑥ 的字段盒、闸⑧ 的版面盒**共用这一份**：两条判据读的是同一帧的
+   * 同一个 DOM，各量一次画面带就可能量出两个口径。量不到画面带时退回恒等变换
    * （宁可少折一次，也不要报一个自己造出来的读数）。
    * 在 effect 里调用（而不是渲染时算好）：`liveBand` 量的必须是**这一帧**的实况。
    */
@@ -1128,14 +644,26 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
     // 「这镜满幅、那镜有安全区」会被闸⑤ 判成「母版常量漂移」，新能力当场判死。
     bg,
     bleed: style.bleed,
-    paper: TOKENS.paper,
-    accent: TOKENS.accent,
-    hl: TOKENS.hl,
+    // 以下四栏报的是**字幕条实际排出去的颜色**（色板命中时逐镜不同），不是 TOKENS
+    // 常量副本——Python 侧把这四个键放进了 `TOKEN_PER_SHOT_KEYS`。
+    //
+    // `captionInk` 与上面的 `ink` **不是一回事**：`ink` 是母版的正文常量、全片一个值，
+    // 闸⑤ 正是拿它比全片一致性；`captionInk` 是字幕条真正用来写字的那一色
+    // （见下面 `Caption` 的 `color: tone.ink`），色板命中时它是色板的 `text`。
+    // 只在 `ink` 里报常量，等于「字幕条读不读得出来」在回读表上无从判起。
+    paper: tone.paper,
+    captionInk: tone.ink,
+    accent: accentColor,
+    hl: hlColor,
     scale: Number(u.toFixed(6)),
     // 以下全是**这一版真正排出去的设备像素**：闸⑤ 容差 0 跨镜比对，
     // 母版被改坏时这里会先红，而不是等抽帧去猜。
     aspect,
-    subtitleMode,
+    // 字幕两维：**逐镜可覆盖**，所以 Python 侧把它们放进了 `TOKEN_PER_SHOT_KEYS`
+    // 白名单（`check_token_drift` 不拿它们比跨镜一致）——报的是这一镜**实际排出去的**
+    // 那一对，不是整片开关的副本。
+    captionStyle,
+    highlightStyle,
     bodyWidth: body.w,
     bodyHeight: body.h,
     topSafe: geo.topSafe,
@@ -1197,102 +725,14 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
     if (frame !== probeFrame) return;
     const root = bodyRef.current;
     if (!root) {
-      console.log(`${LAYOUT_LOG_MARKER}${JSON.stringify({
-        frame, findings: [], scanned: null, thresholds: LAYOUT_PROBE,
-        reason: '画面带 ref 未挂载，这一帧没扫版面',
-      })}`);
+      emitLayoutMissing(frame, '画面带 ref 未挂载，这一帧没扫版面', 'master');
       return;
     }
-    const { findings, scanned } = probeLayout(
-      root,
-      { x: body.x, y: body.y, w: body.w, h: body.h },
-      frameConvert(),
-    );
-    console.log(`${LAYOUT_LOG_MARKER}${JSON.stringify({ frame, findings, scanned, thresholds: LAYOUT_PROBE })}`);
+    // 判据与措辞的单源在 `./lib/LayoutProbe`（2026-10-16 从那两个文件里搬出去的）：
+    // 自包含镜走同一份探针，只是 root 是整帧、`convert` 是恒等。两处共用 `emitLayout`，
+    // 免得一处漏掉 `thresholds`（Python 侧 `describe_layout` 就靠它拿阈值）。
+    emitLayout(root, { x: body.x, y: body.y, w: body.w, h: body.h }, frameConvert(), frame, 'master');
   }, [frame, probeFrame, body.x, body.y, body.w, body.h]);
-
-  // 闸⑪ 资产动效：在两个时点各扫一遍 <img>/<video>，记录盒与 transform。
-  // server.mjs 比对两帧快照：盒/transform 全同 → 静态摆图打回；有变 → 参与动效绿；
-  // 采不到任何资产盒 → 未判（不许记成通过）。
-  // 用两个靠近末尾的帧而非首/末帧：首帧 <img> 可能未加载完（box=y:-999903），
-  // 与探针帧的盒不同会被误判为 animated。两帧都靠近末尾时图片已加载、布局已稳定。
-  // 选 probeFrame-2 与 probeFrame：间隔 2 帧足够检测仍在进行的动效，
-  // 且都在渲染稳定区。对短镜（duration≤4）退化为前半与后半各取一帧。
-  const assetProbeEarly = probeFrame > 4 ? probeFrame - 2 : Math.min(1, Math.floor(durationInFrames / 2));
-  React.useEffect(() => {
-    if (frame !== assetProbeEarly && frame !== probeFrame) return;
-    const root = bodyRef.current;
-    if (!root) return;
-    // 盒折回成片像素：两帧的**同一张静态图**在整片进出场下屏幕盒不同，
-    // 不折的话判据（逐字节比两帧的盒）会把静态摆图判成「参与动效」——一条假绿。
-    // 元素自身的 transform/opacity 照原样上报：母版那层变换挂在祖先上，读不到这里。
-    const convert = frameConvert();
-    const assets = Array.from(root.querySelectorAll('img, video'))
-      .filter((el) => paintedWithin(root, el))
-      .map((el) => {
-        const box = measureBox(el);
-        const s = getComputedStyle(el);
-        const src = el.tagName.toLowerCase() === 'img'
-          ? (el as HTMLImageElement).src
-          : (el as HTMLVideoElement).src;
-        return {
-          tag: el.tagName.toLowerCase(),
-          src: src?.slice(-80),
-          box: box ? convert(box) : null,
-          transform: s.transform,
-          opacity: Number(s.opacity === '' ? 1 : s.opacity),
-        };
-      });
-    console.log(`${ASSET_LOG_MARKER}${JSON.stringify({ frame, assets })}`);
-  }, [frame, assetProbeEarly, probeFrame]);
-
-  // 闸㉗ 的原料：分区揭示的**允许掩码**（R12-T60）。三个决定写在这里：
-  //
-  //   1. `useLayoutEffect` 而不是 `useEffect`：这一条改的是**这一帧的像素**，
-  //      必须在浏览器画这一帧之前落下去。`useEffect` 在 paint 之后跑，逐帧截图时
-  //      会慢一帧（截图拿到的是上一帧的 mask）——而 ㉗ 判的正是「这一帧该不该露」，
-  //      慢一帧就等于把判据整体挪了一格。
-  //   2. 只改 `<img>`（这一族的插画就是它）。母版不知道镜头代码把图画在哪儿，
-  //      所以位置的换算按**元素自己的盒**做（canvas → 元素本地像素），
-  //      与镜头代码怎么摆无关——「区域画在哪儿」于是只有一处实现。
-  //   3. Python 点名的帧各发一行 `DG_REVEAL:`（它自己去抽那一帧来比色），
-  //      别的帧只改像素不出声：毎帧一行会把逐镜账撑成噪声，而 ㉗ 只需要几个时刻。
-  React.useLayoutEffect(() => {
-    const root = bodyRef.current;
-    if (!root) return;
-    const { spec, probeFrames } = revealIn;
-    const imgs = Array.from(root.querySelectorAll('img'))
-      .filter((el) => paintedWithin(root, el)) as HTMLImageElement[];
-    if (!spec) return;
-    const masks = revealMasks(spec, frame, fps);
-    const all = masks.flatMap((m) => m.rects);
-    for (const el of imgs) {
-      const sx = el.offsetWidth / Number(spec.canvas.w);
-      const sy = el.offsetHeight / Number(spec.canvas.h);
-      // 元素自己还没量到尺寸（图未加载）时**不裁**：裁一个 0 宽的盒等于把整张图抹掉，
-      // 而 ㉗ 会把那一帧读成「未开始的区域是纸底」——一条假绿，正好是本闸要拦的那件事。
-      el.style.clipPath = (sx > 0 && sy > 0) ? clipPathOf(mapRects(all, sx, sy)) : 'none';
-    }
-    if (!probeFrames.includes(frame)) return;
-    const convert = frameConvert();
-    const boxes = imgs.map((el) => {
-      const b = measureBox(el);
-      return { src: (el.src ?? '').slice(-80), box: b ? convert(b) : null,
-               local: { w: el.offsetWidth, h: el.offsetHeight } };
-    });
-    console.log(`${REVEAL_LOG_MARKER}${JSON.stringify({
-      frame, canvas: spec.canvas, boxes,
-      // 成片像素（带内坐标）：㉗ 拿它加画面带原点就是能在帧上取样的矩形。
-      // 用**成片像素**而不是元素本地像素：本地的原点在元素自己的角上，
-      // 而元素的位置是镜头代码摆的——那一侧的读数会随排版漂，这一侧不会。
-      regions: masks.map((m) => ({
-        id: m.id, sequence: m.sequence,
-        rects: mapRects(m.rects, (boxes[0]?.box?.w ?? 0) / Number(spec.canvas.w),
-                        (boxes[0]?.box?.h ?? 0) / Number(spec.canvas.h),
-                        boxes[0]?.box?.x ?? 0, boxes[0]?.box?.y ?? 0),
-      })),
-    })}`);
-  }, [frame, fps, revealIn]);
 
   return (
     <AbsoluteFill style={{ background: bg, fontFamily: TOKENS.fontStack }}>
@@ -1319,23 +759,24 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
           {children}
         </div>
 
-        {/* R14：`inline` 档母版**不画字幕**——文字由镜头代码自己排进画面。
-            为什么不是母版换个位置画：参考片那种「文字压在画面上、随构图摆」
-            本质上是**这一镜的构图决定**，只有镜头代码知道它把主体放在哪。
-            母版插一脚就又是「每镜一条固定字幕带」。text/highlight/words 本来
-            就在 `props` 里，镜头代码一直拿得到，这一档只是把绘制权还回去。 */}
-        {subtitleMode !== 'none' && subtitleMode !== 'inline' && text ? (
+        {/* 母版这条字幕。两条不画的路：
+            · `caption_style: none` —— 整片（或这一镜）不上字幕；
+            · 代码里摆了 `<CaptionLayer/>` —— 绘制权还给镜头代码，母版让位（否则同屏两条）。
+            为什么让位这件事要由 Python 侧扫代码来决定：母版在运行期看不到那一镜的代码，
+            而「有没有第二条」是**这一段代码的静态事实**。 */}
+        {captionStyle !== 'none' && !captionFromCode && text ? (
           <Caption
             text={text}
             highlight={highlight}
             words={words}
-            mode={subtitleMode}
+            look={CAPTION_LOOK[captionStyle]}
+            hlLook={HIGHLIGHT_LOOK[highlightStyle]}
             opacity={captionIn}
             geo={geo}
             bottom={captionBottom}
             tone={tone}
-            position={captionPosition}
-            anim={captionAnim}
+            hl={hlColor}
+            accent={accentColor}
           />
         ) : null}
       </AbsoluteFill>
@@ -1347,65 +788,33 @@ const Caption: React.FC<{
   text: string;
   highlight: string[];
   words?: WordTiming[];
-  mode: SubtitleMode;
+  /** 字幕样式那一维的配方（`CAPTION_LOOK`）：底 / 位置 / 入场 / 字号 / 描边。 */
+  look: CaptionStyleLook;
+  /** 高亮样式那一维的配方（`HIGHLIGHT_LOOK`）：`emphasis` 与要不要逐字点亮。 */
+  hlLook: HighlightLook;
   opacity: number;
   geo: (typeof FILM_GEOMETRY)[Aspect];
   /** 字幕条底边到画面底的距离。非满幅时是下安全区正中（今天的行为），
    *  满幅时是几何表给的叠层位置——母版算好传进来，不在这里再判一次满幅。 */
   bottom: number;
-  /** 字幕条的两个颜色，按这一镜底色亮度算（见 `captionTone`）。 */
+  /** 字幕条的两个颜色：色板命中时是色板的 surface/text，否则按底色亮度二档（见 `captionTone`）。 */
   tone: { paper: string; ink: string };
-  /** 字幕位置（模型按构图选）：bottom 默认 / center 压在画面正中 / top 顶部安全区。 */
-  position?: CaptionPosition;
-  /** 字幕入场动画（模型按片子气质选）：fade / rise / pop / karaoke（逐字随语音点亮）。 */
-  anim?: CaptionAnim;
-}> = ({ text, highlight, words, mode, opacity, geo, bottom, tone,
-        position = 'bottom', anim = 'fade' }) => {
+  /** 高亮词块底色（色板 accent 加 40% 透明，或全局粉）。 */
+  hl: string;
+  /** 强调色：`emphasis: 'color'` 时是高亮词的字色，`'ink'` 时是那条笔触的颜色。 */
+  accent: string;
+}> = ({ text, highlight, words, look, hlLook, opacity, geo, bottom, tone, hl, accent }) => {
   const frame = useCurrentFrame();
-  const { width, height, fps } = useVideoConfig();
+  const { height, fps } = useVideoConfig();
   const cap = geo.caption;
-
-  // 字号：按「最多两行」求，并夹在 [0.62, 1.25] × 几何表字号之间。
-  // 原先 fitText 直接取「整句塞进一行」的字号且不设上下限：60 字的句子缩到 14px 看不清，
-  // 四五个字的短句放到 150px+ 撑破字幕盒。两行容量正是 MAX_TEXT_CHARS 的前提。
-  const availW = width - 2 * cap.side - 2 * cap.padX;
-  let fontSize = cap.fontSize;
-  try {
-    const ft = remotionFitText({
-      text,
-      withinWidth: availW,
-      fontFamily: '"Noto Sans CJK SC", sans-serif',
-      fontWeight: 500,
-    });
-    const oneLine = ft.fontSize;
-    // 单行放得下且不超上限 → 单行；否则按两行（单行字号 ×2 再留 8% 断行余量）。
-    fontSize = oneLine >= cap.fontSize ? oneLine : oneLine * 2 * 0.92;
-  } catch {
-    // lint / 构建期没有浏览器环境，退回固定字号
-  }
-  fontSize = Math.round(Math.min(cap.fontSize * 1.25, Math.max(cap.fontSize * 0.62, fontSize)));
-
-  // 逐字时间：把 TTS 词按出现顺序对到字符区间上，得到每个字被读到的那一帧。
-  // 原先拿「片段序号」去取「词序号」的时间（words[i]），片段与词不是一回事；
-  // 高亮也要求 TTS 词是高亮词的子串，TTS 分得比高亮词长时整镜不亮。
-  const charFrames = useMemo(() => charStartFrames(text, words), [text, words]);
-  const timed = charFrames !== null;
-  const reached = (at: number) => !timed || frame >= (charFrames as number[])[at];
-
-  const pieces = splitByHighlights(text, highlight);
-  let cursor = 0;
-  const spans = pieces.map((p) => {
-    const start = cursor;
-    cursor += p.length;
-    return { p, start };
-  });
+  const position = look.position;
 
   // 入场动画（整条字幕）：只在前 0.3 秒内生效，之后静止，不抢画面。
   const t = Math.min(1, frame / Math.max(1, Math.round(0.3 * fps)));
   const ease = 1 - Math.pow(1 - t, 3);
   const enterStyle: React.CSSProperties =
-    anim === 'rise' ? { transform: `translateY(${(1 - ease) * cap.fontSize * 0.8}px)` }
-      : anim === 'pop' ? { transform: `scale(${0.86 + 0.14 * ease})` }
+    look.anim === 'rise' ? { transform: `translateY(${(1 - ease) * cap.fontSize * 0.8}px)` }
+      : look.anim === 'pop' ? { transform: `scale(${0.86 + 0.14 * ease})` }
         : {};
 
   const place: React.CSSProperties =
@@ -1428,48 +837,49 @@ const Caption: React.FC<{
         opacity,
       }}
     >
+      {/* 白字黑边那一档的压暗层：亮底上白字照样糊，把字所在的那一段压暗。
+          **不是纸条**——没有边界、不是纯色块，是一条下深上透的渐隐；所以它跟着
+          这一档走（`look.outline`），也只在下沿位置铺（压屏大字/顶部横幅不需要它）。
+          铺满整帧宽：`left/right` 反向让出外层那两条 `cap.side`。 */}
+      {look.outline && position === 'bottom' ? (
+        <div
+          style={{
+            position: 'absolute',
+            left: -cap.side, right: -cap.side,
+            top: -Math.round(cap.height * 1.7),
+            bottom: -Math.round(cap.height * 0.9),
+            background: 'linear-gradient(to top, rgba(0,0,0,0.66) 0%, '
+              + 'rgba(0,0,0,0.36) 34%, rgba(0,0,0,0.12) 66%, rgba(0,0,0,0) 100%)',
+            pointerEvents: 'none',
+          }}
+        />
+      ) : null}
       <div
         style={{
+          position: 'relative',
           maxWidth: '100%',
-          padding: `${cap.padY}px ${cap.padX}px`,
-          background: tone.paper,
-          borderRadius: cap.radius,
-          color: tone.ink,
-          fontSize: fontSize,
-          fontWeight: 500,
-          lineHeight: 1.35,
+          // 纸条底那一档才有底色、内衬与圆角；无底那几档字直接压在画面上。
+          // 内衬也一起去掉：无底还留着 34px 的内衬，字就比纸条档缩进一圈，
+          // 同一个 `bottom` 下两种观感的字不在同一条线上。
+          padding: look.band ? `${cap.padY}px ${cap.padX}px` : 0,
+          background: look.band ? tone.paper : 'transparent',
+          borderRadius: look.band ? cap.radius : 0,
+          color: look.ink ?? tone.ink,
+          // 字号不在这里给：纸条只管底、内衬与圆角，字号归 `CaptionText`（一处）。
+          // 行高/字重仍旧写在这里，由字继承——它们是这一档的排版。
+          fontWeight: look.weight,
+          lineHeight: look.lineHeight,
           textAlign: 'center',
           ...enterStyle,
         }}
       >
-        {spans.map(({ p, start }, i) => {
-          const isHl = highlight.some((h) => h && h === p);
-          const on = isHl && reached(start);
-          // 高亮词整体占一块粉色：中文可任意断行，「一座城市」被劈成两行时行尾会留下
-          // 一个只包着「一」字的孤立色块。短词锁住不拆；长片段照旧折行，免得撑破字幕盒。
-          const keep = p.length <= 12 && isHl;
-          const hlStyle: React.CSSProperties = {
-            whiteSpace: keep ? 'nowrap' : undefined,
-            background: on ? TOKENS.hl : 'transparent',
-            // torn_highlight：词点亮后留一条下划红线，逐词「撕开」的观感。
-            // 粗细跟字号走，三种画幅下才是同一条线。
-            borderBottom:
-              on && mode === 'torn_highlight'
-                ? `${Math.max(2, Math.round(fontSize / 26))}px solid ${TOKENS.accent}`
-                : 'none',
-          };
-          if (anim !== 'karaoke' || !timed) {
-            return <span key={i} style={hlStyle}>{p}</span>;
-          }
-          // karaoke：未读到的字淡显，读到就实显——整句一直在，眼睛能提前扫读。
-          return (
-            <span key={i} style={hlStyle}>
-              {Array.from(p).map((ch, j) => (
-                <span key={j} style={{ opacity: reached(start + j) ? 1 : 0.38 }}>{ch}</span>
-              ))}
-            </span>
-          );
-        })}
+        {/* 字（逐词点亮 / 换色 / 底色块 / 撕纸笔触 / 自动字号）只有一份实现：`CaptionText`。
+            镜头代码用 `<CaptionLayer/>` 摆出来的那条走的也是它——「母版这条字幕」与
+            「镜头代码自己摆的那条」因此不可能长得不一样。 */}
+        <CaptionText text={text} highlight={highlight} words={words}
+                     emphasis={hlLook.emphasis} karaoke={hlLook.karaoke}
+                     hl={hl} accent={accent} cap={cap}
+                     sizeScale={look.size} outline={look.outline} />
       </div>
     </div>
   );
@@ -1523,3 +933,246 @@ export function splitByHighlights(text: string, highlight: string[]): string[] {
   }
   return out;
 }
+
+/**
+ * 字幕的时间轴：这一镜的整句、高亮词切好的片段、每个字被读到的那一帧。
+ *
+ * 一次算齐，母版、字幕元件与镜头代码拿到的都是同一份。要「字幕与画面互动」的东西
+ * ——图形跟着念到的词跳一下、进度条随词推进——用 `reached(i)` 就够了，
+ * 不必自己再实现一遍 `charStartFrames`（那正是这条链最怕的第二份出处）。
+ */
+export interface CaptionTiming {
+  /** 这一镜的整句（不传 props 时取自注入）。 */
+  text: string;
+  /** 高亮词（不传 props 时取自注入）。 */
+  highlight: string[];
+  words?: WordTiming[];
+  /** 有词时间轴＝能逐词点亮；没有就只有整句一直亮（`reached` 恒 true）。 */
+  timed: boolean;
+  /** 每个字被读到的起始帧；没有词时间轴时为 null。 */
+  charFrames: number[] | null;
+  /** 第 `at` 个字这一刻被读到了没有。 */
+  reached: (at: number) => boolean;
+  /** 整句按高亮词切好的片段，`start` 是它在整句里的字符下标。 */
+  pieces: { p: string; start: number }[];
+}
+
+export function useCaptionTiming(opts: {
+  text?: string;
+  highlight?: string[];
+  words?: WordTiming[];
+} = {}): CaptionTiming {
+  const injected = getInputProps() as Record<string, unknown>;
+  const text = opts.text ?? (typeof injected.text === 'string' ? injected.text : '');
+  const highlight = opts.highlight
+    ?? (Array.isArray(injected.highlight) ? (injected.highlight as string[]) : []);
+  const words = opts.words ?? (injected.words as WordTiming[] | undefined);
+  const frame = useCurrentFrame();
+  // 逐字时间：把 TTS 词按出现顺序对到字符区间上，得到每个字被读到的那一帧。
+  // 原先拿「片段序号」去取「词序号」的时间（words[i]），片段与词不是一回事；
+  // 高亮也要求 TTS 词是高亮词的子串，TTS 分得比高亮词长时整镜不亮。
+  const charFrames = useMemo(() => charStartFrames(text, words), [text, words]);
+  let cursor = 0;
+  const pieces = splitByHighlights(text, highlight).map((p) => {
+    const start = cursor;
+    cursor += p.length;
+    return { p, start };
+  });
+  return {
+    text,
+    highlight,
+    words,
+    timed: charFrames !== null,
+    charFrames,
+    reached: (at: number) => charFrames === null || frame >= charFrames[at],
+    pieces,
+  };
+}
+
+export interface CaptionTextProps {
+  /** 画面上的那行字。不传＝注入里的 `text`（这一镜的整句）。 */
+  text?: string;
+  highlight?: string[];
+  words?: WordTiming[];
+  /** 高亮词**怎么显示**。不传＝跟着注入的「高亮样式」那一维（`HIGHLIGHT_LOOK`）。
+   *  取值与含义见 `CaptionEmphasis` 的注释。 */
+  emphasis?: CaptionEmphasis;
+  /** 逐字点亮（未读到的字淡显）。不传＝跟着注入的「高亮样式」那一维。 */
+  karaoke?: boolean;
+  /** 高亮块底色 / 撕纸笔触颜色。不传＝跟着这一镜的色板（与母版同源）。 */
+  hl?: string;
+  /** 强调色。`emphasis: 'color'` 时它就是**高亮词的字色**；`'ink'` 时是那条笔触的颜色。 */
+  accent?: string;
+  /** 字幕条的几何（字号基准、左右边距、内衬）。不传＝注入画幅的母版几何。 */
+  cap?: { fontSize: number; side: number; padX: number };
+  /** 求字号的可用宽度（设备像素）。不传＝母版字幕条的容量。 */
+  fitWidth?: number;
+  /** 直接给字号，跳过自动求值（要与画面里别的元素对齐时用）。 */
+  fontSize?: number;
+  /** 字号系数：乘在求出来的字号上。母版按 `CAPTION_LOOK[...].size` 传（大字压屏要放大
+   *  一号、整句电影感要收一点），镜头代码自己摆字时缺省 1。 */
+  sizeScale?: number;
+  /** 八向描边色（白字黑边那一档）。给了就用 `ring()` 画一圈，字形自己一个像素不吃。 */
+  outline?: string;
+}
+
+/**
+ * 字幕的**字**：逐词点亮、关键词换色、底色块、撕纸笔触、按两行容量求字号。
+ *
+ * 不画纸条底、不自带定位——底与位置由调用方给（母版给它那一档的底，镜头代码给自己那层
+ * scrim / 笔刷 / 抠图）。「让文字压在画面上」这条路不必手搓：`<CaptionText/>`
+ * 摆的是**画面里的文字**。两维样式**不传就跟着注入走**，所以它排出来的字与母版那条
+ * （`<Caption>` → 也是它）在同一档下逐字相同。
+ */
+export const CaptionText: React.FC<CaptionTextProps> = ({
+  text, highlight, words, emphasis: emphasisProp, karaoke: karaokeProp,
+  hl: hlProp, accent: accentProp, cap: capProp, fitWidth, fontSize: sizeProp,
+  sizeScale = 1, outline,
+}) => {
+  const { width } = useVideoConfig();
+  const t = useCaptionTiming({ text, highlight, words });
+  // 两维都不给 prop 时跟着**注入**那一档走：镜头代码把字摆进画面时，「高亮怎么显示」
+  // 本来就是整片（或这一镜）的一个观感决定，不该由每一份现写的代码各答一次。
+  const hlLook = HIGHLIGHT_LOOK[pickInjected<HighlightStyle>(undefined, 'highlightStyle',
+                                                             HIGHLIGHT_STYLES, 'color')];
+  const emphasis = emphasisProp ?? hlLook.emphasis;
+  const karaoke = karaokeProp ?? hlLook.karaoke;
+  const style = resolveFilmStyle(getInputProps());
+  const look = captionLook(style, style.bg || TOKENS.bg);
+  const hlColor = hlProp ?? look.hl;
+  // 用户在「文字库」钉过的强调色**排在最前**：它在 `captionLook` 里已经盖过色板，
+  // 这里再排到 `accent` 那一栏之前——否则照推荐写法（`accent={palette.accent}`）写的
+  // 每一镜都会把用户挑的颜色顶掉，界面上钉了色、片子里一点没变（这一类「看着对、
+  // 渲出来不是」正是这一处要治的病）。没钉过时这一枚是 `undefined`，一切照旧。
+  const accentColor = injectedAccent() ?? accentProp ?? look.accent;
+  const cap = capProp ?? FILM_GEOMETRY[injectedAspect()].caption;
+  const fontSize = Math.round((sizeProp ?? fitCaptionFontSize(t.text, cap, width, fitWidth))
+                              * sizeScale);
+  // 描边宽度按**字号**给（不是 `em`）：字号是上面求出来的，`em` 在外层先解析成外层的
+  // 字号，写出来的与求出来的不是一回事。系数搬自 `outline-caption` 那份 demo。
+  const shadow = outline
+    ? ring(outline, Math.max(3, Math.round(fontSize * 0.085)))
+    : undefined;
+
+  return (
+    <>
+      {t.pieces.map(({ p, start }, i) => {
+        const isHl = t.highlight.some((h) => h && h === p);
+        const on = isHl && t.reached(start);
+        // 高亮词整体占一块底色：中文可任意断行，「一座城市」被劈成两行时行尾会留下
+        // 一个只包着「一」字的孤立色块。短词锁住不拆；长片段照旧折行，免得撑破字幕盒。
+        const keep = p.length <= 12 && isHl;
+        const tinted = on && emphasis === 'color';
+        const blocked = on && emphasis === 'block';
+        // 撕纸笔触：词点亮后留一条下划线（色板 accent，未命中色板时是全局红），
+        // 「撕开」的观感。粗细跟字号走，三种画幅下才是同一条线。
+        const inked = on && emphasis === 'ink';
+        const hlStyle: React.CSSProperties = {
+          // 字号由**这里**给（不是由外层的纸条/盒子给）：`fitCaptionFontSize` 的产物
+          // 只有一处，母版那张纸条与镜头代码自己那层盒子才可能排出同一个字号。
+          // 行高/字重/颜色仍旧从外面继承——那些是调用方的排版。
+          fontSize,
+          whiteSpace: keep ? 'nowrap' : undefined,
+          background: blocked ? hlColor : 'transparent',
+          color: tinted ? accentColor : undefined,
+          textShadow: shadow,
+          borderBottom: inked
+            ? `${Math.max(2, Math.round(fontSize / 26))}px solid ${accentColor}`
+            : 'none',
+        };
+        if (!karaoke || !t.timed) {
+          return <span key={i} style={hlStyle}>{p}</span>;
+        }
+        // 逐字点亮：未读到的字淡显，读到就实显——整句一直在，眼睛能提前扫读。
+        return (
+          <span key={i} style={hlStyle}>
+            {Array.from(p).map((ch, j) => (
+              <span key={j} style={{ opacity: t.reached(start + j) ? 1 : 0.38 }}>{ch}</span>
+            ))}
+          </span>
+        );
+      })}
+    </>
+  );
+};
+
+export interface CaptionLayerProps {
+  /** 不传＝注入里的那一份（这一镜的整句）。 */
+  text?: string;
+  highlight?: string[];
+  words?: WordTiming[];
+  /** 字幕样式那一维。不传＝注入的那一档。**`none` 不画**（见下面的自守）。 */
+  captionStyle?: CaptionStyle;
+  /** 高亮样式那一维。不传＝注入的那一档。 */
+  highlightStyle?: HighlightStyle;
+  /** 纸条底与字色。不传＝跟着这一镜的色板（与母版同源）。 */
+  tone?: { paper: string; ink: string };
+  hl?: string;
+  accent?: string;
+  /** 画幅（决定字号与左右让出多少）。不传＝注入的那一档。 */
+  aspect?: Aspect;
+  /** 纸条底边到画面底的距离（只对下沿那一档生效）。不传＝母版这一档的位置。 */
+  bottom?: number;
+  /** 整条的透明度。不传＝与母版同一条 0.25 秒淡入。 */
+  opacity?: number;
+}
+
+/**
+ * 整条字幕：底 + 字 + 入场动画，与母版画的是**同一个组件**（`Caption`），
+ * 因此「镜头代码摆的字幕」与「母版那条字幕」在结构上就是同一条，不可能漂移。
+ *
+ * 位置跟着**最近的定位祖先**走：把它放进自己 `position: relative` 的盒子里，字幕就
+ * 相对那个盒子摆——这就是「随构图摆」要的自由度。不带 props 时全部取注入的那一份，
+ * 于是裸 `<CaptionLayer/>` 就等于「母版这一档」。
+ *
+ * **摆了这个元件，母版就让位**：Python 侧扫到代码里有 `<CaptionLayer` 会给母版注入
+ * `captionFromCode`，母版那条不再画。所以「谁来摆」由**代码的静态事实**定，运行期
+ * 不必猜——同屏两条字幕那种只在成片上看得见的错，从结构上不可能发生。
+ *
+ * **自守**：生效的字幕样式是 `none` 时不画。那一档的意思就是「这一镜不上字幕」，
+ * 画出来是自相矛盾。契约层还有闸㉜：申报了 `none` 却在代码里摆 `<CaptionLayer/>`
+ * 直接打回，免得这段代码静悄悄地不生效。
+ */
+export const CaptionLayer: React.FC<CaptionLayerProps> = ({
+  text, highlight, words, captionStyle: captionStyleProp,
+  highlightStyle: highlightStyleProp, tone: toneProp, hl: hlProp, accent: accentProp,
+  aspect: aspectProp, bottom: bottomProp, opacity,
+}) => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+  const aspect = injectedAspect(aspectProp);
+  const geo = FILM_GEOMETRY[aspect];
+  const captionStyle = pickInjected<CaptionStyle>(captionStyleProp, 'captionStyle',
+                                                  CAPTION_STYLES, 'on_picture');
+  const highlightStyle = pickInjected<HighlightStyle>(highlightStyleProp, 'highlightStyle',
+                                                      HIGHLIGHT_STYLES, 'color');
+  const style = resolveFilmStyle(getInputProps());
+  const look = captionLook(style, style.bg || TOKENS.bg);
+  const t = useCaptionTiming({ text, highlight, words });
+
+  // 一次一条，不逐帧刷屏：渲染服务的浏览器日志每条都要过一遍 onBrowserLog。
+  React.useEffect(() => {
+    if (captionStyle === 'none' && t.text) {
+      console.warn('[dg] <CaptionLayer/> 在 caption_style="none" 下不画：这一镜申报了'
+        + '不上字幕。要自己摆字幕，就把这一镜的 caption_style 换成别的档。');
+    }
+  }, [captionStyle, t.text]);
+
+  if (captionStyle === 'none') return null;
+
+  return (
+    <Caption
+      text={t.text}
+      highlight={t.highlight}
+      words={t.words}
+      look={CAPTION_LOOK[captionStyle]}
+      hlLook={HIGHLIGHT_LOOK[highlightStyle]}
+      opacity={opacity ?? captionFadeIn(frame, fps)}
+      geo={geo}
+      bottom={bottomProp ?? captionBottomOf(geo, style.bleed)}
+      tone={toneProp ?? look.tone}
+      hl={hlProp ?? look.hl}
+      accent={injectedAccent() ?? accentProp ?? look.accent}
+    />
+  );
+};

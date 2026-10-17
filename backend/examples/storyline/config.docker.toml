@@ -29,16 +29,35 @@ available_nodes = [
     # 局部改：只对已出片的某一版重烧受影响的镜/窗口，不重做整片。
     # 白名单少一行就等于「那一版改不动」：工具列不出来，前端选区改的派发直接失败。
     "patch_motion_code", "patch_video",
-    # 素材供给（R3 + R6-T24）：先检索内置策展库、未命中再出图。
-    # **这三行与 config.toml 那份必须逐项相同**——这一份才是真机上 editor 容器读的那份
-    # （compose 里 `run_storyline.py --config examples/storyline/config.docker.toml`），
-    # 少一行就等于「这条链在真机上不存在」：节点类写好了、用例也绿，但注册表按本白名单
-    # 过滤，模型手里从来没有这三个工具。两份漂移由 test_video_editing.py 里那条
-    # 「两份白名单逐项相等」按住。
-    "search_illustration", "select_illustration", "imagegen",
+    # 素材供给那三个工具（`search_illustration` / `select_illustration` / `imagegen`）
+    # 2026-10-16 摘了：图形片的画面只有一路——模型逐镜写代码画（闸⑦「每镜必画」）。
+    # **这份白名单与 config.toml 那份必须逐项相同**——这一份才是真机上 editor 容器读的
+    # 那份（compose 里 `run_storyline.py --config examples/storyline/config.docker.toml`），
+    # 两份漂移由 test_video_editing.py 里那条「两份白名单逐项相等」按住。
     # 控制面工具（非 DAG 节点）：read_node_history 读 Store，render_status 轮询渲染任务。
     # 少了 render_status，模型收到「去轮询」的指示却没有可轮询的工具，等于没改。
-    "read_node_history", "render_status",
+    # preview_voice / preview_caption 是前端「文字库」那两件事（试听音色、看字幕样式样张）
+    # 要用的口——**它们在白名单里不是为了给模型用**，而是因为这张表就是主服务侧注册表的
+    # 来源：不写在这儿，`/tts/preview` 与 `/motion/caption-preview` 那两条路由
+    # `reg.execute("preview_voice"/"preview_caption")` 就找不到这个工具（真机表现是
+    # 「剪辑服务还没连上」，而服务明明连着）。它与 read_node_history 同一条道理：
+    # 白名单同时决定「模型能看见谁」与「主服务能转到谁」。
+    "read_node_history", "render_status", "preview_voice", "preview_caption",
+    # 三个自检工具（非 DAG 节点，**不带契约**）：建模在交活**之前**自己跑一遍判据——
+    # ① 这一段 TSX 过不过闸①；② 整片九道闸怎么判；③ 这一镜渲出来长什么样。
+    # 它们没有 `require_node`，但必须在白名单里：这张表同时决定主服务注册表里有谁，
+    # 少一行模型就调不到（`storyline_server/server.py::_register_selfcheck`）。
+    # 不带契约决定的是「会不会被按计划裁」——这三个不带，所以规划轮与执行轮都在。
+    "check_shot_code", "check_film", "preview_shot",
+    # DAG 契约本身（`_register_dag_contract`）：**这是模型看全图的唯一一条路**。
+    # 提示词库那句「要看整张图——有哪些节点、各依赖谁、参数什么形状——调 `dag_contract`」
+    # 指的是它，而 2026-10-16 真机核对时发现：服务端**一直**注册着它（`[storyline]
+    # tools=33` 里那一份），可主服务侧按**这张表**筛选入册，而表里从来没写过它 ——
+    # 于是模型照着提示词去调，拿到的是 UnknownTool（`register_mcp_tools` 的
+    # `_matches(name, enabled_tools)` 那一跳）。少这一行＝那句提示词教模型调一个
+    # 不存在的工具，正是 `consistency.WATCHED` 那条检查存在的理由；名字已一并收进
+    # 那份清单，下次再被静默摘掉启动就报。
+    "dag_contract",
 ]
 
 # ---------------------------------------------------------------------------

@@ -5,9 +5,9 @@
       "palettes": ["vintage-kraft", "modern-light"],
       "texture": "film",
       "texture_alt": "bleach",
-      "subtitle_mode": "torn_highlight",
-      "subject_preference": "位图优先：老照片、纸纹、手绘插画",
-      "asset_sources": ["wikimedia-commons", "ambientcg", "open-peeps"],
+      "caption_style": "paper",
+      "highlight_style": "ink",
+      "subject_preference": "手绘纸感优先：纸纹、线条插画、档案图纸",
       "motif_families": ["photo", "paper", "clipcard", "pagecam"]
     },
     "tech-data": {
@@ -15,9 +15,9 @@
       "palettes": ["modern-light", "color-play"],
       "texture": "none",
       "texture_alt": null,
-      "subtitle_mode": "full",
+      "caption_style": "on_picture",
+      "highlight_style": "color",
       "subject_preference": "代码优先：矢量图、公式、数据卡、图标",
-      "asset_sources": ["iconify"],
       "motif_families": ["vector", "katex", "chart", "gauge", "icon"]
     },
     "night-concept": {
@@ -25,9 +25,9 @@
       "palettes": ["deep-ocean", "midnight", "obsidian-violet"],
       "texture": "glow",
       "texture_alt": null,
-      "subtitle_mode": "torn_highlight",
+      "caption_style": "film_line",
+      "highlight_style": "color",
       "subject_preference": "3D/光优先：三维场景、光效、人物剪影",
-      "asset_sources": ["open-peeps", "polyhaven", "wikimedia-commons"],
       "motif_families": ["three", "aurora", "spotlight", "fracture", "silhouette"]
     }
   },

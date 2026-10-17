@@ -3,13 +3,7 @@ out
 .git
 *.log
 
-# public/ 里只有两样东西：staticFile 的落点（运行时由 /stage-assets 写进来的素材字节）
-# 与空脚手架。**素材字节不许烤进镜像**——那是每次渲染各自投递的内容，烤进去等于让
-# 上次出片的字节跟着下一次跑（同名不同 sha 的素材会被静默复用）。
-#
-# 原来是 `public` 一整行：那连目录本身都不进上下文，镜像里没有 public/，
-# `/stage-assets` 的 `path.join(ROOT,'public',relpath)` 无处可落，
-# `staticFile("…")` 也没有可解析的根。所以改成「排除内容、留脚手架」两行——
-# 注意不是 `public` + `!public/...`：父目录一旦被排除，子目录的 `!` 反选不生效。
-public/assets/*
-!public/assets/.gitkeep
+# （原来这里排除 `public/assets/*` 并把 `.gitkeep` 反选回来：那是给运行时的按镜投递
+#  留脚手架——`.dockerignore` 把素材字节挡在上下文外，只留空目录，`COPY . .` 才带得
+#  进 `public/`。供图通道撤掉后 `public/assets/` 不再随镜像发，这两行随之删掉；
+#  现在 `public/` 里只有随镜像发出去的 `fonts/`。）

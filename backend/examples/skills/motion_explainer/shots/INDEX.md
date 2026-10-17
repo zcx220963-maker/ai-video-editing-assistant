@@ -1,12 +1,12 @@
-# shot 卡索引（133 张，按类别）
+# shot 卡索引（136 张，按类别）
 
 每行：`<类别>/<卡名>` [能量] 时长 — 一句话描述 | 适用 | demo 文件 relpath + 字节数
 
 **选卡看这一份就够**：`card` 一栏照抄行首那个 `<类别>/<卡名>`；
 `derived_from` 一栏照抄 demo 栏里的那个 relpath（`demos/` 前缀可有可无，一镜引多份就都写上）。
 **demo 栏给的是盘上真有的文件名，照抄即可——别拿卡名去拼 `<卡名>.tsx`**：
-132 张卡里有 42 张的文件名与卡名对不上，照卡名拼出来的名字会被取材轮当场打回。
-不要再逐张打开卡全文——SKILL.md 写明「不要读超过 15 张卡」。
+136 张卡里有 44 张的文件名与卡名对不上，照卡名拼出来的名字会被取材轮当场打回。
+不要再逐张打开卡全文——SKILL.md 写明「不要读超过 30 张卡」。
 
 ## camera（10 张）
 
@@ -97,15 +97,15 @@
 
 ## science（9 张）
 
+- `science/compare-duel` [中高] — 对比对擂——三条对比轨逐维亮起，左侧读数先 pop、右侧读数沿对位线滑入咬合，优势标记从胜出一侧弹出，三轨之后总评轨归位报结论 | 时长 208f（约 7s）；三轨各 46f（错峰… | 适用 讲"这两样东西有什么区别"：有性/无性生殖、内燃机/电动机、近视/… | demo `science/compare-duel/CompareDuel.tsx` 10,966 B
 - `science/cross-section-reveal` [中高] — 剖面揭示——一片剖切面自左向右扫过球体，扫到哪层显影哪层（地壳→地幔→外核→内核），标签带引线在该层被扫过 55% 时画入，收尾 30f 真静止 | 时长 150f（5s）；扫过全程 108f + … | 适用 讲"一个东西里面是什么"：地球内部、细胞结构、引擎剖面、地层、脑区… | demo `science/cross-section-reveal/CrossSectionReveal.tsx` 11,360 B
+- `science/curve-function-trace` [中高] — 函数曲线逐笔绘制——坐标轴与包络线先入，主曲线用 clipPath 从左到右一笔笔画出，关键点等曲线"画到"它才弹出标注 | 时长 198f（6.6s）；轴 18f + 包络… | 适用 讲"这个函数长什么样"的段落：阻尼振荡、抛物线、指数衰减、波形演化… | demo `science/curve-function-trace/CurveFunctionTrace.tsx` 11,398 B
+- `science/exploded-assembly` [中高] — 拆解合体——整体先合体呈现，各构件沿半径方向撑开（轨道半径 ×1.45、核 ×1.18），每一件的引线标签在它到位时画入，电子始终绕核旋转，合… | 时长 180f（6s）；合体 24f + 炸开 … | 适用 讲"一个东西由哪些部分组成、各部分在哪"：原子结构、细胞器、引擎拆… | demo `science/exploded-assembly/ExplodedAssembly.tsx` 10,140 B
+- `science/growth-morph` [中高] — 生长变形——形态按阶段逐个构件长出（stagger 4f），阶段切换交叉淡入 + 微移，底部生长轴四节点连线并显示真实天数，末阶段成虫翅膀展开… | 时长 224f（约 7.5s）；每阶段 44f（… | 适用 讲"这个东西是怎么一步步长成的"：完全变态、生命周期、恒星演化、材… | demo `science/growth-morph/GrowthMorph.tsx` 13,622 B
 - `science/map-terrain-build` [中] — 地图地形——等高线自谷底向山顶逐条立起（scale+上移+淡入，顺序=高程），一条河用 dasharray 把自己画出来并带跟随亮点，三个地名… | 时长 158f（5.3s）；等高线 7 条 ×1… | 适用 讲地理/地质/流域/气候：一座山怎么长出来、水往哪走、地形如何决定… | demo `science/map-terrain-build/MapTerrainBuild.tsx` 12,648 B
 - `science/metaphor-bridge` [高] — 比喻桥——把"太阳"换成"一个篮球"再按真实相对比例量出地球：测量线延伸时距离读数真实上跳，走到的位置是一颗针尖大的点（图上放大约 9×，位置… | 时长 168f（5.6s）；篮球入场 16f +… | 适用 讲"这个东西到底有多大/多远/多少"：天体尺度、细胞与细菌、原子与… | demo `science/metaphor-bridge/MetaphorBridge.tsx` 13,619 B
 - `science/process-diagram-flow` [中高] — 流程示意（循环型）——节点先全部落位，箭头按次序逐段用 dasharray 画出来（画的次序=流程次序），一个令牌沿已点亮路径行进并让所在段变… | 时长 176f（5.9s）；4 节点落位 18f… | 适用 讲"这个过程怎么走一圈"：水循环、碳循环、食物链、经济循环、呼吸/… | demo `science/process-diagram-flow/ProcessDiagramFlow.tsx` 14,967 B
-- `science/compare-duel` [中高] — 对比对擂——三条对比轨逐维亮起，左侧读数先 pop、右侧读数沿对位线滑入咬合，优势标记从胜出一侧弹出，三轨之后总评轨归位报结论 | 时长 208f（约 7s）；三轨各 46f（错峰 14f）+ 总评 22f + 静止 30f | 适用 讲"这两样东西有什么区别"：有性/无性生殖、内燃机/电动机、近视/远视、燃烧/呼吸、两种方案 | demo `science/compare-duel/CompareDuel.tsx` 10,966 B
-- `science/timeline-evolution` [中高] — 演化时间轴——水平轴按真实年代比例定位，视口沿轴行进，节点滚到中心时卡片交替弹出并带引线，顶部年份读数随帧真实跳动，末节点急停推近 | 时长 276f（约 9.2s）；入场 20f + 5 段滚动（每段 20f + 节点 hold 24f）+ 推近与静止 36f | 适用 讲"这件事是怎么一步步变成这样的"：生命演化、恒星一生、元素发现史、气候变迁、技术演进 | demo `science/timeline-evolution/TimelineEvolution.tsx` 11,074 B
-- `science/exploded-assembly` [中高] — 拆解合体——整体先合体呈现，各构件沿半径方向撑开（轨道半径 ×1.45、核 ×1.18），每一件的引线标签在它到位时画入，电子始终绕核旋转，合回后末 30f 真静止 | 时长 180f（6s）；合体 24f + 炸开 34f + 悬停 62f + 合回 30f + 静止 30f | 适用 讲"一个东西由哪些部分组成、各部分在哪"：原子结构、细胞器、引擎拆解、心脏四腔、机械传动 | demo `science/exploded-assembly/ExplodedAssembly.tsx` 10,140 B
-- `science/growth-morph` [中高] — 生长变形——形态按阶段逐个构件长出（stagger 4f），阶段切换交叉淡入 + 微移，底部生长轴四节点连线并显示真实天数，末阶段成虫翅膀展开并持续扇动 | 时长 224f（约 7.5s）；每阶段 44f（构件生长 20f + 驻留 24f）+ 过渡 8f + 收尾 24f | 适用 讲"这个东西是怎么一步步长成的"：完全变态、生命周期、恒星演化、材料的相变 | demo `science/growth-morph/GrowthMorph.tsx` 13,622 B
-- `science/curve-function-trace` [中高] — 函数曲线逐笔绘制——坐标轴与网格先淡入，包络线（虚线）先画入，主曲线用 clipPath 从左到右逐笔绘制，关键点在曲线"画到"该点时弹出标注，底部函数式逐字打出 | 时长 198f（6.6s）；轴 18f + 包络 22f + 绘制 120f + 标注滞后 8f + 收尾 30f | 适用 讲"这个函数长什么样"：阻尼振荡、抛物线、指数衰减、波形演化、数学/物理/数据可视化 | demo `science/curve-function-trace/CurveFunctionTrace.tsx` 11,398 B
+- `science/timeline-evolution` [中高] — 演化时间轴——水平轴按真实年代比例定位，视口沿轴行进，节点滚到中心时卡片交替弹出并带引线，顶部年份读数随帧真实跳动，末节点急停推近 | 时长 276f（约 9.2s）；入场 20f +… | 适用 讲"这件事是怎么一步步变成这样的"：生命演化、恒星一生、元素发现史… | demo `science/timeline-evolution/TimelineEvolution.tsx` 11,090 B
 
 ## transition（15 张）
 
@@ -125,17 +125,20 @@
 - `transition/white-flash-logo-simplify-cut` [中高] — 液态金属质感的彩色词标静置流光，蓄力后从字心炸出一记白闪过曝，曝光回落时同一位置已是扁平版字标——一次闪白完成质感降维 | 时长 约 4s（120f@30fps；演出 0–… | 适用 品牌段落收束（华丽演绎→干净定妆）；情绪从炫技切换到正式宣告的转场拍 | demo `transition/white-flash-logo-simplify-cut/WhiteFlashLogoSimplifyCut.tsx` 12,191 B
 - `transition/wipe-transitions` [中] — 几何擦除转场——blinds-slice 百叶窗切条（12 根 3D 叶片错峰翻面成波，波扫过后整页由 A 换成 B） | 时长 前态 ≥20f + 擦除 ~56f + 收… | 适用 新旧页都不动、一条几何边界扫过完成交接的通用转场；不依赖构图里有合… | demo `transition/wipe-transitions/BlindsSlice.tsx` 10,251 B
 
-## typography（22 张）
+## typography（25 张）
 
 - `typography/blur-slide` [低] — 标题逐词入场，y 0.38em→0 + blur 18→0 + opacity 0→1 三通道走同一条 ease-out 同步收敛，词间隔约 … | 时长 约 4.0s（120f@30fps） | 适用 几乎所有标题/副标题成对出现的场合；产品页首屏文案、章节小标题；需… | demo `typography/blur-slide/BlurSlide.tsx` 8,946 B
 - `typography/brace-expand` [中] — 一对紧贴的小花括号先在正中出现，随即带一次过冲向左右弹开并放大到标题级，文字 clip 宽度严格绑括号内缘、像被拉开幕布般从中间揭示，落定后字… | 时长 约 4s（120f@30fps：光标 0–… | 适用 开发者/技术产品的标题字卡；章节开场；需要"一个符号完成揭示"的极… | demo `typography/brace-expand/BraceExpand.tsx` 8,089 B
+- `typography/caption-in-frame` [中低] — 字幕进画面两式——字压图 text-over-art（整句压在图上、自带柔底，图形跟着念到的字动）与字幕搬家 caption-pill-rel… | 时长 单式 5s（demo 150f）；持续型，… | 适用 讲的东西本身就是"图上这几个字"的段落（示意图标注、流程里的词、界… | demo `typography/caption-in-frame/CaptionPillRelocated.tsx typography/caption-in-frame/TextOverArt.tsx` 13,277 B
 - `typography/countdown-arc-scatter` [高] — 纸面表盘 9 个等大数字沿大弧切向排布，整盘扫过 96° 后减速急停，"5" 停在弧顶随即平移落位成标题首字符，其余数字带 blur 原地散去… | 时长 约 3.3s（100f@30fps：扫动 … | 适用 倒计时/时长承诺类文案（"5 min to install"）；数… | demo `typography/countdown-arc-scatter/CountdownArcScatter.tsx` 11,178 B
 - `typography/document-typewriter-reveal` [低中] — 悬浮在暗场里的整页真排版文档窗口在光标后自己"写"出来、侧栏跟进、历史条目逐个落入轨道，相机从斜侧标题特写一路后撤到全窗 | 时长 150f（约 5s，含 history-l… | 适用 文档/报告/笔记类功能镜头；信息密度最高的一拍 | demo `ui-entrance/document-typewriter-reveal/DocumentTypewriterReveal.tsx` 15,509 B
 - `typography/flying-words` [高] — 22 个关键词按黄金角铺在扁椭圆截面上，沿 z 轴从远处飞到相机前擦身而过，透明度走 [0,1,0.5,0.2,0] 生命曲线，跑满 2 整圈… | 时长 约 6.0s（180f@30fps，2 个… | 适用 关键词云/能力清单的动态背景；片头片尾的"信息量"垫底层；需要纵深… | demo `typography/flying-words/FlyingWords.tsx` 10,299 B
 - `typography/glitch-cycle` [中高] — 同一行等宽槽位循环轮播 4 条状态短语，每条头尾按概率关键帧 [1,0,0,0.1,0,0,1] 全乱码、中段偶发单字抖动，切换瞬间叠 RGB… | 时长 约 5.6s（168f@30fps；dem… | 适用 加载/构建/部署过程的状态播报；技术型片头的"系统自述"；需要机器… | demo `typography/glitch-cycle/GlitchCycle.tsx` 11,590 B
 - `typography/gradient-word-sweep` [高] — 黑底标语里关键词被渐变彩光从左到右快速扫过"充能"——波前字符辉光最强向后衰减，填满后字符间勾连细紫红闪电、整词稳态泛光呼吸 | 时长 扫充 ~15–20f（要快）+ 稳态闪电呼… | 适用 标语里给单个动词/卖点词充能（Supercharged/faste… | demo `typography/gradient-word-sweep/GradientWordSweep.tsx` 12,637 B
+- `typography/keyword-color-caption` [中低] — 关键词换色——字幕压在画面上、不留纸条，只有那几个要强调的词换成强调色，画面里对应的图形同步换色 | 时长 持续型，随句长拉长（demo 150f /… | 适用 默认观感（首选的排字方式）：任何「字要压在画面上、又要读得出来」的… | demo `typography/keyword-color-caption/KeywordColorCaption.tsx` 5,812 B
 - `typography/lead-word-zoom-assemble` [中高] — 首词以 2.3 倍字号占据画面中央、hold 期间继续推近 6%，随后一条曲线同时完成「缩回终字号」与「整行左滑归位」，后续词各自从槽位右侧 … | 时长 约 2.8s（84f@30fps；组句 f… | 适用 品牌名/产品名的 Introducing 字卡；发布会式开场第二镜… | demo `typography/lead-word-zoom-assemble/LeadWordZoomAssemble.tsx` 10,715 B
 - `typography/marker-underline-title` [低] — 大标题落定后，关键词下方马克笔下划线从左到右快速描画——变宽笔形、毛糙边缘、微上斜跟随斜体字势，贴着字底 | 时长 标题落定 +4~8f 后起笔，划线 8–1… | 适用 标题里强调单个关键词（new/free/AI…）；手写感/人味的品… | demo `typography/marker-underline-title/MarkerUnderlineTitle.tsx` 6,138 B
+- `typography/outline-caption` [低] — 白字黑边——白字套一圈黑描边、底部压一条渐隐，压在照片/插画/任意乱底上都读得出来；强调词换成暖黄 | 时长 持续型，随句长拉长（demo 150f /… | 适用 实录、插画、照片满屏、口播密集、观众要跟读的段落；底太乱（没有干净… | demo `typography/outline-caption/OutlinedCaption.tsx` 6,025 B
 - `typography/outline-word-fill` [高] — 空心词（细暖灰描边、500 字重）从 3.2 倍急缓收缩落位，虚线大圆随后从 2.8 倍收到字周围并缓慢自转，左右水平虚线从画框边缘内伸；描边… | 时长 约 3.0s（90f@30fps，短促单拍… | 适用 单词式利益点/口号的重锤一拍；节奏卡点上的"钉子"镜；深底品牌片的… | demo `typography/outline-word-fill/OutlineWordFill.tsx` 9,954 B
 - `typography/paper-title-card` [低] — 一句话逐词压印上纸、一个词标强调色斜体、短划线收束 | 时长 1.7–1.8s（50–55f） | 适用 章节转场/价值主张字卡；重要功能出场前的引导卡；全片呼吸位 | demo `typography/paper-title-card/PaperTitleCard.tsx` 6,275 B
 - `typography/pill-chip-slot-cycle-handled` [中] — 白底句式 "Your `chip` Handled" 里深色胶囊内词竖向滚轮轮换，胶囊宽度按预量文本宽插值平滑伸缩、两侧文字被自然挤开收拢，胶… | 时长 约 5.0s（150f@30fps：静置 … | 适用 "我们替你搞定 ___" 这类句式卖点；SaaS 功能列举的一句话… | demo `typography/pill-chip-slot-cycle-handled/PillChipSlotCycleHandled.tsx` 5,221 B
@@ -174,4 +177,4 @@
 - `ui-entrance/value-stagger-gradient` [中高] — 16 根柱入场时 delay 是时间错峰，同时高度/色相/位移/模糊四个属性各自铺成从首到末的数值梯度；第二拍把错峰原点换成中心，脉冲幅度以中… | 时长 约 5.0s（150f@30fps） | 适用 技法演示与参数化能力的展示镜头；也可直接当数据/频谱/均衡器类界面… | demo `ui-entrance/value-stagger-gradient/ValueStaggerGradient.tsx` 7,981 B
 - `ui-entrance/wall-reveal-moves` [中] — 整墙批量入场两式——bento 逐格点亮、蓝图描线成形，全部原位显形不位移，与 deck-deal-flyin 的飞入位移型互补成品类矩阵 | 时长 单式约 5s（A 150f / B 150… | 适用 功能墙/卡片墙/整页界面的整体亮相；内容已在原位、要"显形"而非"… | demo `ui-entrance/wall-reveal-moves/BentoLightUp.tsx ui-entrance/wall-reveal-moves/WireframeDrawOn.tsx` 19,906 B
 
-总计 demo 字节：2,204,519
+总计 demo 字节：2,241,047

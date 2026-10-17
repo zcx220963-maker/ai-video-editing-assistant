@@ -124,14 +124,21 @@ def _known_demo_relpaths() -> frozenset[str]:
 #: 换种说法：这一组数不是「某次跑出来的」，是「在 sanctioned 环境里每次跑都一样的」。
 DERIVED_MIN_SIM = 0.61
 
-#: 旁白音色（edge-tts 中文音色，实测 14 个；值随服务商变，故也放行合规格式）
+#: 旁白音色（edge-tts 中文音色；值随服务商变，故下游也放行合规格式）。
+#:
+#: **只列标准普通话六档**。服务商那里另有八档地方方言——粤语三档（``zh-HK-*``）、
+#: 台湾三档（``zh-TW-*``）、东北口音与陕西方言各一档——它们从这份清单里撤掉了：
+#: 一部中文科普片的旁白只有「普通话」一个答案，把方言摆在「挑一个音色」的十四个
+#: 格子里，只会让人多花时间绕开它们。
+#:
+#: 撤的是**可选清单**，不是校验：老片子里已经写着粤语音色的那一镜仍然过
+#: :data:`_VOICE_RE`（那条按形状认，不按名单认），不会因为名单变小而重烧或报错；
+#: ``KNOB_VALUE_LABELS["voice"]`` 也逐档留着它们的名字，于是确认卡回读时仍是
+#: 一句人话，而不是一个没人认识的机器名。
 VOICES = (
     "zh-CN-XiaoxiaoNeural", "zh-CN-XiaoyiNeural",
     "zh-CN-YunjianNeural", "zh-CN-YunxiNeural", "zh-CN-YunxiaNeural",
-    "zh-CN-YunyangNeural", "zh-CN-liaoning-XiaobeiNeural",
-    "zh-CN-shaanxi-XiaoniNeural",
-    "zh-HK-HiuGaaiNeural", "zh-HK-HiuMaanNeural", "zh-HK-WanLungNeural",
-    "zh-TW-HsiaoChenNeural", "zh-TW-HsiaoYuNeural", "zh-TW-YunJheNeural",
+    "zh-CN-YunyangNeural",
 )
 
 #: 质感档名。**每一镜都能带自己的一档**，顶层那档是「整片默认」：滤镜跑在拼接之前
@@ -214,18 +221,82 @@ MOTION_ANCHOR_FORMS = ("fields.", "subtitle:", "beat:")
 #: 这一点记在 §9-Q98，不许把「3」当成标定结果。
 MOTION_ANCHOR_TOLERANCE_DIV = 3
 
-#: 母版 `<FilmLayout>` 真认的字幕形态。旧链那四档（torn/bottom…）随模板一起消失：
-#: 新链的字幕带只画在母版里，母版没实现的形态就不该出现在可选项里。
+#: **字幕样式**：这一行字长什么样、站在哪。
 #:
-#: R14 加第四档 `inline`：**母版不画字幕条**，文字由镜头代码自己排进画面。
-#: 前三档都是「母版在画面带下方那条固定白底圆角条里画」或「不画」，只有 `inline`
-#: 能做到「这一镜的字压在画面上、随构图摆」——参考片普遍这么做，而这也是
-#: 成片不再长得像 PPT 的关键一档（每镜一条同款字幕带正是那个观感的来源）。
-SUBTITLE_MODES = ("full", "torn_highlight", "none", "inline")
-#: 字幕位置与入场动画（2026-10-15）：模型按构图与片子气质选，整片一档 + 逐镜可覆盖。
-#: 与 remotion/src/tokens.ts 的 CAPTION_POSITIONS / CAPTION_ANIMS 同一份枚举。
-CAPTION_POSITIONS = ("bottom", "center", "top")
-CAPTION_ANIMS = ("fade", "rise", "pop", "karaoke")
+#: 2026-10-16「文字库面板重做」那一轮把原先揉在 `subtitle_mode` / `caption_position` /
+#: `caption_anim` 三个旋钮里的选择拆成两件本来就不相干的事——「字长什么样」（这里）
+#: 与「被点名的词怎么被点出来」（:data:`HIGHLIGHT_STYLES`）。
+#:
+#: 拆的理由不是归类好看，是旧模型里有的组合**说不出来**：「要关键词换色、但不要纸条」
+#: 是最常见的诉求，而旧的三旋钮把纸条底、逐词点亮、撕纸下划线捆在 `torn_highlight`
+#: 一档上，想只要换色就只剩「整句字幕」这条路可退。
+#:
+#: 每一档落到画面上是什么样（有没有纸条底 / 站在哪 / 什么入场 / 字号档 / 要不要描边），
+#: 由 `remotion/src/FilmLayout.tsx` 的 `CAPTION_LOOK` **一处**说了算；那边的枚举镜像
+#: 与这里逐字相同，由 ``tests/test_code_spec.py`` 第 ⑤ 节拿正则比出来。
+CAPTION_STYLES = ("on_picture", "outlined", "paper", "film_line",
+                  "big_center", "top_banner", "none")
+
+#: **高亮样式**：被点名的词怎么被点出来。与上面那一维**正交**——「贴画面 + 关键词换色」
+#: 与「纸条底 + 逐词点亮」都是合法组合，两维各有各的取值域。
+#: 落到 `CaptionText` 上就是把 `emphasis` 与「要不要逐字点亮」两件事定下来
+#: （`FilmLayout.tsx` 的 `HIGHLIGHT_LOOK` 一处说了算）。
+HIGHLIGHT_STYLES = ("color", "karaoke", "block", "ink", "plain")
+
+#: 前端「文字库」里那两排卡。**一档 = 一个取值 + 一句「什么时候该选它」**。
+#:
+#: `key` 就是枚举取值本身（不再另起 `torn-ink` 这种档名）：档名与取值是两套词汇时，
+#: 界面上写着「撕纸高亮·逐词点亮」而渲染认的是另一个字符串——这种不一致不会红，
+#: 只会渲成别的。中文标签由 :func:`library_props` 从 ``KNOB_VALUE_LABELS`` 现取，
+#: 这里**一个中文词都不重复**（唯一那句 ``note`` 是给人挑的时候看的：说适用范围，
+#: 不复述档名）。**每一档的 key 必须在自己那一维的枚举里**，由
+#: ``tests/test_code_spec.py`` 第 ⑨ 节逐档反查（造一个写错的取值必须判红）。
+#:
+#: `group` 决定两排在面板上怎么分：前端按出现顺序取 unique group，连栏名都取
+#: ``LIBRARY_DIM_TITLES[group]``。
+CAPTION_PRESETS: tuple[dict[str, Any], ...] = (
+    {"key": "on_picture", "group": "caption_style",
+     "note": "字直接压在画面上，没有底条。默认这一档——不像 PPT 的根就在这里"},
+    {"key": "outlined", "group": "caption_style",
+     "note": "白字 + 黑描边压在画面上，亮底时自己压一层渐隐。画面深、字要立住时用它"},
+    {"key": "paper", "group": "caption_style",
+     "note": "白纸条压在画面下沿。最稳、最不挑画面的一档，也最容易让整片长得一样"},
+    {"key": "film_line", "group": "caption_style",
+     "note": "一整句淡淡浮在下沿，字号略小、行距松。适合句子短、画面本身在动的段落"},
+    {"key": "big_center", "group": "caption_style",
+     "note": "整句放大压在画面正中，弹出入场。适合一句话就是全片重点的镜头——用多了会腻"},
+    {"key": "top_banner", "group": "caption_style",
+     "note": "纸条挪到顶部安全区、上浮入场，把下半部分整个让出来。适合下半部有主体的镜头"},
+    {"key": "none", "group": "caption_style",
+     "note": "整片不画字幕，只看画面与旁白。适合纯视觉演示、或旁白本身就是字幕的片子"},
+)
+
+HIGHLIGHT_PRESETS: tuple[dict[str, Any], ...] = (
+    {"key": "color", "group": "highlight_style",
+     "note": "被点名的词换成这一镜的强调色，其余字不动。默认这一档"},
+    {"key": "karaoke", "group": "highlight_style",
+     "note": "念到哪个词哪个词从暗变亮，整句一直在、眼睛能提前扫读"},
+    {"key": "block", "group": "highlight_style",
+     "note": "被点名的词垫一块底色。最显眼，也最容易盖住画面上的东西"},
+    {"key": "ink", "group": "highlight_style",
+     "note": "词后拖一条纸感笔触，不给底。比色块轻，比换字色重"},
+    {"key": "plain", "group": "highlight_style",
+     "note": "一个字都不特殊对待，整句一个样。画面已经够闹时用它"},
+)
+
+#: 上面两排合成一份（前端一次拿走）。**顺序即面板上的顺序**。
+LIBRARY_PRESETS: tuple[dict[str, Any], ...] = CAPTION_PRESETS + HIGHLIGHT_PRESETS
+
+#: 音色分组的**前缀**与组名。分组是为了让人在清单里找得动，**不是**给音色重新起名——
+#: 每一档自己的中文标签（``KNOB_VALUE_LABELS["voice"]``）仍然逐字保留。
+#:
+#: 今天只剩「普通话」一组（方言那两组连同它们的音色一起撤了，见 :data:`VOICES`），
+#: 结构仍然留着：``library_props()`` 按前缀分组、断言每个音色都落在某一组里，
+#: 「其他」那一组专收前缀对不上的新音色——服务商哪天加了新语区，面板上会多出一组
+#: 而不是少一档，测试也会指出该给它补一个组名。
+VOICE_GROUPS: tuple[tuple[str, str], ...] = (
+    ("zh-CN", "普通话"),
+)
 
 #: 一段镜头代码的体积上限。lint 与 bundle 都按字节走，超了不是"风格问题"而是
 #: 一次请求把容器内存吃掉一截——这条链一镜一次浏览器，宁可在这里拦。
@@ -235,9 +306,12 @@ MAX_CODE_BYTES = 40_000
 # 字段参数通道（spec §12）：把"可改的东西"从代码里提出来当数据
 # ---------------------------------------------------------------------------
 
-#: 只有这五种，因为前端只有这五种控件。第六种类型的字段会落成一个没人认识的输入框
+#: 只有这五种，因为前端只有这五种控件。多加一种会落成一个没人认识的输入框
 #: ——控件的单一来源是这份 type（旧链 #127「补丁口把字段类型也发出去」那条纪律的延续）。
-FIELD_TYPES = ("number", "color", "text", "bool", "select", "image")
+#: 2026-10-16 摘掉 `image`：它存在的唯一理由是从素材库里挑一张图上屏（值落
+#: `fields.<name>`，换图不必改代码）。取材那三条路拆掉之后它没有对象了，而这一栏
+#: 一旦留着，模型会拿它当「这里可以摆图」的合法出口。
+FIELD_TYPES = ("number", "color", "text", "bool", "select")
 
 #: 每镜最多开几个旋钮。上限不为性能，为**表单可读性**：放开了让模型声明，它会把每个
 #: 字面量都开成字段，一镜四十行表单没人改得动，而那些值本来就在代码里看得见。
@@ -250,7 +324,7 @@ FIELD_NAME_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 #: 那个键**（`{"fields": {"text": …}}` 这一路），画面上少一行字而 lint 只看代码看不见。
 RESERVED_FIELD_NAMES = frozenset({
     "text", "highlight", "words", "fps", "durationInFrames", "width", "height",
-    "aspect", "subtitleMode", "fields", "children",
+    "aspect", "captionStyle", "highlightStyle", "fields", "children",
 })
 
 _HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
@@ -265,6 +339,18 @@ def _expand_hex(color: str) -> str:
     if len(body) == 3:
         body = "".join(c * 2 for c in body)
     return "#" + body.lower()
+
+
+def norm_highlight_color(value: Any) -> str:
+    """自由色那一维（见 :data:`COLOR_KNOBS`）的归一：认得出就回小写六位 `#rrggbb`，
+    **其余一律回空串**（＝没钉，跟色板走）。
+
+    一个函数而不是三处各写一遍正则：校验（`validate_code_spec`）、注入
+    （`code_render.shot_input_props`）、样张（`caption_preview`）读的都是它，
+    于是「什么叫一条合法的强调色」只有一处说法。空串与 `None` 在这里同义。
+    """
+    text = str(value or "").strip()
+    return _expand_hex(text) if text and _HEX_RE.match(text) else ""
 
 
 def _is_num(v: Any) -> bool:
@@ -300,7 +386,7 @@ def _norm_field(item: Any, sid: str, pos: int, errors: list[str]) -> dict[str, A
     ftype = str(item.get("type") or "").strip()
     if ftype not in FIELD_TYPES:
         _err(errors, f"{tag}（{name}）的 type={ftype!r} 不在白名单 "
-                     f"{', '.join(FIELD_TYPES)}——第六种类型会落成一个没人认识的输入框")
+                     f"{', '.join(FIELD_TYPES)}——白名单之外的类型会落成一个没人认识的输入框")
         return None
 
     value = item.get("value")
@@ -484,18 +570,26 @@ SHOT_KNOBS = ("text", "highlight", "min_duration_sec", "fields")
 
 #: 进缓存键的"整片开关"。**这是对 spec §5.2 的加项**，那条清单只写了 fps/aspect，
 #: 漏了这四个真换像素的：`narration`/`voice`/`rate` 改的是切片里的**声音字节**（切片
-#: 自带音轨，命中即整段跳过、连 TTS 都不重发），`subtitle_mode` 改的是母版字幕带的
-#: 画法。不进键的后果与旧链那条注释写过的同族——「少算一个键就是拿旧片冒充新片」。
-#: 反过来 `texture` **仍然不进**：它跑在缓存之后的那一趟滤镜上，换档 0 镜重烧（§5.3）。
+#: 自带音轨，命中即整段跳过、连 TTS 都不重发），`caption_style`/`highlight_style`
+#: 改的是字幕的画法。不进键的后果与旧链那条注释写过的同族——「少算一个键就是拿旧片
+#: 冒充新片」。反过来 `texture` **仍然不进**：它跑在缓存之后的那一趟滤镜上，
+#: 换档 0 镜重烧（§5.3）。
 #:
-#: R7-T22 加的 `entrance`/`exit` 也在这里，理由与 `subtitle_mode` 同一条：入场/出场是
-#: **母版**在切片里画的（`FilmLayout.tsx` 按 token 逐帧插值），所以它换的是切片像素。
+#: R7-T22 加的 `entrance`/`exit` 也在这里，理由与字幕两档同一条：入场/出场画在切片
+#: 里（`FilmLayout.tsx` 按 token 逐帧插值），所以它换的是切片像素。
+#: 2026-10-16 加的 `highlight_color`（用户钉的高亮词颜色）同理，而且更直白：它改的就是
+#: 字幕那几个字的颜色，画进切片里。不进键的后果在这里最好认——换了颜色，整片仍是上一版
+#: 的颜色，而「颜色没跟着变」看起来像没保存成功。
 #: 而同一批加进来的 `transition`/`transition_sec` **故意不在**：转场跑在**拼接**那一趟
 #: （`mediaops.concat` → ffmpeg `xfade`），逐镜切片一个字节都不动——与 `texture` 同族，
 #: 进键的代价是「整片把淡出换成擦除」要重烧 20 镜的 Remotion 帧，而它本来只是一趟
 #: 拼接。tests/test_code_transition.py 对这两侧各有一支断言（在键 / 不在键）。
-FILM_KNOBS = ("fps", "aspect", "narration", "voice", "rate", "subtitle_mode",
-              "entrance", "exit", "caption_position", "caption_anim")
+#: 2026-10-17 加的整片 `palette`（用户要的「整片一个底色」）**在**：与 `texture` 正好
+#: 相反，它改的就是**每一镜的像素**——认不出这一镜自己的色板时，整片那一档直接决定
+#: 这一镜的底色与字幕三色（`film_style_of` 把它写进注入）。不进键的后果与
+#: `highlight_color` 同族：用户在卡上把整片换成深海蓝，出来的还是上一版。
+FILM_KNOBS = ("fps", "aspect", "narration", "voice", "rate", "caption_style",
+              "highlight_style", "highlight_color", "palette", "entrance", "exit")
 
 #: 选区改（P3）对代码镜只开这五条指针。`code` 的改动必须重过闸① 才允许落盘；
 #: `fields/{name}/value` 不动代码字节，改的是注入母版的值，所以不重跑 lint，
@@ -509,38 +603,10 @@ def _err(errors: list[str], msg: str) -> None:
     errors.append(msg)
 
 
-def _norm_assets(raw: Any, sid: str, errors: list[str]) -> list[dict[str, Any]]:
-    """归一化 assets 栏。每项必须有 name/sha256/ext，sha256 是完整 64 位十六进制。"""
-    if not raw:
-        return []
-    if not isinstance(raw, list):
-        _err(errors, f"{sid}：assets 不是数组")
-        return []
-    out: list[dict[str, Any]] = []
-    for j, a in enumerate(raw):
-        if not isinstance(a, dict):
-            _err(errors, f"{sid}：assets[{j}] 不是对象")
-            continue
-        name = str(a.get("name") or "").strip()
-        sha256 = str(a.get("sha256") or "").strip().lower()
-        ext = str(a.get("ext") or "").strip().lstrip(".")
-        if not name:
-            _err(errors, f"{sid}：assets[{j}].name 为空——代码里 staticFile(\"<name>\") 引用需要文件名")
-        if len(sha256) != 64 or not all(c in "0123456789abcdef" for c in sha256):
-            _err(errors, f"{sid}：assets[{j}].sha256={sha256!r} 不是完整 64 位十六进制")
-            sha256 = ""
-        if not ext:
-            _err(errors, f"{sid}：assets[{j}].ext 为空——渲染容器要按扩展名落盘")
-        item: dict[str, Any] = {"name": name, "sha256": sha256, "ext": ext}
-        if isinstance(a.get("source"), dict):
-            item["source"] = a["source"]
-        if isinstance(a.get("alpha"), bool):
-            item["alpha"] = a["alpha"]
-        layer = str(a.get("layer") or "").strip()
-        if layer in ("fg", "bg", "cutout"):
-            item["layer"] = layer
-        out.append(item)
-    return out
+# 2026-10-16 删掉了 `_norm_assets`：它归一的 `shots[].assets`（每项 `{name, sha256,
+# ext}`，sha256 全 64 位）是「上传件/素材上屏」那条路的申报栏——渲染前按 sha256 从
+# asset_library 取字节、投到渲染容器 `public/assets/<镜号>/<name>`。三条取材路拆掉之后
+# 没有任何东西能填进这一栏，留着它等于给模型开一个「这里可以摆图」的合法出口。
 
 
 #: ``derived_from`` 的两种写法：``MANIFEST.json`` 里的 relpath 是**相对 ``demos/``**的
@@ -603,65 +669,62 @@ def _norm_cite(raw: Mapping[str, Any], sid: str,
     「取材白取了」的形状：模型拿到全文、写完代码、再被同一个白名单打回。
     所以白名单只有这里一份，两轮共用。
 
-    「为空」也要在这里报：取材轮不经过 ``validate_code_spec``，不在这里拦，
-    一份没声明出处的骨架会被当成取材成功——那正是「手搓」的入口。
+    **两栏都是选填**（2026-10-16 改）。卡库与 demo 是**供给**，不是义务：整片不声明
+    出处直接写代码是允许的，只声明一部分也是。改之前这两栏是必填、且「为空即报」，
+    于是"不想照卡派生"的模型只有一个出路——挂 `ORIGINAL_SENTINEL` 这个哨兵。那正是
+    「本来一句话就能做的事，非要用一条报错教会你」的形状：哨兵因此连同它那一整段
+    特判一起删了（**哨兵现在与"留空"同义**，老写法照样收得下，只是不再需要）。
+
+    **非空时白名单照旧**：写了卡名就得是库里真有的那张，写了 relpath 就得在册——
+    取材轮与分镜轮仍然共用这一份尺，否则会出现「取材轮放行了分镜轮不认的 relpath」
+    这种「取材白取了」的形状。
     """
     card = str(raw.get("card") or "").strip()
-    if not card:
-        _err(errors, f"{sid}：card 为空——每一镜必须声明选了哪张 shot 配方卡（格式：<类别>/<卡名>）")
-    else:
+    if card:
         known = _known_card_ids()
         if known and card not in known:
             _err(errors, f"{sid}：card={card!r} 不在卡库中（共 {len(known)} 张卡），"
-                         f"模型不能自创卡名，必须从 shots/INDEX.md 里选")
+                         f"报了卡名就得报到库里真有的那一张（见 shots/INDEX.md）")
 
     derived_from = raw.get("derived_from") or []
     if not isinstance(derived_from, list):
         derived_from = [str(derived_from)]
-    listed = [str(d).strip() for d in derived_from if str(d).strip()]
-    # 闸⑳ 的哨兵（R19）走**另一条路**：它不是一个 relpath，所以不能进 demo 白名单比对
-    # （`_norm_demo_relpath` 会把它当路径改写，白名单那一段也会报「不在语料里」——
-    # 而那两句都不是事实）。哨兵只认**单独出现**：与真 demo 混在一张表里就分不清
-    # 这一镜到底算不算原创，而「每镜都挂哨兵 + 顺手抄一份 demo」正是这条口子最省事的绕法。
-    if ORIGINAL_SENTINEL in listed:
-        others = [d for d in listed if d != ORIGINAL_SENTINEL]
-        if others:
-            _err(errors, f"{sid}：derived_from 里既有原创哨兵 {ORIGINAL_SENTINEL} 又列了 demo"
-                         f"（{'、'.join(others)}）——哨兵必须**单独**出现："
-                         "「这一镜从某份 demo 演化而来」与「这一镜不派生自任何 demo」"
-                         "是互斥的两句话，混在一张表里，闸⑳ 的配额就数不准，"
-                         "闸⑫ 也不知道该不该比骨架")
+    # 哨兵与"这一栏没写"是同一件事（不派生自任何 demo），所以先把它摘出来：剩下的才是
+    # 真 relpath，空列表就表示"这一镜不派生"。混着真 demo 写也不再报错——真 demo 数数，
+    # 哨兵那一项按没写处理（旧写法那条「哨兵必须单独出现」的报错随必填一起消失了）。
+    _listed = [str(d).strip() for d in derived_from if str(d).strip()]
+    _sentinel = ORIGINAL_SENTINEL in _listed
+    listed = [d for d in _listed if d != ORIGINAL_SENTINEL]
+    derived_from = [d for d in (_norm_demo_relpath(d) for d in listed) if d]
+    if not derived_from and _sentinel:
+        # 显式写了哨兵：语义与留空相同，但**保留这个写法**——闸⑳ 的配额数的是"明确
+        # 说了这一镜是原创"的那几镜，`style_facts["original_shots"]` 也读它。留空是
+        # "没表态"，写哨兵是"表态了"，闸要的是后者（不然它对着整片留空的片子报绿）。
         return card, [ORIGINAL_SENTINEL]
-
-    derived_from = [_norm_demo_relpath(d) for d in listed]
-    derived_from = [d for d in derived_from if d]
-    if not derived_from:
-        _err(errors, f"{sid}：derived_from 为空——每一镜必须声明代码来自哪些 demo（relpath 列表）")
-    else:
-        known_demos = _known_demo_relpaths()
-        if known_demos:
-            for d in derived_from:
-                if d in known_demos:
-                    continue
-                # 打回要**能照着改**。旧措辞只叫它「从 demos/MANIFEST.json 里选」——那是一份
-                # 10 KB 的附件：模型得再取一次、再读一遍，才拿到「这一个目录下真正叫什么」。
-                # 真机那条 run（034d6b4201ea）就卡在这里收尾：3 镜被同一条打回，它没有名字
-                # 可抄，只能改用「换成同族的卡 / 砍成 11 镜」去问用户。名字给出来，就够了。
-                d_dir, files = demo_dir_files(d, known_demos)
-                if files:
-                    shown = files[:_DEMO_SUGGEST_MAX]
-                    tail = "" if len(shown) == len(files) else f"…（共 {len(files)} 份）"
-                    _err(errors, f"{sid}：derived_from={d!r} 不在 demo 语料白名单中"
-                                 f"（共 {len(known_demos)} 个 demo）——{d_dir}/ 下真有的几份："
-                                 + "、".join(f"{d_dir}/{f}" for f in shown) + tail
-                                 + "。**照抄其中一份**：这一栏要的是具体某一份文件，"
-                                   "不是目录名，也不是照卡名拼出来的 <卡名>.tsx"
-                                   "——卡名与 demo 的文件名常常不是一回事")
-                else:
-                    _err(errors, f"{sid}：derived_from={d!r} 不在 demo 语料白名单中"
-                                 f"（共 {len(known_demos)} 个 demo）——照 shots/INDEX.md 那一行"
-                                 f"的 demo 栏抄（那一栏给的就是真文件名），"
-                                 f"或从 demos/MANIFEST.json 里选")
+    known_demos = _known_demo_relpaths()
+    if derived_from and known_demos:
+        for d in derived_from:
+            if d in known_demos:
+                continue
+            # 打回要**能照着改**。旧措辞只叫它「从 demos/MANIFEST.json 里选」——那是一份
+            # 10 KB 的附件：模型得再取一次、再读一遍，才拿到「这一个目录下真正叫什么」。
+            # 真机那条 run（034d6b4201ea）就卡在这里收尾：3 镜被同一条打回，它没有名字
+            # 可抄，只能改用「换成同族的卡 / 砍成 11 镜」去问用户。名字给出来，就够了。
+            d_dir, files = demo_dir_files(d, known_demos)
+            if files:
+                shown = files[:_DEMO_SUGGEST_MAX]
+                tail = "" if len(shown) == len(files) else f"…（共 {len(files)} 份）"
+                _err(errors, f"{sid}：derived_from={d!r} 不在 demo 语料白名单中"
+                             f"（共 {len(known_demos)} 个 demo）——{d_dir}/ 下真有的几份："
+                             + "、".join(f"{d_dir}/{f}" for f in shown) + tail
+                             + "。**照抄其中一份**：这一栏要的是具体某一份文件，"
+                               "不是目录名，也不是照卡名拼出来的 <卡名>.tsx"
+                               "——卡名与 demo 的文件名常常不是一回事")
+            else:
+                _err(errors, f"{sid}：derived_from={d!r} 不在 demo 语料白名单中"
+                             f"（共 {len(known_demos)} 个 demo）——照 shots/INDEX.md 那一行"
+                             f"的 demo 栏抄（那一栏给的就是真文件名），"
+                             f"或从 demos/MANIFEST.json 里选")
     return card, derived_from
 
 
@@ -714,8 +777,9 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
 
     # R14 风格档（每镜）：满幅与底色。**留空 = 不申报**——母版据此用缺省（有安全区、
     # 底色 TOKENS.bg），也就是今天的行为。这两项改的是像素，所以进缓存键；但它们
-    # **不进 `SHOT_KNOBS`**，而是像 `reveal` 那样只在真有值时进键（见 `shot_cache_key`：
-    # 无条件加会让 `None` 也成为一个值，所有既有镜的键全变、整片白烧一次）。
+    # **不进 `SHOT_KNOBS`**，而是像 `shot_cache_key` 里 `film_style_of` 那一段那样
+    # 只在真有值时进键（无条件加会让 `None` 也成为一个值，所有既有镜的键全变、
+    # 整片白烧一次）。
     #
     # `bleed` 只收布尔：满幅是「是/否」，写成 `"true"` / `1` / `"yes"` 在母版那侧
     # 全落 false（`resolveFilmStyle` 判的是 `=== true`），静默不生效——那正是这条链
@@ -749,24 +813,19 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         _err(errors, f"{sid}：transition={seam!r} 没有对应的转场"
                      f"（可用：{', '.join(TRANSITION_STYLES)}）")
         seam = ""
-    # 层E2 逐镜字幕档（R19）：省略＝跟整片 `subtitle_mode`。**进缓存键**——字幕带是
-    # 母版逐帧画进切片里的（与 `entrance`/`exit` 同族），不进键就会拿旧切片冒充新片。
-    sub = str(raw.get("subtitle_mode") or "").strip()
-    if sub and sub not in SUBTITLE_MODES:
-        _err(errors, f"{sid}：subtitle_mode={sub!r} 不支持"
-                     f"（母版只认：{', '.join(SUBTITLE_MODES)}）")
-        sub = ""
-    # 逐镜字幕位置 / 入场动画：省略＝跟整片那一档。与 subtitle_mode 同族，覆盖了才进缓存键。
-    cap_pos = str(raw.get("caption_position") or "").strip().lower()
-    if cap_pos and cap_pos not in CAPTION_POSITIONS:
-        _err(errors, f"{sid}：caption_position={cap_pos!r} 不支持"
-                     f"（可用：{', '.join(CAPTION_POSITIONS)}）")
-        cap_pos = ""
-    cap_anim = str(raw.get("caption_anim") or "").strip().lower()
-    if cap_anim and cap_anim not in CAPTION_ANIMS:
-        _err(errors, f"{sid}：caption_anim={cap_anim!r} 不支持"
-                     f"（可用：{', '.join(CAPTION_ANIMS)}）")
-        cap_anim = ""
+    # 层E2 逐镜字幕两档（R19 / 2026-10-16 两维化）：省略＝跟整片那一档。
+    # **进缓存键**——字幕是逐帧画进切片里的（与 `entrance`/`exit` 同族），
+    # 不进键就会拿旧切片冒充新片。
+    cap_style = str(raw.get("caption_style") or "").strip().lower()
+    if cap_style and cap_style not in CAPTION_STYLES:
+        _err(errors, f"{sid}：caption_style={cap_style!r} 不支持"
+                     f"（可用：{', '.join(CAPTION_STYLES)}）")
+        cap_style = ""
+    hl_style = str(raw.get("highlight_style") or "").strip().lower()
+    if hl_style and hl_style not in HIGHLIGHT_STYLES:
+        _err(errors, f"{sid}：highlight_style={hl_style!r} 不支持"
+                     f"（可用：{', '.join(HIGHLIGHT_STYLES)}）")
+        hl_style = ""
 
     # R1: card / derived_from 契约栏
     card, derived_from = _norm_cite(raw, sid, errors)
@@ -787,13 +846,11 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         # 层E1/E2（R19）两栏：省略记 `None`。`None` 与「申报了 none」在**母版那侧**
         # 是同一件事（都落整片档），但在**账面**上要分得开——回执与补丁链读的是这里。
         "transition": seam or None,
-        "subtitle_mode": sub or None,
-        "caption_position": cap_pos or None,
-        "caption_anim": cap_anim or None,
+        "caption_style": cap_style or None,
+        "highlight_style": hl_style or None,
         "source": {str(k): str(v) for k, v in src.items()},
         "card": card,
         "derived_from": derived_from,
-        "assets": _norm_assets(raw.get("assets"), sid, errors),
         # 闸⑯ 的两栏（R5-T15）。归一在这里、判据在整片层（check_subject_named）——
         # 与 card/derived_from 同一分工：这一层只把形状收干净（去空白、通道名统一小写），
         # 「填没填、有没有证据」是那一层的事，因为它要读**代码**算通道。
@@ -808,13 +865,9 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         # 改了就该重烧一次是浪费——代价是命中缓存的镜必须按**当前**申报重判，见
         # `code_render` 缓存路径上那一段。
         "motion": raw.get("motion"),
-        # 闸㉘ 的申报（R12-T59）。与 `motion` 同一套分工：形状的唯一主人是
-        # `check_reveal_regions`，所以这里**原样带着走**，连大小写与空白都不动
-        # （在归一里把认不出的写法清成空表，就是把「写了但写错了」修成「没写」）。
-        # **但它与 `motion` 有一处决定性的不同：它进缓存键**（见 `SHOT_KNOBS` 那条注释）
-        # ——`motion` 只是「这条动效为谁动」的申报，改它一个像素都不变；而 `reveal`
-        # 是母版**照着它逐帧算 mask** 的输入，改一次就是改像素。
-        "reveal": raw.get("reveal"),
+        # 2026-10-16 拆掉了这里的 `reveal`（闸㉘/㉗ 那两栏）。它申报的是「整幅插画分几块、
+        # 按什么次序露出来」——`reveal.canvas` 要与库行 width/height 对账、母版按它逐帧
+        # 算掩码、㉗ 再到真帧上比色。整条链的主语是一张 raster 插画，而那条路没有了。
     }
 
 
@@ -849,19 +902,28 @@ def expand_code_refs(raw: Mapping[str, Any]) -> dict[str, Any]:
     return {**raw, "shots": out}
 
 
-def validate_code_spec(raw: dict[str, Any], *,
-                       has_stage_leg: bool | None = None) -> tuple[dict[str, Any], list[str]]:
-    """→ (规范化后的 spec, 错误清单)。错误清单非空即**不可渲染**。
+def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """→ (规范化后的 spec, 契约错误清单)。错误清单非空即**这份 spec 不成立**。
 
-    这一层管两类事：① 逐镜「一定会把画面写坏」的几件事（代码在不在、文案超不超
-    字幕容量、高亮词是不是子串、枚举在不在白名单内）；② **整片层**的五道硬闸——
-    :func:`check_style_quota`（风格配额与纯文字镜占比）、:func:`check_shot_structure`
-    （闸⑨：跨镜骨架同构）、:func:`check_ink_contrast`（闸⑩：字色在底色上读不读得出）、
-    :func:`check_layout_family`（闸⑮：版式族配额）、:func:`check_subject_named`
-    （闸⑯：画面主体具名）。
+    **它只管契约**：逐镜「这份东西能不能用」的那几件事——代码在不在、文案超不超
+    字幕容量、高亮词是不是子串、枚举在不在白名单内、字段声明的形状对不对。
+    这些不满足时渲起来没有意义，所以照旧抛。
+
+    **整片判据不在这一层**（2026-10-16 并档）。闸⑦⑨⑩⑫⑮⑯⑲⑳ 与动效锚㉑ 全部走
+    :func:`whole_film_gate_results` 那**一个**出口，由三个调用点
+    （`plan_motion` 入库前 / `render_motion_code` 烧像素前 / `patch_motion_code`
+    落盘前）附进各自的正常返回，**只报不拦**。搬家的理由写在那个函数的 docstring 里；
+    一句话：判据原来只有一个**拦人**的出路，模型因此看不见它，只能撞上去。
+    谁想自查同一份判据，用 `motion/selfcheck.py` 的 `check_film`（模型手里那个工具
+    包的就是它）。
+
     代码**内容**对不对归闸①（容器里的 lint）与闸④（画面上有没有东西），史实对不对归
-    出处闸与证据账。这几道只出**提醒**的那几份不从本函数返回——它们不拦，由
-    ``style_facts`` 在计划卡与出片回执那两处点名。
+    出处闸与证据账——两者都不在本函数。
+
+    签名里曾经有一个 ``has_stage_leg``（闸⑱「投递腿存在性」要它：客户端没有
+    ``stage_asset`` 口时，声明了 ``assets`` 的片子在一帧不烧之前就该打回）。
+    2026-10-16 随 ``assets`` 栏一起删了——**判据的对象没了，参数就没有意义**：
+    留着它，调用方还得去问客户端要一个再也不用判的能力。
     """
     errors: list[str] = []
     if not isinstance(raw, dict):
@@ -897,26 +959,57 @@ def validate_code_spec(raw: dict[str, Any], *,
             if not -50 <= pct <= 50:
                 _err(errors, f"rate={rate} 超出 ±50%")
 
-    sub_mode = str(raw.get("subtitle_mode") or "torn_highlight")
-    if sub_mode not in SUBTITLE_MODES:
-        _err(errors, f"subtitle_mode={sub_mode!r} 不支持（母版只认：{', '.join(SUBTITLE_MODES)}）")
-        sub_mode = "torn_highlight"
-
-    caption_position = str(raw.get("caption_position") or "bottom").strip().lower()
-    if caption_position not in CAPTION_POSITIONS:
-        _err(errors, f"caption_position={caption_position!r} 不支持"
-                     f"（可用：{', '.join(CAPTION_POSITIONS)}）")
-        caption_position = "bottom"
-    caption_anim = str(raw.get("caption_anim") or "fade").strip().lower()
-    if caption_anim not in CAPTION_ANIMS:
-        _err(errors, f"caption_anim={caption_anim!r} 不支持"
-                     f"（可用：{', '.join(CAPTION_ANIMS)}）")
-        caption_anim = "fade"
+    # 字幕两维（2026-10-16 起）：整片一档 + 逐镜可覆盖。缺省是「贴画面 + 关键词换色」
+    # ——用户否掉了纸条，缺省就得是那个「不像 PPT」的组合。
+    caption_style = str(raw.get("caption_style") or "on_picture").strip().lower()
+    if caption_style not in CAPTION_STYLES:
+        _err(errors, f"caption_style={caption_style!r} 不支持"
+                     f"（可用：{', '.join(CAPTION_STYLES)}）")
+        caption_style = "on_picture"
+    highlight_style = str(raw.get("highlight_style") or "color").strip().lower()
+    if highlight_style not in HIGHLIGHT_STYLES:
+        _err(errors, f"highlight_style={highlight_style!r} 不支持"
+                     f"（可用：{', '.join(HIGHLIGHT_STYLES)}）")
+        highlight_style = "color"
+    # 高亮词的自定义色（2026-10-16）。空串＝没钉，跟色板走（`captionLook()` 的 accent）。
+    # 非空就必须是一条真颜色：它最终落在 CSS 的 `color` 上，一个认不出的值**不报错、
+    # 只是静默变回缺省色**——「面板上明明设了红，渲出来还是色板那个色」是最难查的一类，
+    # 所以这里收窄口径、打回并把账面清成空串（与逐镜 `bg` 那一支同规）。
+    raw_color = str(raw.get("highlight_color") or "").strip()
+    highlight_color = norm_highlight_color(raw_color)
+    if raw_color and not highlight_color:
+        _err(errors, f"highlight_color={raw_color!r} 不是 #rrggbb —— "
+                     "高亮词的颜色只收十六进制（如 #ff8a3d）；空串＝跟色板走")
 
     texture = str(raw.get("texture") or "none").strip().lower()
     if texture not in TEXTURES:
         _err(errors, f"texture={texture!r} 没有对应的滤镜链（可用：{', '.join(TEXTURES)}）")
         texture = "none"
+
+    # 整片底色那一格（2026-10-17）：卡面发 `none`/色板名，文字库面板那条老路发空串，
+    # 两者同义（`norm_palette`）。认不出的名字**报错并清成 `none`**——与 `texture`
+    # 那一支同规：留着它下游只会「认不出就不生效」，而「卡上选了牛皮纸、出来还是米白」
+    # 是最难查的一类静默。
+    #
+    # 只在 `palettes.json` **读得到**时判名字（`every` 非空）：读不到那份文件时
+    # `palettes()` 返回空表，那时报错会把整片打回在一个跟用户无关的理由上——
+    # 这一档的诚实落点是「没指定」（下游 `norm_palette` 同样返回空）。
+    palette_raw = str(raw.get("palette") or "").strip().lower()
+    palette = norm_palette(palette_raw)
+    every = palettes()
+    # `none` 必须**先**排掉：它是卡面那一格的默认值（「不选」），`norm_palette` 把它与空串
+    # 一起归一成 `""`——按下面这条判据就成了「认不出的名字」。
+    # 2026-10-17 真机前修：卡面**每次都发 `none`**，于是每一份从计划卡下来的 spec 都会被
+    # 自己打回一句「palette='none' 不是一套色板」，而可用清单里第一个就写着 `none`
+    # （自相矛盾到读的人会怀疑是配额，不是这一栏）。test_code_spec 里那一支
+    # `palette="none"` 就是它的守卫。
+    if palette_raw and palette_raw != PALETTE_NONE and not palette and every:
+        _err(errors, f"palette={palette_raw!r} 不是一套色板（可用："
+                     f"{PALETTE_NONE}（不指定）、{', '.join(sorted(every))}）")
+        palette = ""
+    # 存 `none` 而不是空串：卡面/契约/回执三处读的是同一个字面量。空串只是文字库面板
+    # 那条老路的写法，在**落盘**这一层归一掉，免得下游又要认两种。
+    palette = palette or PALETTE_NONE
 
     # R7-T22：镜间转场（拼接层）与母版进出场。三条都是**整片开关**，逐镜不覆盖——
     # 转场天生是「两个镜之间」的东西，进出场是母版给每一镜套的同一套动作；
@@ -968,31 +1061,21 @@ def validate_code_spec(raw: dict[str, Any], *,
     if len(shots) != len(raw_shots):
         _err(errors, "有镜头不是对象，已丢弃")
 
-    # 闸⑦⑨⑩⑮⑯ 的硬判据（整片风格配额与纯文字镜占比 / 跨镜同构 / 前景底色对比度 /
-    # 版式族配额 / 主体具名）都挂在这里：三个调用点——plan_motion 入库前、
-    # render_motion_code 烧像素前、patch_motion_code 落盘前——调的都是这一个函数，
-    # 规则因此不可能只在一路上生效。
-    # 提醒那一份从这里单独取（见 style_facts）。
+    # 这个函数的职责是**契约**：字段、容量、类型、归一——「这份 spec 能不能用」。
+    # 整片判据（闸⑦⑨⑩⑫⑮⑯⑲⑳ 与动效锚㉑）**不在这里**（2026-10-16 改）。
+    # 这里原来是 `for checker in WHOLE_FILM_GATES: errors.extend(run_film_gate(...)[0])`
+    # 再单独 extend 一次动效锚㉑——判据只有一个**拦人**的出路，
+    # 于是模型看不到它，只能撞上去，而一次打回的代价是整轮重来。现在它们全部走
+    # `whole_film_gate_results` 那一个出口，由三个调用点附进各自的正常返回，只报不拦。
+    # 契约不满足时**照旧抛**：那不是判据，是输入本身不成立，渲起来也没有意义。
     qc = str(raw.get("qc") or QC_STRICT).strip().lower()
     if qc not in QC_MODES:
         _err(errors, f"qc={qc!r} 不支持（可用：{', '.join(QC_MODES)}）")
         qc = QC_STRICT
-    for checker in WHOLE_FILM_GATES:
-        errors.extend(run_film_gate(checker, shots, strict=qc == QC_STRICT)[0])
-    # 闸㉑ 的**闸前**那一半（R8-T33）：动效事件的锚是纯契约，判它一次 ffmpeg 都不用开，
-    # 所以它跟上面那批整片闸并排放在这里，三个调用点（plan 入库前 / 烧像素前 / 落盘前）
-    # 一起生效。「事件触发帧在不在窗口里」那一半要像素，在 code_render 逐镜那一段。
-    errors.extend(check_motion_anchors(shots))
-    # 闸㉘（R12-T59）：镜级 `reveal` 栏的几何与时序合法性。**也放在这里**，理由与 ㉑ 的
-    # 闸前那一半一字不差：它是纯 schema 校验，判一次一次请求都不用发；而它必须与
-    # ㉑ 共享同一个调用点，否则「计划轮过了、烧像素那一轮没过」这种半合法状态会出现。
-    # ㉘ 的**另一半**（像素与时序对不对得上）是 ㉗，那一条要真帧，在 code_render 里。
-    for s in shots:
-        errors.extend(check_reveal_regions(s))
-    # 闸⑱：投递腿存在性。只有调用方**知道**客户端能力时才判（None = 不判）——
-    # plan_motion 那一侧还没有客户端，硬塞一个 None 当 False 会把「没接腿」误判成「缺腿」。
-    if has_stage_leg is not None:
-        errors.extend(check_stage_leg_present(shots, has_stage_leg=has_stage_leg)[0])
+    # 2026-10-16：这里原来还并排着 ㉘（`check_reveal_regions`，镜级 `reveal` 栏的几何
+    # 与时序合法性）与 ⑱（`check_stage_leg_present`，投递腿存在性）。两道闸的主语都是
+    # 「一整幅 raster 插画上屏」：㉘ 拿 `reveal.canvas` 与库行 width/height 对账，
+    # ⑱ 管的是有没有把素材字节投进渲染容器的那条腿。取材三条路拆掉，两道闸一起消失。
 
     bgm = raw.get("bgm") if isinstance(raw.get("bgm"), dict) else {}
     try:
@@ -1010,13 +1093,14 @@ def validate_code_spec(raw: dict[str, Any], *,
         "narration": narration,
         "voice": voice,
         "rate": rate,
-        "subtitle_mode": sub_mode,
+        "caption_style": caption_style,
+        "highlight_style": highlight_style,
+        "highlight_color": highlight_color,
         "qc": qc,
         # 有配乐时把镜头切点卡到拍上（缺省开；没有配乐或检不出稳定的拍时什么都不做）。
         "beat_sync": raw.get("beat_sync") is not False,
-        "caption_position": caption_position,
-        "caption_anim": caption_anim,
         "texture": texture,
+        "palette": palette,
         "transition": transition,
         "transition_sec": span_text,
         "entrance": motions["entrance"],
@@ -1027,18 +1111,120 @@ def validate_code_spec(raw: dict[str, Any], *,
         "title": str(raw.get("title") or "")[:80],
         "target_duration_sec": raw.get("target_duration_sec"),
     }
+    # 那几档「一开就按镜花钱」的布尔开关（见 SWITCH_KNOBS）：**活着穿过校验**，
+    # 只抄真开的那几个。这一栏漏了，写入方的话就成了空话——`spec["review"] = True`
+    # 过一趟校验回来什么都没有，而回执上写着「这趟没开」，看的人会去查判据、
+    # 查通道、查模型，唯独不会怀疑「开关在半路上掉了」。
+    for key in SWITCH_KNOBS:
+        if _switch_on(raw.get(key)):
+            spec[key] = True
     return spec, errors
 
 
-def film_style_of(shot: Mapping[str, Any]) -> dict[str, Any]:
+def _palette_for_bg(bg: str) -> dict[str, str] | None:
+    """拿一镜申报的底色反查它属于哪套色板（`palettes.json` 是唯一出处）。
+
+    page/surface/field 三个槽位都认——镜头代码常用 surface 当底；槽位按 page → surface
+    → field 的次序试，命中唯一一套就用它。
+
+    **多套撞上同一个颜色时不猜**：`#ffffff` 是 modern-light / solar-pop / coral-burst /
+    color-play 四套的 `surface`，按表序取第一个会把 coral-burst 的砖红强调色发成
+    modern-light 的蓝——一处错色，而回执上看起来和真命中一模一样。撞上就返回 None，
+    与「没申报底色」同一条退路（字幕条退回母版按亮度的二档）。
+    读不到色板文件（返回空表）或都不命中（自造底色）也返回 None。
+    """
+    every = palettes()
+    for slot in ("page", "surface", "field"):
+        hits = [pal for pal in every.values()
+                if str(pal.get(slot) or "").lower() == bg]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            return None
+    return None
+
+
+def _palette_of(shot: Mapping[str, Any], film_palette: str | None = None
+                ) -> dict[str, Any] | None:
+    """这一镜算哪套色板——**三层，从最具体的往下认**。
+
+    1. **这一镜的代码里绑了色板**（`const palette = palettes["…"]`）：这一层最具体，
+       也正是用户要的「个别镜可覆盖」——覆盖写在那一镜自己的代码里。
+    2. **这一镜申报的 `bg`** 反查得出唯一一套：也是覆盖，只是没写色板名。
+    3. **整片默认**（spec 顶层的 `palette`，用户在计划卡上挑的那一格）。
+
+    三层都认不出返回 None——**不猜**。
+
+    为什么先认代码绑定而不是先认整片默认：`bg` 在镜头 schema 里**可省略**（只有
+    `bleed: true` 的镜必须给，闸⑲ 的 :data:`VARIETY_BG_SHARE` 也只要求 ≥25% 的镜申报），
+    所以「拿 bg 反查色板」对多数镜根本不触发——一部片子里会是一半镜头的字幕条跟着色板、
+    一半还是老的白底黑字粉高亮，比统一的老样子更花。而权威来源一直都在同一份代码里：
+    :func:`shot_colors` 静态认得出顶上那句 ``const palette = palettes["…"]``，
+    闸⑩ 与闸⑲ 本来就照它工作。这里用的是同一处，不新增第二个真相源。
+
+    第 3 层是 2026-10-16 加的（整片 `palette` 那一格）：没有它的时候「整片一个调子」
+    只能靠模型在二十份代码里各写一遍同一句绑定来维持——那就是用户说的
+    「底色和字幕不一致」。整片默认落在这一层，**认得出这一镜自己的选择时它一个字节
+    也不生效**，所以「个别镜可覆盖」是结构上的，不是靠约定。
+    """
+    named = str(shot_colors(str(shot.get("code") or "")).get("palette") or "")
+    if named:
+        pal = palettes().get(named)
+        if isinstance(pal, dict) and pal:
+            return pal
+    bg = str(shot.get("bg") or "").strip().lower()
+    if bg:
+        pal = _palette_for_bg(bg)
+        if pal:
+            return pal
+    film = norm_palette(film_palette)
+    if film:
+        pal = palettes().get(film)
+        if isinstance(pal, dict) and pal:
+            return pal
+    return None
+
+
+def _palette_name_of(shot: Mapping[str, Any],
+                     film_palette: str | None = None) -> str:
+    """这一镜**实际用上的**那套色板叫什么（认不出的返回空串）。
+
+    与 :func:`_palette_of` **同一处判据**（`palettes()` 带 `lru_cache`，三层拿到的
+    都是同一个 dict 对象，所以这里按身份反查名字）：两处各认一遍名字，
+    「账上一套、画面上另一套」就是迟早的事。名字只给**读得出名字**的那些镜——
+    认不出返回空串，**不编**。
+    """
+    pal = _palette_of(shot, film_palette)
+    if not pal:
+        return ""
+    for name, every in palettes().items():
+        if every is pal:
+            return name
+    return ""
+
+
+def film_style_of(shot: Mapping[str, Any], *,
+                  film: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """这一镜的风格档（R14）：**只带真申报了的键**。
 
-    → `{}`，或 `{"bleed": bool, "bg": "#rrggbb"}` 的任意子集。
+    → `{}`，或 `{"bleed": bool, "bg": "#rrggbb", "paper": …, "ink": …, "accent": …}`
+    的子集。`paper/ink/accent/bg` 不必是镜申报的，而是 :func:`_palette_of` 认出
+    色板后**自动带出**的（底色 + 条底/字色/强调色四件）——认得出色板时这一镜的底色与
+    字幕条就跟着那套色板走，治的是「换任何色板字幕永远是白底黑字粉高亮」与
+    「绑了深色板、底还是米白」。母版只认色值不认色板名，出处仍只有 `palettes.json` 一份。
+
+    ``film`` 是**整片那一份 spec**（可省）：给了的话，这一镜自己没绑色板、底色也反查
+    不出色板时，落回整片默认的那一档（用户要的「整片一个字段作默认」）。省掉它时
+    行为与 2026-10-16 之前一致——既有调用点不改也不会悄悄换像素。
+
+    `bg` 与三件套的优先级**不同**：`bg` 仍然**申报了就以申报的为准**（那是这一镜明写的
+    底色），没申报才取认出的那套色板的 `page`；三件套则只要 :func:`_palette_of` 认得出
+    色板就给——认的是色板本身，与申没申报底色无关。
 
     为什么只带申报了的键、不补全成完整一份：这一份要**进缓存键**、还要**逐镜过 HTTP**
     （`code_render.shot_input_props` → 渲染容器）。补全之后 `{bleed: false, bg: ""}`
     也成了一个值，于是所有既有镜的键全部改变、整片白烧一次 Remotion 帧，而它们
-    一个字节都没变——与 `shot_cache_key` 里 `reveal` 那一段是同一个教训。
+    一个字节都没变——与 `shot_cache_key` 里 `film_style_of` 那一段是同一个教训。
 
     也正因为「在 / 值不同 / 不在」三态两两算出不同的键，这一处省下的只是无谓的坏键，
     不是判据：申报了 `bleed: false` 与没申报在母版那侧落同一个缺省，键不同只是多烧一次，
@@ -1048,9 +1234,19 @@ def film_style_of(shot: Mapping[str, Any]) -> dict[str, Any]:
     bleed = shot.get("bleed")
     if isinstance(bleed, bool):
         out["bleed"] = bleed
+    pal = _palette_of(shot, (film or {}).get("palette"))
     bg = str(shot.get("bg") or "").strip().lower()
-    if bg:
+    if not bg and pal:
+        # 这一镜没申明底色 → 用它认出的那套色板的 `page`。这是「整片底色一致」真正
+        # 落地的那一行：同一套色板的镜拿到同一个底色，逐镜覆盖的镜拿到自己那一套的。
+        bg = str(pal.get("page") or "").strip().lower()
+    if re.fullmatch(r"#[0-9a-f]{6}", bg):
         out["bg"] = bg
+    if pal:
+        for key, slot in (("paper", "surface"), ("ink", "text"), ("accent", "accent")):
+            color = str(pal.get(slot) or "").strip().lower()
+            if re.fullmatch(r"#[0-9a-f]{6}", color):
+                out[key] = color
     return out
 
 
@@ -1068,52 +1264,32 @@ def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
     knobs = {k: shot.get(k) for k in SHOT_KNOBS}
     # 见 SHOT_KNOBS 那条注释：进键的是值扁表，不是整份声明。
     knobs["fields"] = field_values(shot)
-    # R2: 资产字节进缓存键——换图必须重烧，改注释不重烧
-    assets = shot.get("assets") or []
-    assets_hash = ""
-    if assets:
-        asset_pairs = sorted(
-            f"{a.get('sha256','')}/{a.get('name','')}"
-            for a in assets if isinstance(a, dict)
-        )
-        assets_hash = hashlib.sha256(
-            "|".join(asset_pairs).encode("utf-8")
-        ).hexdigest()[:16]
+    # 2026-10-16：这里原来还有 `assets_hash`（R2：素材字节进键，换图必须重烧）与
+    # `reveal`（R12-T59：母版逐帧算 mask 的输入，改一个揭示时刻就得重烧）。两栏都随
+    # 取材那三条路删了；**键少了两个字段不等于坏键**——键只是「这一镜的身份」，
+    # 少一维就是少一维，不会把两个不同的镜算成同一个（代码字节那一段仍然是主项）。
     payload = {
         "code": str(shot.get("code") or ""),
         "knobs": knobs,
         "film": {k: film.get(k) for k in FILM_KNOBS},
         "master": master_hash,
         "deps": lockfile_hash,
-        "assets_hash": assets_hash,
     }
-    # R12-T59：`reveal` 是**母版逐帧算 mask 的输入**，所以它必须进键——与 `motion`
-    # 恰好相反（那一条刻意不进，理由写在 `_norm_shot` 里）。不进键的后果是这条链最贵的
-    # 那一种：改一个揭示时刻，命中缓存的镜原样返回旧切片，而账上写着「重烧过」。
-    # **只在真有这一栏时才加这一项**：无条件加会改掉所有既有镜的键（`None` 也是一个
-    # 值），整片换一次缓存＝每一镜白烧一次 Remotion 帧——而它们一个字节都没变。
-    # 加了之后「有 → 改了 → 删了」三种状态两两算出的键都不同（在、值不同、不在），
-    # 所以这一处省下的只是无谓的坏键，不是判据。
-    if shot.get("reveal") is not None:
-        payload["reveal"] = shot.get("reveal")
-    # R14 风格档（满幅 / 底色）改的是**像素**，所以必须进键——写法与上面 `reveal`
-    # 一字不差：**只在真有这一栏时才加**。塞进 `SHOT_KNOBS` 或无条件加，都会让
+    # R14 风格档（满幅 / 底色）改的是**像素**，所以必须进键——写法与原来 `reveal`
+    # 那一处一字不差：**只在真有这一栏时才加**。塞进 `SHOT_KNOBS` 或无条件加，都会让
     # `None` 也成为一个值，于是所有既有镜的键全部改变、整片白烧一次 Remotion 帧，
     # 而它们一个字节都没变。
-    style = film_style_of(shot)
+    style = film_style_of(shot, film=film)
     if style:
         payload["film_style"] = style
-    # 层E2（R19）：这一镜**覆盖**了字幕档时也要进键。整片那一档本来就在 `FILM_KNOBS`
-    # 里（`subtitle_mode`），所以只有「申报过覆盖」才加——不加的话「同一段代码、整片
-    # full 而这一镜 inline」会共用一份切片，字幕带本该消失的那一镜会拿到带字幕带的
-    # 旧切片，而账面上一切正常（这正是「少算一个键就是拿旧片冒充新片」）。
-    sub_override = str(shot.get("subtitle_mode") or "")
-    if sub_override:
-        payload["subtitle_mode"] = sub_override
+    # 层E2（R19）：这一镜**覆盖**了字幕两维时也要进键。整片那两档本来就在 `FILM_KNOBS`
+    # 里，所以只有「申报过覆盖」才加——不加的话「同一段代码、整片 paper 而这一镜
+    # on_picture」会共用一份切片，纸条本该消失的那一镜会拿到带纸条的旧切片，
+    # 而账面上一切正常（这正是「少算一个键就是拿旧片冒充新片」）。
     # 卡拍补长改的是帧数（像素与声轨都变了），只在真补了时进键。
     if shot.get("_beat_pad"):
         payload["beat_pad"] = round(float(shot["_beat_pad"]), 3)
-    for k in ("caption_position", "caption_anim"):
+    for k in ("caption_style", "highlight_style"):
         if shot.get(k):
             payload[k] = str(shot[k])
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
@@ -1121,7 +1297,7 @@ def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
 
 
 # ---------------------------------------------------------------------------
-# 闸⑦ 整片层：风格配额与文案具体项（在烧像素之前判，一次都不花）
+# 闸⑦ 整片层：每镜必画与文案具体项（在烧像素之前判，一次都不花）
 # ---------------------------------------------------------------------------
 
 #: **画法通道** → 认的 import 包名。只有「这一镜真的画了东西」的四条算通道：
@@ -1131,22 +1307,44 @@ def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
 #: ``@dg/motion``/``@dg/polish``/``@dg/lib``/``@dg/themes`` 那一类**不再算通道**：
 #: 它们是动效件与色板，不是画面主体。「左边一张卡片 + 右边一段文字」配齐了
 #: ``@dg/lib/ClipCard`` 与 ``@dg/themes``，画面上仍然什么都没有——旧表把它们计入
-#: variety，正是「配额绿了而画面还是 PPT」的那条缝。它们照样在白名单里可以 import，
-#: 只是撑不起配额。
+#: 通道数，正是「闸绿了而画面还是 PPT」的那条缝。它们照样在白名单里可以 import，
+#: 只是撑不起闸⑦。
 #:
 #: **与技能正文「通道表」那张表逐行同源**（``tests/test_code_spec.py`` 第 ⑧ 节拿正文
 #: 比对这些名字）。为什么判据是 import 而不是模型自报的一栏：自报会漂（写了
 #: `style: rough` 而代码里一个 roughjs 都没有），而这条闸要拦的恰恰就是
 #: 「说用了但其实没有」。
+#: 简笔画零件库的**件清单**（源码 `remotion/src/lib/draw/`，别名 `@dg/lib/draw/*`）。
+#: 每件回答「一个能被认出的东西由哪几笔构成」——人、机器、厂房、齿轮、图表…
+#: （`remotion/src/lib/draw/Figure.tsx` 起头那段注释解释了它们能做到什么、做不到什么）。
+#:
+#: **只有这一份**，两处都从这里取：
+#:   · `IMPORT_WHITELIST` —— 模型能 import（也与 `lint-rules.mjs` 的 `ALLOWED_IMPORTS` 对账）；
+#:   · `PICTORIAL_CHANNELS["rough"]` —— 闸⑦「每镜必画」与闸⑯「主体具名」认它们是
+#:     **手绘通道**（这些件底下走的就是 roughjs）。
+#: 两处各写一份必然漂，而漂的那一侧正好是最要命的一侧：名单更新了、通道没更新，
+#: 于是每一镜都被判成「只画了文字与色块」。
+_DRAW_PARTS: tuple[str, ...] = (
+    "@dg/lib/draw/Figure", "@dg/lib/draw/Face", "@dg/lib/draw/Machine",
+    "@dg/lib/draw/Building", "@dg/lib/draw/Vehicle", "@dg/lib/draw/Gear",
+    "@dg/lib/draw/Chart", "@dg/lib/draw/Arrow", "@dg/lib/draw/Coin",
+    "@dg/lib/draw/Book", "@dg/lib/draw/Scale", "@dg/lib/draw/Clock",
+    "@dg/lib/draw/Crown",
+)
+
 PICTORIAL_CHANNELS: dict[str, tuple[str, ...]] = {
-    "rough": ("roughjs",),
+    # 简笔画零件库的每一件都记在这一条上（2026-10-17）：它们底下就是 roughjs 的手绘线，
+    # 只是把「锅炉 + 烟囱 + 飞轮」这类拆法预先写好。不记在这里，`<Machine/>` 画出来的
+    # 东西在闸⑦ 眼里是「只有文字与色块」——判据认的是 import 名，不是产物的形状。
+    "rough": ("roughjs", *_DRAW_PARTS),
     "three": ("three", "@react-three/fiber", "@remotion/three"),
     "katex": ("katex",),
-    "image": ("staticFile",),  # R2: 图像通道——本镜声明了 assets 且 staticFile 引用
 }
 
-#: 归类顺序：专门通道优先，配额才不会被蒙成两种通道各半。
-CHANNEL_ORDER = ("rough", "three", "katex", "image")
+#: 归类顺序：专门通道优先，免得一镜里既有三维又有裸 SVG 引线时被归错主通道。
+#: （`vector` 不在这条链上——它判在 markup 上、不判 import，见 ``_VECTOR_MARKUP_RE``，
+#: 所以 ``shot_style_channel`` 结尾单独给它一档。）
+CHANNEL_ORDER = ("rough", "three", "katex")
 
 #: 第四条通道：代码里真在画几何图形 —— 技能正文那句「（或裸 SVG）」的机器形态。
 #: 判据**是写了画形状的东西**，不是 import：`<svg>`/`<path>` 之外的 `<div>` 加
@@ -1156,21 +1354,20 @@ _VECTOR_MARKUP_RE = re.compile(
     r"|\b(toPaths|toCurves|Path2D|linePath|polylinePath|shapeArc|shapeRect|"
     r"shapeCircle|shapePolygon)\(")
 
-#: 四条通道都不命中的那一类：只有文字与色块。技能正文里的「纯文字/纯色块的那一类镜头」。
+#: 一条画法通道都不命中的那一类：只有文字与色块。技能正文里的「纯文字/纯色块镜」。
 TEXT_CHANNEL = "text"
 
-#: 配额表：镜数 → 至少几种**画法通道**。四条通道全用得上才算多风格：
-#: 6 镜以上三种、10 镜以上四种（10 镜是常见片长，此时「三种通道」意味着有一条
-#: 通道被三镜共用，仍可能全片一个母题——那由闸⑨ 在结构上拦，不归这一条）。
-CHANNEL_QUOTA: tuple[tuple[int, int], ...] = ((6, 3), (10, 4))
+#: **每镜必画**认的那四条通道（闸⑦ 的判据）。图形片的画面只有一路——模型逐镜写代码
+#: 画出来：`rough` 手绘斜纹 / `three` 真三维 / `katex` 公式 / `vector` 几何图形。
+#:
+#: `image`（`staticFile`）**不在里面**：它不是画出来的。2026-10-16 起图形片不再有取材
+#: 通道（不检索素材库、不出图、上传件不上屏），所以「一镜只摆了一张图」等于没画。
+DRAWN_CHANNELS: tuple[str, ...] = ("rough", "three", "katex", "vector")
 
-#: 两条硬闸共同的起步镜数（正文那句「首尾镜不计入分子也不计入分母」也要有分母可算）。
+#: 闸⑮（版式族）的起步镜数：镜数不到这一档，谈「族配额」连分母都不成立。
 MIN_SHOTS_FOR_QUOTA = 6
 
-#: 纯文字/纯色块镜的上限：占**中间镜**（去掉首尾）的三分之一。
-MAX_TEXT_ONLY_SHARE = 1.0 / 3.0
-
-#: 文案具体项的达标线（低于它只出提醒，理由见 :func:`check_style_quota` 末段与
+#: 文案具体项的达标线（低于它只出提醒，理由见 :func:`check_draw_floor` 末段与
 #: :func:`has_concrete_item` 那份判据的覆盖面）。
 CONCRETE_SHARE_TARGET = 0.40
 
@@ -1276,10 +1473,21 @@ def shot_all_channels(code: str) -> set[str]:
     """一镜用到的**所有**画法通道（不按优先级截断）。
 
     与 :func:`shot_style_channel` 的区别：那个按 ``CHANNEL_ORDER`` 只返回第一条
-    匹配（主通道）。配额统计要的是「这一镜真用了哪几种」——一条 three 场景配一圈
+    匹配（主通道）。要「这一镜真用了哪几种」的场合就读这个——一条 three 场景配一圈
     裸 SVG 引线，两种通道都算，``rough+vector`` 互融的镜正是技能正文要的那种。
     """
     return shot_used_channels(code)
+
+
+def shot_drawn(code: str) -> bool:
+    """这一镜有没有**用代码画东西**——闸⑦「每镜必画」的判据。
+
+    判据是**集合相交**（``shot_used_channels(code) & DRAWN_CHANNELS``），不是
+    ``shot_style_channel(code) != TEXT_CHANNEL``：后者只报**主通道**（按 ``CHANNEL_ORDER``
+    取第一条匹配），要「只要命中过一条画法通道就算画了」的语义，就该对全集求交，
+    而不是对主通道求不等。四条画法通道见 ``DRAWN_CHANNELS``。
+    """
+    return bool(shot_used_channels(code) & set(DRAWN_CHANNELS))
 
 
 def has_concrete_item(text: str) -> bool:
@@ -1287,8 +1495,18 @@ def has_concrete_item(text: str) -> bool:
     return any(r.search(text or "") for r in _CONCRETE_RES)
 
 
-def style_facts(shots: list[dict[str, Any]]) -> dict[str, Any]:
-    """整片的风格与文案账（确认卡、出片回执、闸⑦⑨⑩ 三处读同一份，不各算一遍）。"""
+def style_facts(shots: list[dict[str, Any]], *,
+                film: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """整片的风格与文案账（确认卡、出片回执、闸⑦⑨⑩ 三处读同一份，不各算一遍）。
+
+    ``film`` 是**整片那一份 spec**（可省）：给了的话，账里 `palettes` 那一栏记的是
+    这一镜**实际用上的**那套色板（自己绑的 → 自己底色反查的 → 整片默认），而不是
+    「代码里写了没有」。这一栏 2026-10-17 起不再有任何判据读它（闸⑲ 的色板配额那一档
+    删了，理由见 `check_style_variety`），它现在是**给人看的一份读数**：
+    「这条片子的每一镜到底落在哪套色板上」只有这一处答得出来，
+    而「整片一个调子」这件事本来就是要用眼睛核的。
+    """
+
     ids = [str(s.get("id") or f"s{i + 1:02d}") for i, s in enumerate(shots)]
     codes = [str(s.get("code") or "") for s in shots]
     channels = {sid: shot_style_channel(code) for sid, code in zip(ids, codes)}
@@ -1296,7 +1514,6 @@ def style_facts(shots: list[dict[str, Any]]) -> dict[str, Any]:
     variety: set[str] = set()
     for chs in all_channels.values():
         variety |= chs
-    middle = list(channels.items())[1:-1] if len(shots) >= 3 else []
     same_groups = [[ids[i] for i in g] for g in structure_groups(codes)]
     contrast = []
     for sid, code in zip(ids, codes):
@@ -1321,12 +1538,22 @@ def style_facts(shots: list[dict[str, Any]]) -> dict[str, Any]:
             sid: {"declared": str(s.get("subject_channel") or ""),
                   "detected": sorted(shot_all_channels(str(s.get("code") or "")))}
             for sid, s in zip(ids, shots)},
-        "text_only": [sid for sid, c in channels.items() if c == TEXT_CHANNEL],
-        "text_only_middle": [sid for sid, c in middle if c == TEXT_CHANNEL],
-        # 闸⑲ 的三栏账（R19）：逐镜绑的色板名（认不出的记 None）、满幅镜、质感种数。
-        # 色板读的是**代码里那句绑定**（`shot_colors`），不是模型自报的一栏——自报会漂，
-        # 而这一道要拦的恰恰是「说换色板了但其实没有」。
-        "palettes": {sid: shot_colors(code)["palette"] for sid, code in zip(ids, codes)},
+        # 闸⑦ 的账：一条画法通道都没用上的镜。**每镜必画**之下这一栏必须恒为空数组——
+        # 那个空就是「每一镜都画了」的证据，所以它不从账上删掉。
+        #
+        # 判据直接调 `shot_drawn`——**与闸⑦ 同一个谓词**。它与上面那句
+        # `channels[sid] == TEXT_CHANNEL` 在今天恒等（`image` 已从 `PICTORIAL_CHANNELS`
+        # 摘掉，非画法通道一条不剩），但账要跟闸共用判据而不是共用结果：哪天再冒出一条
+        # 「认得出但不作数」的通道，这一栏不会与闸⑦ 分家。
+        "text_only": [sid for sid, code in zip(ids, codes) if not shot_drawn(code)],
+        # 逐镜**实际用上的**色板名（读不出名字的记 None）、满幅镜、质感种数。
+        # 认名字的口子只有一个：`_palette_name_of`（自己绑的 → 自己底色反查的 → 整片默认），
+        # 与 `film_style_of` 注入的是同一处判据——两处各认一遍，「账上一套、画面上另一套」
+        # 就是迟早的事。**不读模型自报的那一栏**：自报会漂，而这一栏要答的正是
+        # 「说换色板了但其实没有」。
+        "palettes": {
+            sid: (_palette_name_of(s, film and film.get("palette")) or None)
+            for sid, s in zip(ids, shots)},
         "bleed_shots": [sid for sid, s in zip(ids, shots) if s.get("bleed") is True],
         # 质感只数**申报过的**值；有镜没申报时补一个空串占一格——空串表示「跟整片默认」，
         # 它与任何具名档都不是同一个值，所以「一档都没申报」在这里读成 1 种（不是 0 种）。
@@ -1347,40 +1574,26 @@ def style_facts(shots: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def check_stage_leg_present(shots: list[dict[str, Any]], *,
-                            has_stage_leg: bool) -> tuple[list[str], list[str]]:
-    """闸⑱：声明了 `assets` 就必须真有**投递腿**（渲染客户端暴露 `stage_asset`）。
-
-    为什么把这条前移到这里：`code_render._stage_shot_assets` 里那条 ``MediaError``
-    本身写得好，但它是**运行期**才响的——等到烧到那一镜才炸，前面几镜白烧，而失败
-    消息还裹在渲染报错里。判据要的是**一帧都没烧之前**把话说清楚：要么补投递腿
-    （R1 收的口），要么去掉 `assets` 声明。这样「缺腿」从运行期事故变成开始前的可报告状态。
-
-    为什么不在 shots 里逐镜报：这是**整片级**能力缺失，不是某一镜写错了——报几十条
-    同义错误只会淹掉真正要改的那一处，所以合并成一条并带上镜数。
-    """
-    if has_stage_leg:
-        return [], []
-    n = sum(1 for s in shots if s.get("assets"))
-    if not n:
-        return [], []
-    return ([f"投递腿缺失：{n} 个镜头声明了 assets，但渲染客户端没有 stage_asset 口——"
-             "素材字节投不进渲染容器，烧到那一镜必炸。先补投递腿，或去掉 assets 声明。"], [])
+# 2026-10-16 删掉了闸⑱（`check_stage_leg_present`：「声明了 `assets` 就必须真有投递腿」）。
+# 它判的是「`shots[].assets` 声明了，而渲染客户端没有 `stage_asset` 口」——两边一起没了：
+# `assets` 栏删了，投递腿本身（`remotion_client.stage_asset` 那个口、`code_render` 里
+# 按 sha256 取字节的那一段）也删了。**这道闸的闸号不再被任何判据占用**，与 ⑪/⑤/⑬/㉗/㉘/㉛
+# 同一处置：删掉的是闸，不是编号本身——将来若要新增一条闸，照旧用没被占用的号。
 
 
-def check_style_quota(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
-    """闸⑦：整片层的风格配额与文案具体项。→ (打回清单, 提醒清单)。
+def check_draw_floor(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """闸⑦：**每镜必画**与文案具体项。→ (打回清单, 提醒清单)。
 
-    三条硬判据全部读**代码字节**，都在烧像素之前判（这一层红一次 = 一次分镜重做，
-    不是几十分钟白烧）：
+    图形片的画面只有一路——模型逐镜写代码画出来。所以判据是**逐镜**的，不是整片
+    「够不够几种」：任何一镜的代码里一条画法通道（``DRAWN_CHANNELS``：rough / three /
+    katex / vector）都没用上，那一镜就是纯文字/纯色块，当场打回并点名。
 
-    1. 通道种数不够（≥6 镜要 3 种、≥10 镜要 4 种，见 ``CHANNEL_QUOTA``）。这条同时
-       拦住正文点名的那种写法——全片只有裸 SVG/图示一种通道，就是「卡片+文字」换了个
-       马甲：variety=1 < 3。计入的只有四条**画法**通道（rough/three/katex/vector），
-       ``@dg/motion`` 那一类动效件不算——它们不画画面主体。
-    2. 全片一条图形通道都没有（≥6 镜时）：这是判据 1 的特例，单独留一条是因为退回理由
-       要能指名「一镜图形都没画」，而不是笼统说「种类不够」。
-    3. 纯文字/纯色块镜超过中间镜的三分之一（首尾不计入分子也不计入分母，与正文同一口径）。
+    为什么从「整片配额」翻成「逐镜底线」：配额拦的是「一条线画到底」，底线拦的是
+    「这一镜根本没画」。后者才是「画面里有东西」这件事的地板，而地板不该有镜数门槛——
+    旧配额表在 6 镜以下**整档不判**，那种长度的片子等于没有这一道闸。
+
+    判据读**代码字节**（import 了还得在代码体里用得上，见 :func:`shot_used_channels`），
+    在烧像素之前判——这一层红一次 = 一次分镜重做，不是几十分钟白烧。
 
     **文案具体项那一条只出提醒，不打回**，这是判过的而不是偷懒：词法只看得见数字、
     引号术语、拉丁缩写，看不见「毕昇」「沈括」「《梦溪笔谈》」之外的地名人名器物名——
@@ -1392,33 +1605,25 @@ def check_style_quota(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]
     errors: list[str] = []
     warns: list[str] = []
     n = len(shots)
-    if n < MIN_SHOTS_FOR_QUOTA:
+    if not n:
         return errors, warns
     facts = style_facts(shots)
-    variety = facts["variety"]
-    want = max(k for limit, k in CHANNEL_QUOTA if n >= limit)
-    if not variety:
+    ids = [str(s.get("id") or f"s{i + 1:02d}") for i, s in enumerate(shots)]
+    # 判据直接调 `shot_drawn`，不从 `facts["text_only"]` 转一手：那一栏与这里今天同源
+    # （它调的也是 `shot_drawn`），但闸是执法点、facts 是给回执与卡片读的汇总——闸的判据
+    # 不绕着汇总走，哪天汇总那一栏变了口径，这道闸也不会跟着变。
+    bare = [sid for sid, s in zip(ids, shots)
+            if not shot_drawn(str(s.get("code") or ""))]
+    if bare:
         errors.append(
-            f"闸⑦ 风格配额：{n} 镜没有一镜画出图形（全是文字与色块）——"
-            f"至少要 {want} 种画法通道。四条真通道按题材选：手绘斜纹用 `roughjs`"
+            f"闸⑦ 每镜必画：{len(bare)}/{n} 镜没有用代码画东西（只有文字与色块）："
+            f"{'、'.join(bare)}。四条画法通道按题材选：手绘斜纹用 `roughjs`"
             "（`rough.generator(...)` 画出的形要有 seed），立体形体用 `three` + "
             "`@react-three/fiber` + `@remotion/three`，式子用 `katex`（记得 "
             "`import \"katex/dist/katex.min.css\"`，不然渲出来是没上下标的纯文本），"
             "流程/曲线/几何用 `@remotion/shapes` 或裸 SVG。**只 import 不调用的那一行"
             "不算通道**（判据读的是代码体里真用得上的那个名字）。技能正文「画面丰富度"
             "合同」那一节逐条写着适合画什么")
-    elif len(variety) < want:
-        errors.append(
-            f"闸⑦ 风格配额：{n} 镜只用了 {len(variety)} 种画法通道（{'、'.join(variety)}），"
-            f"这一档镜数至少要 {want} 种。当前分布："
-            + "、".join(f"{sid}={ch}" for sid, ch in facts["channels"].items())
-            + "——把最该有形体的那几镜换成对应的通道，别为了凑数给用不上的镜塞立方体")
-    text_mid = facts["text_only_middle"]
-    if len(text_mid) > (n - 2) * MAX_TEXT_ONLY_SHARE:
-        errors.append(
-            f"闸⑦ 纯文字镜超标：中间 {n - 2} 镜（首尾除外）里 {len(text_mid)} 镜只有文字"
-            f"与色块，上限是三分之一（最多 {int((n - 2) * MAX_TEXT_ONLY_SHARE)} 镜）——"
-            f"这些镜要补画面主体：{'、'.join(text_mid)}")
     hollow = facts["hollow"]
     if hollow and (n - len(hollow)) / n < CONCRETE_SHARE_TARGET:
         warns.append(
@@ -1430,31 +1635,38 @@ def check_style_quota(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]
 
 
 # ---------------------------------------------------------------------------
-# 闸⑲ 风格配额（R19）：色板 / 质感 / 满幅 / 底色——**逼丰富**的那一道
+# 闸⑲ 风格配额（R19）：质感 / 满幅 / 底色——**逼丰富**的那一道
 # ---------------------------------------------------------------------------
 #
 # 与 ⑦⑮⑯ 的分工：那三道判的是**反雷同**（通道别只一种、卡别同族扎堆、主体别写抽象词），
-# 这一道判的是**逼丰富**。在它之前，色板 / 质感 / 满幅 / 底色这四条**没有任何闸在判**，
-# 于是一条 20 镜片可以全用一套色板 + 一种质感 + 全常规版式而照样过闸——闸绿了，成片
-# 却是「同一张 PPT 换了二十遍字」。
+# 这一道判的是**逼丰富**。在它之前，质感 / 满幅 / 底色这三条**没有任何闸在判**，
+# 于是一条 20 镜片可以全用一种质感 + 全常规版式而照样过闸——闸绿了，成片却是
+# 「同一张 PPT 换了二十遍字」。
 #
 # 强度分两档，判据的性质不同（不是偷懒）：
-#   · **结构判据（打回）**：色板种数、满幅镜数。这两件事在**代码字节**上就能数清
-#     （`shot_colors()["palette"]` 已经能认出每镜绑的是哪套色板；`bleed` 是归一后的
-#     布尔栏），而且「一镜都没满幅」「全片一个调子」是**确定的**退化形态。
+#   · **结构判据（打回）**：满幅镜数。这件事在**代码字节**上就能数清（`bleed` 是归一
+#     后的布尔栏），而且「一镜都没满幅」是**确定的**退化形态。
 #   · **程度判据（只提醒）**：质感种数、`bg` 申报率。质感有「跟整片默认」这一态
 #     （没申报 ≠ 没质感），底色也不是每镜都该有——把这两条做成硬闸就会误伤
 #     「整片一档柔光 + 几镜换底色」这种合法配法。与闸⑨「宁可漏报，不许误报」同一纪律。
+#
+# 2026-10-17 删掉了「色板种数 ≥ ceil(n/4)」那一档。它与这一道其余三条**方向相反**：
+# 那三条逼的是「别二十镜一个框、一个质感」，而它逼的是「别二十镜一个色」——
+# 于是系统会奖励一部片子铺开六套底色，而用户在真机上要的恰恰是**整片一个底色**
+# （「怎么做让它默认的整体风格一致?就是起码的底色和字幕保持一致」，紧接着的
+# 决定是「整片一个字段作默认，个别镜可覆盖」）。它逼出来的东西正是用户要消除的东西，
+# 所以删的是**这一档**，不是这一道：质感 / 满幅 / 底色三条原样留着。
+# 换掉它的新载体是 spec 顶层那个 `palette` 字段（见 `FILM_KNOBS`），
+# 以及账里逐镜读得出的 `style_facts()["palettes"]`——那条读数现在答的是
+# 「每一镜实际落在哪套色板上」，人一眼看得出整片是不是一个调子。
 
-#: 这一道从几镜起判。三镜片用三套色板是常态，不是纪律（与 ⑦ 的起步镜数同一个道理）。
+#: 这一道从几镜起判。三镜片各画各的是常态，不是纪律（与 ⑦ 的起步镜数同一个道理）。
 VARIETY_MIN_SHOTS = 6
-#: 色板种数下限 = ceil(n / 这个数)：镜数越多，越不该只用一个调子。
-VARIETY_PALETTE_DIV = 4
 #: 质感种数下限。
 VARIETY_MIN_TEXTURES = 3
 #: 满幅镜数下限 = ceil(n / 这个数)（20 镜 → 4 镜）。
 VARIETY_BLEED_DIV = 5
-#: `bg` 申报率下限（满幅镜另有一条更硬的：满幅**必须**给 `bg`，见判据 ④）。
+#: `bg` 申报率下限（满幅镜另有一条更硬的：满幅**必须**给 `bg`，见判据 ③）。
 VARIETY_BG_SHARE = 0.25
 
 
@@ -1462,18 +1674,14 @@ def check_style_variety(shots: list[dict[str, Any]]
                         ) -> tuple[list[str], list[str], list[str]]:
     """闸⑲ 风格配额：整片的**丰富度**够不够。→ (打回, 提醒, 未判)。
 
-    四条判据，强度见上面那段：
+    三条判据，强度见上面那段（原来的第一条「色板种数」删了，理由也写在那一段里）：
 
-    1. **色板种数** ≥ ``ceil(n / VARIETY_PALETTE_DIV)``（结构 → 打回）。读的是
-       ``shot_colors(code)["palette"]``——代码里那句 ``const palette = palettes["…"]``。
-       一镜都认不出色板时落**未判**（第三个出口），不装成通过：认不出与「只用了一套」
-       在回执上是两句话。
-    2. **满幅镜数** ≥ ``ceil(n / VARIETY_BLEED_DIV)``（结构 → 打回）。不写 `bleed` 时
+    1. **满幅镜数** ≥ ``ceil(n / VARIETY_BLEED_DIV)``（结构 → 打回）。不写 `bleed` 时
        每一镜都被裁进同一条居中的画面带里，这正是成片「像 PPT」的结构原因（R14 把
        `bleed` 这条路开出来了，这一条是**逼它真的被用上**）。
-    3. **质感种数** ≥ ``VARIETY_MIN_TEXTURES``（程度 → 只提醒）。质感有「跟整片默认」
+    2. **质感种数** ≥ ``VARIETY_MIN_TEXTURES``（程度 → 只提醒）。质感有「跟整片默认」
        这一态，只数**申报过的**值，并把「没申报的镜数」写进提醒里——宁可漏报。
-    4. **`bg` 申报率** ≥ ``VARIETY_BG_SHARE``，且**满幅镜必须给 `bg`**（程度 → 只提醒）。
+    3. **`bg` 申报率** ≥ ``VARIETY_BG_SHARE``，且**满幅镜必须给 `bg`**（程度 → 只提醒）。
        满幅不给底色时深色板的正文会压在母版奶油底上，而闸④ 还拿 `bg` 当判空的基准色。
     """
     errors: list[str] = []
@@ -1485,27 +1693,7 @@ def check_style_variety(shots: list[dict[str, Any]]
     facts = style_facts(shots)
     ids = [str(s.get("id") or f"s{i + 1:02d}") for i, s in enumerate(shots)]
 
-    # ① 色板种数
-    bound = facts["palettes"]
-    known = sorted({v for v in bound.values() if v})
-    want_pal = -(-n // VARIETY_PALETTE_DIV)
-    if not known:
-        undetermined.append(
-            "闸⑲ 风格配额·色板这一档本片**没判**：一镜的色板都没能从代码里静态认出来"
-            "（写法不是 `const palette = palettes[\"…\"]`，或者容器里读不到 "
-            "`palettes.json`）。未判不是通过。")
-    elif len(known) < want_pal:
-        every = sorted(palettes())
-        errors.append(
-            f"闸⑲ 风格配额：{n} 镜只绑了 {len(known)} 套色板（{'、'.join(known)}），"
-            f"这一档至少要 {want_pal} 套。色板的唯一出处是 "
-            f"`remotion/src/themes/palettes.json` 的八套色板"
-            f"（{'、'.join(every) if every else 'vintage-kraft / deep-ocean / … 共八套'}）"
-            "——**逐镜按题材选**，别让二十镜共用一个调子：全片一个色正是成片"
-            "「像同一张 PPT 换字」的原因之一。写法照技能正文的模板："
-            "`const palette = palettes[\"<色板名>\"];` 写在代码顶部")
-
-    # ② 满幅镜数
+    # ① 满幅镜数
     bleeds = facts["bleed_shots"]
     want_bleed = -(-n // VARIETY_BLEED_DIV)
     if len(bleeds) < want_bleed:
@@ -1516,7 +1704,7 @@ def check_style_variety(shots: list[dict[str, Any]]
             "这正是成片**像 PPT** 的结构原因。画整屏插画、满版描线、大场景、"
             "背景要铺满的镜头就写 `bleed: true`（满幅镜记得同时给 `bg`）")
 
-    # ③ 质感种数（只提醒）
+    # ② 质感种数（只提醒）
     tex = facts["textures"]
     if len(tex) < VARIETY_MIN_TEXTURES:
         undeclared = sum(1 for s in shots if not str(s.get("texture") or "").strip())
@@ -1527,7 +1715,7 @@ def check_style_variety(shots: list[dict[str, Any]]
             + "质感是**打磨层**不是构图层（滤镜跑在拼接之前的那一趟逐镜切片上），"
               "换一档不重烧任何一镜的帧，所以「第 3 镜老电视、其余柔光」这种配法是免费的")
 
-    # ④ 底色申报（只提醒；满幅那一条更硬）
+    # ③ 底色申报（只提醒；满幅那一条更硬）
     with_bg = [sid for sid, s in zip(ids, shots) if str(s.get("bg") or "").strip()]
     bleed_no_bg = [sid for sid, s in zip(ids, shots)
                    if s.get("bleed") is True and not str(s.get("bg") or "").strip()]
@@ -1611,8 +1799,10 @@ LAYOUT_FAMILY_MAX_SHOTS = 2
 
 #: ⑯ 的通道白名单。**与 :func:`shot_style_channel` 的返回值是同一套词**（不多不少）——
 #: 两处对得上，才谈得上「申报的通道」与「代码里认得的通道」逐字对账。`text` 不在里面：
-#: 那一档是 ⑦ 允许的纯文字/纯色块镜，⑯ 对它另有规矩（见 :func:`check_subject_named`）。
-SUBJECT_CHANNELS: tuple[str, ...] = ("rough", "three", "katex", "vector", "image")
+#: 那是「一条画法通道都没命中」，2026-10-16 起由 ⑦「每镜必画」逐镜打回，
+#: ⑯ 对它另有规矩（见 :func:`check_subject_named`）。`image` 也不在里面——图形片不再有
+#: 取材通道（不检索素材库、不出图、上传件不上屏），申报它等于申报一件不存在的东西。
+SUBJECT_CHANNELS: tuple[str, ...] = ("rough", "three", "katex", "vector")
 
 #: `subject` 的长度上下界（字符）。太短是「东西」「这个」这类指代，太长是整句话而不是
 #: 名词短语——⑯ 要的是**能被认出的那个东西**的名字，不是论题。
@@ -1656,7 +1846,7 @@ def check_layout_family(shots: list[dict[str, Any]]) -> tuple[list[str], list[st
     东西，不新造字段：一份片子里 `data` 族摆三镜，观众看到的就是同一套版式在重复。
     §9-Q84 记了这条口径（同时也记了合同原话里那个不存在的 `layout` 栏）。
 
-    纯文字/纯色块族受 ⑦ 的 1/3 约束（:func:`check_style_quota` 第 3 条），不在这里重算。
+    纯文字/纯色块镜由闸⑦「每镜必画」逐镜拦掉（:func:`check_draw_floor`），不在这里重算。
     镜数不到 ``MIN_SHOTS_FOR_QUOTA`` 不判——三镜片谈「族配额」连分母都不成立。
     `card` 为空的那几镜不在这里喊第二遍（``_norm_cite`` 已经逐镜报过），配额账只把
     **选定了卡**的镜算进分母与族账。
@@ -1702,18 +1892,24 @@ def check_subject_named(shots: list[dict[str, Any]]) -> tuple[list[str], list[st
 
     - ``subject``：**每镜必填**。非空、``SUBJECT_MIN_CHARS``~``SUBJECT_MAX_CHARS`` 字、
       不在 :data:`ABSTRACT_SUBJECTS` 里。抽象词机器认不出、画面上也认不出，等于没写。
-    - ``subject_channel``：**有图形主体的镜必填**（取值 = :data:`SUBJECT_CHANNELS` 五选一），
+    - ``subject_channel``：**有图形主体的镜必填**（取值 = :data:`SUBJECT_CHANNELS` 四选一），
       且必须是**这一镜代码里真用上的**通道之一（:func:`shot_all_channels`）。自报的通道
       必须有证据——「写着 rough 而代码里一个 roughjs 都没有」正是 ⑦ 要拦的那种形状，
       ⑯ 不再开一个能自报的后门。
-    - 纯文字/纯色块镜（⑦ 允许的那 ≤1/3）：**不许**填 ``subject_channel``——它代码里一条
-      画法通道都没有，填了就是自报无证据。这一档的 ``subject`` 照样要写（字也可以是主体，
-      如「「毕昇」两个字」；连一个具体名词都写不出来，说明这一镜本来就该补画面）。
+    - 纯文字/纯色块镜：2026-10-16 起**这一档不存在**——闸⑦「每镜必画」逐镜打回。
+      这里仍留一条同义的判据当安全网（⑦ 万一又被放宽时不至于两道闸各说各话），
+      措辞直接点名 ⑦，不把它写成第二条规矩。
 
-    ⑯ 判不了「画出来的那个东西像不像 ``subject`` 说的那个」——那是 ⑲-b（盲描述）的活。
-    它判的是**有没有具名、名字有没有证据**，这两件事机器判得动，也正是「卡片+文字」那一类
-    镜最缺的一格（合同 §5.3 把 ``subject``/``subject_channel`` 挂在 ``card`` 里描述，
-    实现上它们是镜头上的两个平级键：``card`` 在本仓已是**字符串**卡 id，见 §9-Q85）。
+    ⑯ 判不了「画出来的那个东西像不像 ``subject`` 说的那个」——那是 **⑲-b** 的活
+    （2026-10-17 落地：``judge_channel.judge_identity`` 先让一个看不见答案的观察员**盲描述**
+    画面上那件东西是什么，再拿申报的 ``subject`` 去比；由回看环的 ``identity`` 开关逐镜调用，
+    红镜与几何闸的红镜走**同一条**修复的路）。它落在这一层之外：这里判的是**有没有具名、
+    名字有没有证据**，那两件事机器判得动，也正是「卡片+文字」那一类镜最缺的一格
+    （合同 §5.3 把 ``subject``/``subject_channel`` 挂在 ``card`` 里描述，实现上它们是镜头上的
+    两个平级键：``card`` 在本仓已是**字符串**卡 id，见 §9-Q85）。
+
+    ⑲-b **不用** ``subject_terms``：盲描述那条路一个词族也不需要，所以那一栏仍**不在**
+    schema 里（回看环 :data:`review_loop.SUBJECT_TERMS_FIELD` 那段注释记着这笔账）。
     """
     errors: list[str] = []
     for i, s in enumerate(shots):
@@ -1732,18 +1928,20 @@ def check_subject_named(shots: list[dict[str, Any]]) -> tuple[list[str], list[st
             _err(errors, f"{head}subject={subject!r} 长度 {len(subject)} 字，"
                          f"要 {SUBJECT_MIN_CHARS}~{SUBJECT_MAX_CHARS} 字——太短是指代"
                          f"（「东西」「这个」），太长是整句话而不是主体名")
-        # 通道这一栏两向都判：有图形主体的镜必填且要有证据，纯文字镜填了就是自报。
+        # 通道这一栏两向都判：有图形主体的镜必填且要有证据。
         declared = str(s.get("subject_channel") or "").strip().lower()
         detected = sorted(shot_all_channels(str(s.get("code") or "")))
         if not detected:
-            if declared:
-                _err(errors, f"{head}这一镜的代码里只有文字与色块（一条画法通道都没用上），"
-                             f"却申报了 subject_channel={declared}——纯文字镜不填这一栏，"
-                             f"填了就是自报无证据（⑦ 允许的这类镜有 1/3 的上限）")
+            # 安全网，不是第二条规矩：正常入口下闸⑦ 已经逐镜拦掉了这一镜，走到这里说明
+            # ⑦ 被放宽了。措辞直接点名 ⑦，免得同一件事在两处读成两条不同的要求。
+            _err(errors, f"{head}这一镜的代码里只有文字与色块（一条画法通道都没用上）——"
+                         f"这正是闸⑦「每镜必画」拦的那一镜"
+                         + (f"；另外还申报了 subject_channel={declared}，"
+                            f"没有图形的镜申报通道就是自报无证据" if declared else ""))
             continue
         if not declared:
             _err(errors, f"{head}这一镜画了图形主体（代码里认得的通道：{'、'.join(detected)}），"
-                         f"但没填 subject_channel——五选一：{'、'.join(SUBJECT_CHANNELS)}，"
+                         f"但没填 subject_channel——四选一：{'、'.join(SUBJECT_CHANNELS)}，"
                          f"填**主体**是用哪条通道画的")
             continue
         if declared not in SUBJECT_CHANNELS:
@@ -1753,6 +1951,65 @@ def check_subject_named(shots: list[dict[str, Any]]) -> tuple[list[str], list[st
             _err(errors, f"{head}申报 subject_channel={declared}，而这一镜代码里用的是"
                          f"{'、'.join(detected)}——自报的通道必须有证据。要么把这一镜的主体"
                          f"改成用 {declared} 画，要么按代码里真用的那条申报")
+    return errors, []
+
+
+# ---------------------------------------------------------------------------
+# 闸㉝ 具名件（2026-10-17）：每一镜至少用上简笔画零件库里的一件
+# ---------------------------------------------------------------------------
+
+
+def drawn_parts(code: str) -> list[str]:
+    """这一镜的代码真用上了哪几件 `@dg/lib/draw/*`（升序）。
+
+    「用上」与画法通道同一套证据口径（:func:`shot_used_channels`）：**import 了还得在
+    代码体里出现那个绑定名**。「`import { Figure } from '@dg/lib/draw/Figure'` 而 JSX
+    里一个 `<Figure/>` 都没有」是凑配额最省事的写法，这道闸不认。
+    """
+    bindings = imported_bindings(code)
+    return sorted(p for p in _DRAW_PARTS
+                  if (names := bindings.get(p)) is not None and _uses_binding(code, names))
+
+
+def check_named_parts(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """闸㉝：每一镜至少用上一件**简笔画零件库**的件。→ (打回清单, 提醒清单)。
+
+    **它治的是用户那句「画的一点也不写实」。** 零件库
+    （`remotion/src/lib/draw/`，别名 `@dg/lib/draw/*`）把「一个能被认出的东西由哪几笔
+    构成」预先写好了：人、机器、厂房、齿轮、图表、天平、钟…。库在那里而没人用，
+    于是真机上出现的是「180 个点拼成的一个椭圆，标注『19 世纪·富态』」——形状随意、
+    认不出是什么。这一道判据的机器形态就是**「这一镜有没有一件具名的东西」**。
+
+    **判据是静态的，判在烧像素之前**（与 ⑦ 同一档），所以它**判不出「像不像」**：
+    它只认「用没用上库里那一件」。一个 `<Figure/>` 摆在画面角落、主体仍旧是那团点阵，
+    这一道不响——那一格是盲描述那一路的活（见 :func:`check_subject_named` 末段）。
+    把这条说清楚，是为了不让读回执的人以为「㉝ 绿了＝画得像」。
+
+    **为什么是硬闸（不在 `SOFT_GATES` 里）**：用户对这一条的原话是「必需像」，
+    而它在代码层永远可满足——库里没有合用的那件时，仍可自己用 `<path>` 画，
+    只要**同时**用上库里一件（哪怕只是一支 `<Arrow/>` 指着自己画的那个东西）。
+    一道永远可满足、且直接对应用户那句抱怨的判据，做成「建议」就等于没做。
+
+    没有 code 的镜**跳过**：取材轮落在 `plan_motion` 的入口就被拦下了（`forage_scan`），
+    走不到这里；真走到这里的空代码由契约那一层报「code 为空」，不在这儿喊第二遍。
+    """
+    errors: list[str] = []
+    for i, s in enumerate(shots):
+        code = str(s.get("code") or "")
+        if not code.strip():
+            continue
+        if drawn_parts(code):
+            continue
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        _err(errors,
+             f"闸㉝ 具名件：{sid}：这一镜一件简笔画零件都没用上——库里没有**能被认出的"
+             f"东西**，画面上就只有随手拼的形状。把这一镜的 `subject`（"
+             f"{str(s.get('subject') or '没填')}）照着「外轮廓 → 标志物 → 3~6 个部件」"
+             f"拆成库里的件拼出来：{', '.join(_DRAW_PARTS)}。库里的件不够用时，"
+             f"仍要自己用 `<path>`/`<circle>` 补，但**同时也要用上至少一件**"
+             f"（哪怕只是一支 `<Arrow/>` 指着你画的那个东西）——这一道管的是"
+             f"「画面上有没有一件具名的东西」。用上库里件的镜，"
+             f"`subject_channel` 就填 `rough`")
     return errors, []
 
 
@@ -1848,6 +2105,76 @@ def check_subject_present(shots: list[dict[str, Any]], *,
 
 
 # ---------------------------------------------------------------------------
+# 闸⑧ 字压图：画出来的那个东西被自己的字幕盖住
+#
+# ⑧ 原有三类命中（叠字 / 被画面带裁掉 / 引线悬空），**第四类 `overlap_subject`
+# 2026-10-16 才加**——在此之前全仓没有一处代码在问「这块字是不是压在图上」：
+# 母版量的图形盒只当读数上报（`scanned.subjects` / `subject_boxes`），从不与文字盒相交。
+# 用户从真机上指出来的正是这一条（「画出来的字还会遮住图画，说了也没有用」）。
+#
+# 分工照旧：读数是 TS 侧量的（`tokens.LAYOUT_PROBE` 的阈值随读数一起回传在
+# `thresholds` 里），这一层只把读数**判成红**，不另写一个 0.3——两把尺迟早会分叉，
+# 而分叉之后没有任何测试会红。
+# ---------------------------------------------------------------------------
+
+#: 字压图那条打回理由里给的改写方向。给的是**两条出路**而不是「改小一点」：
+#: 这个判据只报「这块字被盖住多少」，盒子该往哪挪是构图的事，说死了等于替模型排版。
+_TEXT_OVER_SUBJECT_HINT = "把这块字移开，或者给它一条自己的衬底（底色纸条）再压在图上"
+
+
+def check_text_over_subject(shots: list[dict[str, Any]], *,
+                            scanned: Mapping[str, Any] | None = None
+                            ) -> tuple[list[str], list[str], list[str]]:
+    """闸⑧ 字压图：这一镜的字幕是不是压在画出来的图形上。→ (打回, 提醒, 未判)。
+
+    **为什么没有「提醒」那一档。** 这条判据是纯几何的（交叠 ÷ 文字盒面积过不过线，
+    读数是 TS 侧算好的），过线就是过线，没有「偏了一点」的中间态。给一条「略微压住」
+    的建议，等于让模型去调一个 0.05 的量而代价是一整镜的重烧——净亏。
+
+    **为什么只认 `overlap_subject` 这一种命中。** ⑧ 另外三类是「几何猜的」，
+    真画面上都可能是合法设计（刻意叠字、指向画面外的暗示），
+    `code_render.summarize_layout` 那段注释专门写了「误报的代价是模型与用户开始无视
+    整条通道」。字压图不一样：一块字被图形盖掉一半，就是读不出，没有「刻意的」那种读法。
+
+    **未判只有一种**：这一镜的版面没回读到（`status != "scanned"`）。
+    注意 `scanned.texts == 0`（纯图元镜）**不是**未判——那一趟真扫了，只是这一镜没有
+    文字元素，它结构上不可能犯这个错。把它写成未判会让每一镜纯图元的片子进回看环重烧，
+    而那正是「把未判当通过」的反面错误：把「验过、没事」写成「没验」。
+    """
+    errors: list[str] = []
+    undetermined: list[str] = []
+    readings = scanned or {}
+    for i, s in enumerate(shots):
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        head = f"闸⑧ 字压图：{sid}："
+        got = readings.get(sid) if isinstance(readings, Mapping) else None
+        got = got if isinstance(got, Mapping) else None
+        if got is None or got.get("status") != "scanned":
+            undetermined.append(
+                f"{head}这一镜的版面没回读到（闸⑧ 那一趟没扫成），这一格**没有量过**"
+                f"——未判不是通过")
+            continue
+        th = got.get("thresholds") if isinstance(got.get("thresholds"), Mapping) else {}
+        line = th.get("subject_overlap_ratio", "未知")
+        for f in (got.get("findings") or []):
+            if not isinstance(f, Mapping) or str(f.get("kind") or "") != "overlap_subject":
+                continue
+            ts = f.get("texts") if isinstance(f.get("texts"), (list, tuple)) else []
+            who = "、".join(f"「{str(t)[:16]}」" for t in ts) or "这一镜的一处文字"
+            # 坐标只在**四栏都在**时印：缺一栏时印一个半张表，读者只会照着它去算，
+            # 而算出来的位置是错的（缺数时宁可不给，与 `_reading` 同一条道理）。
+            box = f.get("box") if isinstance(f.get("box"), Mapping) else {}
+            where = ""
+            if all(k in box for k in ("x", "y", "w", "h")):
+                where = (f"（这块字在带内 x={box['x']} y={box['y']}"
+                         f" w={box['w']} h={box['h']}）")
+            _err(errors, f"{head}{who} 压在画出来的图形上（这块字被盖住 "
+                         f"{_reading(f.get('ratio'))}，判据 {line}）{where}"
+                         f"——{_TEXT_OVER_SUBJECT_HINT}")
+    return errors, [], undetermined
+
+
+# ---------------------------------------------------------------------------
 # 闸㉕ 徽章构图（R11-T53/㉕）：一枚徽章撑满画面 ≠ 一个场景
 # ---------------------------------------------------------------------------
 
@@ -1867,8 +2194,10 @@ BADGE_CENTER_TOL = 0.08
 #: 1.35 ≈ 4:3 略宽——4:3 已是「一张图」的形状，正圆徽章与正方徽章的实测比值都 <1.1。
 BADGE_ASPECT_TOL = 1.35
 
-#: 徽章那条打回理由里给的改写方向（技能正文「先取 `asset_role=part` 拼场景」那条）。
-_BADGE_HINT = "先把 `asset_role='part'` 的部件取几件拼成一个场景"
+#: 徽章那条打回理由里给的改写方向。**这一句 2026-10-16 改过口径**：它原来指向技能正文
+#: 「先取 `asset_role='part'` 的部件拼场景」——那是取材通道还在时的写法。今天没有部件
+#: 可取，能扩成场景的只有自己画的代码，所以给的出路改成「在同一段代码里加件」。
+_BADGE_HINT = "在同一段代码里再加两三件（背景、标注、对照物），把这个单件扩成一个场景"
 
 
 def check_badge_composition(shots: list[dict[str, Any]], *,
@@ -1970,10 +2299,10 @@ def check_badge_composition(shots: list[dict[str, Any]], *,
                  f"{abs((x + w / 2) - bw / 2) / bw * 100:.1f}% ≤ {BADGE_CENTER_TOL * 100:.0f}%）、"
                  f"形状近似方形（长边/短边 {aspect:.2f} ≤ {BADGE_ASPECT_TOL:g}，"
                  f"盒 {int(round(w))}×{int(round(h))} px）——"
-                 f"把一件件素材放大铺满，屏幕上就是一枚徽章或一块色斑，"
+                 f"把一个单件放大铺满，屏幕上就是一枚徽章或一块色斑，"
                  f"观众看到的是「图标」而不是「这一镜在讲什么」。"
-                 f"这一镜要真的像场景：{_BADGE_HINT}（按技能正文那句，"
-                 f"取 4~6 件摆到不同位置、大小错开、彼此有前后或相邻关系），"
+                 f"这一镜要真的像场景：{_BADGE_HINT}（几件摆到不同位置、大小错开、"
+                 f"彼此有前后或相邻关系），"
                  f"或者换一个版式族（主体 + 标注、主体 + 局部放大、时间轴）；"
                  f"真就只需要一个图形时，把它缩到带的三成以内、挪离正中，"
                  f"让画面里还有别的东西可看")
@@ -1999,6 +2328,17 @@ def _as_float(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def _reading(value: Any) -> str:
+    """一条**读数**写进告警里的样子：两位小数；不是数就明写「拿不到读数」。
+
+    为什么不在缺数时印 `None`：那句告警是要发给模型看的，`None` 会被读成「零」
+    或「一个叫 None 的值」，而事实是这一栏没量到——两种意思差得很远，
+    而这条链上「没量到被写成量到了」是反复踩过的那一类错。
+    """
+    got = _as_float(value)
+    return "拿不到读数" if got is None else f"{got:.2f}"
 
 
 def _as_int(value: Any) -> int | None:
@@ -2110,278 +2450,19 @@ def check_motion_anchors(shots: list[dict[str, Any]]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 闸㉘ 标注层几何与时序合法（R12-T59）：分区揭示的申报栏，一次请求都不发出就判完
+# 2026-10-16 删掉了闸㉘ 那一族（`REVEAL_DIRECTIONS` / `REVEAL_HOLD_MAX_MS` /
+# `_REVEAL_FIELDS` / `_reveal_ints` / `_reveal_size` / `_reveal_ms` /
+# `reveal_canvas` / `reveal_probe_frames` / `check_reveal_regions`）。
+#
+# 它们判的都是镜级 `reveal` 申报栏：这一镜的画面分几块、按什么次序露出来。
+# 这条链的主语是一张**真 raster 插画**——`reveal.canvas` 要与库行 width/height
+# 对账、母版按 directions 逐帧算掩码、㉗ 再到真帧上比色。而画面上屏那条路
+# （检索素材库 / 出图 API / 上传件）整条拆掉了：图形片的每一镜都由模型写 TSX
+# 代码画出来（闸⑦「每镜必画」），画面里没有「一整幅插画」这个东西。
+#
+# **闸号 ㉘ 与它的下半场 ㉗ 一起不再被占用**，与 ⑪/⑬/⑱/㉛ 同一处置。
 # ---------------------------------------------------------------------------
 
-#: 分区揭示的推进方向（`reveal.regions[].direction`）。
-#: 四档都带一个「整块一次显示」的 `whole`：它落在两种正常写法上——① 一块没有推进感的
-#: 元素（画面上直接出现的一面标注）；② 作者还没想好推进方向。**不给 `whole` 会逼人瞎填
-#: 一个方向**，而瞎填的方向会直接决定 mask 的插值（母版按它逐帧扫），也就是决定像素。
-REVEAL_DIRECTIONS = ("ltr", "rtl", "ttb", "btt", "whole")
-
-#: 幕时长允许的超额（ms）：`scene_duration_ms` 与「末段结束」之间可以留的停留。
-#: 判据不是「有停留」，而是**这个停留必须写在账上**（㉘ 的等式），0 也合法——
-#: 一镜的最后一笔落定就是这一镜的结尾，那是最常见的写法。
-REVEAL_HOLD_MAX_MS = 4000
-
-#: `direction=whole` 时母版不做推进插值，所以它的 `duration_ms` 只用来占位。
-#: 今天 **不额外校验**（写 0 也收）：一个「整块显示」的元素，谁也说不出它的时长该是多少，
-#: 凭空定一个下限只是给模型加一条背不出理由的规矩。这一条如实写在这里，别当成漏。
-_REVEAL_FIELDS = ("id", "label", "sequence", "narrative_role", "subtitle_ref",
-                  "region", "direction", "start_ms", "duration_ms", "protected")
-
-
-def _reveal_ints(rect: Any) -> tuple[dict[str, int] | None, str]:
-    """`region{整数像素}` → 四个整数；不是整数就退回（连同理由）。"""
-    if not isinstance(rect, Mapping):
-        return None, f"region 不是对象（{type(rect).__name__}）"
-    out: dict[str, int] = {}
-    for k in ("x", "y", "w", "h"):
-        v = rect.get(k)
-        # `True` 是 int 的子类：`isinstance(True, int)` 为真，所以先排掉 bool，
-        # 再要求值本身是 int 或「整数值的字符串/浮点」。坐标不许是 12.5——
-        # 半像素坐标在不同画幅下取整方向不同，两处一取整就成了两把尺。
-        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
-            return None, f"region.{k}={v!r} 不是数字"
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return None, f"region.{k}={v!r} 不是数字"
-        if f != int(f):
-            return None, f"region.{k}={v!r} 不是整数像素"
-        out[k] = int(f)
-    if out["w"] <= 0 or out["h"] <= 0:
-        return None, f"region 的宽高读到 {out['w']}×{out['h']}（必须为正）"
-    return out, ""
-
-
-def _reveal_size(raw: Any) -> tuple[tuple[int, int] | None, str]:
-    """`canvas` → `(w, h)`（正整数两栏）；缺栏或非整数退回。"""
-    if not isinstance(raw, Mapping):
-        return None, f"不是对象（{type(raw).__name__}）"
-    pair: list[int] = []
-    for k in ("w", "h"):
-        v = raw.get(k)
-        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
-            return None, f"{k}={v!r} 不是数字"
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return None, f"{k}={v!r} 不是数字"
-        if f != int(f) or int(f) <= 0:
-            return None, f"{k}={v!r} 不是正整数像素"
-        pair.append(int(f))
-    return (pair[0], pair[1]), ""
-
-
-def _reveal_ms(value: Any) -> int | None:
-    """毫秒栏 → 非负整数；不是就 None（连同 NaN/负值一起退回）。"""
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        return None
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    if f != int(f) or f < 0:
-        return None
-    return int(f)
-
-
-def reveal_canvas(raw: Mapping[str, Any]) -> tuple[int, int] | None:
-    """`reveal.canvas` → `(w, h)`；缺这一栏或不是正整数像素时退回 `None`。
-
-    单独开一个口子（而不是让调用方去碰 `_reveal_size` 那两个返回值），是为了让
-    「canvas 怎么读」只有**一处**实现：尺寸对账（`code_render._check_reveal_canvas`）
-    与 ㉘ 的形状校验必须用同一套读法，否则会出现一处认 `"1024"`、另一处不认这种
-    「两边都说自己判了」的局面。非法那一档 ㉘ 会报（它才是形状的主人），这里不重复报。
-    """
-    size, _why = _reveal_size(raw.get("canvas"))
-    return size
-
-
-def reveal_probe_frames(shot: Mapping[str, Any], *, frames: int, fps: int) -> list[int]:
-    """这一镜 ㉗ 要取证的**帧号**（升序去重；没申报 `reveal` 时是空表）。
-
-    取法：每一块「**应该刚画满**」的那一帧 = `ceil((start_ms + duration_ms) / 1000 × fps)`。
-
-    为什么只要这几个时刻（而不是每帧都取）：「到点必须已显示」与「未到点必须是纸底」
-    这两句话在**同一帧**上同时判得动——在这一帧上，这一块必须已经画满，而它后面那些块
-    必须还是纸底。于是 `n` 块只要 `n` 个时刻，㉗ 就同时把两个方向都看住了：
-    某块提前露出来，会在**前一块**的那个时刻被抓到；某块到点没显示，在它自己的时刻被抓到。
-    逐帧取是 `n × fps` 个采样，而多出来的那些帧说的还是同一件事。
-
-    越界钳到 `[0, frames-1]`：申报写到这一幕之外（㉘ 不判这个——它是「这一幕多长」的
-    问题，不是这一块的几何错）时，取这一镜**最后一帧**；那一帧仍然能证「到点没显示」。
-    """
-    raw = shot.get("reveal")
-    if not isinstance(raw, Mapping):
-        return []
-    regions = raw.get("regions")
-    if not isinstance(regions, (list, tuple)):
-        return []
-    last = max(0, int(frames) - 1)
-    out: set[int] = set()
-    for r in regions:
-        if not isinstance(r, Mapping):
-            continue
-        start = _reveal_ms(r.get("start_ms"))
-        dur = _reveal_ms(r.get("duration_ms"))
-        if start is None or dur is None:
-            continue
-        at = int(-(-(start + dur) * int(fps) // 1000))       # 向上取整的整数写法
-        out.add(max(0, min(last, at)))
-    return sorted(out)
-
-
-def check_reveal_regions(shot: Mapping[str, Any]) -> list[str]:
-    """闸㉘ 镜级 `reveal` 栏的**形状合法性**（R12-T59），→ 错误清单（空＝过或没申报）。
-
-    判六件事，全部是纯 schema 校验（不读像素、不读库，与 闸⑯ 的写法那一半同族）：
-
-    1. `canvas` 两栏是**正整数**；每个 `region` 四栏是**整数像素**（浮点坐标打回：
-       半像素在不同画幅下取整方向不同，两处一取整就成了两把尺）；
-    2. `region ⊂ canvas`（越界的区域在画面上永远揭不开——母版按 canvas→盒 的比例换算，
-       越界部分一乘就是画外，而账上它看着是合法的）；
-    3. `sequence` **从 1 起、连续、不重复**（它是母版排揭示顺序、㉗ 找「后续区域」的唯一
-       依据：有洞或有重号，两处就会各排出一个顺序）；
-    4. **幕内 `start_ms` 两两不重叠**——按 sequence 排好的相邻两段，
-       `前段 start_ms + duration_ms ≤ 后段 start_ms`；重叠的两段会同时推进两个 mask，
-       画面上是两块一起揭开，而账上读作「依次」；
-    5. `scene_duration_ms == 末段结束 + 停留`，停留 ∈ [0, :data:`REVEAL_HOLD_MAX_MS`]，
-       **且等式必须写对**：账上的幕时长是拼接与验收读的那个数，差一毫秒就是两笔账；
-    6. `protected[]` 里的每个 id 都在本镜区域里（保护一个不存在的区域＝这句话没有对象）。
-
-    **拿不准的不许记成过**（D-未判不绿的反面用法）：这一条判的是**形状**，形状缺栏一律
-    打回而不是「未判」——闸前这一层没有「未判」这个出口，未判属于需要真机读数的那几条
-    （㉗）。所以这里宁可退回让模型补全，也不放一份读不懂的申报进渲染。
-    """
-    errors: list[str] = []
-    raw = shot.get("reveal")
-    if raw is None:
-        return errors                       # 没申报＝这一镜不走这一族风格，㉘ 不适用
-    sid = str(shot.get("id") or "")
-    head = f"闸㉘ 标注层：{sid}："
-    if not isinstance(raw, Mapping):
-        return [f"{head}reveal 不是对象（{type(raw).__name__}）——"
-                f"这一栏要么不写，要么写成 {{canvas, scene_duration_ms, regions[]}}"]
-
-    cw = ch = None
-    got_canvas, why = _reveal_size(raw.get("canvas"))
-    if got_canvas is None:
-        _err(errors, f"{head}reveal.canvas 读不出来：{why}——区域坐标以插画原图的像素"
-                     f"为单位，没有 canvas 就说不清这四个数是画在哪张图上的")
-    else:
-        cw, ch = got_canvas
-
-    regions = raw.get("regions")
-    if not isinstance(regions, (list, tuple)) or not regions:
-        return errors + [f"{head}reveal.regions 为空——申报了这一族风格就得说清有几块、"
-                         f"按什么顺序揭"]
-
-    seen_ids: set[str] = set()
-    seqs: list[int] = []
-    spans: list[tuple[int, int, int, str]] = []      # (sequence, start_ms, end_ms, id)
-    prot: list[tuple[str, list[str]]] = []
-    for i, r in enumerate(regions, 1):
-        rid = str(r.get("id") or "").strip() if isinstance(r, Mapping) else ""
-        if not rid:
-            _err(errors, f"{head}第 {i} 块没有 id——它是顺序、保护栏与回执三处的指针")
-            rid = f"#{i}"
-        if rid in seen_ids:
-            _err(errors, f"{head}id 重复：{rid!r}（回执与 protected 都按 id 指，重号就指不准）")
-        seen_ids.add(rid)
-        if not isinstance(r, Mapping):
-            _err(errors, f"{head}第 {i} 块不是对象（{type(r).__name__}）")
-            continue
-        # 多出来的键**当场退回**，不静默忽略：这一栏的名字有两种写法的诱惑
-        # （`startMs` 与 `start_ms` 只差一个下划线），静默忽略＝模型以为它申报了时序，
-        # 而母版读到的是「没有开始时刻」——两边的账就这么分开了。
-        extra = sorted(set(r) - set(_REVEAL_FIELDS))
-        if extra:
-            _err(errors, f"{head}{rid}：不认的栏位 {extra}——这一族只认 "
-                         f"{', '.join(_REVEAL_FIELDS)}（毫秒与逐块栏位一律下划线写法，"
-                         f"`startMs` 这种驼峰不认，别两处各写一个名字）")
-        seq = r.get("sequence")
-        if isinstance(seq, bool) or not isinstance(seq, int):
-            _err(errors, f"{head}{rid}：sequence={seq!r} 不是整数")
-            seq = None
-        else:
-            seqs.append(seq)
-        start = _reveal_ms(r.get("start_ms"))
-        dur = _reveal_ms(r.get("duration_ms"))
-        if start is None:
-            _err(errors, f"{head}{rid}：start_ms={r.get('start_ms')!r} 不是非负整数毫秒")
-        if dur is None:
-            _err(errors, f"{head}{rid}：duration_ms={r.get('duration_ms')!r} 不是非负整数毫秒")
-        if start is not None and dur is not None and seq is not None:
-            spans.append((seq, start, start + dur, rid))
-        direction = str(r.get("direction") or "").strip().lower()
-        if direction not in REVEAL_DIRECTIONS:
-            _err(errors, f"{head}{rid}：direction={r.get('direction')!r} 不是一条推进方向"
-                         f"（可用：{', '.join(REVEAL_DIRECTIONS)}）")
-        canon, why = _reveal_ints(r.get("region"))
-        if canon is None:
-            _err(errors, f"{head}{rid}：{why}")
-        elif cw is not None and ch is not None:
-            x, y, w, h = canon["x"], canon["y"], canon["w"], canon["h"]
-            if x < 0 or y < 0 or x + w > cw or y + h > ch:
-                _err(errors, f"{head}{rid}：区域 {x},{y} {w}×{h} 超出了 canvas "
-                             f"{cw}×{ch}——越界的那部分按比例换算到画面上是画外，"
-                             f"永远揭不开，而账上它看着合法")
-        sub = r.get("subtitle_ref")
-        if sub is not None:
-            idx = _reveal_ms(sub)
-            if idx is None or idx < 1:
-                _err(errors, f"{head}{rid}：subtitle_ref={sub!r} 不是「第几个词」"
-                             f"（从 1 起的整数，与 `subtitle:<i>` 锚同一套序号）")
-        got_prot = r.get("protected")
-        if got_prot is not None:
-            if not isinstance(got_prot, (list, tuple)):
-                _err(errors, f"{head}{rid}：protected 不是数组")
-            else:
-                prot.append((rid, [str(p) for p in got_prot]))
-
-    # ③ sequence 从 1 连续不重复：只在每一块都给出了整数 sequence 时才判——
-    # 已有别的红在上面点了名，这里再报一次同一件事只是噪声。
-    if seqs and len(spans) == len(seqs) and sorted(seqs) == list(range(1, len(seqs) + 1)):
-        pass
-    elif seqs:
-        _err(errors, f"{head}sequence 必须从 1 起、连续、不重复，实得 {sorted(seqs)}"
-                     f"（{len(regions)} 块）——母版排揭示顺序与 ㉗ 找「后续区域」都按它，"
-                     f"有洞或有重号，两处会各排出一个顺序")
-
-    # ④ 幕内 start_ms 两两不重叠（按 sequence 排序后判相邻）
-    ordered = sorted(spans)
-    for (s1, a1, e1, id1), (s2, a2, _e2, id2) in zip(ordered, ordered[1:]):
-        if a2 < e1:
-            _err(errors, f"{head}{id1}（第 {s1} 块，{a1}–{e1} ms）与 {id2}"
-                         f"（第 {s2} 块，{a2} ms 起）**在时间上重叠**——两块会同时推进"
-                         f"各自的 mask，画面上是一起揭开，而账上读作「依次」")
-
-    # ⑤ 幕时长等式：末段结束 + 停留
-    if ordered:
-        last_end = ordered[-1][2]
-        scene = _reveal_ms(raw.get("scene_duration_ms"))
-        if scene is None:
-            _err(errors, f"{head}scene_duration_ms={raw.get('scene_duration_ms')!r} "
-                         f"不是非负整数毫秒——它是这一幕的总长，拼接按它对齐")
-        else:
-            hold = scene - last_end
-            if hold < 0:
-                _err(errors, f"{head}scene_duration_ms={scene} ms **短于**末段结束 "
-                             f"{last_end} ms——最后一笔还没画完这一幕就结束了")
-            elif hold > REVEAL_HOLD_MAX_MS:
-                _err(errors, f"{head}scene_duration_ms={scene} ms 比末段结束 {last_end} ms "
-                             f"多出 {hold} ms 的停留，超过 {REVEAL_HOLD_MAX_MS} ms 上限"
-                             f"——这么长的空等要么是时长算错了，要么该拆成两幕")
-
-    # ⑥ protected 指向本镜真有的区域
-    for rid, ids in prot:
-        ghost = [p for p in ids if p and p not in seen_ids]
-        if ghost:
-            _err(errors, f"{head}{rid}：protected 里的 {ghost} 不在本镜区域里"
-                         f"——保护一个不存在的区域＝这句话没有对象")
-    return errors
 
 
 def check_motion_windows(shot: Mapping[str, Any], *, events: Sequence[Mapping[str, Any]],
@@ -3231,8 +3312,9 @@ def collect_demos(plan: list[dict[str, Any]]
             demos.append({
                 "relpath": rel,
                 "bytes": len(data),
-                # sha16 让模型（与逐镜账）能指名「我读的是这一版的这份文件」；
-                # 与闸⑬ 给素材算 sha16 是同一套写法，两处不共享代码但共享口径。
+                # sha16 让模型（与逐镜账）能指名「我读的是这一版的这份文件」。
+                # 短哈希（前 16 位）而不是全量：这一栏是**给人指名用**的，不是校验和
+                # ——要校验字节，渲染侧那一趟再按整份算。
                 "sha16": hashlib.sha256(data).hexdigest()[:16],
                 "text": data.decode("utf-8", "replace"),
             })
@@ -3296,7 +3378,7 @@ def check_shot_structure(shots: list[dict[str, Any]]
                 "也就是**只换了字与色相，没换画法**。这不叫多风格，叫拼贴："
                 "让这些镜各用一种自己的母题（手绘 roughjs / 真三维 three / 公式 katex / "
                 "几何图示四种里至少三种），并且每镜的版式、时间轴与图形参数都要不同。"
-                "技能正文「画面丰富度合同与风格配额」那一节写着四类母题怎么选")
+                "技能正文「画面丰富度合同」那一节写着四类母题怎么选")
         else:
             warns.append(
                 f"结构提醒：{label} 两镜的代码骨架相似度 ≥{STRUCT_SAME:.2f}"
@@ -3397,6 +3479,60 @@ def palettes() -> dict[str, dict[str, str]]:
             if isinstance(v, dict) and k != "preset"}
 
 
+#: 八套色板的**中文名**。上面的 JSON 是色板取值的唯一出处，这里补的只是「它叫什么」——
+#: 「文字库」面板上那一排色块要有一行字，而面板上出现的每一个中文词都只有一处出处，
+#: 所以前端不许自己把 `deep-ocean` 翻成「深海蓝」。
+#:
+#: 与 `palettes()` 的键**一一对应**，由 ``tests/test_code_spec.py`` 逐项断言：
+#: JSON 里加了新色板而这里没加，面板上会显示一个机器名（不红但是丑）；这里多写了一个
+#: 已经没有的色板，那一行就是永远选不到的死条目。
+PALETTE_LABELS: dict[str, str] = {
+    "vintage-kraft": "复古牛皮纸",
+    "deep-ocean": "深海蓝",
+    "obsidian-violet": "黑曜紫",
+    "modern-light": "现代浅色",
+    "midnight": "午夜暗场",
+    "solar-pop": "阳光波普",
+    "coral-burst": "珊瑚撞色",
+    "color-play": "彩块拼接",
+}
+
+#: 「不指定色板」那一档的名字——即 `tokens.ts` 的底色与按亮度二档的字幕配色。
+#: 单独一个常量而不是塞进 :data:`PALETTE_LABELS`：它不是一套色板，而正是
+#: 「没有色板」这件事在面板上的说法。
+#: 措辞不再提「母版」：样张渲的是自包含的镜头代码，成片里这一档也是镜头代码
+#: 落回 `TOKENS`（母版下线那一轮之后，没有「母版底色」这回事了）。
+PALETTE_DEFAULT_LABEL = "默认（片子的底色）"
+
+#: 「不指定色板」在**卡面**上的取值字面量。为什么用 `none` 而不是空串（2026-10-16）：
+#: 计划卡上的每个开关都要有一个模型能**照抄**的取值，而空串在提示里是一个看不见的
+#: 东西——`texture`/`transition`/`entrance` 三档的「不选」都写作 `none`，同一张卡上
+#: 第四维另立一个空串写法只会多一处抄错的机会。文字库面板那条老路仍旧发空串
+#: （`motion_caption_preview(palette="")`），两者**同义**，由 :func:`norm_palette` 归一。
+PALETTE_NONE = "none"
+
+#: 整片色板那一格的候选值：`none` + 八套色板（顺序与 :data:`PALETTE_LABELS` 一致）。
+#: 它与 `texture` 同一族——**整片一个默认，个别镜可覆盖**（覆盖写在那一镜的代码里：
+#: `const palette = palettes["…"]`，或者它自己申报的 `bg`）。
+PALETTE_CHOICES: tuple[str, ...] = (PALETTE_NONE, *PALETTE_LABELS)
+
+
+def norm_palette(value: Any) -> str:
+    """整片色板取值归一 → 色板名，或 ``""``（= 不指定）。
+
+    两种写法同义：卡面发 ``none``、文字库面板发空串。认不出的名字也返回 ``""``——
+    **这里不报错**，报错在 :func:`validate_code_spec`（契约层，那里才拿得到 errors）；
+    这一层只是「读一个整片取值」，与 :func:`_palette_for_bg` 的「认不出就不猜」同规。
+
+    读不到 `palettes.json` 时 :func:`palettes` 返回空表，于是任何名字都归一成 ``""``
+    ——那正是「这一档今天没判」的诚实落点，而不是把一整片打回。
+    """
+    name = str(value or "").strip().lower()
+    if not name or name == PALETTE_NONE:
+        return ""
+    return name if name in palettes() else ""
+
+
 @lru_cache(maxsize=1)
 def token_colors() -> dict[str, str]:
     """`remotion/src/tokens.ts` 里那几个字面颜色（bg/ink/accent/hl…）。"""
@@ -3409,6 +3545,29 @@ def token_colors() -> dict[str, str]:
         return {}
     return {k: v for k, v in re.findall(
         r"\b(\w+)\s*:\s*['\"](#[0-9a-fA-F]{3,8})['\"]", src)}
+
+
+@lru_cache(maxsize=1)
+def sample_shot_code() -> str:
+    """字幕样式样张的**底稿镜头代码**（`remotion/src/preview/caption-sample.tsx`）。
+
+    它是一份合法镜头代码（过与模型那些同一套闸①），但不参与成片：只为
+    `caption_preview.preview_job()` 渲样张时当画面底稿——成片里那条字幕由母版壳或
+    镜头代码自己摆，与这份底稿无关。
+    为什么另存一份、不复用 `user-shots/shot.tsx`：那一份是渲染容器**每次出片覆写的
+    落点文件**（`remotion/server.mjs` 的 `SHOT_FILE`），真机上一镜正在渲的时候读它，
+    读到的是别人那一镜的代码——样张会随机画成别的片子的某一镜。
+
+    读不到返回空串（镜像里没 COPY 这份文件、或本地跑在别的目录下），
+    `caption_preview.preview_job()` 据此不渲（回 `None`）：预览是增益，不是出片链路的一环。
+    """
+    p = _master_file("src/preview/caption-sample.tsx")
+    if not p:
+        return ""
+    try:
+        return p.read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def resolve_color(token: str, default_palette: str | None = None) -> str | None:
@@ -3547,6 +3706,67 @@ def check_ink_contrast(shots: list[dict[str, Any]]
     return errors, warns, undetermined
 
 
+#: `<CaptionLayer` 的出现。只认标签名这一件事——属性、空格、换行都可能有，
+#: 但元件名不会变（它就是从 `@dg/film` import 进来的那个符号）。
+_CAPTION_LAYER_RE = re.compile(r"<\s*CaptionLayer\b")
+
+
+def caption_by_code(code: str) -> bool:
+    """这段镜头代码**自己摆了整条字幕**吗（`<CaptionLayer/>`）。
+
+    有两处在读它，判的是同一件事：闸㉜（申报了 `none` 却摆着——那段代码静悄悄不生效），
+    与 `code_render.shot_input_props`（扫到就注入 `captionFromCode`，**母版那条让位**，
+    免得同屏两条）。判据只此一份：两处各写一条正则，迟早会有一处漏掉某种写法
+    （换行、带属性、`<CaptionLayer >`），而漏掉的那一次表现为成片上一闪而过的双字幕。
+    """
+    return bool(_CAPTION_LAYER_RE.search(code or ""))
+
+
+def check_caption_ownership(shots: list[dict[str, Any]]
+                            ) -> tuple[list[str], list[str], list[str]]:
+    """闸㉜：声明了「不上字幕」的镜，代码里就别再摆整条字幕。
+
+    2026-10-16 起字幕成了可 import 的元件（`@dg/film` 的 `CaptionLayer` /
+    `CaptionText` / `useCaptionTiming`），摆放位置归镜头代码。同一天字幕两维化
+    （`caption_style` × `highlight_style`），`<CaptionLayer/>` 的**自守规则**跟着变成
+    「`caption_style === 'none'` 时不画」——因为那一档的意思就是「这一镜没有字幕」。
+
+    于是有一种**静默**错误：这一镜声明了不上字幕，而代码里摆着 `<CaptionLayer/>`。
+    它自守不画，那条字幕永远不会出现，而在此之前契约层一句话都不会说。判据就是这一句：
+    **代码摆了 `<CaptionLayer/>` 而这一镜申报的字幕样式是 `none`**。
+
+    **这一条只判「这一镜显式申报了 `none`」那一种**，因为本函数的入参只有 `shots`——
+    整片那一档在这里读不到。而整片 `none` 时不算错：代码不带参数地摆 `<CaptionLayer/>`
+    （推荐写法）本来就是**把决定权交给注入的那一档**，用户在上不上字幕之间选，选到
+    `none` 就是他要的结果，不是静默失败。
+
+    摆 `<CaptionLayer/>` 不需要任何申报：`shot_input_props` 扫到它就注入
+    `captionFromCode`，母版那条**让位**（见 :func:`caption_by_code`）。所以「摆了字幕却
+    同屏两条」从结构上不可能发生，这一条也不必判它。要判的只剩上面那一种自相矛盾。
+
+    不判反向（`none` 之外却没画字）：文本扫描分不清「没画」与「用别的方式画了」
+    （手搓文字一直是合法的）。那一条交给样张与每镜的预览静帧——文案有没有落到画面上，
+    一眼就能看见。
+
+    `<CaptionText/>`（只有字，不画纸条底）不进这条判据：摆一个**画面里的字**是合法的，
+    `typography` 那一族正在干这个，禁掉它会误伤整族。
+    """
+    errors: list[str] = []
+    for i, s in enumerate(shots):
+        if not caption_by_code(str(s.get("code") or "")):
+            continue
+        style = str(s.get("caption_style") or "").strip()
+        if style != "none":
+            continue
+        sid = str(s.get("id") or f"s{i + 1:02d}")
+        errors.append(
+            f"闸㉜ 字幕归属：{sid} 申报了 caption_style=\"none\"（这一镜不上字幕），"
+            "代码里却摆着整条 <CaptionLayer/>——它自守不画，那条字幕永远不会出现。"
+            "要么把这一镜的字幕样式改成要画的那一档（贴画面 / 白字黑边 / 纸条底…），"
+            "要么改用 <CaptionText/> 只摆画面里的字，要么把这处删掉")
+    return errors, [], []
+
+
 #: 自动修字色时的两个候选：白与近黑。不取色板里的 `text`——那正是这类错的来源
 #: （深色板的 text 是浅色，模型把它写到浅底上就糊了）。
 _AUTOFIX_INKS = ("#ffffff", "#141414")
@@ -3615,35 +3835,44 @@ def autofix_ink_contrast(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[s
     return {**raw, "shots": out}, notes
 
 
-#: 整片层的八道判据（闸⑦ 风格配额 / 闸⑲ 风格丰富度 / 闸⑫ 与 demo 骨架同构 /
-#: 闸⑳ 原创配额 / 闸⑨ 跨镜同构 / 闸⑩ 文字对比度 / 闸⑮ 版式族配额 / 闸⑯ 主体具名）。
+#: 整片层的十道判据（闸⑦ 每镜必画 / 闸⑲ 风格丰富度 / 闸⑫ 与 demo 骨架同构 /
+#: 闸⑳ 原创配额 / 闸⑨ 跨镜同构 / 闸⑩ 文字对比度 / 闸⑮ 版式族配额 / 闸⑯ 主体具名 /
+#: 闸㉝ 具名件 / 闸㉜ 字幕归属）。
 #: **三处调用点**（plan_motion 入库前、render 烧像素前、patch 落盘前）与**两处报账**
 #: （计划卡、出片回执）都从这一个元组取，规则因此不可能只在某一路上生效；这也是
 #: 「清单只有一个」那条纪律落在这一族判据上的样子（同一形状的清单漂移踩过三次，
 #: 见 §9-Q90/Q91）。
 #:
-#: ⑦ 与 ⑲ 是**一对**，别把它们的职责搞混：⑦ 管**反雷同**（画法通道别只一种、
-#: 纯文字镜别超三分之一），⑲ 管**逼丰富**（色板 / 满幅 / 质感 / 底色这四条
-#: 在此之前没有任何闸在判）。⑫ 与 ⑳ 同理：⑫ 判「声明派生就要真像」，⑳ 判
-#: 「走原创的那几镜别超过 20%」。
-WHOLE_FILM_GATES = (check_style_quota, check_style_variety,
+#: ⑦ 与 ⑲ 是**一对**，别把它们的职责搞混：⑦ 管**地板**（每一镜都得用代码画出东西来），
+#: ⑲ 管**逼丰富**（色板 / 满幅 / 质感 / 底色这四条在此之前没有任何闸在判）。
+#: ⑫ 与 ⑳ 同理：⑫ 判「声明派生就要真像」，⑳ 判「走原创的那几镜别超过 20%」。
+#: ㉝ 接在 ⑦ 后面把**地板抬高一格**：⑦ 问「画了没有」，㉝ 问「画的是不是一件**能被
+#: 认出的东西**」（零件库里的件）。两条都判在烧像素之前，都硬拦。
+WHOLE_FILM_GATES = (check_draw_floor, check_style_variety,
                     check_derived_similarity, check_original_share,
                     check_shot_structure, check_ink_contrast,
-                    check_layout_family, check_subject_named)
+                    check_layout_family, check_subject_named,
+                    check_named_parts,
+                    check_caption_ownership)
 
-#: 只提醒、不打回的那几道（2026-10-15）：色板多样⑲、卡族多样⑮、原创占比⑳。
-#: 它们逼的是「多样」，但同时把「整片统一风格 / 统一色调 / 更多原创镜」这类有意为之的
-#: 选择一并打回，换来的是整份分镜重写重提。降为建议后照样出现在渲染前的计划确认卡上
-#: （style_warnings），由用户在那一眼里决定要不要改。
-#: ⑦（画法通道 + 纯文字镜占比）**仍是硬闸**：它挡的是「一整条 PPT 配旁白」这种质量
-#: 底线问题，不是风格偏好。对比度、结构、主体具名同样仍是硬闸。
-SOFT_GATES = frozenset({check_style_variety, check_layout_family, check_original_share})
-#: 预览档（qc=preview）再多放软的四道「品味型」契约闸：画法通道⑦、跨镜同构⑨、
-#: 派生相似⑫、主体具名⑯。预览档的前提是**渲染前有人看静帧**（计划确认卡上的预览图），
-#: 人眼替掉了这几道机器判据；无人值守的严格档（qc=strict）照旧硬拦。
-#: 对比度⑩ 与结构合法性在两档都是硬闸。
-PREVIEW_SOFT_GATES = SOFT_GATES | frozenset({check_style_quota, check_shot_structure,
-                                             check_derived_similarity, check_subject_named})
+#: 「建议」档：这几道的打回项降为提醒（加 `（建议）` 前缀），与"打回档"同在一条回执里，
+#: 读的人（与模型）分得出轻重。
+#:
+#: **档是判据自己的属性，不再是质检档的函数**（2026-10-16 并档）。并档前这里是三份
+#: ——`SOFT_GATES`（两档都软）、`PREVIEW_SOFT_GATES`（只在预览档软）、以及"两份都不在"
+#: 的硬闸——由 `qc` 挑一份用。现在整片闸**一律只报不拦**（拦的位置在三个调用点，
+#: 见 `whole_film_gate_results`），于是"哪一档该软"这个问题本身没有意义了：一份就够。
+#:
+#: ⑦（每镜必画）与 ⑩（字色对比度）**不放进这一份，是有意的**：它们说的不是品味，
+#: 是「这一镜画面上根本没东西」和「字压字看不清」——没有"人眼替机器判"的余地。
+#: 留着"打回档"这个轻重，模型读 `check_film` 时一眼能分出哪几条必须改、哪几条可商量。
+#: **不拦 ≠ 不明说**：判据照旧说全，拦不拦由调用方定，这正是「闸变工具」那条线。
+SOFT_GATES = frozenset({check_style_variety, check_layout_family, check_original_share,
+                        check_shot_structure, check_derived_similarity, check_subject_named})
+#: 旧名（并档前"只在预览档软"的那一份）。并档后与 `SOFT_GATES` 是**同一个集合**，
+#: 留着只为不打断既有引用（`test_caption_layer.py` 按名字查过它）。
+#: **别只往其中一个加东西**——加进任一个就等于加进另一个，那正是并档要消掉的东西。
+PREVIEW_SOFT_GATES = SOFT_GATES
 SOFT_PREFIX = "（建议）"
 
 #: 质检档：preview＝主流做法（渲染前人看预览静帧，渲后像素闸只提醒、不打回重烧）；
@@ -3668,32 +3897,54 @@ def with_default_qc(raw: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
-def run_film_gate(gate: Any, shots: list[dict[str, Any]], *, strict: bool = True) -> tuple:
-    """跑一道整片闸；软闸的打回项降为提醒（加「（建议）」前缀），其余原样返回。"""
+def run_film_gate(gate: Any, shots: list[dict[str, Any]]) -> tuple:
+    """跑一道整片闸；建议档那几道的打回项降为提醒（加「（建议）」前缀），其余原样返回。
+
+    **没有 `strict` 参数了**（2026-10-16 并档）：这一层只决定**轻重**，不决定拦不拦。
+    拦的位置在三个调用点，而从并档那天起它们一个都不拦——所以"哪一档"这个自变量
+    在这条路上已经不存在了，留着它就只是让人以为换个档会换个结果。
+    """
     got = gate(shots)
-    if gate not in (SOFT_GATES if strict else PREVIEW_SOFT_GATES):
+    if gate not in SOFT_GATES:
         return got
     return ([], [f"{SOFT_PREFIX}{e}" for e in got[0]] + list(got[1]), *got[2:])
 
 
-def whole_film_gate_results(shots: list[dict[str, Any]], *, strict: bool = True
+def whole_film_gate_results(shots: list[dict[str, Any]]
                             ) -> tuple[list[str], list[str], list[str]]:
-    """把整片八道闸的三个出口合成一份：``(打回, 提醒, 未判)``。
+    """整片判据**唯一的出口**：十道闸 + 动效锚定㉑ 合成一份 ``(打回, 提醒, 未判)``。
 
     **三个出口是这一条的全部意思**（T28）：一道闸说不清的时候，它的答案既不是
     「过」也不是「不过」，而是「没判」——三者必须落在三个不同的格子里，因为回执、
     计划卡与模型读的都是格子名。判据自己带第三个出口时就用它；还没带第三态的那些
     闸按两态处理（``len(got) > 2`` 那一下），不逼它们假装有未判档。
+
+    **为什么整片判据全在这里、而不在 `validate_code_spec` 里**（2026-10-16 改）。
+    并档前它只被"计划卡要看账"的那几处调用，真正拦人靠的是 `validate_code_spec`
+    里那个循环——于是判据只有一个**拦人**的出路，模型看不见它，只能撞上去；一次
+    打回的代价是整轮重来。现在分工反过来：
+
+    * `validate_code_spec` 只管**契约**（字段、容量、类型、归一）——「这份 spec
+      能不能用」。契约不满足时照旧抛，因为那不是判据，是输入本身不成立。
+    * 整片判据全部走这里。三个调用点（`plan_motion` 入库前 / `render_motion_code`
+      烧像素前 / `patch_motion_code` 落盘前）把三个出口**原样附进各自的正常返回**，
+      一个都不抛。模型因此看得到自己撞上的是哪几条、轻重如何，用户也在计划卡上
+      看得到同一份账。
+
+    ㉑ 的**闸前**那一半并在这里（R8-T33）。它原来跟闸并排摆在 `validate_code_spec`
+    里，是唯一绕过本函数、连轻重档都没有的一道：动效锚是纯契约，判它一次 ffmpeg
+    都不用开。「事件触发帧在不在窗口里」那一半要像素，仍在 `code_render` 逐镜那一段。
     """
     errors: list[str] = []
     warns: list[str] = []
     undetermined: list[str] = []
     for gate in WHOLE_FILM_GATES:
-        got = run_film_gate(gate, shots, strict=strict)
+        got = run_film_gate(gate, shots)
         errors.extend(got[0])
         warns.extend(got[1])
         if len(got) > 2:
             undetermined.extend(got[2])
+    errors.extend(check_motion_anchors(shots))
     return errors, warns, undetermined
 
 
@@ -3715,9 +3966,66 @@ def whole_film_gate_results(shots: list[dict[str, Any]], *, strict: bool = True
 #: （逐接缝的转场表），今天没有这个需求；而进出场天生是母版给每一镜套的同一套动作。
 #: 它们都在计划卡上（用户在批准之前就看得到「镜间怎么接、每镜怎么进」），
 #: 而卡面的每一项都要能反查到来源 + 有中文标签，所以档位全是枚举（见 TRANSITION_SEC_CHOICES）。
-KNOB_FIELDS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode",
-               "caption_position", "caption_anim",
+#:
+#: ``palette``（2026-10-17）与 ``texture`` 是同一族的第二条：**整片默认，个别镜可覆盖**。
+#: 它不是自由值（八套色板 + `none`，见 PALETTE_CHOICES）——卡面的每一项都要能反查到
+#: 枚举源，自由值进卡面会让整份计划被打回（`COLOR_KNOBS` 那条注释记着这笔账）。
+#: 逐镜覆盖**不在卡上**：它就写在那一镜自己的代码里（`const palette = palettes["…"]`）
+#: 或那一镜申报的 `bg` 里，所以卡面只问一次。
+KNOB_FIELDS = ("aspect", "fps", "narration", "voice", "rate", "caption_style",
+               "highlight_style", "palette",
                "texture", "transition", "transition_sec", "entrance", "exit")
+
+#: 整片**布尔开关**——那几档「一开就按镜花钱」的能力：㉖ 回看环（``review``）、
+#: 层 D2 静帧审美评审（``still_review``）、⑲-b 身份判据（``identity``）。
+#:
+#: 它们**不在 `KNOB_FIELDS` 里**（计划卡上没有位置）：卡面那排 radio 回答的是「这条片子
+#: 长什么样」，而这三档回答的是「愿不愿意为每镜一次带图的多模态调用付钱」。把它们摊在
+#: 卡上，等于让「想挑个竖屏」的人顺手替自己选一张最贵的账单。它们也不进 `FILM_KNOBS`
+#: （不进缓存键）：它们不改像素，改的是「烧完像素之后再看一遍」这条腿。
+#:
+#: 那它们怎么活着走到渲染链上？——**靠这一栏**。`validate_code_spec` 返回的是一个**新**
+#: 字典（逐栏抄已知字段），不在这里抄一遍的栏位就是被静默删掉：调用方写了
+#: ``spec["identity"] = True``、回执上却写着「这趟没开」——「开关写了不生效」是最难查的
+#: 一类形状，和自由色 `highlight_color`（见 :data:`COLOR_KNOBS`）当初掉进去的是同一个坑。
+#: 打开它们的写法也与自由色同一条路：写进 ``args["spec"]``（`motion_prefs` 那句
+#: 「值写进 spec 而不是顶层」是同一个理由）。它们**不进** `code_spec_schema`：那份 schema
+#: 是给模型看的，而这三档花的是用户的钱——摆在那儿等于邀请模型替用户按下付款键。
+#:
+#: **只抄真开的那几个**：缺省不留这一栏，于是 `spec.get(...)` 得到 `None`，与「没写」
+#: 逐字同义——回执里「这趟没开」那句措辞因此仍然成立。
+SWITCH_KNOBS: tuple[str, ...] = ("review", "still_review", "identity")
+
+
+def _switch_on(value: Any) -> bool:
+    """一个整片开关是不是真的被打开了。
+
+    只认真开的那几种写法（``True`` / ``"true"`` / ``"1"`` / ``"yes"`` / ``"on"``）。
+    其余一律当**没开**——尤其是 ``"false"``：它是个非空字符串，真值判断会把它读成「开」，
+    而「用户关掉了回看，回执却说回看跑过」与 `narration` 那条注释记的是同一个坑
+    （``bool("false") is True``）。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
+
+#: 「文字库」面板上那几维里**自由取色**的：值不是「档」而是一条 ``#rrggbb``
+#: （空串 = 没钉，跟色板走）。
+#:
+#: 它**不在 `KNOB_FIELDS` 里**，也不在 `knob_props()` 里——这一条是试出来的，不是设计
+#: 偏好：卡面的每一项都要能反查到枚举源（`plan/vocab.py::enum_source`：枚举 / 开关 /
+#: 带界数值 / 曲库标签组），自由色四样都不是，于是模型只要照 schema 写了这一栏，
+#: **整份计划会被打回**（「参数「highlight_color」没有可反查的枚举源」）。
+#: 所以它的路与上面那排开关不同：用户在面板上钉的值由主服务**写进 `spec`**
+#: （`motion_prefs.SPEC_LEVEL_KEYS`），再由 `validate_code_spec` 归一、`shot_input_props`
+#: 注入。进 `spec` 就够了——渲染链读的是那一份，而计划卡上不需要有它的位置。
+#:
+#: 单独一张表而不是在面板那侧按名字判：前端要「渲取色控件还是一排卡」这件事有个契约里的
+#: 判据（`library_props()` 把它翻成 dims 的 ``kind``），与栏名同一条纪律——
+#: 面板上那个控件长什么样，不该由前端自己按键名猜。
+COLOR_KNOBS: tuple[str, ...] = ("highlight_color",)
 
 _VOICE_RE = re.compile(r"^[a-z]{2}(-[A-Za-z]{2,})?-[A-Za-z]+Neural$")
 _RATE_RE = re.compile(r"^[+-]\d{1,3}%$")
@@ -3743,6 +4051,9 @@ KNOB_VALUE_LABELS: dict[str, dict[str, str]] = {
         "zh-CN-YunxiNeural": "男声·普通话（偏年轻）",
         "zh-CN-YunxiaNeural": "男声·少年音",
         "zh-CN-YunyangNeural": "男声·播报腔",
+        # 以下八档**不再出现在可选清单里**（见 ``VOICES``），标签留着只为回读：
+        # 老片子里挑了方言音色的那一镜，确认卡上仍要写「女声·粤语」而不是
+        # ``zh-HK-HiuGaaiNeural``。删掉它们才是真把老片子的回执弄难看。
         "zh-CN-liaoning-XiaobeiNeural": "女声·东北口音",
         "zh-CN-shaanxi-XiaoniNeural": "女声·陕西方言",
         "zh-HK-HiuGaaiNeural": "女声·粤语",
@@ -3754,20 +4065,25 @@ KNOB_VALUE_LABELS: dict[str, dict[str, str]] = {
     },
     "rate": {"-20%": "很慢", "-10%": "稍慢", "+0%": "正常",
              "+10%": "稍快", "+20%": "较快", "+30%": "很快"},
-    # 母版 <FilmLayout> 只认这四档；旧链的 torn / bottom 随模板一起消失。
-    # `inline` 是唯一「文字进画面」的档（母版不画，交回镜头代码）——它的标签必须
-    # 说清这一点，不然选的人会以为它和 `none` 一样是「不上字幕」。
-    "subtitle_mode": {"torn_highlight": "撕纸条·逐词点亮", "full": "整句字幕",
-                      "none": "不上字幕",
-                      "inline": "文字进画面（母版不画，随构图摆）"},
-    "caption_position": {"bottom": "底部字幕条", "center": "压在画面正中",
-                         "top": "顶部安全区"},
-    "caption_anim": {"fade": "淡入", "rise": "上浮入场", "pop": "弹出放大",
-                     "karaoke": "逐字随语音点亮"},
+    # 字幕两维（2026-10-16）：字长什么样 × 被点名的词怎么被点出来。旧的三旋钮
+    # （subtitle_mode / caption_position / caption_anim）不在这一族里了。
+    # 标签说清「观众看到的是什么」：写字纸/描边/位置/入场都归前者，换色/点亮/色块归后者。
+    "caption_style": {"on_picture": "贴画面·无底条", "outlined": "白字黑边",
+                      "paper": "纸条底·画面下沿", "film_line": "整句电影感·下沿淡浮",
+                      "big_center": "大字压屏·画面正中", "top_banner": "顶部横幅",
+                      "none": "不上字幕"},
+    "highlight_style": {"color": "关键词换色", "karaoke": "逐词点亮",
+                        "block": "底色块", "ink": "撕纸高亮",
+                        "plain": "不强化·整句一个样"},
     # 质感每一镜都能带一档（顶层是整片默认），标签要说清「加的是哪种观感」，不然选的人只能猜
     "texture": {"none": "不加（原片直出）", "film": "老胶片·颗粒与暗角",
                 "tv": "老电视·扫描线与色偏", "glow": "柔光·高光处泛开",
                 "bleach": "漂白·硬对比低饱和"},
+    # 整片色板（2026-10-17）。八套色板的名字**不在这里重列**——它们是 PALETTE_LABELS
+    # 那一份（与 palettes.json 逐项对齐，由 tests/test_code_spec.py 断言），这里只把
+    # 「不指定」那一档摆进去。`none` 的措辞就是 PALETTE_DEFAULT_LABEL，与文字库面板
+    # 同源：同一件事在两个面板上不许显示成两副面孔。
+    "palette": {PALETTE_NONE: PALETTE_DEFAULT_LABEL, **PALETTE_LABELS},
     # R7-T22：转场与进出场。措辞要说清「观众看到的是什么」，而不是抄 ffmpeg 的档名
     # （wipeleft 这三个字母对人没有意义）。四条都在确认卡与计划卡两张卡上出现。
     "transition": {"none": "硬切（镜镜直接接）", "fade": "淡叠·前一镜淡出后一镜淡入",
@@ -3788,8 +4104,9 @@ KNOB_VALUE_LABELS: dict[str, dict[str, str]] = {
              "zoom": "轻拉远·缩小出画"},
 }
 
-#: 本链字幕档的单独视图（确认卡与母版参数都从这里取词）
-SUBTITLE_LABELS = KNOB_VALUE_LABELS["subtitle_mode"]
+#: 本链字幕两维的单独视图（确认卡与母版参数都从这里取词）
+CAPTION_STYLE_LABELS = KNOB_VALUE_LABELS["caption_style"]
+HIGHLIGHT_STYLE_LABELS = KNOB_VALUE_LABELS["highlight_style"]
 
 #: 每字朗读秒数的经验区间：估算总时长用，不是承诺值。
 #: 实测 zh-CN 男声 +0% 约 0.22~0.28 秒/字（含标点停顿），比 edge-tts 老兜底的
@@ -3838,21 +4155,26 @@ def knob_props() -> dict[str, Any]:
             "type": "string", "enum": list(RATE_CHOICES), "default": "+0%",
             "description": "语速档位，越快整片越短；与目标时长对账先看它",
         },
-        "subtitle_mode": {
-            "type": "string", "enum": list(SUBTITLE_MODES), "default": "torn_highlight",
-            "description": "字幕形态。inline=母版不画、文字交回镜头代码排进画面",
+        "caption_style": {
+            "type": "string", "enum": list(CAPTION_STYLES), "default": "on_picture",
+            "description": "字幕长什么样、站在哪（整片默认，每镜可覆盖）；none=不上字幕",
         },
-        "caption_position": {
-            "type": "string", "enum": list(CAPTION_POSITIONS), "default": "bottom",
-            "description": "字幕位置（整片默认，每镜可覆盖）：底部/画面正中/顶部",
-        },
-        "caption_anim": {
-            "type": "string", "enum": list(CAPTION_ANIMS), "default": "fade",
-            "description": "字幕入场动画（整片默认，每镜可覆盖）；karaoke=逐字随语音点亮",
+        "highlight_style": {
+            "type": "string", "enum": list(HIGHLIGHT_STYLES), "default": "color",
+            "description": "被点名的词怎么被点出来（整片默认，每镜可覆盖）",
         },
         "texture": {
             "type": "string", "enum": list(TEXTURES), "default": "none",
             "description": "整片默认质感档；每一镜可用自己的 texture 覆盖它。换它不重烧镜头",
+        },
+        # 整片底色那一格（2026-10-17）。description 与 texture 那一条同形：说清「它是
+        # 默认、谁能覆盖、换它的代价是什么」。**收在一行、60 字内**（`knob_facts` 的 note
+        # 取前 60 字，超了会截在半句话上，而这里正好会截在 `palettes["…` 中间）。
+        # 逐镜覆盖的写法归技能正文——模型看不到「色板写在这一镜代码里」这件事，
+        # 而卡面只问一次。
+        "palette": {
+            "type": "string", "enum": list(PALETTE_CHOICES), "default": PALETTE_NONE,
+            "description": "整片底色与字幕配色那一档；某一镜要另调就改那一镜的代码",
         },
         # R7-T22 的四条。description 收成一行、≤60 字（`knob_facts` 的 note 取前 60 字，
         # 超了会截在半句话上），「怎么选」那套教程在技能正文里。
@@ -3877,6 +4199,117 @@ def knob_props() -> dict[str, Any]:
     for key, spec in props.items():
         spec["value_labels"] = dict(KNOB_VALUE_LABELS.get(key) or {})
     return props
+
+
+#: 「文字库」面板管得着的那几维。**与 `KNOB_FIELDS` 分开列**：那一个是整片开关的全集
+#: （计划卡上每一项都能改），这一个只挑出与「声音和字」有关的几维——面板把 `voice`
+#: 与 `rate` 摆在一起是给人「挑一个音色顺便调语速」，不是要把画幅帧率也塞进来。
+#: 取值与标签**不在这里重列**，`library_props()` 从 `knob_props()` 现取。
+#:
+#: 2026-10-16 加 `highlight_color`（「自定义高亮词颜色」）：它与上面那几维的区别只在
+#: 值的形状（自由色而非档位），在面板上仍是「用户挑、钉进这条对话」的同一件事，
+#: 所以进这张表、由 dims 的 ``kind`` 分出控件形状。**它排在高亮样式后面**——
+#: `library_props()` 按这张表的次序构造 dims，前端按 dims 的次序排，位置因此由这里定。
+LIBRARY_DIMS: tuple[str, ...] = ("caption_style", "highlight_style", "highlight_color",
+                                 "voice", "rate")
+
+#: 上面那几维在面板上的**栏目名**。为什么这也归后端：与取值标签同一条纪律——
+#: 面板上出现的每一个中文词都只有一处出处。前端自己写「高亮样式」，两边迟早对不上
+#: 的是「这一栏管的是哪一维」这件事本身，而那种错不会红，只会让人改错东西。
+#: 前两维**同时也是两排卡的组名**（见 :data:`CAPTION_PRESETS` 的 ``group``）：
+#: 前端按 ``presets[].group`` 现取栏名，一个字符串都不自己拼。
+LIBRARY_DIM_TITLES: dict[str, str] = {
+    "caption_style": "字幕样式",
+    "highlight_style": "高亮样式",
+    # 这一维挨着「高亮样式」摆：它管的就是那几档（换色/底色块/撕纸）里被点亮的词
+    # 用哪个颜色。空串＝跟随这一镜的色板。
+    "highlight_color": "强调色",
+    "voice": "音色",
+    "rate": "语速",
+}
+
+
+def library_props() -> dict[str, Any]:
+    """前端的「文字库」要的全部内容，一次打包。**前端零硬编码**。
+
+    与计划卡那条纪律同源：卡面 radio 的文字来自契约的 ``value_labels``，这里也一样——
+    取值清单与中文标签从 ``knob_props()``（它自己又取自 ``CAPTION_STYLES`` /
+    ``HIGHLIGHT_STYLES`` / ``VOICES`` / ``KNOB_VALUE_LABELS``）现取，前端**一个取值、
+    一个中文词都不许自己写**。前端自己列一遍的后果不是报错，是界面上写着「纸条底」
+    而渲染认的是另一个字符串——那种不一致不会红，只会渲出来不一样。
+
+    四块内容：
+
+    * ``presets`` —— 面板上那两排卡，见 :data:`CAPTION_PRESETS` / :data:`HIGHLIGHT_PRESETS`
+      （`key` 就是取值，`label` 在这里从 ``KNOB_VALUE_LABELS`` 现取，`group` 决定分排）；
+    * ``dims`` —— 上面几维的 ``title`` / ``kind`` / ``enum`` / ``default`` /
+      ``value_labels``（栏目名也在这儿，前端连「这一栏叫什么」都不自己写；
+      ``kind`` 是**控件形状**——``enum`` 渲一排档、``color`` 渲一枚取色器，
+      自由色那一维的 ``enum`` 因此是空表）；
+    * ``voice_groups`` —— 音色按 :data:`VOICE_GROUPS` 的前缀分组，每档带它自己的标签；
+    * ``palettes`` —— 预览样张用的色板清单（第一项是「不指定」那一档），
+      每项带 ``label`` 与三色 ``swatch``（色块本身就是那套色板的样子，见下）。
+
+    由 ``tests/test_code_spec.py`` 的第 ⑨ 节守着与 ``knob_props()`` 逐字一致。
+    """
+    knobs = knob_props()
+    dims: dict[str, Any] = {}
+    for key in LIBRARY_DIMS:
+        spec = knobs.get(key) or {}
+        free_color = key in COLOR_KNOBS
+        dims[key] = {"title": LIBRARY_DIM_TITLES.get(key, key),
+                     # 面板据此决定渲哪一种控件：`enum` = 一排档，`color` = 一枚取色器。
+                     # 前端不按键名猜（猜错的表现是「点开一个空的档位列表」，而不是报错）。
+                     "kind": "color" if free_color else "enum",
+                     # 自由色那一维**没有 `knob_props()` 那一份 schema 可读**（它进不了
+                     # 卡面，见 `COLOR_KNOBS`）：取值清单空、缺省是空串（＝没钉）。
+                     # 这三栏因此在这里直接给，而不是从 `knobs` 取。
+                     "enum": [] if free_color else list(spec.get("enum") or ()),
+                     "default": "" if free_color else spec.get("default"),
+                     "value_labels": {} if free_color
+                     else dict(spec.get("value_labels") or {})}
+
+    labels = dims["voice"]["value_labels"]
+    grouped: list[dict[str, Any]] = []
+    placed: set[str] = set()
+    for prefix, group_label in VOICE_GROUPS:
+        items = [{"value": v, "label": labels.get(v) or v}
+                 for v in VOICES if v.startswith(prefix + "-")]
+        placed.update(i["value"] for i in items)
+        grouped.append({"key": prefix, "label": group_label, "items": items})
+    # 不在任何前缀下的音色不静默丢掉：收进一个自成一组的「其他」，并在
+    # `tests/test_code_spec.py` 第 ⑨ 节断言这一组为空——服务商加了新地区，
+    # 界面该看得见它，而不是少一档而没人知道。
+    rest = [{"value": v, "label": labels.get(v) or v}
+            for v in VOICES if v not in placed]
+    if rest:
+        grouped.append({"key": "other", "label": "其他", "items": rest})
+
+    # 样张色板。挑哪一套**只影响那张预览图**，不影响成片——成片里每一镜跟着它
+    # 自己的色板走（`film_style_of`）。摆出来是因为「字幕条到底跟不跟色板走」这件事
+    # 光看档名看不出来：同一档字幕，母版底色下是白底黑字，深海蓝下是深底浅字。
+    # 第一项是空串（不指定），它那一组色块取自母版常量（`tokens.ts`）。
+    token = token_colors()
+    palette_options: list[dict[str, Any]] = [{
+        "key": "", "label": PALETTE_DEFAULT_LABEL,
+        "swatch": {"page": token.get("bg") or "", "text": token.get("ink") or "",
+                   "accent": token.get("accent") or ""}}]
+    for name, pal in palettes().items():
+        palette_options.append({
+            "key": name, "label": PALETTE_LABELS.get(name, name),
+            "swatch": {slot: str(pal.get(slot) or "") for slot in ("page", "text", "accent")}})
+
+    return {
+        # 卡面文字从取值标签现取：档名就是取值，中文标签只有 `KNOB_VALUE_LABELS` 一处。
+        "presets": [{"key": p["key"], "group": p["group"],
+                     "label": (dims.get(p["group"], {}).get("value_labels") or {}).get(p["key"])
+                              or p["key"],
+                     "note": p["note"],
+                     "knobs": {p["group"]: p["key"]}} for p in LIBRARY_PRESETS],
+        "dims": dims,
+        "voice_groups": grouped,
+        "palettes": palette_options,
+    }
 
 
 #: 镜头代码能 import 的包。**必须与 `remotion/lint-rules.mjs` 的 `ALLOWED_IMPORTS`
@@ -3928,6 +4361,10 @@ IMPORT_WHITELIST: tuple[str, ...] = (
     "@dg/lib/Caption", "@dg/lib/ClipCard", "@dg/lib/DigitRoll",
     "@dg/lib/FlashCut", "@dg/lib/PageCam", "@dg/lib/VerticalTicker",
     "@dg/lib/FlatPanel",
+    # 简笔画零件库（2026-10-17，清单见 `_DRAW_PARTS`）。**逐件列，与上面那几件同一口径**
+    # ——每件是一个文件级入口，目录名（`@dg/lib/draw`）没有 index 文件，列了它闸① 放行、
+    # 打包期才炸。
+    *_DRAW_PARTS,
     "@dg/lib/helpers/motion", "@dg/lib/helpers/rand", "@dg/lib/helpers/shake",
     "@dg/lib/helpers/camera",
     "@dg/themes/palettes.json",
@@ -3938,19 +4375,21 @@ IMPORT_WHITELIST: tuple[str, ...] = (
 #: 分层的依据是实测而不是偏好：工具 schema 的散文**送不到模型那里**——节点工具的
 #: inputSchema 由 ``server.py::_signature_for`` 从 Python 签名生成，只取 ``type``，
 #: ``spec`` 到那侧只剩 ``additionalProperties: true``。所以这一段过去那 2 KB 教程
-#: 谁也没教过，而技能正文逐条写过同一套规则（还多教了 ``useBody()`` 那条母版几何）：
-#: 两处各写一遍必然漂，漂的那一侧又没人会去读，于是成了假文档。
-#: 留下的是**判据**——白名单、母版包裹、字段对账三条、体积与判空，它们与本模块的常量
+#: 谁也没教过，而技能正文逐条写过同一套规则（从前还多教过 ``useBody()`` 那条母版几何，
+#: 母版下线那一轮撤了）：两处各写一遍必然漂，漂的那一侧又没人会去读，于是成了假文档。
+#: 留下的是**判据**——白名单、自包含构图、字段对账三条、体积与判空，它们与本模块的常量
 #: 和容器里的 lint 一一对应；``tests/test_code_spec.py`` 同时核对这份文本与技能正文，
 #: 谁单独改了哪一条都会红。
 _CODE_DOC = (
     "这一镜的**完整 .tsx**（一个文件，顶层一个默认导出的镜头组件），由 creation-remotion "
     "逐帧渲染。闸①（容器里的 ESLint）在渲染前判，违规带镜号与行号退回，不烧像素。"
-    "**写法纪律（画面带坐标系 `useBody()`、母题铺满带子、四条画法通道与 seed、"
+    "**写法纪律（自包含构图、母题铺满画面、四条画法通道与 seed、"
     "按墙钟随机的禁令、字体只用 Noto）见技能正文「镜头代码合同」一节**，这里只列会判红的：\n"
-    "· 必须 `import { FilmLayout } from \"@dg/film\"` 并把顶层 JSX 包进 `<FilmLayout>`——"
-    "字幕带、安全区、边距、字阶、配色全在母版里，镜头代码只填主体区；不包就没有字幕，"
-    "且闸⑤ 读不到这一镜的 token\n"
+    "· **这一镜自包含**：顶层 `<AbsoluteFill>` 自己构图（底色、边距、字幕位都归你），"
+    "画幅从 `useVideoConfig()` 拿。母版 `<FilmLayout>` 已下线，不要 import 它；"
+    "`@dg/film` 现在是**零件包**（字幕三件 `CaptionLayer`/`CaptionText`/`useCaptionTiming`、"
+    "字段标注 `F`）。全片一致靠 `@dg/tokens` 的 `TOKENS`（底色/墨色/强调色）与卡库配方，"
+    "不靠一个壳替你排\n"
     "· import 只许这些包（镜像里真装了的东西）：" + ", ".join(IMPORT_WHITELIST) +
     "；相对路径自由\n"
     "· 时刻只能来自 `useCurrentFrame()`：禁 `Math.random`（要随机用 remotion 的 "
@@ -3962,21 +4401,26 @@ _CODE_DOC = (
     "**静默回落**成别的东西）；字体只用镜像里已有的 Noto CJK 家族\n"
     "· **不要自己写时长**：`durationInFrames` 由闸② 按真实语音时长注入，"
     "代码里读它来自作主张就等于替声音定时长\n"
-    "· 字幕内容不要画进代码——`text` 与 `highlight` 由母版排，画两遍是重影\n"
+    "· **字幕由你排**：`text`（这一镜整句）、`highlight`（要强调的词）、`words`"
+    "（TTS 逐词帧）由闸② 注入，你用 `@dg/film` 的字幕件把它们摆成画面里的字"
+    "（推荐「关键词换色」：字压在画面上、高亮词换这一镜的强调色——见技能正文「字自己排」"
+    "一节）。别自己再实现一遍片段切分与求字号（那是第二份实现，两处断行迟早不一样），"
+    "也别把 `text` 当画面文案另画一遍（同一句话两处画＝重影）\n"
     "· 可改的值开成 `fields` 旋钮：代码里读 `fields.<name>`，"
     "并在真的把它画上那个位置时套一层 "
-    "`<F name=\"…\" value={fields.…}>`（`F` 由 `@dg/film` 导出）。母版按这份标注回读"
-    "「值 + 盒」给闸⑥ 对账，字段级命中表拿它定位。三条 lint 在烧像素之前判："
-    "声明了却没人读、读了却没声明、`<F>` 标的 value 不是这个字段自己的值\n"
+    "`<F name=\"…\" value={fields.…}>`（`F` 由 `@dg/film` 导出），字段级命中表拿它定位。"
+    "三条 lint 在烧像素之前判：声明了却没人读、读了却没声明、`<F>` 标的 value 不是"
+    "这个字段自己的值\n"
     "· 画法按题材选，不是装饰。四条**画法通道**：手绘斜纹 `roughjs`、真三维 `three` + "
     "`@react-three/fiber` + `@remotion/three`、公式 `katex`（+ 它的样式表）、几何与图示"
-    "（裸 `<svg>` 或 `@remotion/shapes`）。闸⑦ 数的是整片用了几种通道，而**只 import "
-    "一行而代码体里没用那个名字**不算用了这一条\n"
+    "（裸 `<svg>` 或 `@remotion/shapes`）。闸⑦ 是**逐镜**判的：每一镜都得用这四条里"
+    "至少一条画出东西来，只有文字与色块的镜打回；而**只 import 一行而代码体里没用"
+    "那个名字**不算用了这一条\n"
     "· 整片层还有两道也在烧像素之前判的闸：闸⑨ 不许三镜以上的代码骨架一模一样"
     "（剥掉文案字符串与颜色之后逐字相同＝只换了色相，那叫拼贴），闸⑩ 不许字色在"
     "这一镜写出的每一种底色上都低于 3:1（画面有字而观众读不出）\n"
-    "· 画面里得有能认出来的东西：闸④ 在**母版画面带内**按像素判空"
-    "（三帧带内非底色占比低于 2% 退回）")
+    "· 画面里得有能认出来的东西：闸④ 按像素判空（自包含镜按整帧，套母版的镜按母版"
+    "画面带；三帧非底色占比低于 2% 且内容没铺开就退回）")
 
 
 def spec_schema() -> dict[str, Any]:
@@ -3990,6 +4434,16 @@ def spec_schema() -> dict[str, Any]:
         "type": "object",
         "properties": {
             **knob_props(),
+            # 自由取色的那一维（见 :data:`COLOR_KNOBS`）**只在这里露面，不进
+            # :func:`knob_props`**。它是整片开关不假，但不属于「该摆在计划卡上让人勾」
+            # 的那一类：卡面每一项都要能反查到枚举源，自由色四样都不是，写进卡面参数
+            # 的后果是**整份计划被打回**。摆在 spec 这一份 schema 里有两个用处：
+            # 模型看得见这一栏存在（写 `palette.accent` 就够，见技能正文），以及启动期
+            # 那条一致性检查认得出它——技能正文点到 `highlight_color` 时不该被报成造工具名。
+            "highlight_color": {
+                "type": "string", "pattern": "^#[0-9a-f]{6}$",
+                "description": "高亮词那一块的色（#rrggbb）。留空＝这一镜跟自己那套色板的 "
+                               "accent；用户在「文字库」钉过时一律以用户的为准"},
             "qc": {"type": "string", "enum": list(QC_MODES),
                    "description": "质检档：preview（缺省，渲染前人看预览静帧，渲后像素闸只提醒）/ "
                                   "strict（无人值守，机器判据全部硬拦）"},
@@ -4015,7 +4469,13 @@ def spec_schema() -> dict[str, Any]:
                                "（min_duration_sec 给 1.5~2.5，代码画封面与落款就行）",
                 "items": {
                     "type": "object",
-                    "required": ["code", "text", "card", "derived_from", "subject"],
+                    # 只有这两样是**这一镜成立**的必要条件（没有代码就没有画面，没有文案
+                    # 就没有这一镜要说的话）。`card` / `derived_from` / `subject` 从
+                    # 2026-10-16 起是**选填**：卡库与 demo 是**供给**，不是义务——
+                    # 「提供 llm 所有的工具」与「逼 llm 每镜都用」是两件事，原来那个
+                    # required 把它们混成了一件。想照卡派生、想声明出处、想报主体，
+                    # 照旧写；不想，就不写。
+                    "required": ["code", "text"],
                     "properties": {
                         "id": {"type": "string",
                                "description": "镜号，省略则按顺序补 s01/s02…"},
@@ -4043,8 +4503,8 @@ def spec_schema() -> dict[str, Any]:
                         # 闸⑯ 的两栏（R5-T15）。subject 进 required：它是「这一镜画的是
                         # 什么东西」那句白纸黑字的话，缺了这一格，整片就退回「卡片+文字」
                         # 那个在评审里被驳回过的形态而我们事后判不出来。subject_channel
-                        # 不进 required——纯文字/纯色块镜（⑦ 允许的 ≤1/3）**不许**填它，
-                        # 填了就是自报无证据，所以它的必填性由 check_subject_named 按
+                        # 不进 required——每一镜都有自己的画法，填哪一条取决于**代码里
+                        # 真用了哪条**，所以它的必填性由 check_subject_named 按
                         # 「这一镜代码里有没有画法通道」逐镜定，schema 这一层写不出来。
                         "subject": {"type": "string", "maxLength": SUBJECT_MAX_CHARS,
                                     "description": "这一镜画面上**能被认出的那个东西**"
@@ -4054,26 +4514,13 @@ def spec_schema() -> dict[str, Any]:
                                                    "既画不出来也认不出来）"},
                         "subject_channel": {"type": "string", "enum": list(SUBJECT_CHANNELS),
                                             "description": "主体是用哪条画法通道画的"
-                                                           "（rough/three/katex/vector/image）。"
+                                                           "（rough/three/katex/vector）。"
                                                            "必须与代码里真用上的通道一致"
-                                                           "（闸⑯ 按代码对账）；这一镜只有"
-                                                           "文字与色块时**不要填**"},
-                        "assets": {"type": "array",
-                                   "description": "本镜引用的素材资产。每个声明 name/sha256/ext/source/alpha/layer。"
-                                                  "代码里用 staticFile(\"<name>\") 引用，lint 做双向对账。"
-                                                  "sha256 是全 64 位十六进制——渲染前按 sha256 从 asset_library 取字节、"
-                                                  "投到渲染容器 public/assets/<本镜镜号>/<name>",
-                                   "items": {"type": "object",
-                                             "required": ["name", "sha256", "ext"],
-                                             "properties": {
-                                                 "name": {"type": "string"},
-                                                 "sha256": {"type": "string",
-                                                            "description": "完整 sha256（64 位十六进制）"},
-                                                 "ext": {"type": "string"},
-                                                 "source": {"type": "object"},
-                                                 "alpha": {"type": "boolean"},
-                                                 "layer": {"type": "string", "enum": ["fg", "bg", "cutout"]},
-                                             }}},
+                                                           "（闸⑯ 按代码对账）"},
+                        # 2026-10-16 删掉了 `assets` 栏（每项 name/sha256/ext，
+                        # 渲染前按 sha256 从 asset_library 取字节投进渲染容器）。
+                        # 三条取材路拆掉之后没有任何东西能填进这一栏，而 schema 里
+                        # 留着它，等于在契约上给模型开一个「这里可以摆图」的出口。
                         "highlight": {"type": "array", "items": {"type": "string"},
                                       "maxItems": MAX_HIGHLIGHTS_PER_SHOT,
                                       "description": "逐词点亮的词，每个都必须是 text 的子串，"
@@ -4110,111 +4557,12 @@ def spec_schema() -> dict[str, Any]:
                                                        "每一个锚都得在触发帧的窗口内，"
                                                        "所以别把整句话的词都挂上来"},
                                 }}},
-
-                        # 闸㉘（R12-T59）。**挂在这一族里**（与 `motion` 并排，不另起
-                        # 一个「元素申报」的顶层口）：两者回答的是同一个问题的两侧——
-                        # `motion` 说「这条动效为哪条数据动」，`reveal` 说「这一块画面
-                        # 什么时候揭」。分成两个口，模型迟早会只写一个。
-                        #
-                        # **不进 required**：这一族风格（分区揭示）是可选画法，绝大多数
-                        # 片子不写它。真写了的那一镜，㉘ 逐条判它的几何与时序（判据在
-                        # `check_reveal_regions`，一次请求都不发就判完）。
-                        "reveal": {
-                            "type": "object",
-                            "description": "**分区揭示**：把画面当纸，一块一块按顺序画出来"
-                                           "（白板讲解风）。只在你要这一镜真的分块揭示时写，"
-                                           "不写＝这一镜不走这一族。写了就要写全三样："
-                                           "`canvas`（插画原图的像素尺寸，区域坐标以它为"
-                                           "单位）、`scene_duration_ms`（这一幕总长＝末段"
-                                           "结束＋停留，停留 ≤ "
-                                           f"{REVEAL_HOLD_MAX_MS} ms）、`regions[]`。"
-                                           "闸㉘ 判：整数像素坐标、区域不出 canvas、"
-                                           "sequence 从 1 连续不重复、幕内 start_ms 两两"
-                                           "不重叠、幕时长等式成立、protected 指得着；"
-                                           "闸㉗ 再拿真帧比色判「未开始的区域是不是还是"
-                                           "纸底」",
-                            "required": ["canvas", "scene_duration_ms", "regions"],
-                            "properties": {
-                                "canvas": {
-                                    "type": "object", "required": ["w", "h"],
-                                    "description": "插画**原图**的像素尺寸——区域坐标的"
-                                                   "坐标系。必须与你 `assets` 里那张图的真"
-                                                   "尺寸一致（渲染前按库里那一行核对，"
-                                                   "对不上直接退回）",
-                                    "properties": {"w": {"type": "integer"},
-                                                   "h": {"type": "integer"}}},
-                                "scene_duration_ms": {
-                                    "type": "integer",
-                                    "description": "这一幕的总长（毫秒）＝最后一段结束 + "
-                                                   "停留。这个等式是 ㉘ 的一条判据："
-                                                   "账上的时长要能一眼算出来"},
-                                "regions": {
-                                    "type": "array", "minItems": 1,
-                                    "description": "按揭示顺序的一块块元素。"
-                                                   "一块＝画面上一个矩形区域，"
-                                                   "按 direction 推进地把纸画满",
-                                    "items": {
-                                        "type": "object",
-                                        "required": ["id", "sequence", "region",
-                                                     "direction", "start_ms",
-                                                     "duration_ms"],
-                                        "properties": {
-                                            "id": {"type": "string",
-                                                   "description": "本镜内唯一的名字"
-                                                                  "（顺序、protected、回执"
-                                                                  "三处都按它指）"},
-                                            "label": {"type": "string",
-                                                      "description": "这一块画的是什么"
-                                                                     "（给人看的一句话）"},
-                                            "sequence": {"type": "integer",
-                                                         "description": "第几块，从 1 起、"
-                                                                        "连续、不重复"},
-                                            "narrative_role": {
-                                                "type": "string",
-                                                "description": "它在叙事里干什么"
-                                                               "（建立 / 对比 / 结论…）"},
-                                            "subtitle_ref": {
-                                                "type": "integer",
-                                                "description": "这一块与旁白第几个词对齐"
-                                                               "（从 1 起，与 "
-                                                               "`subtitle:<i>` 锚同一套"
-                                                               "序号）"},
-                                            "region": {
-                                                "type": "object",
-                                                "required": ["x", "y", "w", "h"],
-                                                "description": "画在哪：**整数像素**，"
-                                                               "坐标系是 `canvas`"
-                                                               "（半像素不收——不同画幅下"
-                                                               "取整方向不同，两处一取整"
-                                                               "就成了两把尺）",
-                                                "properties": {
-                                                    "x": {"type": "integer"},
-                                                    "y": {"type": "integer"},
-                                                    "w": {"type": "integer"},
-                                                    "h": {"type": "integer"}}},
-                                            "direction": {
-                                                "type": "string",
-                                                "enum": list(REVEAL_DIRECTIONS),
-                                                "description": "这一块往哪个方向推进："
-                                                               "ltr 左→右 / rtl 右→左 / "
-                                                               "ttb 上→下 / btt 下→上 / "
-                                                               "whole 整块一次显示"},
-                                            "start_ms": {"type": "integer",
-                                                         "description": "这一块从这一幕的"
-                                                                        "第几毫秒开始画"},
-                                            "duration_ms": {
-                                                "type": "integer",
-                                                "description": "画这一块用多少毫秒"},
-                                            "protected": {
-                                                "type": "array",
-                                                "items": {"type": "string"},
-                                                "description": "这一块**不许覆盖**的"
-                                                               "其它块 id——画到它们头上"
-                                                               "就说明顺序或坐标错了"
-                                                               "（㉗ 的允许掩码会把它们"
-                                                               "扣掉）"},
-                                        }}},
-                            }},
+                        # 2026-10-16 删掉了 `reveal` 栏（闸㉘ 判它的几何与时序、
+                        # ㉗ 拿真帧比色判「未开始的区域是不是还是纸底」）。它申报的
+                        # 主语是**一整幅 raster 插画**：`canvas` 要与库行 width/height
+                        # 对账、区域坐标以插画像素为单位。画面上屏那条路没了，这一栏
+                        # 也就没有对象——所以整块摘掉，而不是留着让模型申报一个没人
+                        # 读的栏。
                         "fields": {
                             "type": "array", "maxItems": MAX_FIELDS_PER_SHOT,
                             "description": "这一镜**交出去给用户改的旋钮**（≤12 个）：把将来"
@@ -4331,23 +4679,20 @@ def spec_schema() -> dict[str, Any]:
                                                       "时长沿用整片 `transition_sec`。"
                                                       "**换它不重烧任何一镜**：转场跑在拼接"
                                                       "那一趟，逐镜切片一个字节都不动"},
-                        "subtitle_mode": {"type": "string",
-                                          "enum": list(SUBTITLE_MODES),
-                                          "description": "**这一镜**的字幕形态"
-                                                         "（可省略＝跟整片 `subtitle_mode`）。"
-                                                         "用途：整片走 `torn_highlight`，但某几镜"
-                                                         "要 `inline`（文字进画面、随构图摆）或"
-                                                         "要 `none`（整屏插画，不想压字）。"
-                                                         "**它与整片那一档都会进缓存键**"
-                                                         "（字幕带是母版画进切片里的）"},
-                        "caption_position": {"type": "string",
-                                             "enum": list(CAPTION_POSITIONS),
-                                             "description": "**这一镜**的字幕位置（可省略＝跟整片）。"
-                                                            "主体在下半屏时放 top，整屏插画留白在中间时放 center"},
-                        "caption_anim": {"type": "string",
-                                         "enum": list(CAPTION_ANIMS),
-                                         "description": "**这一镜**的字幕入场动画（可省略＝跟整片）。"
-                                                        "金句/结论镜用 pop 或 karaoke 加强"},
+                        "caption_style": {"type": "string",
+                                          "enum": list(CAPTION_STYLES),
+                                          "description": "**这一镜**的字幕样式"
+                                                         "（可省略＝跟整片 `caption_style`）。"
+                                                         "用途：整片走 `on_picture`（字贴画面、"
+                                                         "无底条），但某几镜要 `none`（整屏插画、"
+                                                         "不想压字）或 `big_center`（一句话就是"
+                                                         "全片重点）。**它与整片那一档都会进"
+                                                         "缓存键**（字幕是画进切片里的）"},
+                        "highlight_style": {"type": "string",
+                                            "enum": list(HIGHLIGHT_STYLES),
+                                            "description": "**这一镜**的高亮样式（可省略＝跟整片）。"
+                                                           "被点名的词怎么被点出来：换字色 / 逐词点亮 "
+                                                           "/ 底色块 / 纸感笔触 / 不强化"},
                         "source": {"type": "object",
                                    "description": "出处 {\"标题\": …, \"链接\": …}。机器不判真伪，"
                                                   "它如实出现在分镜卡与逐镜账上（不进画面）。"

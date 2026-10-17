@@ -7,7 +7,7 @@
 Q113 那条——``undetermined`` **并阻断出片**。所以这个模块缺席的表现不是「少一个功能」，
 是**每一片有红镜的片子都出不来**。本模块把那个洞堵上。
 
-**两件事，一条通道。**
+**三件事，一条通道。**
 
 1. **帧通道（T31）**：``judge_frame`` 把一镜的 ``frame.png`` + 母版量到的五栏几何读数 +
    既有闸判它红/未判的**原文** + 那一镜的 spec（含现有代码）一起递过去，拿回一份**代码
@@ -16,6 +16,9 @@ Q113 那条——``undetermined`` **并阻断出片**。所以这个模块缺席
 2. **静帧审美评审（层 D2）**：``review_still`` 把闸④ 从「带子里有没有东西」抬到
    「画得好不好」。闸④ 是**机器判据**（像素非空），它天生判不了构图失衡、元素重叠、
    廉价光效；这一半补的就是那句「好看吗」。
+3. **⑲-b 身份判据**：``judge_identity`` 判**画面上那个东西是不是文案说的那个**
+   （``blind_read`` 先盲描述，再拿申报的 ``subject`` 去比）。⑯ 明写着自己判不动这一格，
+   闸㉝ 只判「有没有落到一个具名件上」——「必需像」这句话落在判据上的唯一形状是看画面。
 
 **裁决那一半复用既有客户端，不另起一个。** 静帧评审走 ``agent_framework.judge`` 的
 ``judge()``（``secrets.py`` 那套身份/键位、页面配置压过 env、热读）——Q90/Q91 反复点的
@@ -194,12 +197,14 @@ def _unwrap(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 _SYSTEM = """你是这个视频项目里的**镜头代码医生**。你收到的是一镜**已经渲出来的画面**、
-母版在像素上量到的几何读数，以及既有闸判它红/未判的原文。你的唯一任务是：**改这一镜的
+从画面像素量到的几何读数（只有套了母版的镜才有读数，自包含的镜没有——**不要**把「没有
+读数」当成画面是空的），以及既有闸判它红/未判的原文。你的唯一任务是：**改这一镜的
 代码**，让画面同时满足「闸不红了」与「画面本身站得住」。
 
 硬约束（违反其中任何一条，你的提案会被打回，等于这一轮白花）：
 · 交出来的必须是**完整可落盘的一份 TSX**，`export default` 一个组件；
-· 组件必须包在 `<FilmLayout>` 里（母版是唯一 Composition，它独占底色/画面带/字幕带）；
+· 组件**自包含**：顶层是 `<AbsoluteFill>`，底色/构图/字号/字幕位都由这一镜自己定；
+  母版 `<FilmLayout>` 已下线，不要 import 它（`@dg/film` 现在只是字幕与小组件的零件包）；
 · 只改这一镜；不要动别的镜的代码，不要新增依赖，不要 import 项目里没有的模块；
 · 逐帧纯函数：不许 `Date.now()`、`Math.random()`、网络请求；
 · 代码 ≤ 40000 字节。
@@ -224,10 +229,11 @@ def _user_text(*, sid: str, reasons: Sequence[str], columns: Mapping[str, Any] |
     if terms_field and subject_terms:
         lines.append(f"这一镜申报的词族（{terms_field}）：{subject_terms}")
     if col:
-        lines.append("母版量到的几何读数：" + "、".join(
+        lines.append("从画面量到的几何读数（套母版的镜才有）：" + "、".join(
             f"{k}={v}" for k, v in col.items()))
     else:
-        lines.append("母版这一趟没量到几何读数（**不要**据此以为画面是空的）")
+        lines.append("这一趟没量到几何读数（自包含的镜本来就没有，**不要**"
+                     "据此以为画面是空的）")
     if reasons:
         lines.append("既有闸判它红/未判的原文（逐条照抄，别改写）：")
         lines += [f"  {i}. {r}" for i, r in enumerate(reasons, 1)]
@@ -513,17 +519,164 @@ async def review_still(*, shot: Mapping[str, Any] | None = None, image: Any = No
 
 
 # ---------------------------------------------------------------------------
+# ④ ⑲-b 身份判据（盲描述）：画面上那个东西，是文案说的那个吗
+# ---------------------------------------------------------------------------
+# 这一条填的是**⑯ 明写着自己判不动的那一格**：闸⑯ 只问「这一镜有没有申报一个具名的
+# 主体、那个通道在代码里有没有证据」，它**判不了画出来的那个东西像不像**申报的主体。
+# 静态那半（闸㉝）能判「有没有落到库里一个具名件上」，也判不了「像不像」。
+# 「必需像」这句话落在判据上的唯一形状就是**看画面**——所以在这一层。
+
+#: 本模块的第二个入口名。``review_loop`` 按这个名字探它，与
+#: :data:`ENTRY_NAME` 同一条纪律：探测与调用必须问同一个名字。
+IDENTITY_ENTRY = "judge_identity"
+
+#: 盲描述的问句。**「盲」是这一条的全部**：不告诉它 ``subject`` 是什么，
+#: 它就无从把申报的东西复述回来。先问「你看见了什么」，再拿申报的去比。
+#: 反过来（先把 subject 递过去、问「像不像」）拿回来的是一句**附和**——
+#: 那条路上，画成一团乱麻也有一半概率被夸「抓住了神韵」。
+_BLIND_SYSTEM = (
+    "你是这一镜画面的**观察员**。只看画面，如实说出你看见了什么。"
+    "**不要猜这张图想画什么**，不要评价，不要给建议。只回一个 JSON 对象，不要别的字：\n"
+    '{"thing": "<画面里最显眼的那件东西是什么，用日常说法，不超过 20 字>",'
+    '"kind": "<它属于哪一类：人 / 器物 / 建筑 / 车辆 / 图表 / 符号 / 文字块 / 说不清>",'
+    '"others": ["<画面上另外还有哪些可辨认的东西；没有就空数组>"],'
+    '"readable": <能不能一眼看出这件事物是什么，true/false>}'
+)
+
+#: 身份问句。极性跟着 ``judge()`` 的语义走（``verdict=True`` ＝ 与事实矛盾／违反），
+#: 与 ``review_still`` 的「是否违反」逐字同规：**不像 ＝ true**。
+_IDENTITY_QUESTION = (
+    "下面那段描述出自**另一个人**：他只看画面，不知道这一镜的文案。\n"
+    "这一镜的文案点到的主体是「{subject}」。请判断：他看见的那件东西**不是**这个主体吗？\n"
+    "判法：类别与标志物对得上就算**是那个主体**（简笔画求达意不求写实——"
+    "「蒸汽机」画成锅炉加烟囱加飞轮，是对得上的；「一个人」画成一根线挑着一个头，也对得上）；"
+    "明显是别的东西（说的是机器、画出来让人看不出是什么；说的是人、画的是一列方块）"
+    "就是**不是**。\n"
+    "只判身份，不判画得好不好（那是另一条判据）。不是＝true；是＝false。"
+)
+
+
+async def blind_read(image: Any) -> dict[str, Any] | None:
+    """帧 → **盲描述**（``thing`` / ``kind`` / ``others`` / ``readable``）。失败 → ``None``。
+
+    它是 ⑲-b 的「眼」，与 ``read_frame`` 是**两问**而不是一问：``read_frame`` 问的是
+    「有没有一个明确的主体」（一个布尔），这一问问的是「那个东西是什么」。
+    合并成一问的后果是模型会顺手把「像不像」也答了，而那时判据面根本没被用上——
+    与 ``review_still`` 那条「两段各干各的」同一条理由。
+
+    输入里**没有** ``subject``：这一层看不见答案，也就无从附和。
+    """
+    url = _data_url(image)
+    if not url:
+        return None
+    messages = [{"role": "system", "content": _BLIND_SYSTEM},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "画面上有什么？按格式回 JSON。"},
+                    {"type": "image_url", "image_url": {"url": url}}]}]
+    try:
+        resp = await _llm().complete(messages)
+    except Exception:             # noqa: BLE001 —— 读不到帧就是未判，不阻塞交付
+        return None
+    content = str(getattr(resp, "content", "") or "")
+    m = re.search(r"\{.*\}", content, re.S)
+    if not m:
+        return None
+    try:
+        got = json.loads(m.group())
+    except Exception:             # noqa: BLE001
+        return None
+    if not isinstance(got, Mapping):
+        return None
+    keep = ("thing", "kind", "others", "readable")
+    out = {k: got.get(k) for k in keep if k in got}
+    return out or None
+
+
+async def judge_identity(*, shot: Mapping[str, Any] | None = None, image: Any = None,
+                         user_id: str = "") -> dict[str, Any]:
+    """一镜的 ⑲-b 裁决：**画面上那个东西是文案说的那个吗**。
+
+    → ``{"verdict": bool|None, "confidence": float, "reason": str, "subject": str,
+    "blind": dict|None, "by": str, "why": str}``
+
+    ``verdict=True`` ＝ **不像**（画面上那个东西不是申报的 ``subject`` 说的那个）；
+    ``False`` ＝ 像；``None`` ＝ **未判**（没帧 / 这一镜没申报 subject / 读不到 /
+    调用失败 / 低置信）。极性跟着 ``judge.py`` 的「与事实矛盾」走，与 ``review_still``
+    逐字同规，调用方不必在这里再翻译一次。
+
+    **三条出路各有各的话，不许合并**（P5 / D-未判不绿）：
+
+    * ``readable=false``（观察员说这件东西认不出是什么）→ **直接判不像**，不再花第二次
+      调用。理由就是用户那句话：「必需像」——一个看画的人说不出画的是什么，它就不像。
+      这一条**不走**裁决通道，所以 ``by="blind"`` 与 ``by="judge"`` 必须分得开：
+      「两个模型比出来的」与「一个模型说认不出」是两件事，回执上不能长成同一句话。
+    * 观察员看清楚了、但裁决通道没配／调用失败 → 未判。**不许**把「看不出来」
+      折算成「像」，也不许把「没配」折算成「不像」。
+    """
+    spec = dict(shot or {}) if isinstance(shot, Mapping) else {}
+    subject = str(spec.get("subject") or "").strip()
+    blank: dict[str, Any] = {"verdict": None, "confidence": 0.0, "reason": "",
+                             "subject": subject, "blind": None, "by": "", "why": ""}
+    if not subject:
+        return {**blank, "why": ("这一镜没有申报 `subject`（闸⑯ 会拦这一格）——"
+                                 "⑲-b 无从比「像不像」，记未判")}
+    # 先问裁决通道在不在**再读帧**：反过来的话，没配判断模型时这一条会替每一镜白花一次
+    # 带图调用（`judge_ready` 是免费的），而「没配置＝完全不启用」是这一层的纪律。
+    mod = _judge_module()
+    ready, why = await _judge_ready(mod)
+    if not ready:
+        return {**blank, "why": why}
+    blind = await blind_read(image)
+    if blind is None:
+        return {**blank,
+                "why": ("这一镜的画面没读到（没帧，或盲描述那一次调用失败）——"
+                        "记未判，不许拿「没量到」当「像」")}
+    # 认不出是什么 ＝ 不像。这一条不必再问一次裁决通道：观察员自己就说了认不出。
+    if blind.get("readable") is False:
+        thing = str(blind.get("thing") or "").strip() or "说不清是什么"
+        return {"verdict": True, "confidence": 1.0, "subject": subject, "blind": blind,
+                "by": "blind", "why": "",
+                "reason": (f"只看画面的人说不出画的是什么（他说的是「{thing}」）——"
+                           f"文案点到的主体是「{subject}」，这一镜的画面认不出它")}
+    text = "；".join(x for x in (
+        f"文案：{spec.get('text')}" if spec.get("text") else "",
+        f"申报的主体：{subject}",
+        "另一个人只看画面写下的描述：" + json.dumps(blind, ensure_ascii=False)) if x)
+    question = _IDENTITY_QUESTION.format(subject=subject)
+    try:
+        v = await mod.judge(question, text=text,
+                           facts={"shot": spec.get("id"), "subject": subject,
+                                  "blind": blind}, user_id=user_id)
+    except Exception as exc:      # noqa: BLE001 —— 任何失败＝未判，绝不阻塞交付
+        return {**blank, "blind": blind,
+                "why": f"⑲-b 裁决调用失败（{type(exc).__name__}: {str(exc)[:160]}）——记未判"}
+    if not v:
+        return {**blank, "blind": blind,
+                "why": "裁决没给出可用结论（没配置 / 调用失败 / 置信度不够）——"
+                       "记未判，**不许**折算成「像」"}
+    return {"verdict": bool(v.get("verdict")), "confidence": float(v.get("confidence") or 0.0),
+            "reason": str(v.get("reason") or ""), "subject": subject, "blind": blind,
+            "by": "judge", "why": ""}
+
+
+# ---------------------------------------------------------------------------
 # 能力：如实报两半
 # ---------------------------------------------------------------------------
 
 async def capability() -> dict[str, Any]:
-    """本模块的两半各自在不在。**只读、只描述**，不拦任何东西。
+    """本模块的几半各自在不在。**只读、只描述**，不拦任何东西。
 
     ``frame`` 恒为真（模块能 import 就说明入口在，``review_loop`` 那一侧也按同一事实探）。
+    ``identity`` 报的是 ⑲-b 那个入口在不在——与 ``frame`` 同一条理由：**探测与调用必须问
+    同一个名字**，名字漂了就会出现「探测说在、调用说没有」。
     ``judge`` 报的是裁决通道——与 ``review_loop.capability()`` 同一句为什么，
     因为它们是同一件事的两次读法，两处措辞漂了就会出现「回看环说没配、评审说能跑」。
     """
-    out: dict[str, Any] = {"gate": GATE, "frame": True, "judge": False, "why": ""}
+    out: dict[str, Any] = {"gate": GATE, "frame": True, "judge": False, "why": "",
+                           "identity_why": ""}
+    out["identity"] = callable(globals().get(IDENTITY_ENTRY))
+    if not out["identity"]:
+        out["identity_why"] = f"本模块没有 ⑲-b 入口 `{IDENTITY_ENTRY}`"
     ready, why = await _judge_ready(_judge_module())
     out["judge"] = ready
     out["why"] = why

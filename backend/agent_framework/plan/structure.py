@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 from .support import PlanIssues, clean
 from .vocab import PlanVocabulary
@@ -42,65 +42,15 @@ class StructureChecks:
                     issues.error(f"计划 {tag} 第 {step['seq']} 步（{step['node']}）"
                                  f"排在它的前置「{dep}」之前，与 DAG 契约冲突。")
 
-    def explicit_deps(self, tag: str, steps: list[dict[str, Any]],
-                      issues: PlanIssues, *,
-                      hints: Mapping[str, str] | None = None) -> None:
-        """卡上必须列出「不会自动补齐」的前置，否则执行轮跑到那一步必炸。
-
-        执行期拦截器**只**自动补齐没标 ``require_explicit_call`` 的依赖；标了的那几个
-        （``filter_clips`` / ``group_clips`` / ``script_template_rec`` / ``transition_rec``
-        / ``text_rec``）一旦缺失就抛 ValueError：
-
-            group_clips 需要你直接调用并传入创意决策参数，不能自动补齐。
-
-        真机实测：p1 卡只列了 ``group_clips`` 却漏了 ``script_template_rec``，
-        执行到 ``generate_script`` 被拦下——用户已经点过确认，却注定失败。
-
-        ``topology`` 写明「前置没上卡是允许的（拦截器会补齐）」，
-        这对可自动补齐的依赖成立；对这几个不成立，所以补这一道。
-
-        查的是**传递闭包**，而且要**穿过没上卡的中间节点**：真机三张卡都是
-        ``select_BGM → generate_script → script_template_rec``（最后一个不可补齐），
-        中间那个自己不是，但它踩着一个是的。
-
-        ``hints`` 是「缺的那个节点本身能配什么开关」（``PlanValidator._explicit_knob_hints``）。
-        为什么要随这句忠告一起给（真机实测，14 镜「薄肌理论」那条 run）：光说「把它也写进
-        steps」，模型补上步骤时会顺手给这个从没用过的节点**造**开关——三个前置各造一个
-        （``grouping`` / ``keep`` / ``template``），下一枪的 21 条意见里 9 条是这么来的。
-        **上一枪的忠告生产了下一枪的错误**，而 `max_retries=1` 只给两次机会。
-        拿不到事实（没接词表 / 契约没接上）时这一段自动省略，退回原措辞。
-        """
-        explicit = self.vocab.explicit_call_nodes()
-        if not explicit:
-            return                  # 契约没接上／没有这类节点：退回原行为
-        present = {s["node"] for s in steps}
-        # 按**缺的那个节点**去重：一张卡漏一个 script_template_rec，下游三个步骤都会
-        # 撞上它，三条几乎一样的话只会把清单挤满（补一个节点三处都解决）。
-        # 取最先撞上的那一步当锚点——步骤序就是拓扑序，它排在那之前即可。
-        reported: set[str] = set()
-        for step in steps:
-            queue: list[str] = list(step["requires"])
-            seen: set[str] = set()
-            while queue:
-                dep = queue.pop(0)
-                if dep in seen:
-                    continue
-                seen.add(dep)
-                if dep not in present and dep in explicit and dep not in reported:
-                    reported.add(dep)
-                    issues.error(
-                        f"计划 {tag} 的步骤「{step['node']}」依赖「{dep}」，"
-                        f"但 {dep} 不会自动补齐（它需要你传入创意决策参数）。"
-                        f"请把 {dep} 也写进这张计划的 steps，排在 {step['node']} 之前。"
-                        f"{(hints or {}).get(dep, '')}")
-                # 没上卡的中间节点**也要继续顺着它的前置查**：原先这里 `continue`
-                # 直接掐断，于是上面那种写法一路放行，卡面看着齐全，用户点完确认
-                # 跑到 select_BGM 才被执行期拦下。执行期的
-                # ``Interceptor._ensure_deps`` 是递归穿过没跑过的中间节点的，
-                # 校验必须与它同口径，否则等于没拦。
-                contract = self.vocab.contract.get(dep)
-                if contract is not None:
-                    queue.extend(contract.requires)
+    # 2026-10-16 删掉了 `explicit_deps`（「标了 require_explicit_call 的前置必须
+    # 写进 steps，否则打回」）。它守的是执行期那个报错，而那个报错本身撤了
+    # ——架构总纲里只有「拦截器递归补齐」，没有「某些节点必须显式调用否则报错」
+    # 这一条，它是全仓唯一一处超出文档的硬约束（见 `orchestration.Interceptor`
+    # 的 `_ensure_deps` / `_annotate`）。判据撤了，这条校验就没有守的对象：
+    # 留着它只会继续把「没把某几步写进卡」当成错误，而它已经只是一种写法。
+    # 那几步仍然**值得**写进卡（写进去才由你定参数，不写就按默认值补）——
+    # 这句话归规划轮提示段（`prompt._explicit_nodes`）与工具说明（`mcp._desc_tail`），
+    # 它们给的是建议，不再是一条会把卡打回的规则。
 
     def skip_rules(self, tag: str, steps: list[dict[str, Any]],
                    issues: PlanIssues) -> None:

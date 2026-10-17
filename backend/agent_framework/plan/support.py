@@ -51,7 +51,7 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 两者都不是入参键，schema 扫不出来，不收就是假告警——技能正文教模型「拖镜头长度
     # 改的是 min_duration_sec」，被拦下来模型只能换个说法，读者反而看不到真字段名。
     "min_duration_sec", "before_frames",
-    # 闸⑦（整片风格配额）与闸④ 的第二半（带内填充度）的产物键：技能正文教模型
+    # 闸⑦（每镜必画）与闸④ 的第二半（带内填充度）的产物键：技能正文教模型
     # 「照 style_channels 说出这版用了哪几条画法通道」「fill_warnings 那几镜要重排」，
     # 这些值只出现在回执与分镜账里，schema 扫不出来，不收就是假告警。
     "style_channels", "style_text_only", "style_warnings",
@@ -61,13 +61,6 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 技能正文教模型「有告警就照条目点名、有没扫的镜就如实说没验过」，这两个键只活在回执里，
     # schema 扫不出来，不收就是假告警。
     "layout_warnings", "layout_unscanned",
-    # 闸⑬（资产存在且非纯色）的产物键，与上一栏同形同理由：assets_warnings 是逐镜带镜号
-    # 的人话（哪一件素材被拒、错在哪），assets_unjudged 点名的不是「这一镜的图没问题」
-    # 而是「这一镜没人验过」。技能正文教模型「被判据拒的镜要点名说图上不了屏、未判的镜
-    # 要如实说没验过」，这两个键只活在回执里，schema 扫不出来，不收就是假告警——
-    # 而这一栏比版面那栏更刺眼：模型嘴上说着「画面主体已核实」而账上写着未判，
-    # 正是 D-未判不绿 要防的那件事。
-    "assets_warnings", "assets_unjudged",
     # 闸⑭（动效事件密度）的产物键，与上两栏同形同理由：motion_warnings 是逐镜带镜号的人话
     # （「像素上数不出先后动」是哪一镜、数到几段、最紧一对隔多少帧），motion_unjudged 点名
     # 的不是「动效没问题」而是「这一镜的动效没人判过」（抽帧拿不到 / 容器比判据旧）。
@@ -82,18 +75,6 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 同一形状：`vocab.props_for` 只扫顶层，嵌套键扫不出来，不收就是假告警）。
     "motion_anchor_warnings", "motion_anchor_unjudged",
     "motion", "anchors", "kind",
-    # 闸㉗（分区揭示的时序一致，R12-T61）的产物键 + 它那一族**分镜 schema 的嵌套键**。
-    # `reveal_declared_shots` / `reveal_unjudged` 是整片账里那两栏（「申报了几镜」与
-    # 「哪几镜没判过」），技能正文要教模型照它们如实复述——这一栏比上面几栏更刺眼：
-    # 模型嘴上说「揭示时序已核」，而账上写着未判，正是 D-未判不绿 要防的那件事。
-    # 后面那一串（`reveal`/`canvas`/`scene_duration_ms`/`regions`/`region`/`direction`/
-    # `start_ms`/`duration_ms`/`protected`/`sequence`/`label`/`narrative_role`/`subtitle_ref`）
-    # 与 `motion`/`anchors`/`kind` 同一形状：它们在**分镜 schema 里**（不是臆造名），
-    # 但计划文案的词表只扫工具 schema 的顶层键，分镜里那层扫不到，不收就是假告警。
-    "reveal_declared_shots", "reveal_unjudged",
-    "reveal", "canvas", "scene_duration_ms", "regions", "region", "direction",
-    "start_ms", "duration_ms", "protected", "sequence", "label",
-    "narrative_role", "subtitle_ref",
     # 闸⑮（版式族配额）与闸⑯（主体具名）的产物键：技能正文要教模型「每镜写清 subject
     # 与 subject_channel」，卡面的逐镜账里这两栏与 style（代码里认得的通道）并排摆着。
     # `subject`/`subject_channel` **在 plan_motion 的 schema 里**（不是臆造名），但

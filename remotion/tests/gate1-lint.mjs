@@ -20,14 +20,19 @@ export const UserShot = () => {
 };
 `;
 
-const unwrapped = `import React from 'react';
-import { useCurrentFrame } from 'remotion';
-export const UserShot = () => <div>{useCurrentFrame()}</div>;
-`;
-
-const noWrapImportOnly = `import React from 'react';
-import { FilmLayout } from '@dg/film';
-export const UserShot = () => <div>hi</div>;
+/** 自包含镜：顶层直接是 `<AbsoluteFill>`，不 import 也不包母版。
+ *  母版下线那一轮之前这形状是**红**的（`dg/must-wrap-film-layout`），现在是**正解**——
+ *  起手模板就是这个形状，闸① 只留「合法镜头」那几条（白名单、导出、动效、字体）。 */
+const selfContained = `import React from 'react';
+import { AbsoluteFill, interpolate, useCurrentFrame } from 'remotion';
+import { E } from '@dg/motion';
+const _t = E.linear(0);
+const Shot = () => {
+  const frame = useCurrentFrame();
+  const op = interpolate(frame, [0, 20], [0, 1], { extrapolateRight: 'clamp' });
+  return <AbsoluteFill style={{ backgroundColor: '#f6f1e4', opacity: op }}><div>hi</div></AbsoluteFill>;
+};
+export default Shot;
 `;
 
 const noExportAtAll = `import React from 'react';
@@ -182,12 +187,14 @@ const Shot = () => <FilmLayout><div style={{ fontFamily: '"Noto Sans SC", sans-s
 export default Shot;
 `;
 
-/** 绿：webfont 字族由**母版**加载（`@dg/film` 副作用 import `@dg/fonts`），
+/** 绿：webfont 字族由**根文件**加载（`src/entry.tsx` 副作用 import `@dg/fonts`），
  *  所以镜头自己不写 loadFont 也不该被误杀——它是「随镜像发的字族」，
  *  不是「这个文件加载的字族」。当初把判据写成「同文件必须 loadFont」的话，
- *  这一条就会红，而它红得没有道理：母版是硬性包裹层，每一镜都带着它。 */
-const webFontFromFilm = `${FIELDS_HEAD}
-const Shot = () => <FilmLayout><div style={{ fontFamily: '"Noto Sans SC", sans-serif' }}>hi</div></FilmLayout>;
+ *  这一条就会红，而它红得没有道理：注册表挂在每一镜都必经的那个根上。
+ *  （母版下线之前它挂在 `FilmLayout` 上——那正是「不套母版就没字」的那条暗沟，
+ *  随母版一起挪到了根文件。） */
+const webFontFromRoot = `${FIELDS_HEAD}
+const Shot = () => <div style={{ fontFamily: '"Noto Sans SC", sans-serif' }}>hi</div>;
 export default Shot;
 `;
 
@@ -232,28 +239,22 @@ const Shot = () => <FilmLayout><div>hi</div></FilmLayout>;
 export default Shot;
 `;
 
-/** 素材：staticFile 引用的名字与「本镜声明 + 真投递」两份账逐一对上（R2-T6）。
- *
- *  为什么要两份账、且要**两句不同的**拒绝理由：名字写成代码里没有的那个，是模型自己
- *  编的（改代码就行）；名字声明了、投递腿却没把字节送进容器，是链路的错（改代码没用）。
- *  一句「资产不存在」把这两件事糊在一起，拿到它的人只能靠猜该动哪边。
- */
-const ASSET_HEAD = `import React from 'react';
+// ---- `staticFile` 只许指字体（R2-T6 退化后的那一半）----
+// 供图通道撤掉后，随镜铺进 `public/` 的只剩 `fonts/`，`staticFile` 还能指的也就剩字体。
+// 一条红一条绿：绿的那条证「字体照旧放行」，红的那条证「别的名字真被打回」——
+// 只测绿的那一侧等于没测，规则写错成「永远通过」和写对，打印出来一模一样。
+const FONT_ONLY_HEAD = `import React from 'react';
 import { staticFile } from 'remotion';
 import { FilmLayout } from '@dg/film';
 import { E } from '@dg/motion';
 const _t = E.linear(0);
 `;
-/** 绿：引用了声明里有的名字，而且那件确实投到了。 */
-const assetOk = `${ASSET_HEAD}const Shot = () => <FilmLayout><img src={staticFile("chart.png")} /></FilmLayout>;
+/** 绿：只指字体——这一镜 public/ 里随镜像发出去的那个命名空间。 */
+const staticFontOk = `${FONT_ONLY_HEAD}const Shot = () => <FilmLayout><img src={staticFile("fonts/NotoSansSC-000.woff2")} /></FilmLayout>;
 export default Shot;
 `;
-/** 红：staticFile 的名字不在本镜声明里（模型编的）。 */
-const assetUndeclared = `${ASSET_HEAD}const Shot = () => <FilmLayout><img src={staticFile("ghost.png")} /></FilmLayout>;
-export default Shot;
-`;
-/** 红：名字声明了，manifest 里却没有它——声明与投递是两条腿，这条说的是第二条断了。 */
-const assetDeclared = `${ASSET_HEAD}const Shot = () => <FilmLayout><img src={staticFile("chart.png")} /></FilmLayout>;
+/** 红：指了一张图。供图通道没了，运行时它根本不在，画出来是空的——摆一张图不叫画。 */
+const staticNonFont = `${FONT_ONLY_HEAD}const Shot = () => <FilmLayout><img src={staticFile("logo.png")} /></FilmLayout>;
 export default Shot;
 `;
 
@@ -266,8 +267,7 @@ const has = (rule, like) => (e) =>
 const cases = [
   ['起手模板（必须绿）', template, (e) => e.length === 0],
   ['违规样本（必须红，且逐条命中）', bad, null],
-  ['没有母版 import（必须红 noImport）', unwrapped, (e) => e.some((x) => x.rule === 'dg/must-wrap-film-layout')],
-  ['有 import 但没包裹（必须红 noWrap）', noWrapImportOnly, (e) => e.some((x) => x.msg.includes('顶层 JSX'))],
+  ['自包含镜（不包母版，必须绿）', selfContained, (e) => e.length === 0],
   // 契约（_CODE_DOC）教的是「顶层一个默认导出」，entry.tsx 也必须认这一种，
   // 否则模型照文档写出来的镜头会走到 Remotion 内部报「component 收到 undefined」
   ['只有 export default（契约教的写法，必须绿）', defaultOnly, (e) => e.length === 0],
@@ -286,7 +286,7 @@ const cases = [
     (e) => e.some((x) => x.rule === 'dg/font-family-whitelist')],
   ['字体：白名单字族（必须绿）', okFont, (e) => e.length === 0],
   ['字体：随镜像发的 webfont 字族 + 真加载（必须绿）', webFontOk, (e) => e.length === 0],
-  ['字体：webfont 字族由母版加载，镜头不 import 也不误杀（必须绿）', webFontFromFilm,
+  ['字体：webfont 字族由根文件加载，镜头不 import 也不误杀（必须绿）', webFontFromRoot,
     (e) => e.length === 0],
   ['字体：名字长得像但不是（必须红 逐字相等不是前缀）', webFontNearMiss,
     has('dg/font-family-whitelist', '不在镜像字体白名单内')],
@@ -298,6 +298,9 @@ const cases = [
     has(FONT_LOAD, '没有这个文件')],
   ['字体：loadFont 的 format 与后缀对不上（必须红 格式）', fontBadFormat,
     has(FONT_LOAD, '对不上')],
+  ['staticFile：只指字体（必须绿）', staticFontOk, (e) => e.length === 0],
+  ['staticFile：指了非字体（必须红 staticfile-font-only）', staticNonFont,
+    has('dg/staticfile-font-only', '指的不是字体')],
 ];
 
 let fail = 0;
@@ -309,25 +312,6 @@ for (const [name, code, predicate, declared] of cases) {
   if (name.startsWith('违规') && r.ok) { console.log('  !! 违规样本竟然过了'); fail++; }
 }
 
-// 素材那三条单开一轮：它们要传第四个参数（投递账 staged），与上面那批的调用形状不同。
-// 三条各自的**红法**才是重点：编的名字要判成「没声明」，真名字没投上去要判成「没投递」，
-// 而且必须是**两句不同的话**——合成一句就等于把「改代码」和「修链路」混成同一个待办。
-const ASSET_RULE = 'dg/staticfile-asset-check';
-const assetCases = [
-  ['素材：声明了且投到了（必须绿）', assetOk, ['chart.png'], ['chart.png'], (e) => e.length === 0],
-  ['素材：staticFile 引用了没声明的名字（必须红 未声明）', assetUndeclared, ['chart.png'],
-    ['chart.png'], has(ASSET_RULE, '未声明')],
-  ['素材：声明了但没投到容器（必须红 没投到渲染容器）', assetDeclared, ['chart.png'],
-    [], has(ASSET_RULE, '没投到渲染容器')],
-  ['素材：投递账看不见（staged=null，只问代码合规的口）→ 不误杀，绿',
-    assetDeclared, ['chart.png'], null, (e) => e.length === 0],
-];
-for (const [name, code, assets, staged, predicate] of assetCases) {
-  const r = await lintShotCode(code, [], assets, staged);
-  console.log(`\n=== ${name} → ok=${r.ok}`);
-  for (const e of r.errors) console.log(`  [${e.rule}] ${e.line}:${e.column} ${e.msg.slice(0, 70)}`);
-  if (predicate && !predicate(r.errors)) { console.log('  !! 不符合预期'); fail++; }
-}
 console.log(fail === 0 ? '\nPASS' : `\nFAIL ${fail}`);
 // 构建层末尾用的是本脚本的退出码（`node tests/gate1-lint.mjs`）。只打印不改码
 // 等于闸① 的红用例失败了镜像照样烤成功——那层「硬验」就白写了。

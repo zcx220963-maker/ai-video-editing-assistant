@@ -13,15 +13,11 @@ import { dgPlugin, RESTRICTED_GLOBALS, RESTRICTED_SYNTAX } from './lint-rules.mj
  */
 const eslintFor = (() => {
   const cache = new Map();
-  return (declared, assets = [], staged = null) => {
-    // staged 也进缓存键：同一镜返工前后可能一件素材都没投上，配置必须跟着变。
-    // `null` 与 `[]` 在这里是两个不同的键（`\u0000` 前缀区分），不能混。
-    const key = declared.join('\u0000') + '@' + assets.join('\u0000')
-      + '@' + (staged === null ? '\u0000null' : staged.join('\u0000'));
+  return (declared) => {
+    const key = declared.join('\u0000');
     let inst = cache.get(key);
     if (inst) return inst;
     const fieldOpts = () => ['error', { declared }];
-    const assetOpts = () => ['error', { declared: assets, staged }];
     inst = new ESLint({
       overrideConfigFile: true,
       overrideConfig: {
@@ -35,7 +31,6 @@ const eslintFor = (() => {
         plugins: { dg: dgPlugin },
         rules: {
           'dg/only-allowed-imports': 'error',
-          'dg/must-wrap-film-layout': 'error',
           'dg/needs-shot-export': 'error',
           'dg/no-external-urls': 'error',
           'dg/must-use-motion': 'error',
@@ -43,7 +38,7 @@ const eslintFor = (() => {
           'dg/fields-declared-unused': fieldOpts(),
           'dg/fields-undeclared-read': fieldOpts(),
           'dg/field-mark-not-reading': fieldOpts(),
-          'dg/staticfile-asset-check': assetOpts(),
+          'dg/staticfile-font-only': 'error',
           'dg/font-family-whitelist': 'error',
           'dg/font-load-check': 'error',
           'no-restricted-globals': ['error', ...RESTRICTED_GLOBALS],
@@ -67,18 +62,12 @@ const eslintFor = (() => {
  * `declaredFields` 缺省成空数组是**有意的严格**：没声明就是没声明，此时代码里出现
  * 任何 `fields.x` 或 `<F>` 都会被打回。想关掉这三条的唯一办法是显式传名单。
  */
-export async function lintShotCode(code, declaredFields = [], assetNames = [],
-                                   stagedAssets = null) {
+export async function lintShotCode(code, declaredFields = []) {
   const declared = [...new Set((Array.isArray(declaredFields) ? declaredFields : [])
     .map((s) => String(s)))].filter(Boolean);
-  const assets = [...new Set((Array.isArray(assetNames) ? assetNames : [])
-    .map((s) => String(s)))].filter(Boolean);
-  const staged = stagedAssets == null ? null
-    : [...new Set((Array.isArray(stagedAssets) ? stagedAssets : [])
-      .map((s) => String(s)))].filter(Boolean);
   let reports;
   try {
-    reports = await eslintFor(declared, assets, staged)
+    reports = await eslintFor(declared)
       .lintText(String(code ?? ''), { filePath: 'shot.tsx' });
   } catch (err) {
     return { ok: false, errors: [{ rule: 'lint-crash', line: 1, msg: String(err?.message ?? err) }] };

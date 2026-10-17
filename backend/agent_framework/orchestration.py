@@ -411,6 +411,10 @@ class Interceptor:
     def __init__(self, registry: NodeRegistry) -> None:
         self.registry = registry
         self.order_trace: list[str] = []  # 实际执行顺序，便于断言与观测
+        #: 本次 ``invoke`` 里「按**默认参数**替你补的创作决策步」（见 ``_ensure_deps``）。
+        #: 每次 invoke 开头清空，结束时由 ``_annotate`` 写进回执——模型因此看得见
+        #: 哪几步不是自己定的。**它是一份观测，不是一份状态**：不落库、不进产物。
+        self.filled_by_default: list[dict[str, str]] = []
 
     def _require(self, name: str) -> BaseNode:
         node = self.registry.get(name)
@@ -426,7 +430,7 @@ class Interceptor:
         """执行一个节点（``name``/``state`` 是**位置专用**，理由见下）。
 
         ``/`` 不是风格洁癖，是修过的一次真机事故：``params`` 是**节点自己的入参**，
-        它当然可以有跟拦截器同名的键——``imagegen`` 的 schema 里就有一项 ``name``
+        它当然可以有跟拦截器同名的键——`search_media` 的 schema 里就有一项 ``name``
         （落盘文件名）。调用侧一律写成 ``invoke(node.name, state, **args)``，于是那个
         ``name`` 既被第一个位置参数占着、又来一个同名关键字，Python 当场抛
         ``TypeError: Interceptor.invoke() got multiple values for argument 'name'``。
@@ -438,13 +442,41 @@ class Interceptor:
         这类冲突在语法层面不可能再发生。
         """
         # 客户端参数先留痕：依赖补齐以默认入参执行，跨节点开关靠 state.flags 传达
+        self.filled_by_default = []
         state.flags.update(params)
         args = await self.inject_media_content_before(name, state, dict(params))
         node = self._require(name)
         result = await node(state, **args)
         await self.save_media_content_after(name, state)
         self.order_trace.append(name)
-        return result
+        return self._annotate(result)
+
+    def _annotate(self, result: Any) -> Any:
+        """把「这几步是拦截器按默认参数替你补的」写进本次回执。
+
+        **在哪一层做这件事，是这一步的要点。** 回执有**两条**出路——app 侧
+        ``video_editing.NodeTool.execute``（拼一份紧凑摘要）与剪辑服务端
+        ``server.py`` 的节点 handler（``json.dumps(result)``）——两边都从
+        ``invoke`` 的返回值出发。写在 ``invoke`` 里，两条路一次到位；写在任一侧，
+        另一侧就永远看不到，而"哪几步不是我定的"这件事在哪一侧说不出来都是同一个后果。
+
+        只对 dict 结果加键：节点契约就是返回对象，非对象结果（目前没有）原样放过。
+        **不改被存起来的那一份**：``save_media_content_after`` 已经在上一行跑完了，
+        所以产物与逐镜账里不会有这一栏——它是一次调用的观测，不是产物的一个字段。
+        """
+        if not self.filled_by_default or not isinstance(result, dict):
+            return result
+        named = "、".join(
+            f"{f['node']}（{f['display']}）" if f.get("display") else f["node"]
+            for f in self.filled_by_default)
+        out = dict(result)
+        out["filled_by_default"] = [dict(f) for f in self.filled_by_default]
+        out["filled_by_default_note"] = (
+            f"上面这份产物里有 {len(self.filled_by_default)} 步不是你调用的，是拦截器按"
+            f"**默认参数**替你补的：{named}。它们各自是一处**创作决策**（挑哪些片段、"
+            f"怎么分组、用哪套模板…），默认值只保证「跑得通」，不保证是你要的那一版。"
+            f"想改就自己重调那一步、再回到这里——重调会以你的参数覆盖这次补出来的那份。")
+        return out
 
     async def inject_media_content_before(
         self, name: str, state: NodeState, request_args: dict[str, Any]
@@ -471,12 +503,19 @@ class Interceptor:
             if await state.store.has(dep):
                 continue  # 依赖已执行，无需重复
             dep_node = self._require(dep)
-            if getattr(dep_node, 'require_explicit_call', False):
-                raise ValueError(
-                    f"{dep} 需要你直接调用并传入创意决策参数，不能自动补齐。"
-                    f"请先调用 {dep}，再调用 {name}。"
-                )
             await self._ensure_deps(dep, state, path=[*path, name])  # 递归执行上游节点
             await dep_node(state)  # 以默认入参补齐前置
             self.order_trace.append(dep)
             await self.save_media_content_after(dep, state)
+            if getattr(dep_node, 'require_explicit_call', False):
+                # 这一步标的是「它是一处**创作决策**」（挑哪些片段、怎么分组、用哪套
+                # 模板…），参数本该由模型自己定。2026-10-16 起不再抛错拦下来：
+                #   · 架构总纲里只有「拦截器递归补齐」，**没有**「某些节点必须显式调用
+                #     否则报错」这一条——这是全仓唯一一处超出文档的硬约束；
+                #   · 它的代价落在用户身上：卡已经点过确认，执行到一半才失败，而模型
+                #     收到的是一句不含"怎么办"的话。
+                # 改成照样补齐、但**如实记一笔**（`_annotate` 写进回执）：安全网还在，
+                # 模型看得见哪几步不是自己定的，也知道"想改就重调它"。
+                self.filled_by_default.append({
+                    "node": dep, "display": str(getattr(dep_node, "display_name", "") or ""),
+                    "needed_by": name})

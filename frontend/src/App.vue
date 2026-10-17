@@ -5,7 +5,7 @@
 //   delta / stream_end / answer（MQ OutBound → Connection Manager 回投）。
 // 身份（spec §7）：首次访问 POST /register 换一份 token，之后 HTTP 带 Bearer、
 //   WS 带 ?token=；请求里不再出现 user_id——它由服务端从 token 反查。
-import { computed, reactive, ref, nextTick, onMounted, onBeforeUnmount } from "vue";
+import { computed, reactive, ref, watch, nextTick, onMounted, onBeforeUnmount } from "vue";
 import MotionEditor from "./MotionEditor.vue";
 
 const TOKEN_KEY = "ca.token";
@@ -204,6 +204,7 @@ async function openConv(cid) {
   preview.value = null;              // 换会话先清掉，避免显示上一个会话的编排
   if (activePanel.value === 'runs') await loadRuns();
   if (activePanel.value === 'plan') await loadPreview(cid);
+  if (activePanel.value === 'textlib') await loadConvPrefs();
   ensureSocket(cid);
 }
 
@@ -212,7 +213,9 @@ async function checkActiveRun(cid) {
     const r = await fetch(`/convs/${cid}/runs/active`, { headers: authHeaders() });
     if (!r.ok) return;
     const j = await r.json();
-    if (!j.run) return;
+    // 没有「在途」也没有「等审批」的 run ≠ 这个会话没出过事：**死在半路**也是没有
+    // 在途 run，而服务端 /runs/active 对 failed 一个字都不回。见下面的兜底。
+    if (!j.run) { await offerResumeIfNewestFailed(cid); return; }
     if (j.run.status === "running") {
       busy[cid] = j.run.run_id;
       msgs(cid).push({
@@ -274,6 +277,55 @@ async function checkActiveRun(cid) {
       });
     }
   } catch (_) { /* 查不到不影响正常使用 */ }
+}
+
+// 冷启动兜底之二：上一个任务**死在半路**时，界面上得有一个能点的东西。
+//
+// 服务端 /runs/active 只认「在途」和「等审批」两种，一条 failed 的 run 它一个字都不回，
+// 前端原先就跟着 `if (!j.run) return` 走了。于是真机上出现过这样一幕
+// （2026-10-16，run 9272c7f59501 那 20 镜）：编辑器容器被重建、MCP 会话失效，
+// 第 89 轮整条链停死；用户刷新前端——**界面看起来只是"停了"**，既没有报错也没有按钮，
+// 只能自己翻执行记录才找得到那条「从最新一致点续跑」。
+//
+// 只认**最新那条**是 failed：会话里后面若又跑过（completed / 等审批 / 在途），
+// 说明用户已经往下走了，不再翻旧账。
+async function offerResumeIfNewestFailed(cid) {
+  if (cid !== active.value) return;
+  try {
+    await ensureIdentity();
+    const r = await fetch(`/convs/${encodeURIComponent(cid)}/runs`, { headers: authHeaders() });
+    if (!r.ok) return;
+    const j = await r.json();
+    const run = (j.runs || [])[0];               // 服务端按「最近的在前」排
+    if (!run || run.status !== "failed") return;
+    // **去重靠扫列表，不靠一张旁挂的"提过没有"表**：这条路径的每一个调用方
+    // （openConv / reloadAfterReconnect）都在它之前刚跑过 loadHistory，
+    // 而 loadHistory 是整体重建 `histories[cid]`。用旁挂表就会出现
+    // 「历史一重建、气泡没了，可表里记着提过 → 再也不补」。气泡自己在列表里，
+    // 就以列表为准。
+    if (msgs(cid).some((m) => m.resume && m.resume.run_id === run.run_id)) return;
+    msgs(cid).push({
+      role: "assistant", state: "error", resume: run,
+      text: `⚠️ 上一个任务在第 ${run.iteration} 轮**失败**了，整条链停在半路。`
+          + `已经跑出来的产物都还在工作区里，可以从最新一致点接着跑——不会从头重来。`,
+    });
+    scrollDown();
+  } catch (_) { /* 拉不到就不提，不影响正常使用 */ }
+}
+
+// 气泡上那颗按钮。请求本身照旧走 `doResume`（与执行记录面板里那颗是同一段代码），
+// 这里只多管两件事：**防连点**、以及**失败要看得见**。
+async function resumeFromBubble(m) {
+  const cid = active.value;
+  const run = m.resume;
+  m.resume = null;                 // 先收掉按钮
+  await doResume(run);
+  if (!runsError.value) return;    // 成功：doResume 已关抽屉并接上流式进度，收掉就对了
+  // 失败时 `doResume` 把话说进 `runsError`——那是**执行记录抽屉**的位置，对话里根本看不见。
+  // 所以把按钮还回去，并在对话里补一句；否则用户点了「续跑」像什么都没发生。
+  m.resume = run;
+  msgs(cid).push({ role: "assistant", state: "error", text: "续跑没能提交：" + runsError.value });
+  scrollDown();
 }
 
 // 列表是异步拉的：手快的用户可能在它回来前就按了发送，先补上当前会话再说。
@@ -339,27 +391,6 @@ function toggleEntryMode() {
   entryMode.value = entryMode.value === "auto" ? "plan" : "auto";
   localStorage.setItem("ca.entryMode", entryMode.value);
 }
-const drawerW = ref(Number(localStorage.getItem("ca.drawerW")) || 380);
-const resizing = ref(false);
-function startResize(ev) {
-  if (ev.button !== 0) return;
-  resizing.value = true;
-  const startX = ev.clientX, startW = drawerW.value;
-  const move = (e) => {
-    // 向左拖 = 变宽;夹在 300~720
-    drawerW.value = Math.min(720, Math.max(300, startW + (startX - e.clientX)));
-  };
-  const up = () => {
-    resizing.value = false;
-    localStorage.setItem("ca.drawerW", String(drawerW.value));
-    document.removeEventListener("mousemove", move);
-    document.removeEventListener("mouseup", up);
-  };
-  document.addEventListener("mousemove", move);
-  document.addEventListener("mouseup", up);
-  ev.preventDefault();
-}
-
 // —— 工具库两级导航:父列表(分类) → 二级清单 ——
 const toolView = ref(null);       // null=父列表;'tools'|'skills'|'mcp'=已进入的分类
 const catManage = ref(null);      // 分类管理弹窗:null|'tools'|'skills'|'mcp'
@@ -383,6 +414,43 @@ const catalogLabels = ref({});
 // /tools 的 params_display：参数名中文标签的**单源表**（帧里的 arg_labels 才是第一来源）。
 const paramLabels = ref({});
 const activePanel = ref(null);
+
+// 抽屉宽度**按面板各记一份**：文字库那一屏是左右两栏（样张 248px 钉在左边 + 右边两列卡），
+// 拢共要 ~750px；380px 底下那两栏会被挤成一条，还不如原来的竖排。
+// 别的面板沿用老宽度、老键 `ca.drawerW`——用户之前拖出来的宽度不会丢。
+const DRAWER_W_DEFAULT = { textlib: 760 };
+const DRAWER_W_MIN = 300;
+const DRAWER_W_MAX = 1000;      // 上限跟着抬高：样张那一屏宽一点才排得开两列卡
+const DRAWER_W_FALLBACK = 380;
+function drawerWOf(panel) {
+  const own = Number(localStorage.getItem("ca.drawerW." + panel));
+  if (own) return own;
+  if (DRAWER_W_DEFAULT[panel]) return DRAWER_W_DEFAULT[panel];
+  return Number(localStorage.getItem("ca.drawerW")) || DRAWER_W_FALLBACK;
+}
+const drawerW = ref(drawerWOf(activePanel.value));
+const resizing = ref(false);
+function startResize(ev) {
+  if (ev.button !== 0) return;
+  resizing.value = true;
+  const startX = ev.clientX, startW = drawerW.value;
+  const move = (e) => {
+    // 向左拖 = 变宽;夹在 300~1000
+    drawerW.value = Math.min(DRAWER_W_MAX,
+      Math.max(DRAWER_W_MIN, startW + (startX - e.clientX)));
+  };
+  const up = () => {
+    resizing.value = false;
+    localStorage.setItem("ca.drawerW." + (activePanel.value || ""), String(drawerW.value));
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", up);
+  };
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", up);
+  ev.preventDefault();
+}
+// 换面板＝换成那一屏自己记着的宽度（文字库第一次打开是 560，其余是 380）。
+watch(activePanel, (p) => { drawerW.value = drawerWOf(p); });
 const libraryItems = ref([]);
 const loadingLibrary = ref(false);
 const libSelected = reactive({});   // material_id -> true
@@ -481,6 +549,289 @@ async function toggleBgm() {
     await loadBgm();
     await loadBgmImported();
   }
+}
+
+// ---- 文字库：把「字幕长什么样」与「谁来读」从模型手里接过来（只对本对话生效） ----
+// 面板上出现的**每一个取值与中文词都来自 /motion/text-library**（剪辑服务端契约里的
+// `library_props()`）：档名、取值、标签、连栏目名都在那一份里。前端自己列一遍的后果
+// 不是报错，是界面上写着「撕纸条·逐词点亮」而渲染认的是另一个字符串——这种不一致不会红，
+// 只会渲成别的。下面只有几个**协议键名**（不是给人看的词）：样张那两个查询参数，
+// 以及归右栏的声音两维。字样两维的**栏名、取值、顺序**一律按契约里出现的顺序现取。
+const CAPTION_DIM = "caption_style";     // 样张端点的查询参数名 · 第一维
+const HIGHLIGHT_DIM = "highlight_style"; // 样张端点的查询参数名 · 第二维
+const SOUND_DIMS = ["voice", "rate"];
+const textLib = ref({ presets: [], dims: {}, voice_groups: [] });
+const loadingTextLib = ref(false);
+const textLibError = ref("");
+const convPrefs = ref({});          // 本对话挑过的维度：{维度: 原始取值}，未挑过的键不存在
+const savingPrefs = ref("");
+const shownPick = ref({});          // 样张区正看哪几档：{组: 档名}，点说明换它、**不改偏好**
+const voicePreviewUrls = ref({});   // 试听直链缓存（试听文案固定，同一音色同一语速只合成一次）
+const previewKey = ref("");         // 正在响的那个音色+语速；同一时刻只留一个播放器
+const loadingVoice = ref("");
+
+// 两排卡：按契约里 `presets[].group` 的出现顺序取 unique，前端不列名单。
+const presetGroups = computed(() => {
+  const seen = [];
+  for (const p of textLib.value.presets || []) {
+    if (p.group && !seen.includes(p.group)) seen.push(p.group);
+  }
+  return seen;
+});
+function presetsOf(group) {
+  return (textLib.value.presets || []).filter((p) => p.group === group);
+}
+// 预设档管得着哪几维 —— 从契约的档位里现取并集，不另写一份名单。
+const presetDims = computed(() => {
+  const seen = [];
+  for (const p of textLib.value.presets || []) {
+    for (const k of Object.keys(p.knobs || {})) if (!seen.includes(k)) seen.push(k);
+  }
+  return seen;
+});
+// 顶栏那句「本对话：…」分两段说：字样那两维（预设档管得着的）与声音那两维。
+const subtitleDims = computed(() => presetDims.value.filter((k) => !SOUND_DIMS.includes(k)));
+const libReady = computed(() => !!(textLib.value.presets || []).length
+  || !!(textLib.value.voice_groups || []).length);
+
+function labelOf(dim, value) {
+  return ((textLib.value.dims || {})[dim]?.value_labels || {})[value] || value;
+}
+function dimTitle(dim) {
+  return (textLib.value.dims || {})[dim]?.title || dim;
+}
+function presetOn(p) {
+  const knobs = p.knobs || {};
+  const keys = Object.keys(knobs);
+  return keys.length > 0 && keys.every((k) => convPrefs.value[k] === knobs[k]);
+}
+// 这一组正看哪一档：点过的（只看不挑）> 他挑中的 > 清单第一档。**每组各取一档**，
+// 于是「字幕样式」与「高亮样式」两排各自记得自己那一格，拼起来就是样张那一对。
+function shownOf(group) {
+  const list = presetsOf(group);
+  return list.find((p) => p.key === shownPick.value[group])
+    || list.find(presetOn) || list[0] || null;
+}
+function showPreset(p) {
+  const cur = shownPick.value[p.group];
+  shownPick.value = { ...shownPick.value, [p.group]: cur === p.key ? "" : p.key };
+}
+function summaryOf(dims) {
+  return dims.map((k) => (convPrefs.value[k] ? labelOf(k, convPrefs.value[k]) : ""))
+    .filter(Boolean).join(" · ");
+}
+const hasPrefs = computed(() => Object.keys(convPrefs.value || {}).length > 0);
+const subtitleSummary = computed(() => summaryOf(subtitleDims.value));
+const soundSummary = computed(() => summaryOf(SOUND_DIMS));
+const vkey = (v) => v + "|" + (convPrefs.value.rate || "");
+
+async function loadTextLib() {
+  loadingTextLib.value = true;
+  textLibError.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch("/motion/text-library", { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    textLib.value = (j && typeof j === "object") ? j : {};
+  } catch (e) {
+    textLib.value = { presets: [], dims: {}, voice_groups: [] };
+    textLibError.value = "拿不到字幕样式与音色清单：" + e.message;
+  } finally {
+    loadingTextLib.value = false;
+  }
+}
+
+async function loadConvPrefs() {
+  if (!active.value) { convPrefs.value = {}; return; }
+  try {
+    await ensureIdentity();
+    const r = await fetch(`/convs/${encodeURIComponent(active.value)}/prefs`,
+      { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    convPrefs.value = j.prefs || {};
+  } catch (e) {
+    convPrefs.value = {};
+    textLibError.value = "读不到本对话已挑的样式：" + e.message;
+  }
+}
+
+// 写入一律走服务端的校验口（值不在枚举里会被 422 打回，契约拿不到时它宁可拒收），
+// 所以这里不做本地白名单——本地再判一遍就等于第二份名单。
+async function saveConvPrefs(patch) {
+  if (!active.value) return;
+  savingPrefs.value = Object.keys(patch).join("、");
+  textLibError.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch(`/convs/${encodeURIComponent(active.value)}/prefs`, {
+      method: "PUT",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ prefs: patch }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    convPrefs.value = j.prefs || {};
+  } catch (e) {
+    textLibError.value = "这次没存上：" + e.message;
+  } finally {
+    savingPrefs.value = "";
+  }
+}
+
+async function pickPreset(p) {
+  // 选中一档＝只写**它自己那一组的那一维**。两排卡并存，写别的组就把另一排清掉了
+  // ——「字幕样式」与「高亮样式」是两条正交的选择，谁都不该动对方。
+  // （档位自带的 `knobs` 本来就只含本组那一维，所以照原样写出去即可。）
+  await saveConvPrefs({ ...(p.knobs || {}) });
+}
+
+async function pickDim(dim, value) {
+  await saveConvPrefs({ [dim]: value || null });
+}
+
+async function clearPrefs() {
+  const patch = {};
+  for (const k of Object.keys(convPrefs.value)) patch[k] = null;
+  shownPick.value = {};
+  await saveConvPrefs(patch);
+}
+
+async function auditionVoice(voice) {
+  const rate = convPrefs.value.rate || "";
+  const key = voice + "|" + rate;
+  loadingVoice.value = voice;
+  textLibError.value = "";
+  try {
+    await ensureIdentity();
+    let url = voicePreviewUrls.value[key];
+    if (!url) {
+      const r = await fetch(`/tts/preview?voice=${encodeURIComponent(voice)}`
+        + `&rate=${encodeURIComponent(rate)}`, { headers: authHeaders() });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+      url = j.url;
+      voicePreviewUrls.value = { ...voicePreviewUrls.value, [key]: url };
+    }
+    // 换一个音色＝换掉那个 <audio> 的 src：只有重新挂载才会触发 autoplay，
+    // 所以先清空、等一帧再置上（同一档再点一次也重放）。
+    previewKey.value = "";
+    await nextTick();
+    previewKey.value = key;
+  } catch (e) {
+    textLibError.value = "试听失败：" + e.message;
+  } finally {
+    loadingVoice.value = "";
+  }
+}
+
+async function toggleTextLib() {
+  activePanel.value = activePanel.value === 'textlib' ? null : 'textlib';
+  if (activePanel.value === 'textlib') {
+    // 样张跟着清单走：`previewPair` 要等清单回来才知道是哪一对，那个 watch 会接上。
+    // 不 await 清单——它是本地读契约，快；而样张那一路要打包几秒（渲染容器那一侧）。
+    await loadTextLib();
+    await loadConvPrefs();
+    void loadCaptionPreview();
+  }
+}
+
+// ---- 字幕样张：把「这一对渲出来长什么样」在**渲染之前**看到 ----------------------
+// 探的是 /motion/caption-preview，出来的是渲染链渲的真图（同一张样片镜、同一件字幕元件，
+// 只换注入的两个样式名与强调色）——不是前端照着档名画一张示意图。示意图是第二份实现，
+// 它会与成片漂，而漂的方式恰恰是「看着对、渲出来不是」。
+//
+// 缓存按**那一对**存：一次只渲一张，点过的再来就走对象存储里的缓存。
+//
+// 这里曾经还有一行色板筹码（换样张的底色/纸条底/字色看同一对的样子）。用户 2026-10-16
+// 看过之后否掉了：「可以自定义了，为什么还要你提供那些固定的」。成片里每一镜各按自己绑的
+// 那套色板走、色板本来就是模型按镜挑的，面板上再摆一份**只作用于这张图**的固定九档，
+// 就是第二份名单——而且其中「强调色」那一色与下面那一行是同一个东西，钉住之后筹码上
+// 那个圆点还会显示错的色。取色那件事只归「强调色」那一行。
+const capPreview = ref({});      // { "字幕+高亮[@色值]": 直链 | null }；null＝要过、没回来
+const loadingPreview = ref(false);
+const previewErr = ref("");
+
+// 自由取色的那几维（契约里 `kind === "color"`）：面板据此渲取色器，而不是一排卡。
+// 键名一个都不写死——今天只有「强调色」一维，但这一行不知道这件事。
+const colorDims = computed(() => Object.entries(textLib.value.dims || {})
+  .filter(([, d]) => d && d.kind === "color").map(([k]) => k));
+const colorDim = computed(() => colorDims.value[0] || "");
+// 用户钉住的色值；空串＝没钉＝跟色板走。只认归一过的六位小写，别的一律当没钉
+// （收下的脏值只会让样张与成片悄悄差一个颜色，且两边的缓存键还不一致）。
+const previewColor = computed(() => {
+  const v = String(convPrefs.value[colorDim.value] || "").trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(v) ? v : "";
+});
+// 取色器的起手色＝契约里「默认」那一档的强调色（母版底色的那一套）。前端**不新长出一个
+// 品牌色常量**——那会与片子里真正用的色板漂开。
+const colorSeed = computed(() => {
+  const list = textLib.value.palettes || [];
+  const pal = list.find((p) => p.is_default) || list.find((p) => !p.key) || list[0] || {};
+  const sw = pal.swatch || {};
+  return sw.accent || sw.text || "#ff8a3d";
+});
+
+// 每组各取一档，拼成正看的那一对。空串＝这一组还没得挑（清单没回来）。
+const previewCaption = computed(() => (shownOf(CAPTION_DIM) || {}).key || "");
+const previewHighlight = computed(() => (shownOf(HIGHLIGHT_DIM) || {}).key || "");
+// 与后端 `caption_preview.pair_key` 同一拼法（`caption+highlight[@色值]`）——回执键、
+// 对象键、缓存键都是它，前端只是照契约拼一次。色值进这个键，于是「换个颜色＝换张图」
+// 在这三层上自动成立，不用另加一段清理逻辑。
+const previewPair = computed(() => (previewCaption.value && previewHighlight.value)
+  ? `${previewCaption.value}+${previewHighlight.value}`
+    + (previewColor.value ? `@${previewColor.value.slice(1)}` : "")
+  : "");
+const previewPairLabel = computed(() => {
+  const a = shownOf(CAPTION_DIM); const b = shownOf(HIGHLIGHT_DIM);
+  return (a && b) ? `${a.label} · ${b.label}` : "";
+});
+const previewUrl = computed(() => previewPair.value
+  ? (capPreview.value[previewPair.value] || "") : "");
+// 这一对**要回来过**没有：要回来过却没有直链（渲染中途出错时那条不回键），与「还没去要」
+// 是两句不同的话——前者说「这一对这次没渲出来」，后者说「点一下就有」。
+const previewAsked = computed(() => previewPair.value
+  && previewPair.value in capPreview.value);
+
+async function loadCaptionPreview() {
+  const pair = previewPair.value;
+  if (!pair) return;                                     // 清单还没回来，没得可渲
+  if (pair in capPreview.value) return;                   // 这一对已经要过了
+  loadingPreview.value = true;
+  previewErr.value = "";
+  try {
+    await ensureIdentity();
+    // `palette` 留空＝「默认（片子的底色）」那一档：成片里每一镜各按自己绑的色板走，
+    // 这张图不该假装站在某一套色板上。
+    const r = await fetch(`/motion/caption-preview?palette=`
+      + `&caption=${encodeURIComponent(previewCaption.value)}`
+      + `&highlight=${encodeURIComponent(previewHighlight.value)}`
+      + `&color=${encodeURIComponent(previewColor.value)}`,
+      { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    let url = null;
+    for (const s of j.stills || []) if (s.key === pair) url = s.url;
+    // 记的是**这一对**（而不是整批回执）：换一对样式或换一个强调色就是另一个键。
+    capPreview.value = { ...capPreview.value, [pair]: url };
+  } catch (e) {
+    previewErr.value = "字幕样张没渲出来：" + e.message;
+  } finally {
+    loadingPreview.value = false;
+  }
+}
+
+// 换正看的那一对（点卡片说明）或换强调色都要重取。清单回来之前 `previewPair` 是空串，
+// 那一次进函数就返回——清单回来时它变了，这里会自己再跑一次。
+watch(previewPair, () => { void loadCaptionPreview(); });
+
+// 刷新＝连样张一起重取：清单与样张是两件事，但「刷新」这个动作在人心里是
+// 「这一屏重新来一遍」，只换清单会留下半旧的图。
+async function refreshTextLib() {
+  capPreview.value = {};
+  await loadTextLib();
+  await loadCaptionPreview();
 }
 
 // ---- 执行记录 / 时间旅行 / 分叉：后端那一整套 run 端点的前端口 ----
@@ -2491,8 +2842,8 @@ const TOOL_LABELS = {
   create_cron_job: "创建定时任务",
   list_cron_jobs: "查看定时任务",
   delete_cron_job: "删除定时任务",
-  search_illustration: "检索配图",
-  select_illustration: "选用配图",
+  // 出图链路拿掉后，「检索配图 / 选用配图」这两个工具在后端词表里也不再存在，
+  // 标签留在兜底映射里，只会让不存在的名字看着像还在。
 };
 function toolLabel(name, display) {
   if (display) return display;                       // 帧里自带的 *_display：第一来源
@@ -3043,13 +3394,8 @@ const searchDraft = ref({ provider: "", base_url: "", api_key: "" });
 const savingSearch = ref(false);
 const testingSearch = ref(false);
 const testSearchResult = ref(null);
-// 图像出图后端：provider + 密钥/自建地址 + 模型/尺寸，全空 = 降级为素材库检索。
-// model/size 是 T24 新增的两栏：以前模型名写死在请求体里（doubao-seedream-5-0-pro），
-// 换一家后端就会把火山那个模型名原样发给别家。两栏留空 = 用该后端的默认值。
-const imageDraft = ref({ provider: "", base_url: "", api_key: "", model: "", size: "" });
-const savingImage = ref(false);
-const testingImage = ref(false);
-const testImageResult = ref(null);
+// 图像出图后端的那组草稿与自检状态（provider / 密钥 / 模型 / 尺寸、保存中 / 自检中 / 自检结果）
+// 随面板一并删除：成片每一镜由 LLM 写 TSX 现画，界面上已没有任何图源可配。
 
 // 记忆（memories 表按身份摊开）：只由 Agent 的工具读写的话，用户看不见也改不掉。
 // 这三态对应「读到了什么 / 编辑中的草稿（按 category 存）/ 正在保存哪个」。
@@ -3084,16 +3430,6 @@ async function loadSettings() {
     api_key: "",
   };
   testSearchResult.value = null;
-  imageDraft.value = {
-    // 这两栏填的是**页面原文**（用户自己填的），空着显示空——生效值走 effective_model，
-    // 见上方面板里那行状态文字。混用会让「我没填怎么冒出一个模型名」变成一团雾。
-    provider: j.image?.provider || "",
-    base_url: j.image?.base_url || "",
-    api_key: "",
-    model: j.image?.model || "",
-    size: j.image?.size || "",
-  };
-  testImageResult.value = null;
   return j;
 }
 
@@ -3503,86 +3839,8 @@ async function testSearchConn() {
   }
 }
 
-async function saveImage() {
-  if (savingImage.value) return;
-  savingImage.value = true;
-  keyError.value = "";
-  try {
-    await ensureIdentity();
-    const r = await fetch("/settings/image", {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({
-        provider: imageDraft.value.provider,
-        base_url: imageDraft.value.base_url.trim(),
-        api_key: imageDraft.value.api_key.trim(),
-        model: imageDraft.value.model.trim(),
-        size: imageDraft.value.size.trim(),
-      }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
-    testImageResult.value = null;
-    await loadSettings();
-  } catch (e) {
-    keyError.value = "图像后端保存失败：" + e.message;
-  } finally {
-    savingImage.value = false;
-  }
-}
-
-async function clearImageOverride() {
-  if (savingImage.value) return;
-  savingImage.value = true;
-  keyError.value = "";
-  try {
-    await ensureIdentity();
-    const r = await fetch("/settings/image", {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      // 五项一起清：留空的项后端按「清除页面覆盖」处理（模型/尺寸回该后端默认），
-      // 只清前三项会让模型名变成一份没人记得从哪来的页面覆盖。
-      body: JSON.stringify({ provider: "", base_url: "", api_key: "", model: "", size: "" }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
-    testImageResult.value = null;
-    await loadSettings();
-  } catch (e) {
-    keyError.value = "清除图像后端失败：" + e.message;
-  } finally {
-    savingImage.value = false;
-  }
-}
-
-async function testImageConn() {
-  if (testingImage.value) return;
-  testingImage.value = true;
-  keyError.value = "";
-  testImageResult.value = null;
-  try {
-    await ensureIdentity();
-    const r = await fetch("/settings/image/test", {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      // 带上草稿里的模型/尺寸：可以「先试再存」。留空则由后端回落到已保存的配置，
-      // 所以自检跑的就是链上真正会用的那个模型——不是页面上的一个平行世界。
-      body: JSON.stringify({
-        prompt: "",
-        model: imageDraft.value.model.trim(),
-        size: imageDraft.value.size.trim(),
-      }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
-    testImageResult.value = j;
-  } catch (e) {
-    keyError.value = "出图自检没跑成：" + e.message;
-  } finally {
-    testingImage.value = false;
-  }
-}
-
+// 出图后端那三个处理器（保存 / 清除页面覆盖 / 自检）随面板删除：
+// /settings/image 与 /settings/image/test 两条路由后端已不再提供，前端留着只会打空。
 
 function newConv() {
   const c = freshConv();
@@ -3676,6 +3934,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       <div class="rail-btns">
         <button class="help" :class="{ on: activePanel === 'library' }" @click="toggleLibrary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg> 素材库</button>
         <button class="help" :class="{ on: activePanel === 'bgm' }" @click="toggleBgm"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg> 音乐库</button>
+        <button class="help" :class="{ on: activePanel === 'textlib' }" @click="toggleTextLib"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M4 7V4h16v3"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="7" x2="12" y2="20"/></svg> 文字库</button>
         <button class="help" :class="{ on: activePanel === 'tools' }" @click="toggleHelp"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg> 工具库</button>
       </div>
 
@@ -3913,6 +4172,13 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               </div>
               <span class="txt"><template v-for="(s, j) in segs(m.text)" :key="j"><b v-if="s.b">{{ s.t }}</b><span v-else>{{ s.t }}</span></template></span>
               <span v-if="m.state === 'streaming'" class="caret">▍</span>
+              <!-- 死在半路的那条 run（见 offerResumeIfNewestFailed）：与执行记录面板里
+                   那颗按钮同一段 `doResume`，只是把入口摆到用户真正会看的地方。 -->
+              <div v-if="m.resume" class="ru-actions">
+                <button class="clip ghost" :disabled="forking" @click="resumeFromBubble(m)">
+                  {{ forking ? "提交中…" : "从最新一致点续跑" }}
+                </button>
+              </div>
             </template>
           </div>
         </div>
@@ -4090,11 +4356,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       </footer>
     </main>
 
-    <!-- 右侧抽屉：工具库 / 素材库 / 音乐库 / 时间线 / 执行记录 / 设置（互斥，同时只开一个） -->
+    <!-- 右侧抽屉：工具库 / 素材库 / 音乐库 / 文字库 / 时间线 / 执行记录 / 设置（互斥，同时只开一个） -->
     <aside v-if="activePanel" class="drawer" :style="{ width: drawerW + 'px' }">
       <div class="drawer-grip" title="拖拽调宽" @mousedown="startResize"></div>
       <header class="drawer-head">
-        <b>{{ activePanel === 'plan' ? '📋 剪辑链路' : activePanel === 'tools' ? '工具库' : activePanel === 'library' ? '素材库' : activePanel === 'bgm' ? '🎵 音乐库' : activePanel === 'timeline' ? '时间线编辑器' : activePanel === 'runs' ? '执行记录 · 时间旅行' : '设置' }}</b>
+        <b>{{ activePanel === 'plan' ? '📋 剪辑链路' : activePanel === 'tools' ? '工具库' : activePanel === 'library' ? '素材库' : activePanel === 'bgm' ? '🎵 音乐库' : activePanel === 'textlib' ? '✍️ 文字库' : activePanel === 'timeline' ? '时间线编辑器' : activePanel === 'runs' ? '执行记录 · 时间旅行' : '设置' }}</b>
         <button class="drawer-x" @click="activePanel = null">×</button>
       </header>
 
@@ -4659,6 +4925,154 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         </div>
       </div>
 
+      <!-- 文字库：字幕样式与朗读音色。挑过的维度**只对这条对话**生效，其余仍归模型；
+           开一册新卷就回到「交给模型自己定」。 -->
+      <div v-if="activePanel === 'textlib'" class="library">
+        <div class="lib-head">
+          <span class="lib-count">
+            <template v-if="!active">先开一册卷（或点进一个会话）再挑</template>
+            <template v-else-if="!hasPrefs">本对话还没挑过——字幕与声音都由模型定</template>
+            <template v-else>
+              本对话：<template v-if="subtitleSummary">字幕 {{ subtitleSummary }}</template>
+              <template v-if="subtitleSummary && soundSummary"> · </template>
+              <template v-if="soundSummary">音色 {{ soundSummary }}</template>
+            </template>
+          </span>
+          <button v-if="hasPrefs" class="help" :disabled="!!savingPrefs" @click="clearPrefs">
+            {{ savingPrefs ? "恢复中…" : "恢复默认（交给模型决定）" }}
+          </button>
+          <button class="help" @click="refreshTextLib" :disabled="loadingTextLib || loadingPreview">
+            {{ (loadingTextLib || loadingPreview) ? "刷新中…" : "刷新" }}
+          </button>
+        </div>
+        <div v-if="textLibError" class="lib-empty bad">{{ textLibError }}</div>
+        <div v-if="!libReady && loadingTextLib" class="lib-empty">正在取字幕样式与音色清单…</div>
+        <div v-else-if="!libReady" class="lib-empty">
+          拿不到清单——剪辑服务还没连上时会这样。稍后点「刷新」重试。
+        </div>
+
+        <template v-if="libReady">
+          <!-- 这一屏**左右两栏**：样张钉在左边（滚的时候不动），右边才是要挑的那些卡。
+               从前是一路竖着排下来——样张 440px 高，挑音色要先滚过它，而「看着样张挑」
+               恰恰是这个面板唯一的用法。抽屉拖窄了（放不下两栏）它自己折回上下的老样子。 -->
+          <div class="tl-body">
+            <div class="tl-rail">
+            <!-- 样张：先把「这一对渲出来长什么样」摆出来，再让人挑。
+                 图是渲染容器渲的真帧（同一张样片镜、同一件字幕元件，只换注入的两个样式名
+                 与强调色），不是前端照着档名画的示意图——示意图是第二份实现，它会与成片漂，
+                 而漂出来的样子恰恰是「看着对、渲出来不是」，正是这一块要治的病。
+                 一次只渲**一对**：下面两排各点一档，这里就换成那两档拼出来的样子。 -->
+            <div class="lib-head">
+              <b>字幕样张</b>
+              <span class="lib-count">
+                <template v-if="previewPairLabel">正看：{{ previewPairLabel }}</template>
+                两排各点一档的说明即换样张；这里只看不选，要生效仍按下面卡片点头。
+                底是一块空白（只留一层明暗，好看对比度）——画面由镜头代码自由画，不在这里挑
+              </span>
+            </div>
+            <div class="tl-preview">
+              <img v-if="previewUrl" class="tl-shot" :src="previewUrl"
+                   :alt="previewPairLabel || '字幕样张'" />
+              <div v-else class="tl-shot tl-shot-empty">
+                <template v-if="loadingPreview">正在渲样张…（同一对只渲这一次，之后走缓存）</template>
+                <template v-else-if="previewErr">{{ previewErr }}</template>
+                <template v-else-if="previewAsked">这一对这次没渲出来——换一档看，或点右上「刷新」重来</template>
+                <template v-else>点下面任一档即可看到它在真实渲染下的样子</template>
+              </div>
+            </div>
+            </div>
+            <div class="tl-cols">
+            <!-- 两排卡：字幕样式 × 高亮样式。排数、栏名、取值全部按契约现取——两维正交，
+                 挑哪一档只写它自己那一维，另一维原样留着。 -->
+            <template v-for="g in presetGroups" :key="g">
+              <div class="lib-divider"></div>
+              <div class="lib-head">
+                <b>{{ dimTitle(g) }}</b>
+                <span class="lib-count">挑一档＝整片默认；某一镜要单独换，仍到计划里改它自己的那一份</span>
+              </div>
+              <div class="lib-grid">
+                <div v-for="p in presetsOf(g)" :key="p.key" class="lib-item"
+                     :class="{ sel: presetOn(p) }">
+                  <div class="lib-meta tl-meta-pick"
+                       :class="{ on: (shownOf(g) || {}).key === p.key }"
+                       @click="showPreset(p)">
+                    <b>{{ p.label }}</b>
+                    <span>{{ p.note }}</span>
+                  </div>
+                  <button class="lib-add" :disabled="!!savingPrefs" @click="pickPreset(p)">
+                    {{ presetOn(p) ? "已选（点击重设）" : "用这一档" }}
+                  </button>
+                </div>
+              </div>
+            </template>
+
+            <!-- 自由取色那一维（高亮词的颜色）：不钉＝跟色板走，钉住＝整条片子按这个色。
+                 键名与栏名照旧从契约现取——上面两排卡是「一排档」，这一维是一条颜色，
+                 形状由契约里的 `kind` 说了算，面板不猜。 -->
+            <template v-for="dim in colorDims" :key="dim">
+              <div class="lib-divider"></div>
+              <div class="lib-head">
+                <b>{{ dimTitle(dim) }}</b>
+                <span class="lib-count">高亮词那一块用哪个色。不钉＝各镜跟自己那套色板；
+                  钉住＝整条片子的高亮词都用这个色（镜头代码里自己写的那一色也盖过）</span>
+              </div>
+              <div class="tl-color">
+                <button class="tl-color-btn" :class="{ sel: !previewColor }"
+                        :disabled="!!savingPrefs" @click="pickDim(dim, null)">
+                  跟随色板
+                </button>
+                <label class="tl-color-pick" :class="{ sel: !!previewColor }">
+                  <input type="color" :value="previewColor || colorSeed"
+                         :disabled="!!savingPrefs"
+                         @change="pickDim(dim, $event.target.value)" />
+                  <span class="tl-color-val">{{ previewColor || "跟色板走" }}</span>
+                </label>
+              </div>
+            </template>
+
+            <div class="lib-divider"></div>
+            <div class="lib-head">
+              <b>{{ dimTitle("voice") }}</b>
+              <label class="tl-rate">
+                <span>{{ dimTitle("rate") }}</span>
+                <select :value="convPrefs.rate ?? (textLib.dims || {}).rate?.default ?? ''"
+                        :disabled="!!savingPrefs"
+                        @change="pickDim('rate', $event.target.value)">
+                  <option v-for="o in ((textLib.dims || {}).rate?.enum || [])" :key="o" :value="o">
+                    {{ labelOf("rate", o) }}
+                  </option>
+                </select>
+              </label>
+              <span class="lib-count">点「试听」会用这个音色读一句固定的话</span>
+            </div>
+            <div v-for="g in (textLib.voice_groups || [])" :key="g.key" class="tl-group">
+              <div class="tl-group-label">{{ g.label }}</div>
+              <div class="lib-grid">
+                <div v-for="v in (g.items || [])" :key="v.value" class="lib-item"
+                     :class="{ sel: convPrefs.voice === v.value }">
+                  <div class="lib-meta">
+                    <b>{{ v.label }}</b>
+                    <span>{{ v.value }}</span>
+                  </div>
+                  <audio v-if="previewKey === vkey(v.value)"
+                         :src="voicePreviewUrls[vkey(v.value)]"
+                         class="lib-aud" controls autoplay></audio>
+                  <button class="lib-add" :disabled="loadingVoice === v.value"
+                          @click="auditionVoice(v.value)">
+                    {{ loadingVoice === v.value ? "合成中…"
+                       : (previewKey === vkey(v.value) ? "重听" : "试听") }}
+                  </button>
+                  <button class="lib-add" :disabled="!!savingPrefs" @click="pickDim('voice', v.value)">
+                    {{ convPrefs.voice === v.value ? "已选（点击重设）" : "用这个音色" }}
+                  </button>
+                </div>
+              </div>
+            </div>
+            </div>
+          </div>
+        </template>
+      </div>
+
       <div v-if="activePanel === 'settings'" class="settings">
         <!-- LLM 主模型:密钥 + 模型名/地址(可选),一个保存按钮 -->
         <div class="set-line set-head">
@@ -4850,68 +5264,9 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <div v-if="testSearchResult.ok" class="set-note">{{ testSearchResult.message }}</div>
         </div>
 
-        <!-- 图像出图后端：未配时整条出图路径优雅降级为素材库检索 -->
-        <div class="set-line set-head">
-          图像出图后端
-          <span v-if="settings && settings.image" :class="settings.image.provider ? 'set-v' : 'set-note'">
-            {{ settings.image.provider
-               ? `走 ${settings.image.provider}（来源 ${settings.image.source}）`
-               : "未配置 —— 出图走素材库检索降级（§5.3）" }}
-            <template v-if="settings.image.masked"> · {{ settings.image.masked }}</template>
-          </span>
-        </div>
-        <div class="set-line">
-          <select v-model="imageDraft.provider" :disabled="savingImage">
-            <option value="">素材库检索降级（不指定出图后端）</option>
-            <option v-for="p in (settings && settings.image && settings.image.providers) || []"
-                    :key="p" :value="p">{{ p }}</option>
-          </select>
-          <input v-model.trim="imageDraft.base_url" spellcheck="false"
-                 placeholder="自建实例地址 http(s)://…（留空用默认）"
-                 :disabled="savingImage" />
-          <input v-model.trim="imageDraft.api_key" type="password" autocomplete="off"
-                 spellcheck="false" placeholder="出图 API Key（不改则留空）"
-                 :disabled="savingImage" />
-        </div>
-        <div class="set-line">
-          <input v-model.trim="imageDraft.model" spellcheck="false"
-                 :placeholder="`模型名（留空用后端默认${settings && settings.image && settings.image.default_model ? '：' + settings.image.default_model : '（该后端没有默认值，必须填）'}）`"
-                 :disabled="savingImage" />
-          <input v-model.trim="imageDraft.size" spellcheck="false"
-                 placeholder="尺寸 宽x高，如 1024x1024（留空用默认）"
-                 :disabled="savingImage" />
-        </div>
-        <div class="set-line">
-          <button class="clip" :disabled="savingImage" @click="saveImage">
-            {{ savingImage ? "保存中…" : "保存" }}
-          </button>
-          <button class="clip" :disabled="testingImage" @click="testImageConn">
-            {{ testingImage ? "自检中…" : "测试出图" }}
-          </button>
-          <button v-if="settings && settings.image && settings.image.overridden"
-                  class="clip ghost" :disabled="savingImage" @click="clearImageOverride">清除页面覆盖</button>
-        </div>
-        <p class="set-note">
-          siliconflow / minimax / zhipu / aliyun / volc 都要 API Key；留空即降级为素材库检索，保存即生效不重启。
-        </p>
-        <!-- 「我明明没填，为什么会有个模型名」要在这一行就能回答：页面原文为空时显示
-             生效值（后端默认）。自检落一张 PNG 到工作区，这里只报路径与 sha16，不打印密钥。 -->
-        <p v-if="settings && settings.image && settings.image.provider" class="set-note">
-          会用：{{ settings.image.effective_model || "（该后端没有默认模型，必须自己填）" }}
-          · {{ settings.image.effective_size || "1024x1024" }}
-        </p>
-        <div v-if="testImageResult" class="probe">
-          <div>
-            <b :class="testImageResult.ok ? 'ok' : 'bad'">{{ testImageResult.provider || "未配置" }}</b>
-            {{ testImageResult.ok
-               ? `出图成功 · ${testImageResult.model || "?"} · ${testImageResult.width || "?"}×${testImageResult.height || "?"} · ${testImageResult.latency_ms || 0}ms`
-               : "不通 · " + (testImageResult.message || "未知错误") }}
-          </div>
-          <div v-if="testImageResult.ok" class="set-note">
-            落盘 {{ testImageResult.artifact }}（{{ testImageResult.bytes }} 字节，sha16 {{ testImageResult.sha16 }}）
-          </div>
-          <div v-for="n in testImageResult.notes || []" :key="n" class="set-note bad">{{ n }}</div>
-        </div>
+        <!-- 图像出图后端那块设置（provider / 密钥 / 模型 / 尺寸 + 保存 / 自检 / 清除覆盖）已随出图链路一起拿掉：
+             成片不再从任何图源取图（素材库检索、出图 API、上传位图都没有了），每一镜由 LLM 写 TSX 现画，
+             这块面板留着就是让人去配一条不存在的路。 -->
         <!-- 记忆：Agent 自己攒的长期记忆，此前只能由 update_memory/read_memory 读写，
              用户在界面上看不见也改不掉。这一块把它摊开——查、改、删都在这里。 -->
         <div class="set-line set-head">
@@ -5891,6 +6246,94 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   transition: all 0.18s;
 }
 .lib-add:hover { color: #fff8ec; background: var(--vermilion); border-style: solid; }
+
+/* 文字库：语速那一格 + 音色分组 */
+.tl-rate {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--ink-soft);
+}
+.tl-rate span { flex: 0 0 auto; }
+.tl-rate select {
+  flex: 1 1 auto; min-width: 0; padding: 4px 8px;
+  font-size: 12.5px; color: var(--ink);
+  background: rgba(255, 253, 247, 0.9); border: 1px dashed var(--line); border-radius: 4px;
+  outline: none;
+}
+.tl-rate select:focus { border-color: var(--vermilion); border-style: solid; }
+.tl-rate { margin-left: auto; }
+.tl-group { margin-bottom: 10px; }
+.tl-group-label {
+  font-family: var(--serif); font-size: 12px; letter-spacing: 2px;
+  color: var(--ink-soft); margin: 8px 0 6px;
+}
+
+/* 文字库：左右两栏（左边样张，右边要挑的卡）。样张 440px 高、右栏的卡更长，
+   不把它钉在左边的话，滚到音色那一段去挑就再也看不见自己正在配的那张图了。
+   抽屉拖窄到放不下两栏时它自己折回上下的老样子（`flex-wrap` 兜的），不必另写一套。 */
+.tl-body { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+/* 宽度**写死**成样张那一栏的宽（248px ＝ 竖屏图限高 440 时的宽）。不写死会出事：
+   `flex: 0 0 auto` 的基准是 max-content，而这一栏里那句说明是一整段中文——按「一行放得下
+   整段」算出来是一千多像素，整栏会把右边挤没。写死这一栏，段子在栏内自己折行。 */
+.tl-rail { flex: 0 0 248px; width: 248px; position: sticky; top: 0; }
+/* 栏名与那句说明在这个宽度里竖着排（横排时标题要占掉一半，说明被挤成一条条窄的） */
+.tl-rail .lib-head { display: block; }
+.tl-rail .lib-head b { display: block; margin-bottom: 6px; }
+.tl-cols { flex: 1 1 420px; min-width: 300px; }
+/* 右栏的卡比别处窄一档（200 而不是 220）。样张那一栏固定吃掉 264px，沿用 220 的话
+   常见的抽屉宽度（~950px）下右栏只剩两列——卡片总高反而比原来竖排时还高，
+   分栏就白分了。200px 底下同样宽度能排三列，而行数才是这一屏要省的东西。
+   代价说清楚：卡片窄一点、说明多折一行；档名（如 zh-CN-XiaoxiaoNeural）仍放得下。 */
+.tl-cols .lib-grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+
+/* 文字库：字幕样张。图来自渲染容器。
+   尺寸**按图自己的比例**收（只压高度），不写死宽高比也不裁：样张是竖屏的，
+   若按 16:9 装进去会在两侧留一片黑，看着像字形被压扁了；写死比例以后样张换成
+   横屏又会再错一次——所以只限高，比例交给图片自己说。 */
+.tl-preview { margin-bottom: 12px; }
+.tl-shot {
+  flex: 0 0 auto; max-height: 440px; max-width: 100%; width: auto; height: auto;
+  border-radius: 4px; background: #16130f; display: block;
+  border: 1px solid var(--line); box-shadow: 2px 3px 0 rgba(38, 34, 28, 0.08);
+}
+.tl-shot-empty {
+  width: 248px; height: 440px; display: flex; align-items: center; justify-content: center;
+  text-align: center; padding: 12px; box-sizing: border-box;
+  font-family: var(--serif); font-size: 12.5px; letter-spacing: 1px; color: #b9b1a3;
+}
+/* 卡片说明兼作「换样张」的开关：点它只看图，不动本对话的设定 */
+.tl-meta-pick { cursor: pointer; }
+.tl-meta-pick:hover b { color: var(--vermilion-deep); }
+.tl-meta-pick.on b { color: var(--vermilion-deep); }
+
+/* 文字库：自由取色那一维（高亮词的颜色）。两枚控件＝「跟色板走」与「钉一个色」，
+   选中态与卡片同一套笔法（实底朱红／描边高亮），一眼看得出这一维钉没钉。 */
+.tl-color { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.tl-color-btn {
+  cursor: pointer; padding: 6px 14px; font-family: var(--serif); font-size: 12px;
+  letter-spacing: 2px; color: var(--vermilion-deep);
+  background: transparent; border: 1px dashed var(--vermilion); border-radius: 4px;
+  transition: all 0.18s;
+}
+.tl-color-btn:hover, .tl-color-btn.sel {
+  color: #fff8ec; background: var(--vermilion); border-style: solid;
+}
+.tl-color-pick {
+  display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
+  padding: 3px 12px 3px 4px; border-radius: 4px;
+  border: 1px solid var(--line); background: rgba(255, 253, 247, 0.9);
+  box-shadow: 2px 3px 0 rgba(38, 34, 28, 0.05);
+}
+.tl-color-pick.sel { border-color: var(--vermilion); box-shadow: 0 0 0 2px rgba(200, 64, 31, 0.18); }
+/* 原生取色器的色块自带一圈内边距与白边框，抠掉才和旁边的字底一样齐 */
+.tl-color-pick input[type="color"] {
+  width: 36px; height: 28px; padding: 0; border: 0;
+  background: transparent; cursor: pointer;
+}
+.tl-color-pick input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+.tl-color-pick input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 3px; }
+.tl-color-val {
+  font-family: var(--serif); font-size: 12px; letter-spacing: 1px; color: var(--ink-soft);
+}
 
 /* 音乐库搜索框 */
 .bgm-search {

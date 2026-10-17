@@ -87,10 +87,11 @@ class PlanGate:
         return self.vocab.output_keys()
 
     def explicit_call_nodes(self) -> set[str]:
-        """必须**显式写进 steps** 的节点（执行期不自动补齐的那几个）。
+        """**建议**写进 steps 的节点（不写也会被拦截器按默认参数补齐的那几个）。
 
-        规划轮提示段用它把这件事说在前面——原先只有校验器知道，模型要交一次卡、
-        吃一次打回才知道。
+        规划轮提示段用它把这件事说在前面。它们的参数就是创意决策所在——写进卡才由
+        模型定，不写就按默认值补。2026-10-16 之前这是一条硬判据（没写进卡就打断回），
+        与架构总纲的「拦截器递归补齐」相冲，已撤（见 ``structure.StructureChecks``）。
         """
         return self.vocab.explicit_call_nodes()
 

@@ -518,8 +518,9 @@ class SpeechRoughCutNode(StoryNode):
     })
 
     async def process(self, state, inputs):
-        # 修字优先：correct_transcript 标了「必须显式调用」、也不在下面的 required_nodes 里，
-        # 所以拦截器不会替我补齐它——只能自己探 Store：用户/模型修过字，这段口播的文本就得按改后的走。
+        # 修字优先：correct_transcript 不在下面的 required_nodes 里（它是「按需触发」那类
+        # 节点，标了 require_explicit_call），所以拦截器没有边可以补它——只能自己探 Store：
+        # 用户/模型修过字，这段口播的文本就得按改后的走。
         # 它只换 text、id 与时间戳逐字不动，因此后面的区间合并与选段逻辑一字不用改。
         source = inputs["asr"]
         if await state.store.has("correct_transcript"):
@@ -2186,10 +2187,25 @@ def _frame_spotcheck(path: Path, duration: float, dst_dir: Path) -> dict[str, An
     也只证明「我打算这么排」；黑屏、定格、整片没画面这类事故只有像素知道。
     用 ffmpeg 出灰度裸流而不是装图片库：一帧就是 w*h 个字节，均值和指纹在 Python 里算，
     不新增依赖。
+
+    取样点必须落在**真实存在的帧**上：``duration`` 是容器的时长，最后一帧的 PTS 是
+    ``duration - 1/fps``，所以 ``0.85 × duration`` 在低帧率短片里会落在那之后——
+    ``-ss`` 把没有 PTS ≥ 该时刻的帧全丢掉，ffmpeg 退出码 0 却什么都不输出。
+    这里不把它当"抽帧失败"（那样整条证据链就降级了），而是先按帧率把点夹回最后一帧；
+    夹取后若两个点撞到一起就只留一个（同一点抽两次没有意义）。
     """
     dst_dir.mkdir(parents=True, exist_ok=True)
-    times = ([0.0] if duration < 0.8 else
-             [round(duration * f, 3) for f in (0.15, 0.5, 0.85)])
+    info = mediaops.probe(str(path))
+    dur = float(duration or info.get("duration") or 0.0)
+    fps = float(info.get("fps") or 0.0)
+    if dur < 0.8 or fps <= 0:
+        times = [0.0]
+    else:
+        last = max(dur - 1.0 / fps, 0.0)        # 最后一个真实存在的帧
+        # 取到毫秒要**向下**取整：最后一帧的 PTS 常是 0.66667 这种除不尽的数，
+        # 四舍五入成 0.667 就又跑到它后面去了（实测：那样第 3 帧照样取不到）。
+        times = list(dict.fromkeys(
+            int(min(dur * f, last) * 1000) / 1000.0 for f in (0.15, 0.5, 0.85)))
     luma: list[float] = []
     fingerprints: list[str] = []
     for i, t in enumerate(times):
@@ -2204,7 +2220,10 @@ def _frame_spotcheck(path: Path, duration: float, dst_dir: Path) -> dict[str, An
         fingerprints.append(hashlib.sha256(data).hexdigest()[:12])
     black = [i for i, v in enumerate(luma) if v < 6.0]
     return {"at": times, "luma": luma, "black_indices": black,
-            "distinct": len(set(fingerprints)) == len(fingerprints),
+            # 只有一个取样点时"互不相同"是白给的：一张帧谈不上动没动。**未判**，
+            # 不许拿它当"画面在动"的证据（同判据：未判 ≠ 通过）。
+            "distinct": len(fingerprints) >= 2
+                        and len(set(fingerprints)) == len(fingerprints),
             "min_luma": min(luma)}
 
 
@@ -4067,13 +4086,10 @@ def build_real_registry(settings: Settings, providers: Providers, storage: Stora
                                     RenderCodeMotionVideoNode)
     from .motion_plan import PlanMotionNode
     from .web_nodes import RenderWebNode
-    from .asset_nodes import ASSET_NODE_CLASSES
-    from .imagegen_nodes import IMAGE_NODE_CLASSES
     reg = NodeRegistry()
     name_to_cls = {cls.name: cls
                    for cls in [*REAL_NODE_CLASSES, RenderWebNode, PlanMotionNode,
-                               RenderCodeMotionVideoNode, PatchCodeMotionVideoNode,
-                               *ASSET_NODE_CLASSES, *IMAGE_NODE_CLASSES]}
+                               RenderCodeMotionVideoNode, PatchCodeMotionVideoNode]}
     for nm in (allowed or list(name_to_cls)):
         cls = name_to_cls.get(nm)
         if cls is not None:

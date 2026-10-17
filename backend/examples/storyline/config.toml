@@ -29,15 +29,31 @@ available_nodes = [
     # 局部改：只对已出片的某一版重烧受影响的镜/窗口，不重做整片。
     # 白名单少一行就等于「那一版改不动」：工具列不出来，前端选区改的派发直接失败。
     "patch_motion_code", "patch_video",
-    # 素材供给（R3 + R6-T24）：先检索内置策展库、未命中再出图。
-    # 这三行以前**不在这里**——节点类写好了、用例也绿，但生产注册表按本白名单过滤，
-    # 于是模型手里从来没有这两个工具，「检索 → 选用 → 上屏」整条 R3 链在真机上等于没接。
-    # 判据就是 T15b 新写的那条：白名单里的每个名字都必须真的注册出来（少一行 = 那条链
-    # 在真机上不存在，而离线用例照样全绿——正是这份文档一路在治的那种假绿）。
-    "search_illustration", "select_illustration", "imagegen",
+    # 素材供给那三个工具（`search_illustration` / `select_illustration` / `imagegen`）
+    # 2026-10-16 摘了：图形片的画面只有一路——模型逐镜写代码画（闸⑦「每镜必画」）。
+    # 白名单里留一行不存在的工具，真机表现是「模型能看见它、点了必失败」；节点类与
+    # 那三行由 test_video_editing.py 的白名单↔注册表相等那条用例一并守着。
     # 控制面工具（非 DAG 节点）：read_node_history 读 Store，render_status 轮询渲染任务。
     # 少了 render_status，模型收到「去轮询」的指示却没有可轮询的工具，等于没改。
-    "read_node_history", "render_status",
+    # preview_voice / preview_caption 见 config.docker.toml 那条注释：它们是「文字库」
+    # 试听键与样式样张的入口，进白名单的理由是主服务侧的注册表就按这张表建
+    # （与两份白名单逐项相等那条用例是两回事）。
+    "read_node_history", "render_status", "preview_voice", "preview_caption",
+    # 三个自检工具（非 DAG 节点，**不带契约**）：建模在交活**之前**自己跑一遍判据——
+    # ① 这一段 TSX 过不过闸①；② 整片九道闸怎么判；③ 这一镜渲出来长什么样。
+    # 它们没有 `require_node`，但必须在白名单里：这张表同时决定主服务注册表里有谁，
+    # 少一行模型就调不到（`storyline_server/server.py::_register_selfcheck`）。
+    # 不带契约决定的是「会不会被按计划裁」——这三个不带，所以规划轮与执行轮都在。
+    "check_shot_code", "check_film", "preview_shot",
+    # DAG 契约本身（`_register_dag_contract`）：**这是模型看全图的唯一一条路**。
+    # 提示词库那句「要看整张图——有哪些节点、各依赖谁、参数什么形状——调 `dag_contract`」
+    # 指的是它，而 2026-10-16 真机核对时发现：服务端**一直**注册着它（`[storyline]
+    # tools=33` 里那一份），可主服务侧按**这张表**筛选入册，而表里从来没写过它 ——
+    # 于是模型照着提示词去调，拿到的是 UnknownTool（`register_mcp_tools` 的
+    # `_matches(name, enabled_tools)` 那一跳）。少这一行＝那句提示词教模型调一个
+    # 不存在的工具，正是 `consistency.WATCHED` 那条检查存在的理由；名字已一并收进
+    # 那份清单，下次再被静默摘掉启动就报。
+    "dag_contract",
 ]
 
 # ---------------------------------------------------------------------------

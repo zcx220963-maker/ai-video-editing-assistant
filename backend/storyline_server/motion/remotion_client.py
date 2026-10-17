@@ -7,10 +7,9 @@
     POST /lint          → {ok, errors:[{rule,line,column,msg}], declared}   恒 200
     POST /render-shot   → {ok, cache_key, artifact, bytes, composition,
                             probed, timings, tokens, fields_used, layout_used,
-                            assets_gate, motion, warnings}
+                            motion, warnings}
 
     GET  /artifact/{k}  → video/mp4 字节
-    POST /stage-assets  → {ok, relpath, sha16, bytes} | {ok, relpath, sha16, idempotent}
 
 三条写代码时必须记住的事：
 
@@ -87,7 +86,6 @@ def health(*, base: str | None = None, timeout: int = 10) -> dict[str, Any]:
 
 
 def lint(code: str, *, declared_fields: list[str] | None = None,
-         assets: list[Any] | None = None,
          base: str | None = None, timeout: int = 60) -> dict[str, Any]:
     """闸①。恒 200，返回 {ok, errors, declared}；不 ok 由调用方决定打回还是放弃。
 
@@ -98,23 +96,17 @@ def lint(code: str, *, declared_fields: list[str] | None = None,
     payload: dict[str, Any] = {"code": code}
     if declared_fields is not None:
         payload["declared_fields"] = list(declared_fields)
-    if assets:
-        # 与渲染口同一份素材名单：不传的话引用了素材的镜会被素材规则误判。
-        payload["assets"] = list(assets)
     _, j = _request("POST", "/lint", base=base, payload=payload, timeout=timeout)
     return j
 
 
 def render_shot(*, code: str, cache_key: str, input_props: dict[str, Any],
                 declared_fields: list[str] | None = None,
-                assets: list[dict[str, Any]] | None = None,
                 render: dict[str, Any] | None = None,
                 base: str | None = None, timeout: int = 900) -> dict[str, Any]:
     """渲一镜。服务端会自己再 lint 一遍，返回的 `errors` 就是拒绝理由。
 
     抛错时 `lint_errors` 非空 = 闸①拒绝（重交代码可修），为空 = 渲染/超预算类失败。
-    `assets` 是本镜声明的素材列表（传给服务端做 staticFile 双向对账）。
-
     `render` 是**像素档**：`{draft, scale, image_format, jpeg_quality, crf, concurrency}`。
     不传＝服务端默认（成片档），传了也只是换档，**不换判据**——闸⑭ 读 64 px 宽的灰度差、
     闸⑥⑧⑲-a 读比例盒，都与输出分辨率无关。所以 `draft=True` 那一档是给验收循环用的：
@@ -126,8 +118,6 @@ def render_shot(*, code: str, cache_key: str, input_props: dict[str, Any],
                                "input_props": input_props}
     if declared_fields is not None:
         payload["declared_fields"] = list(declared_fields)
-    if assets is not None:
-        payload["assets"] = list(assets)
     if render is not None:
         payload["render"] = dict(render)
     status, j = _request("POST", "/render-shot", base=base, payload=payload,
@@ -160,24 +150,6 @@ def fetch_artifact(artifact: str, dest: Path, *, base: str | None = None,
     return len(data)
 
 
-def stage_asset(*, relpath: str, sha16: str, bytes_b64: str,
-                base: str | None = None, timeout: int = 120) -> dict[str, Any]:
-    """把一个素材文件投到渲染容器 public/ 下（/stage-assets 端点）。
-
-    `relpath` 是相对于 public/ 的路径（即 assets 栏的 `name`）；
-    `sha16` 是 sha256 前 16 位，服务端按它对账——声明与实算不符直接 400；
-    `bytes_b64` 是文件字节的 base64 编码。
-
-    幂等：同一 relpath + sha16 已存在时服务端返回 `{idempotent: true}`，不重写。
-    """
-    _, j = _request("POST", "/stage-assets", base=base,
-                    payload={"relpath": relpath, "sha16": sha16, "bytes_b64": bytes_b64},
-                    timeout=timeout)
-    if not j.get("ok"):
-        raise RemotionError(f"素材投递失败（{relpath}）：{j.get('error') or j}")
-    return j
-
-
 def render_stills(*, code: str, input_props: dict[str, Any], frames: list[int],
                   scale: float = 0.4, base: str | None = None,
                   timeout: int = 120) -> list[dict[str, Any]]:
@@ -195,29 +167,49 @@ def render_stills(*, code: str, input_props: dict[str, Any], frames: list[int],
     return list(j.get("stills") or [])
 
 
+def render_stills_multi(*, code: str, variants: list[dict[str, Any]],
+                        scale: float = 0.4, base: str | None = None,
+                        timeout: int = 300) -> list[dict[str, Any]]:
+    """**一段代码、多组 props** 各渲一张静帧 → ``[{variant, frame, jpeg_b64}]``。
+
+    与 :func:`render_stills` 是同一个口：差别只在这个走它的 `variants` 分段口，
+    于是渲染容器**只打包一次**。为什么值得单独一条：一屏字幕样张是六档样式共用同一份
+    样片代码、只换注入的 props——逐档各发一次就要各打包一遍（每遍 1~3 秒），
+    面板上点一下要干等十几秒。
+
+    `variant` 是**序号回执**：调用方按它对号入座，不靠数组次序猜（少一张图时，
+    按次序对就会把「第 5 档的图」发成「第 6 档的图」，且看不出来）。
+    """
+    payload = {"code": code, "variants": list(variants), "scale": scale}
+    status, j = _request("POST", "/render-stills", base=base, payload=payload,
+                         timeout=timeout)
+    if status != 200 or not j.get("ok"):
+        raise RemotionError(f"样张渲染失败：{j.get('error') or j}", status=status)
+    return list(j.get("stills") or [])
+
+
 def endpoints(*, base: str | None = None, health_timeout: int = 10,
               lint_timeout: int = 60, render_timeout: int = 900,
-              fetch_timeout: int = 300, stage_timeout: int = 120) -> dict[str, Any]:
-    """五个口绑成一组普通可调用对象：``{health, lint, render, fetch, stage_asset}``。
+              fetch_timeout: int = 300) -> dict[str, Any]:
+    """几个口绑成一组普通可调用对象：``{health, lint, render, fetch, stills,
+    stills_multi}``。
 
     执行层拿这一组而不是直接 import 本模块的函数，为的是**依赖注入不用 monkeypatch**：
     离线用例塞一个假服务就是一段 dict，而改模块函数会把别的用例一起带跑。
-    位置参数口径固定：``render(code, cache_key, input_props)``、``fetch(artifact, dest)``、
-    ``stage_asset(relpath, sha16, bytes_b64)``。
+    位置参数口径固定：``render(code, cache_key, input_props)``、``fetch(artifact, dest)``。
     """
     return {
         "health": lambda: health(base=base, timeout=health_timeout),
         "lint": lambda code, declared_fields=None: lint(
             code, declared_fields=declared_fields, base=base, timeout=lint_timeout),
-        "render": lambda code, cache_key, input_props, declared_fields=None, assets=None, render=None: render_shot(
+        "render": lambda code, cache_key, input_props, declared_fields=None, render=None: render_shot(
             code=code, cache_key=cache_key, input_props=input_props,
-            declared_fields=declared_fields, assets=assets, render=render, base=base,
+            declared_fields=declared_fields, render=render, base=base,
             timeout=render_timeout),
         "fetch": lambda artifact, dest: fetch_artifact(artifact, dest, base=base,
                                                        timeout=fetch_timeout),
-        "stage_asset": lambda relpath, sha16, bytes_b64: stage_asset(
-            relpath=relpath, sha16=sha16, bytes_b64=bytes_b64, base=base,
-            timeout=stage_timeout),
         "stills": lambda code, input_props, frames, scale=0.4: render_stills(
             code=code, input_props=input_props, frames=frames, scale=scale, base=base),
+        "stills_multi": lambda code, variants, scale=0.4: render_stills_multi(
+            code=code, variants=variants, scale=scale, base=base),
     }

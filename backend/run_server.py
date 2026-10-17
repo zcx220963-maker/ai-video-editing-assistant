@@ -57,7 +57,8 @@ from agent_framework.prompts import build_prompt_library, validate_manifest
 from agent_framework.agent import _refresh_prompt_texts as refresh_prompt_texts
 from agent_framework.ask_gate import refresh_prompt_texts as refresh_ask_gate_texts
 from agent_framework.ask_user import AskUserTool
-from agent_framework.consumer import CHAT_TOPIC, session_key
+from agent_framework.consumer import CHAT_TOPIC
+from agent_framework.identity import session_key
 from agent_framework.heartbeat import Heartbeat
 from agent_framework.hooks import (
     ApprovalHook,
@@ -279,7 +280,6 @@ def build_runtime(
     topic: str = CHAT_TOPIC,
     skills_dir: str | Path | bool | None = None,     # 导入源目录；False=关闭技能系统
     use_memory: bool = True,                         # 长期记忆存 PG memories 表
-    bootstrap_dir: str | Path | None = None,
     # 提示词目录（prompts/*.md）；None = 用仓库自带的 prompts/，False = 关闭（全走内联）
     prompts_dir: str | Path | bool | None = None,
     use_checkpoint: bool = True,                       # False = 关闭崩溃恢复快照
@@ -317,7 +317,8 @@ def build_runtime(
 
     # 提示词库：默认接仓库自带的 prompts/（存在就用），所以「提示词搬出 .py」
     # 默认生效，而不是又一个要记得打开的开关——Bootstrap 机制当年就是死在
-    # 「写了但没人接」上（bootstrap_dir 一直没传）。System prompt、规划轮整段、
+    # 「写了但没人接」上（bootstrap_dir 一直没传，那一层 2026-10-16 已删，
+    # 见 context.ContextBuilder.__init__ 里那段注释）。System prompt、规划轮整段、
     # 子 Agent 的 system、几条纠错说明都从这里读；文件缺失则逐段回落到内联默认值。
     # **必须排在所有消费者之前**：下面的 make_spawn_tool 会把子 Agent 提示词
     # 在构造时就固化进 SubAgentRunner，PlanGate 也要拿这份引用——晚一步就变成
@@ -367,8 +368,24 @@ def build_runtime(
     # rerun_from：从某节点回退并重跑（上游产物复用、产物作用域换新）
     register_run_tools(registry, editing_contract)
 
-    # spawn：子 Agent 可用工具（联网检索）；trace_mq 让子 Agent 工具调用也回投到父会话窗口。
-    registry.register(make_spawn_tool(llm, [lambda r: register_web_tools(r)], trace_mq=mq))
+    # spawn：子 Agent 可用工具（文件 + 联网检索）；trace_mq 让子 Agent 工具调用也回投到
+    # 父会话窗口。
+    #
+    # **文件那一份是 2026-10-16 补的，补之前这里只给联网。** 真机代价（run
+    # 9272c7f59501，20 镜那条）：模型派子 Agent 去「把 shots/s01~s20 读出来汇总成
+    # JSON 写到 shots/spec.json」——那正是子 Agent 该干的活——而子 Agent 手里只有
+    # fetch_url / web_search，`file://` 与 `localhost` 都被拒，如实回报「硬性工具缺失」，
+    # 模型只好自己重读 20 个文件。**而 `subagent.SpawnTool` 的描述当时就写着「子 Agent
+    # 可能写文件或联网」**——描述与装配对不上，正是那个文件上面自己点名的那一类错
+    # （「描述撒谎的代价不是慢，是计划错」）。所以这里补的是**装配**，不是描述。
+    #
+    # 权限边界没有放开：工作区根仍是 `session_workspace_root(storage.workspace.root)`
+    # ——**本会话**的作用域，与父 Agent 手上那三个文件工具同一份 root_provider；
+    # `--approve-tools` 那道人审照旧（它在 registry 上，不在装配这一跳）；
+    # 「子 Agent 不能再派生」也照旧（`SUBAGENT_DENY_TOOLS` 剥掉的是派生类，不是文件类）。
+    registry.register(make_spawn_tool(
+        llm, [lambda r: register_file_tools(r, session_workspace_root(storage.workspace.root)),
+              lambda r: register_web_tools(r)], trace_mq=mq))
 
     # 主动提问：把「需要用户拿主意」的时刻变成选项卡弹窗（不再让用户纯打字回答）。
     # 模型调它 → 本轮挂起 → 用户点选 → 从断点续跑。与审批共用同一套挂起/续跑机制。
@@ -431,7 +448,6 @@ def build_runtime(
 
     context_builder = ContextBuilder(
         None,                       # None = 按提示词库解析；显式字符串仍可覆盖
-        bootstrap_dir=bootstrap_dir,
         context_sources=context_sources,
         compressor=compressor,
         prompt_library=prompt_library,

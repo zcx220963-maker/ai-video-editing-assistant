@@ -169,24 +169,34 @@ def preview_summary(preview: Mapping[str, Any] | None) -> dict[str, str]:
 #: ``KNOB_FIELDS`` 同源；两份名单漂移由 tests/test_code_spec.py 拦下）。
 #: 为什么不在这里 import 那个模块：主服务不装配剪辑服务端的实现，而这里读错的后果
 #: 只是摘要少显示一个字段——它不参与任何执行判定。
-MOTION_KNOBS = ("aspect", "fps", "narration", "voice", "rate", "subtitle_mode",
-                "caption_position", "caption_anim",
-                "texture", "transition", "transition_sec", "entrance", "exit")
+MOTION_KNOBS = ("aspect", "fps", "narration", "voice", "rate", "caption_style",
+                "highlight_style",
+                "palette", "texture", "transition", "transition_sec", "entrance", "exit")
 
-#: 卡面要给人看的词，不是枚举字面量（用户不需要背 portrait / torn_highlight）。
+#: 卡面要给人看的词，不是枚举字面量（用户不需要背 portrait / paper）。
 #: 这三张表只是**拿不到契约 value_labels 时的兜底**，取值与措辞都必须和
 #: ``code_spec.KNOB_VALUE_LABELS`` 逐字一致——不一致时确认卡会把同一个决定显示成
 #: 两副面孔。契约在时走 ``props_for(节点名)``，这里不参与判定。
 _ASPECT_LABELS = {"portrait": "竖屏", "landscape": "横屏", "square": "方屏"}
-_SUBTITLE_LABELS = {"torn_highlight": "撕纸条·逐词点亮", "full": "整句字幕",
-                    "none": "不上字幕"}
-_CAPTION_POSITION_LABELS = {"bottom": "底部字幕条", "center": "压在画面正中",
-                            "top": "顶部安全区"}
-_CAPTION_ANIM_LABELS = {"fade": "淡入", "rise": "上浮入场", "pop": "弹出放大",
-                        "karaoke": "逐字随语音点亮"}
+_CAPTION_STYLE_LABELS = {"on_picture": "贴画面·无底条", "outlined": "白字黑边",
+                         "paper": "纸条底·画面下沿", "film_line": "整句电影感·下沿淡浮",
+                         "big_center": "大字压屏·画面正中", "top_banner": "顶部横幅",
+                         "none": "不上字幕"}
+_HIGHLIGHT_STYLE_LABELS = {"color": "关键词换色", "karaoke": "逐词点亮",
+                           "block": "底色块", "ink": "撕纸高亮",
+                           "plain": "不强化·整句一个样"}
 _TEXTURE_LABELS = {"none": "不加（原片直出）", "film": "老胶片·颗粒与暗角",
                    "tv": "老电视·扫描线与色偏", "glow": "柔光·高光处泛开",
                    "bleach": "漂白·硬对比低饱和"}
+# 整片底色那一格（2026-10-17）。与 ``code_spec.KNOB_VALUE_LABELS["palette"]`` 逐字一致
+# （那份是分镜契约侧、这里兜底用）——八套色板的中文名两边各写一遍是既有规矩：
+# 主服务不装配剪辑服务端的实现，而漂了就是在两张卡上对同一档说两句话。
+# `none` 的措辞与文字库面板的那一档同源（`code_spec.PALETTE_DEFAULT_LABEL`）。
+_PALETTE_LABELS = {"none": "默认（片子的底色）",
+                   "vintage-kraft": "复古牛皮纸", "deep-ocean": "深海蓝",
+                   "obsidian-violet": "黑曜紫", "modern-light": "现代浅色",
+                   "midnight": "午夜暗场", "solar-pop": "阳光波普",
+                   "coral-burst": "珊瑚撞色", "color-play": "彩块拼接"}
 # R7-T22 的四条同规矩。**进出场分成两张表**：同一个取值「rise」在入场里是
 # 「自下浮入」、在出场里是「向上浮出」，共用一张表就会在确认卡上写出一句反话。
 _TRANSITION_LABELS = {"none": "硬切（镜镜直接接）",
@@ -273,11 +283,10 @@ def motion_summary(source: Mapping[str, Any] | None,
             out["声音"] = "旁白 " + " ".join(x for x in (voice, rate) if x)
         else:
             out["声音"] = "无旁白（按阅读节奏驻留）"
-    sub = word("subtitle_mode", src.get("subtitle_mode"), _SUBTITLE_LABELS)
+    sub = word("caption_style", src.get("caption_style"), _CAPTION_STYLE_LABELS)
     if sub:
-        pos = word("caption_position", src.get("caption_position"), _CAPTION_POSITION_LABELS)
-        anim = word("caption_anim", src.get("caption_anim"), _CAPTION_ANIM_LABELS)
-        out["字幕"] = "，".join(x for x in (sub, pos, anim) if x)
+        hl = word("highlight_style", src.get("highlight_style"), _HIGHLIGHT_STYLE_LABELS)
+        out["字幕"] = "，".join(x for x in (sub, hl) if x)
     texture = word("texture", src.get("texture"), _TEXTURE_LABELS)
     # 逐镜点名（B6）：整片那一档只是**默认**，一镜能点一档、也能点名不要。确认卡不许把
     # 「整片不加、第 3 镜老电视」显示成「没加质感」——那是用户正要批准的一个观感决定。
@@ -293,6 +302,13 @@ def motion_summary(source: Mapping[str, Any] | None,
             f"，{n_override} 镜点名换过档" if n_override else "")
     elif n_override:
         out["质感（逐镜点名）"] = f"整片不加，{n_override} 镜自己点了档"
+    # 整片底色那一格（2026-10-17）。只在**真选了一套**时才出一行：「默认（片子的底色）」
+    # 是缺省，每张确认卡上都写一句只会把真正要批的那几行淹掉（与「硬切」那一行同理）。
+    # 逐镜覆盖数**不数**：色板没有逐镜的那一栏（它是写在那一镜代码里的），
+    # 数不出来就不写一个估的数——「几镜换过档」在质感那一行是真的，这里不是。
+    palette = str(src.get("palette") or "").strip().lower()
+    if palette and palette != "none":
+        out["底色"] = word("palette", palette, _PALETTE_LABELS)
     # R7-T22：接缝与进出场。只在**不是硬切/不动**时才出一行——「硬切」是默认，
     # 每张确认卡上都写一句「镜镜直接接」只会把真正要批的那几行淹掉。
     trans_style = str(src.get("transition") or "none").strip().lower()
@@ -367,9 +383,11 @@ def build_render_ask(preview: Mapping[str, Any] | None, *,
         # 分镜阶段算出的「比目标长/短不少」是这条通道唯一能提前给出的偏差——
         # 它必须出现在题面上：删镜还是加速，是用户在**开渲之前**该做的决定。
         warnings += [str(w) for w in (motion.get("target_warnings") or [])]
-        # 闸⑦ 的文案与风格提醒也上这一张卡：它们**故意不做硬闸**（词法认不出专名，
+        # 分镜阶段那些**只提醒**的条目（文案具体项、色板/卡族/原创占比这些多样性建议）
+        # 也上这一张卡：它们故意不做硬闸（词法认不出专名、审美选择不该被机器判死，
         # 误伤的代价是一整轮重规划），而「不打回」不等于「用户看不见」——开渲之前是
         # 唯一还能一句「这几镜太空，重写」的时机，出了片再改就是重烧。
+        # 闸⑦「每镜必画」不在这里：它是硬闸，没画画的镜根本走不到确认卡这一步。
         warnings += [str(w) for w in (motion.get("style_warnings") or [])]
     conflict = duration_conflict(preview)
 

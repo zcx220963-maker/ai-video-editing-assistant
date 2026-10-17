@@ -13,7 +13,7 @@ export const BRAND = {
   ink: '#171714', // 亮底上的取景框色
   paper: '#F5F3EE', // 暗底上的取景框色（反白版）/ 浅色背景
   slate: '#B5B0A5', // 次级文字（暗底）
-  font: '"Avenir Next", Avenir, Inter, "Helvetica Neue", "PingFang SC", Arial, sans-serif', // 字标字体
+  font: '"Noto Sans CJK SC", sans-serif', // 字标字体
 } as const;
 
 // 标志的两段路径（viewBox 0 0 128 128）：frame = 开口取景框，cut = 斜切。分开导出，方便分段做动画

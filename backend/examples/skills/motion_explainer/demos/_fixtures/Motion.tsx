@@ -2,7 +2,7 @@
 // 缓动表 E / 分段进度 seg / 插值 lerp / 确定性伪随机 rand + DesignStage 设计坐标容器。
 // 全部是纯函数，由 useCurrentFrame 驱动，满足 Remotion 确定性渲染要求。
 import React from 'react';
-import { AbsoluteFill, useCurrentFrame, useVideoConfig } from 'remotion';
+import { AbsoluteFill, Easing, useCurrentFrame, useVideoConfig } from 'remotion';
 
 export const E = {
   linear: (t: number) => t,
@@ -25,6 +25,13 @@ export const E = {
     const w = 8 + 8 * (1 - bounce);
     return 1 - Math.exp(-6 * t) * Math.cos(w * t * bounce * 2.2);
   },
+  // R5-T16：官方的两条默认缓动（Remotion `markup` skill 里点名的基准曲线）。
+  // 为什么进这里而不是每镜自己写：缓动曲线是**观感**里最容易各写各的一格，
+  // 48 张卡各挑一条曲线，整片就没有统一的手感了。上面那张手写表留着不动既有卡，
+  // 新写的动效优先用这两个——`bezier(0.16,1,0.3,1)` 是「快出慢收」，
+  // `spring({damping:200})` 是高阻尼无回弹，两者覆盖绝大部分入场/位移。
+  standard: Easing.bezier(0.16, 1, 0.3, 1),
+  spring200: Easing.spring({ damping: 200 }),
 };
 
 export const lerp = (t: number, a: number, b: number) => a + (b - a) * t;

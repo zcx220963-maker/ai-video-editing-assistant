@@ -165,7 +165,9 @@ from .mq import (
     KafkaMessageQueue,
     build_message_queue,
 )
-from .consumer import SessionConsumer, CHAT_TOPIC, CONSUMER_GROUP, session_key
+from .consumer import SessionConsumer, CHAT_TOPIC, CONSUMER_GROUP
+#: 会话键的拼法只住在 identity 里（consumer 也是从那儿取的）。
+from .identity import session_key
 from .connection_manager import (
     ConnectionManager,
     OUTBOUND_TOPIC,

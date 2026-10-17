@@ -32,9 +32,10 @@ class NodeContract:
     # maximum/unit）。MCP 的工具声明只带得出类型，枚举与上下界留在剪辑服务端，
     # 计划卡要拿它们当「可反查的枚举源」，所以随契约一并取回。
     params: Mapping[str, Any] = field(default_factory=dict)
-    # 该节点**不会**被主服务自动补齐（需 LLM 显式调用并传创意决策参数）。
-    # 计划门据此在出卡阶段就挡下「漏了这个前置」的计划——否则用户确认完，
-    # 执行到下游那一步才抛错，整轮白跑。
+    # 该节点的创意决策参数**本意由调用方给**（服务端标了 require_explicit_call）。
+    # 2026-10-16 降价：漏了它不再打断回，执行期照常按默认参数补齐并在回执里点名。
+    # 计划门只拿它写一句建议（`plan.prompt._explicit_nodes`）与工具说明里那条附注
+    # （`tools.mcp._desc_tail`）——「写进去才由你定参数」。
     explicit: bool = False
 
     @property
@@ -49,6 +50,12 @@ class NodeContract:
 @dataclass
 class EditingContract:
     nodes: dict[str, NodeContract] = field(default_factory=dict)
+    #: 剪辑服务端声明的「文字库」清单（命名字幕样式档 + 各维枚举与中文标签 + 音色分组）。
+    #: **不是节点契约**，但走的是同一条通道：只读、由剪辑服务端声明、随 `dag_contract`
+    #: 一次带回。并进这一份而不是另开一个拉取口：多一个口就多一次「连上了但那份没取到」
+    #: 的半截状态，而前端拿不到它就只能把取值自己列一遍——那正是这条链最忌讳的第二出处。
+    #: 取不到时是空表，调用方按「没这份东西」处理（前端退化成只显示计划卡那条路）。
+    text_library: Mapping[str, Any] = field(default_factory=dict)
 
     def __bool__(self) -> bool:
         return bool(self.nodes)
@@ -120,7 +127,8 @@ def parse_contract(payload: Any) -> EditingContract:
         elif isinstance(spec, (list, tuple)):
             out[str(name)] = NodeContract(name=str(name),
                                           requires=tuple(str(x) for x in spec))
-    return EditingContract(nodes=out)
+    lib = payload.get("text_library")
+    return EditingContract(nodes=out, text_library=lib if isinstance(lib, dict) else {})
 
 
 async def load_contract(client: Any, *, timeout: float = 30.0,

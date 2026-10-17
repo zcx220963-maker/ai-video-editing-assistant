@@ -4,6 +4,7 @@
 // 依赖仅 remotion + react；可选共享件——copy demo 时一并带上并改 import 路径。
 import React from 'react';
 import { useCurrentFrame } from 'remotion';
+import { fitText as remotionFitText } from '@remotion/layout-utils';
 
 // ───────────────────────── 缓动 ─────────────────────────
 
@@ -65,14 +66,38 @@ export const velocity = (f: (frame: number) => number, frame: number) => f(frame
 // ───────────────────────── 字体 ─────────────────────────
 
 export const FONT = {
-  sans: '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Inter, Arial, sans-serif',
-  mono: '"SF Mono", "JetBrains Mono", Menlo, monospace',
+  sans: '"Noto Sans CJK SC", sans-serif',
+  mono: '"Noto Sans Mono CJK SC", monospace',
 };
 
 // 按字号给字距（em）：大标题收紧、正文微收、小字放开；caps=true（全大写）整体放松一档
 export const tracking = (size: number, caps = false) => {
   const base = size >= 96 ? -0.04 : size >= 56 ? -0.03 : size >= 28 ? -0.02 : size >= 16 ? -0.008 : 0.01;
   return `${(base + (caps ? 0.03 : 0)).toFixed(3)}em`;
+};
+
+/** 运行时字宽自适应：给一段文字和最大宽度，返回能装下的字号。
+ *  用 Noto CJK 实测（不再按 SF Pro 估），从根上解 J7 度量错位与闸⑧ 叠字。
+ *  只能在渲染期（浏览器里）调；lint / 构建期不调。 */
+export const fitText = (opts: {
+  text: string;
+  maxWidth: number;
+  fontFamily?: string;
+  fontWeight?: number;
+  maxLines?: number;
+  maxFontSize?: number;
+  minFontSize?: number;
+}): { fontSize: number } => {
+  try {
+    return remotionFitText({
+      text: opts.text,
+      withinWidth: opts.maxWidth,
+      fontFamily: opts.fontFamily ?? FONT.sans,
+      fontWeight: opts.fontWeight ?? 400,
+    });
+  } catch {
+    return { fontSize: opts.maxFontSize ?? 48 };
+  }
 };
 
 // ───────────────────────── 表面材质 ─────────────────────────

@@ -1,7 +1,7 @@
 """①~④ 四重校验器的**步骤级**那一半：node 白名单 / skills_hint / param_options，
 外加逐步骤的 why/expectation 与 seq。纯代码，一次 LLM 都不叫。
 
-跨步骤的结构判据（拓扑、显式依赖、跳过规则、重复步骤、重复开关、文案卫生）在
+跨步骤的结构判据（拓扑、跳过规则、重复步骤、重复开关、文案卫生）在
 ``structure.StructureChecks``——它拿的是一张完整的卡，不是单步。
 **单个取值**那一级的判据（候选值能不能反查回来、一个开关上的几处毛病怎么合成一句）
 在 ``switches``——它不认识步骤、节点与 tag，这一层只管逐步归一化并把意见汇总。
@@ -45,37 +45,14 @@ class PlanValidator:
             return [], issues
         allowed = self.vocab.whitelist()
         skills = await self._skill_map()
-        hints = await self._explicit_knob_hints()
         out: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         for index, plan in enumerate(raw, start=1):
             norm = await self._validate_plan(plan, index, allowed, skills, issues,
-                                             seen_ids, hints)
+                                             seen_ids)
             if norm is not None:
                 out.append(norm)
         return out, issues
-
-    async def _explicit_knob_hints(self) -> dict[str, str]:
-        """「缺的那个前置补进 steps 时，它自己能配什么开关」——按节点一句，缺什么给什么。
-
-        为什么要专门备一份（真机实测，14 镜「薄肌理论」那条 run）：打回消息让模型把
-        ``片段分组`` / ``片段筛选`` / ``脚本模板推荐`` 三个前置补进 steps，**却没说过
-        这三个节点能配什么**。模型补上步骤的同时给它们各造了一个开关（``grouping``
-        / ``keep`` / ``template``），第二枪的 21 条意见里 9 条是这一条引出来的——
-        **上一枪的忠告，直接生产了下一枪的错误**。而 `max_retries=1` 只给两次机会，
-        等于这一枪就没得改了。这里把这三个节点的真实开关随那句忠告一起给出去。
-
-        只在真有这类节点时才取数：``explicit_call_nodes`` 常在为空，那时一次都不问
-        （取开关事实要走一遍 ``enum_source``，曲库标签那一路是真去取标签的）。
-        """
-        out: dict[str, str] = {}
-        for node in sorted(self.vocab.explicit_call_nodes()):
-            fact = await self.vocab.knob_facts_for(node)
-            head = knob_hint(fact, prefix=f"「{node}」")
-            # 两种处境两种收尾：本来就没开关的，写上这一步就行；有开关的，只许用这些。
-            out[node] = head + ("写上这一步即可，不要为它配参数。" if not fact.get("knobs")
-                                else "只写这些，别的名字不要造。")
-        return out
 
     async def _skill_map(self) -> dict[str, Any]:
         """技能表。``__unreadable__`` 是哨兵：没接技能库与读不到同一种处境——
@@ -89,8 +66,8 @@ class PlanValidator:
 
     async def _validate_plan(self, plan: Mapping[str, Any], index: int,
                              allowed: set[str], skills: Mapping[str, Any],
-                             issues: PlanIssues, seen_ids: set[str],
-                             hints: Mapping[str, str]) -> dict[str, Any] | None:
+                             issues: PlanIssues, seen_ids: set[str]
+                             ) -> dict[str, Any] | None:
         tag = clean(plan.get("plan_id")) or f"p{index}"
         # 本份计划之后出的每条意见都记上来源：三份候选的毛病往往一模一样，
         # 打回清单要按它把「同一件事在第几份上」合成一条（``PlanIssues.groups``）。
@@ -121,7 +98,11 @@ class PlanValidator:
         # 被推去问用户「这轮没有剪辑工具怎么办」（那一轮就是死路）。
         view = norm_steps if ok else topology_view(self.vocab.contract, steps)
         self.structure.topology(tag, view, issues)
-        self.structure.explicit_deps(tag, view, issues, hints=hints)
+        # 原先还有一条 `explicit_deps`（「标了 require_explicit_call 的前置必须写进
+        # steps」）夹在这里。它守的是执行期那个「必须先显式调用」的报错，而那个报错
+        # 已撤（见 `structure.StructureChecks` 上方那段注释与 `orchestration.Interceptor`）：
+        # 那几步没写进卡**不是错误**，只是写法之一——执行期会按默认参数替你补齐，
+        # 并在回执里标注是哪几步。建议归提示段（`prompt._explicit_nodes`）。
         if ok:
             # 跳过规则要写回步骤字段（skippable / skip_reason），只在归一化过的步骤上跑。
             self.structure.skip_rules(tag, view, issues)

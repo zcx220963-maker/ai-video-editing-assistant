@@ -16,6 +16,9 @@
  *
  * 另有 POST /render-stills：同一套打包，只渲几帧小 JPEG（渲染前计划确认卡上的预览图）。
  * 成本约是整镜渲染的百分之一，这是 Remotion 官方推荐的「抽几帧看」的验证方式。
+ * 它还带一个可选的 `variants` 分段口（见 `stillJobs`）：一段代码配多组 props，各渲
+ * 一张——「文字库」的六档字幕样式就是这么一次打包渲完的。
+ * 它顺带回一行版面读数（`layout`，见 `renderStills`）——那是修一处版面最便宜的时刻。
  */
 import http from 'node:http';
 import fs from 'node:fs/promises';
@@ -25,12 +28,13 @@ import { execFileSync, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { lintShotCode } from './lint.mjs';
-import { PUBLIC, shotPublicDir, linkShippedNamespaces, readAssetManifest,
-         gateAssets } from './assetgate.mjs';
 import { motionDensity } from './motionsample.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const OUT = path.join(ROOT, 'out');
+// 渲染期 `staticFile()` 的根。供图通道撤掉后每一镜没有自己的一份素材字节，
+// 这个根无条件就是 `public/`（字体住在 `public/fonts/`，随镜像发）。
+const PUBLIC = path.join(ROOT, 'public');
 const recursiveDir = { recursive: true };
 const SHOT_FILE = path.join(ROOT, 'src', 'user-shots', 'shot.tsx');
 const PORT = Number(process.env.PORT || 8010);
@@ -38,6 +42,40 @@ const PORT = Number(process.env.PORT || 8010);
 // 直接 500），只有 swangle 画得出带光影的几何体。改这一档等于决定 3D 通道在不在。
 const GL = process.env.DG_GL || 'swangle';
 const BROWSER = process.env.DG_BROWSER || '/usr/bin/chromium';
+
+/** 三条回读通道的行首标记。**与 `src/tokens.ts` 的同名常量一起改**——写在这里而不是
+ *  某个处理函数里，是因为 `/render-shot` 与 `/render-stills` 两个口都要认它们
+ *  （版面那一路 2026-10-16 起两个口都接）。 */
+const TOKEN_MARKER = 'DG_TOKENS:';   // = TOKEN_LOG_MARKER
+const FIELD_MARKER = 'DG_FIELDS:';   // = FIELD_LOG_MARKER
+const LAYOUT_MARKER = 'DG_LAYOUT:';  // = LAYOUT_LOG_MARKER
+
+/** 探针帧 = 末帧往前这一格（= `src/tokens.ts` 的 `FIELD_PROBE_TAIL`）。
+ *  为什么这个数在服务端也要有一份：`/render-stills` 得知道**该抽哪一帧**才拿得到回读行
+ *  ——探针只在那一帧跑，抽别的帧回来的是「这一镜没扫过」。 */
+const PROBE_TAIL = 2;
+
+/** 版面那一行**有两个上报者**（`src/lib/LayoutProbe.tsx` 的 `by`）：母版量画面带，
+ *  测量壳量整帧。套了母版的镜两行都会来，所以「谁说了算」得有个明确的规矩，
+ *  不能靠「后一行覆盖前一行」——那等于把胜负交给 effect 的执行次序，
+ *  而这个次序正是 2026-10-16 那次真机事故的成因（壳的整帧口径盖掉了母版的画面带口径，
+ *  母版镜的 `band` 全报成整帧、进出场那层变换也没折回去）。
+ *
+ *  规矩：**先要真扫到的，再要母版的**。
+ *   - 两行都真扫到 → 母版那一行（画面带口径才是这一镜的版面，壳的整帧口径是把
+ *     母版的 gutter 与字幕带也算进去了）；
+ *   - 只有一行真扫到 → 那一行（母版那条「画面带 ref 未挂载」的落空行不该把一份
+ *     真读数挤掉）；
+ *   - 两行都没扫到 → 母版那一行（它的 `reason` 才是这一镜的真实原因）。
+ *  一个都没有 → null（Python 侧落 `missing`，不是「干净」）。 */
+function pickLayout(lines) {
+  if (!lines.length) return null;
+  const scanned = (l) => !!l && typeof l === 'object' && l.scanned
+    && typeof l.scanned === 'object';
+  const pool = lines.filter(scanned);
+  const from = pool.length ? pool : lines;
+  return from.find((l) => l.by === 'master') ?? from[from.length - 1];
+}
 
 const require = createRequire(import.meta.url);
 const remotionVersion = require('remotion/package.json').version;
@@ -83,23 +121,19 @@ async function acquireSlot() {
 }
 
 /** 打包一镜：写 shot.tsx → bundle()。调用方负责把它放进 `serialize`。 */
-async function bundleShot(code, shotId) {
+async function bundleShot(code) {
   const { bundle } = await loadRemotion();
   await fs.mkdir(path.dirname(SHOT_FILE), recursiveDir);
   await fs.mkdir(OUT, recursiveDir);
-  // publicDir 是 bundle 的入参：目录不存在 bundler 会当场炸，而「这一镜一件素材都没有」
-  // 是完全正常的一镜。先建出来，代价是一次 mkdir。
-  const publicDir = shotPublicDir(shotId);
-  await fs.mkdir(publicDir, recursiveDir);
-  // `bundle()` 只铺一个目录当 `staticFile()` 的根，而字体不在这一镜的素材目录里
-  // （`public/fonts/` 是随镜像发的公共命名空间）——先接进来，否则每一个镜头都会
-  // 因为母版加载字体而 404 收场。详见 `linkShippedNamespaces` 的注释。
-  const shipped = await linkShippedNamespaces(shotId);
+  // publicDir 是 bundle 的入参：目录不存在 bundler 会当场炸。`public/` 随镜像发出去，
+  // 里面住着 `fonts/`——`staticFile('fonts/…')` 的根就是它。供图通道撤掉后每一镜
+  // 不再有自己的一份素材字节，这个根无条件就是 `public/`。
+  await fs.mkdir(PUBLIC, recursiveDir);
   await fs.writeFile(SHOT_FILE, code, 'utf8');
   const t0 = Number(process.hrtime.bigint() / 1000000n);
   const serveUrl = await bundle({
     entryPoint: path.join(ROOT, 'src', 'index.ts'),
-    publicDir,
+    publicDir: PUBLIC,
     webpackOverride: (cfg) => ({
       ...cfg,
       resolve: {
@@ -120,29 +154,71 @@ async function bundleShot(code, shotId) {
       },
     }),
   });
-  return { serveUrl, shipped, bundleMs: Number(process.hrtime.bigint() / 1000000n) - t0 };
+  return { serveUrl, bundleMs: Number(process.hrtime.bigint() / 1000000n) - t0 };
 }
 
-/** 预览静帧：同一套打包，渲几帧小 JPEG（base64 内联回传，不落 /out）。 */
-async function renderStills(payload) {
-  const code = String(payload.code ?? '');
-  const shotId = String(payload.input_props?.shotId ?? '');
-  const inputProps = {
-    ...(payload.input_props ?? {}),
-    fps: Number(payload.input_props?.fps ?? 30),
-    durationInFrames: Number(payload.input_props?.durationInFrames ?? 0),
+/** 一组要渲的静帧：分段（每个 props 各渲自己的帧）与不分段（一份 props 渲几帧）在
+ *  这里归一成同一个形状，后面就只有一条渲染循环。`props` 里的 fps/durationInFrames
+ *  是母版算时长的输入（闸②），缺一个就 400——**每一组各自判**，一段参数不全不该被
+ *  另一段的合法参数掩盖过去。 */
+function stillJobs(payload) {
+  const norm = (raw) => {
+    const p = {
+      ...(raw ?? {}),
+      fps: Number((raw ?? {}).fps ?? 30),
+      durationInFrames: Number((raw ?? {}).durationInFrames ?? 0),
+    };
+    if (!p.durationInFrames) {
+      const err = new Error('durationInFrames 必须由调用方注入');
+      err.status = 400;
+      throw err;
+    }
+    return p;
   };
-  if (!inputProps.durationInFrames) {
-    const err = new Error('durationInFrames 必须由调用方注入');
-    err.status = 400;
-    throw err;
+  const variants = Array.isArray(payload.variants) ? payload.variants.slice(0, 16) : [];
+  if (variants.length) {
+    // 分段口：同一段代码、不同的 props，各渲一帧。**只打包一次**是它存在的唯一理由
+    // ——「文字库」的六档字幕样式共用同一份样片代码，逐档各发一次请求就要各打包一遍
+    // （1~3 秒），一屏样张要等十几秒。
+    return variants.map((v, i) => {
+      const props = norm(v?.input_props);
+      const raw = Number(v?.frame);
+      const frame = Number.isFinite(raw) ? Math.round(raw)
+        : Math.floor(props.durationInFrames * 0.7);
+      return { props, frames: [frame], variant: i };
+    });
   }
+  const props = norm(payload.input_props);
   const frames = (Array.isArray(payload.frames) ? payload.frames : [])
     .map(Number).filter(Number.isFinite).slice(0, 4);
-  if (!frames.length) frames.push(Math.floor(inputProps.durationInFrames * 0.7));
+  if (!frames.length) frames.push(Math.floor(props.durationInFrames * 0.7));
+  return [{ props, frames, variant: null }];
+}
+
+/** 预览静帧：同一套打包，渲几帧小 JPEG（base64 内联回传，不落 /out）。
+
+ *  `variants` 是可选的**分段口**：给了就按段渲（每段自己的 input_props 与帧号），
+ *  没给就是老样子（一份 props 渲几帧）。两路的返回形状是同一个 `stills` 数组，
+ *  分段那一路每项多一个 `variant` 序号——调用方按序号对号入座，不靠数组次序猜。
+ *
+ *  **版面回读（2026-10-16 新接）。** 这个口从前完全没接 `onBrowserLog`，于是模型在
+ *  「计划还没确认、像素还没烧」的时候看不到任何版面问题，而那是修一处版面**最便宜**的
+ *  时刻（一张静帧的成本约是整镜的百分之一，改法就是把两行代码错开）。
+ *
+ *  接法有两处讲究，都不许省：
+ *  1. **必须真渲探针帧。** 探针只在 `durationInFrames - PROBE_TAIL` 那一帧跑，而
+ *     不分段那一路缺省抽的是 `0.7 × 时长`——两个帧号不是一回事。只挂 `onBrowserLog`
+ *     而不加帧，回应里永远是一条空读数，而空读数长得**像**「这一镜版面干净」。
+ *  2. **探针帧不进 `stills`。** 它是为了取回读才渲的，不是调用方要的那张图；
+ *     混进数组会改调用方已有的「按 frame 对号」假设。多渲一张的代价留在服务端这一层。
+ *  分段口不加：那一路是「同一段代码、六档字幕样式」，各档各渲一遍探针帧等于把样张
+ *  成本翻三倍，而它要回答的问题（这六档长什么样）跟版面无关。那一路的 `layout` 如实为 null。 */
+async function renderStills(payload) {
+  const code = String(payload.code ?? '');
+  const jobs = stillJobs(payload);
   const scale = Math.min(1, Math.max(0.2, Number(payload.scale ?? 0.4)));
   const { selectComposition, renderStill, openBrowser } = await loadRemotion();
-  const { serveUrl, bundleMs } = await serialize(() => bundleShot(code, shotId));
+  const { serveUrl, bundleMs } = await serialize(() => bundleShot(code));
   await acquireSlot();
   let browser = null;
   try {
@@ -150,24 +226,60 @@ async function renderStills(payload) {
     browser = await openBrowser('chrome', {
       browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
     });
-    const composition = await selectComposition({
-      serveUrl, id: 'shot', inputProps, puppeteerInstance: browser,
-      browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
-    });
-    const last = composition.durationInFrames - 1;
     const stills = [];
-    for (const f of frames) {
-      const frame = Math.max(0, Math.min(last, Math.round(f)));
-      const { buffer } = await renderStill({
-        serveUrl, composition, inputProps, frame, puppeteerInstance: browser,
-        imageFormat: 'jpeg', jpegQuality: 80, scale,
+    let layout = null;        // 只由不分段那一路填（见上面第 2 条）
+    const layoutLines = [];
+    const logNotes = [];
+    const onBrowserLog = (log) => {
+      const text = String(log?.text ?? '');
+      const lat = text.indexOf(LAYOUT_MARKER);   // 实测可能带 " Tab N, file:line " 前缀
+      if (lat < 0) return;
+      try {
+        layoutLines.push(JSON.parse(text.slice(lat + LAYOUT_MARKER.length)));
+      } catch (err) {
+        if (logNotes.length < 4) logNotes.push(`版面行解析失败：${String(err).slice(0, 120)}`);
+      }
+    };
+    for (const job of jobs) {
+      // 分段口里每一段的时长可以不同（时长由 props 决定），所以组合要按段选一次；
+      // 不分段那一路只有一段，行为与从前逐字相同。
+      const composition = await selectComposition({
+        serveUrl, id: 'shot', inputProps: job.props, puppeteerInstance: browser,
         browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
       });
-      stills.push({ frame, jpeg_b64: buffer ? Buffer.from(buffer).toString('base64') : '' });
+      const last = composition.durationInFrames - 1;
+      const clamp = (f) => Math.max(0, Math.min(last, Math.round(f)));
+      // 探针帧：不分段那一路无条件渲一张（只为取回读行）。
+      // 调用方恰好在 `frames` 里点了同一帧就**不重复渲**，那一张照进 stills。
+      const probeFrame = job.variant === null ? clamp(composition.durationInFrames - PROBE_TAIL) : null;
+      const want = job.frames.map(clamp);
+      const all = probeFrame !== null && !want.includes(probeFrame) ? [...want, probeFrame] : want;
+      for (const frame of all) {
+        const { buffer } = await renderStill({
+          serveUrl, composition, inputProps: job.props, frame, puppeteerInstance: browser,
+          imageFormat: 'jpeg', jpegQuality: 80, scale,
+          browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
+          onBrowserLog,
+        });
+        // 只为取回读渲的那一张不进 stills：调用方按 `frame` 对号入座，多塞一张会改掉
+        // 它已有的假设（而且它并没有要这张图）。
+        if (!want.includes(frame)) continue;
+        stills.push({
+          frame, jpeg_b64: buffer ? Buffer.from(buffer).toString('base64') : '',
+          ...(job.variant === null ? {} : { variant: job.variant }),
+        });
+      }
     }
     const ms = Number(process.hrtime.bigint() / 1000000n) - t0;
-    console.log(`[stills] ${shotId} ${stills.length}帧 bundle=${bundleMs}ms render=${ms}ms`);
-    return { ok: true, stills, timings: { bundle_ms: bundleMs, render_ms: ms } };
+    // 与 `/render-shot` 同一条规矩（`pickLayout`）：母版与测量壳各发一行时，母版优先。
+    layout = layoutLines.length ? pickLayout(layoutLines) : null;
+    console.log(`[stills] ${stills.length}帧 layout=${layout ? 'yes' : 'no'} `
+      + `bundle=${bundleMs}ms render=${ms}ms`);
+    return {
+      ok: true, stills, layout,
+      ...(logNotes.length ? { warnings: logNotes } : {}),
+      timings: { bundle_ms: bundleMs, render_ms: ms },
+    };
   } finally {
     if (browser) await browser.close({ silent: true }).catch(() => {});
     releaseSlot();
@@ -212,21 +324,28 @@ const sha16 = (buf) => createHash('sha256').update(buf).digest('hex').slice(0, 1
 
 /** 缓存键要的两段身份哈希（spec §5.2），Python 侧从这里取，不把文件字节再搬一遍。
  *
- *  母版 = `<FilmLayout>` + token。改这两个文件＝全片换像素但不改任何一镜的代码，
- *  不进键就会命中旧母版渲出的切片。lockfile 同理：换一版 three.js 也是换像素。
+ *  母版 = `<FilmLayout>` + token + **版面探针**。改这几个文件＝全片换像素/换读数但不改
+ *  任何一镜的代码，不进键就会命中旧母版渲出的切片。lockfile 同理：换一版 three.js
+ *  也是换像素。
+ *
+ *  `lib/LayoutProbe.tsx` 2026-10-16 进这一份，不是顺手加：探针是**搬出去**的（原来在
+ *  `FilmLayout.tsx` 里），只哈希母版的话，「改探针」不再改哈希——于是改完探针重渲，
+ *  拿的还是旧键，命中的旧切片里 `layout_used` 仍是 `missing`，而新判据一条都不会响。
+ *  这个错看不出来、且只在第二次之后出现，正是这条注释下面那段说的同一种。
  *
  *  **每次现读，不缓存。** 进程内缓存＝`docker cp` 换过母版后 /healthz 还在报旧哈希，
  *  于是新母版渲出的片子拿的还是旧键——命中缓存把旧切片发给新请求，正是这条链最贵的
- *  那种错（看不出来，且只在第二次之后出现）。两个小文件的读盘钱不买这个错。
+ *  那种错（看不出来，且只在第二次之后出现）。几个小文件的读盘钱不买这个错。
  *
  *  读不到就抛：宁可 /healthz 500，也不许报一个「空的但看起来能用」的哈希。 */
 async function versions() {
-  const [layout, tokens, lock] = await Promise.all([
+  const [layout, probe, tokens, lock] = await Promise.all([
     fs.readFile(path.join(ROOT, 'src', 'FilmLayout.tsx')),
+    fs.readFile(path.join(ROOT, 'src', 'lib', 'LayoutProbe.tsx')),
     fs.readFile(path.join(ROOT, 'src', 'tokens.ts')),
     fs.readFile(path.join(ROOT, 'package-lock.json')),
   ]);
-  return { master_hash: sha16(Buffer.concat([layout, tokens])),
+  return { master_hash: sha16(Buffer.concat([layout, probe, tokens])),
            lockfile_hash: sha16(lock) };
 }
 
@@ -248,24 +367,11 @@ const declaredFrom = (payload) => {
 async function renderShot(payload) {
   const code = String(payload.code ?? '');
   const declaredFields = declaredFrom(payload);
-  const assetNames = (payload.assets ?? []).map(a => a.name ?? a).map(String);
-  // 镜号在 props 里（`code_render.shot_input_props`）——用它定位 publicDir 与 manifest。
-  const shotId = String(payload.input_props?.shotId ?? '');
-  const staged = await readAssetManifest(shotId);
-  const lint = await lintShotCode(code, declaredFields, assetNames, staged);
+  const lint = await lintShotCode(code, declaredFields);
   if (!lint.ok) {
     const err = new Error('闸① lint 未通过');
     err.status = 400;
     err.lint = lint.errors;
-    throw err;
-  }
-
-  // 闸⑬ 在熔合之前：盘上字节已就位，此时拒掉省下的是一整镜的烧渲染。
-  const assetsGate = await gateAssets(shotId);
-  if (assetsGate.status === 'rejected') {
-    const err = new Error(assetsGate.reason);
-    err.status = 400;
-    err.assets_gate = assetsGate;
     throw err;
   }
 
@@ -332,7 +438,7 @@ async function renderShot(payload) {
   const outputLocation = path.join(OUT, `${fileKey}.mp4`);
 
   const { selectComposition, renderMedia } = await loadRemotion();
-  const { serveUrl, shipped, bundleMs } = await serialize(() => bundleShot(code, shotId));
+  const { serveUrl, bundleMs } = await serialize(() => bundleShot(code));
   // 打包完之后的逐帧渲染按名额并发（见 RENDER_SLOTS）。
   await acquireSlot();
   try {
@@ -354,16 +460,10 @@ async function renderShot(payload) {
   // 闸⑤ 的原料：母版渲染时会 console.log 一行 `DG_TOKENS:<json>`，
   // 这一版 renderer 没有 onBrowserOpen，而 onBrowserLog 是公开口、且只在真渲染时经过，
   // 读到的就是这一镜实际用上的值（不是根页面里母版的默认值）。
-  const TOKEN_MARKER = 'DG_TOKENS:';   // 与 src/tokens.ts 的 TOKEN_LOG_MARKER 同名，两处一起改
-  const FIELD_MARKER = 'DG_FIELDS:';   //   与 src/tokens.ts 的 FIELD_LOG_MARKER 同名，两处一起改
-  const LAYOUT_MARKER = 'DG_LAYOUT:';  //   与 src/tokens.ts 的 LAYOUT_LOG_MARKER 同名，两处一起改
-  const ASSET_MARKER = 'DG_ASSETS:';   //   与 src/tokens.ts 的 ASSET_LOG_MARKER 同名，两处一起改
-  const REVEAL_MARKER = 'DG_REVEAL:';  //   与 src/tokens.ts 的 REVEAL_LOG_MARKER 同名，两处一起改
+  // 三个行首标记在模块顶部（`/render-stills` 也认版面那一个）。
   let browserLogTruncated = false;
   let fieldsUsed = null;
-  let layoutUsed = null;
-  const assetSnapshots = {};  // { [frame]: { frame, assets: [{tag, src, box, transform, opacity}] } }
-  const revealSnapshots = {}; // { [frame]: { frame, canvas, boxes, regions: [{id, sequence, rects}] } }
+  const layoutLines = [];   // 版面那一行可能有两条（母版 + 测量壳），收齐了再 `pickLayout`
   const onBrowserLog = (log) => {
     const text = String(log?.text ?? '');
     const at = text.indexOf(TOKEN_MARKER);   // 实测可能带 " Tab N, file:line " 前缀，不按行首判
@@ -396,41 +496,10 @@ async function renderShot(payload) {
     const lat = text.indexOf(LAYOUT_MARKER);
     if (lat >= 0) {
       try {
-        layoutUsed = JSON.parse(text.slice(lat + LAYOUT_MARKER.length));
+        layoutLines.push(JSON.parse(text.slice(lat + LAYOUT_MARKER.length)));
       } catch (err) {
         warnings.push(`版面行解析失败：${String(err).slice(0, 120)}`);
       }
-      return;   // 版面这一路是记账用的 warning，重试那一遍更稳，直接覆盖，不记不一致
-    }
-    const aat = text.indexOf(ASSET_MARKER);
-    if (aat >= 0) {
-      try {
-        const parsed = JSON.parse(text.slice(aat + ASSET_MARKER.length));
-        assetSnapshots[parsed.frame] = parsed;
-      } catch (err) {
-        warnings.push(`资产行解析失败：${String(err).slice(0, 120)}`);
-      }
-      return;
-    }
-    const vat = text.indexOf(REVEAL_MARKER);
-    if (vat >= 0) {
-      let parsed = null;
-      try {
-        parsed = JSON.parse(text.slice(vat + REVEAL_MARKER.length));
-      } catch (err) {
-        warnings.push(`分区揭示行解析失败：${String(err).slice(0, 120)}`);
-        return;
-      }
-      // 同一帧被 seek 到两遍时取后一遍，但**两遍不一样必须记账**——与字段行同一规矩：
-      // ㉗ 拿这一行的矩形去抽帧采样，「同一帧两次算出不同的掩码」意味着这份账在这一镜上
-      // 不牢（多半是插画的盒在两遍之间变了：图首帧未加载完，盒是 0）。
-      // 不在这里判红：判红要读像素，那是 Python 侧（㉗）的事，这一层只如实搬。
-      const prev = revealSnapshots[parsed.frame];
-      if (prev && JSON.stringify(prev) !== JSON.stringify(parsed)) {
-        warnings.push(`分区揭示回读在第 ${parsed.frame} 帧出现两遍且内容不一致` +
-                      '（同一帧两次算出不同的允许掩码），取最后一遍——这一镜的 ㉗ 证据不牢');
-      }
-      revealSnapshots[parsed.frame] = parsed;
       return;
     }
     // 镜头代码里的 console.log 一律进 warnings（有上限，不让一段狂打的代码撑爆响应）
@@ -464,6 +533,18 @@ async function renderShot(payload) {
   }
   const renderMs = now() - t2;
   const frames = composition.durationInFrames;
+  // 版面行可能有两条（母版 + 测量壳），收齐之后按 `pickLayout` 的规矩挑一条。
+  // 挑之前先记一句**同一上报者给了两个不同读数**的情况——那才是真不稳（同一探针帧被
+  // seek 两遍、却量出不同的版面）。两个**不同**上报者同时出现是设计内的（见 `pickLayout`），
+  // 不记账，否则每一个套母版的镜都会带一句无意义的告警。
+  const layoutUsed = pickLayout(layoutLines);
+  for (const by of ['master', 'shell']) {
+    const mine = layoutLines.filter((l) => l.by === by);
+    if (mine.length > 1 && new Set(mine.map((l) => JSON.stringify(l))).size > 1) {
+      warnings.push(`版面回读出现两遍且内容不一致（${by} 在同一探针帧两次 seek 得到` +
+                    '不同的版面），取最后一遍——这条通道的证据链在这一镜上不牢');
+    }
+  }
   const timings = {
     bundle_ms: bundleMs,
     select_ms: selectMs,
@@ -476,8 +557,7 @@ async function renderShot(payload) {
     `字段=${fieldsUsed ? `${(fieldsUsed.marks ?? []).length}处/${declaredFields.length}声明` : `无/${declaredFields.length}声明`} ` +
     `版面=${layoutUsed ? (layoutUsed.scanned
       ? `${(layoutUsed.findings ?? []).length}告警/扫${layoutUsed.scanned.texts}字${layoutUsed.scanned.leaders}线`
-      : `落空(${String(layoutUsed.reason ?? '无').slice(0, 24)})`) : '无'}` +
-    `公共命名空间=${shipped.length ? shipped.join('+') : '无'}`);
+      : `落空(${String(layoutUsed.reason ?? '无').slice(0, 24)})`) : '无'}`);
   if (browserLogTruncated) warnings.push('[browser] 日志超过 20 条，其余已略');
   if (!tokens) warnings.push('闸⑤ 回读落空：这一镜没读到母版 token，跨镜一致性比对对它跳过');
   // 声明了字段却没回读到行＝这一镜一处 `<F>` 标注都没标到（或母版那侧的通道没跑起来）。
@@ -517,59 +597,6 @@ async function renderShot(payload) {
     if ((scanned.dropped ?? 0) > 0) {
       warnings.push(`闸⑧ 版面：单帧 finding 超过上限，母版那边丢了 ${scanned.dropped} 条`);
     }
-  }
-
-  // 闸⑪ 资产动效：比对首帧与探针帧的资产快照，判三态。
-  // 静态摆图 → 打回；参与动效 → 绿；采不到盒 → 未判（不许记成通过）。
-
-  let assetMotion = { status: 'undetermined', reason: '没有收到资产探针行' };
-  const snapFrames = Object.keys(assetSnapshots).map(Number).sort((a, b) => a - b);
-  if (snapFrames.length >= 2) {
-    const snap0 = assetSnapshots[snapFrames[0]];
-    const snapN = assetSnapshots[snapFrames[snapFrames.length - 1]];
-    const a0 = snap0.assets ?? [];
-    const aN = snapN.assets ?? [];
-    if (a0.length === 0 && aN.length === 0) {
-      assetMotion = { status: 'undetermined', reason: '两帧都没采到资产盒（可能无 <img>/<video>，或落在 display:contents 里）' };
-    } else {
-      const bySrc = (arr) => {
-        const m = new Map();
-        for (const a of arr) if (a.src) m.set(a.src, a);
-        return m;
-      };
-      const m0 = bySrc(a0);
-      const mN = bySrc(aN);
-      let animated = false;
-      let staticCount = 0;
-      let compared = 0;
-      for (const [src, a] of m0) {
-        const b = mN.get(src);
-        if (!b) continue;
-        compared++;
-        const boxSame = JSON.stringify(a.box) === JSON.stringify(b.box);
-        const transformSame = (a.transform ?? 'none') === (b.transform ?? 'none');
-        const opacitySame = (a.opacity ?? 1) === (b.opacity ?? 1);
-        if (boxSame && transformSame && opacitySame) staticCount++;
-        else animated = true;
-      }
-      if (compared === 0) {
-        assetMotion = { status: 'undetermined', reason: `两帧各有 ${a0.length}/${aN.length} 个资产，但按 src 匹配不到同一资产` };
-      } else if (animated) {
-        assetMotion = { status: 'animated', reason: `${compared} 个资产中至少一个的盒/transform/opacity 在两帧间有变化`, compared, staticCount };
-      } else {
-        assetMotion = { status: 'static', reason: `${compared} 个资产的盒/transform/opacity 在两帧间完全不变——静态摆图`, compared };
-      }
-    }
-  } else if (snapFrames.length === 1) {
-    assetMotion = { status: 'undetermined', reason: `只收到一帧的资产快照（frame ${snapFrames[0]}），无法比对` };
-  }
-  if (assetMotion.status === 'static') {
-    warnings.push(`闸⑪ 资产动效：${assetMotion.reason}——J2 要求主体参与动效，不是静态摆图`);
-  } else if (assetMotion.status === 'undetermined') {
-    warnings.push(`闸⑪ 资产动效：未判——${assetMotion.reason}`);
-  }
-  if (assetsGate.status === 'undetermined') {
-    warnings.push(`闸⑬ 资产存在且非纯色：未判——${assetsGate.reason}`);
   }
 
   // 闸⑭ 动效事件密度：抽帧算相邻差，切成「先后变化段」。
@@ -638,24 +665,11 @@ async function renderShot(payload) {
     // 与 fields_used 同一条道理——没读到就是 null，这一层的 warnings 里已经如实写了「落空」，
     // 下游不许把 null 读成「扫过且干净」。
     layout_used: layoutUsed,
-    // 闸⑪ 资产动效三态：'static'（打回）/ 'animated'（通过）/ 'undetermined'（未判）。
-    // 未判不许记成通过——下游回执必须如实区分。
-    asset_motion: assetMotion,
     // 闸⑭ 动效事件密度的原料：抽帧曲线的**逐格差**、切出来的**先后变化段**、
     // 以及那一组阈值。判（段数 ≥2、相邻 ≥0.4 s）由 Python 侧做——那里才是闸的出口，
     // 而这一层只负责把像素变成可数的东西。阈值随行是为了让红的时候能核对
     // 「它按哪条线判的」，不是让人在回执里改的。
     motion,
-    // 闸⑬ 资产存在且非纯色：逐件判据回执（status 三态 + 每件的 sha16/尺寸/主色）。
-    // `undetermined` 与闸⑪ 同规：如实回传，下游不许读成通过。rejected 在这一步
-    // 根本走不到这里（熔合前就 400 了），能到这个字段的只有 ok / undetermined。
-    assets_gate: assetsGate,
-    // 闸㉗ 的原料（R12）：母版在 Python 点名的那几帧各回读一行「这一帧哪些区域允许被看见」
-    // （成片像素、带内坐标）。与 fields_used/layout_used 同规：没读到就是 null/空表，
-    // 这一层的 warnings 已经如实写了「解析失败/两遍不一致」，下游**不许**把空表读成
-    // 「每一块都没问题」——空表的正确读法是「这一镜没有分区揭示的申报，或通道没跑起来」，
-    // 两者要 ㉗ 自己去分辨（它手上有申报）。
-    reveal_used: Object.keys(revealSnapshots).length ? revealSnapshots : null,
     warnings,
   };
   } finally {
@@ -673,13 +687,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/lint') {
       const body = await readBody(req);
-      const assetNames = (body.assets ?? []).map(a => a.name ?? a).map(String);
-      // 这个口是「只问这段代码合不合规」——它不带镜号，于是**看不见投递账**。
-      // 看不见就不判那一半（readAssetManifest 给 null），只比代码与声明名单。
-      // 若这里也按「没投递」判红，局部改代码那条路（只重过闸①、不重烧）会整条断掉。
-      const staged = body.shot_id ? await readAssetManifest(String(body.shot_id)) : null;
-      return send(res, 200, await lintShotCode(body.code ?? '', declaredFrom(body),
-                                               assetNames, staged));
+      return send(res, 200, await lintShotCode(body.code ?? '', declaredFrom(body)));
     }
     if (req.method === 'POST' && url.pathname === '/render-shot') {
       const body = await readBody(req);
@@ -703,29 +711,6 @@ const server = http.createServer(async (req, res) => {
       }
       return send(res, 200, { ok: true, removed: names.length, bytes });
     }
-    if (req.method === 'POST' && url.pathname === '/stage-assets') {
-      const body = await readBody(req);
-      const relpath = String(body.relpath ?? '');
-      const sha16 = String(body.sha16 ?? '');
-      const bytesB64 = String(body.bytes_b64 ?? '');
-      if (!relpath || !sha16 || !bytesB64)
-        return send(res, 400, { ok: false, error: 'relpath/sha16/bytes_b64 缺一不可' });
-      // 落点与闸⑬/`shotPublicDir` 同源（`assetgate.PUBLIC`）：投到哪、判哪，
-      // 只能是一处算出来的，否则闸判的是一个空目录而投递落在另一个。
-      const safe = path.join(PUBLIC, relpath);
-      if (!safe.startsWith(PUBLIC))
-        return send(res, 400, { ok: false, error: 'relpath 穿越' });
-      const bytes = Buffer.from(bytesB64, 'base64');
-      const hash = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
-      if (hash !== sha16)
-        return send(res, 400, { ok: false, error: `sha16 不符：声明 ${sha16}，实算 ${hash}` });
-      await fs.mkdir(path.dirname(safe), { recursive: true });
-      if (await fs.stat(safe).then(() => true).catch(() => false))
-        return send(res, 200, { ok: true, relpath, sha16, idempotent: true });
-      await fs.writeFile(safe, bytes);
-      console.log(`[stage-assets] ${relpath} (${bytes.length} bytes sha16=${sha16})`);
-      return send(res, 200, { ok: true, relpath, sha16, bytes: bytes.length });
-    }
     if (req.method === 'GET' && url.pathname.startsWith('/artifact/')) {
       const key = decodeURIComponent(url.pathname.slice('/artifact/'.length));
       const file = path.join(OUT, `${path.basename(key)}.mp4`);   // basename：不给路径穿越留口
@@ -740,7 +725,6 @@ const server = http.createServer(async (req, res) => {
       ok: false,
       error: String(err?.message ?? err),
       ...(err.lint ? { errors: err.lint } : {}),
-      ...(err.assets_gate ? { assets_gate: err.assets_gate } : {}),
     });
   }
 });

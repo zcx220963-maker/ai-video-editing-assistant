@@ -99,14 +99,9 @@ def default_runtime_context() -> str:
 def _fact_line(row: Mapping[str, Any]) -> str:
     """一行素材事实：id | 文件名 | 类型 | 时长 | 分辨率 | 音轨。缺列就跳过该段。
 
-    R13-T66：**位图**多带两段 ``sha256=…`` 与 ``ext=…``。理由只有一条——镜头侧
-    ``shots[].assets`` 的三键就是 ``name/sha256/ext``（``code_spec._norm_assets``），
-    而 sha256 必须是**完整 64 位十六进制**、ext 不能为空，两处任一不合规都在契约层被打回。
-    模型手上没有这两个值时只有两条路：去猜（猜错就是「传了图也用不上」），或者放弃用这张图。
-    所以事实行必须给全，而不是只给文件名。
-
-    **只对位图给**：视频/音频不进 ``shots[].assets``（它们走 ``clips`` / ``bgm.ref``），
-    给它们补两段等于往上下文里塞没人读的字节。
+    R13-T66 曾经在这里给**位图**多补两段 ``sha256=…`` 与 ``ext=…``，理由是镜头侧
+    ``shots[].assets`` 的三键要它们。那条腿 2026-10-16 拆了（图形片每一镜都由模型写
+    代码画，上传件一律不上屏），这两个值没有任何读者了——留在上下文里就是白涨 token。
     """
     bits = [str(row.get("id") or row.get("material_id") or "?"),
             str(row.get("filename") or "(未命名)"),
@@ -119,13 +114,6 @@ def _fact_line(row: Mapping[str, Any]) -> str:
         bits.append(f"{w}x{h}")
     if row.get("kind") in (None, "video"):
         bits.append("含音轨" if row.get("has_audio") else "无音轨")
-    if str(row.get("kind") or "") == "image":
-        sha = str(row.get("sha256") or "").strip().lower()
-        if len(sha) == 64:
-            bits.append(f"sha256={sha}")
-        ext = _ext_of(str(row.get("filename") or ""))
-        if ext:
-            bits.append(f"ext={ext}")
     return " | ".join(bits)
 
 
@@ -143,10 +131,10 @@ def render_attachments_section(rows: Sequence[Mapping[str, Any]],
     if rows:
         lines.append("本条消息附带以下素材（material_id 已通过归属校验，可直接使用）：")
         lines.extend(f"- {_fact_line(r)}" for r in rows)
-        # 三类分开说，因为**它们上屏的路不是同一条**：视频走 load_media、音频走 bgm 参数、
-        # 位图走 shots[].assets。混成一句「把以上全部 material_id 传给 load_media」，
-        # 位图会被送去一条不收它的腿（load_media 的 kinds 是 video/audio），
-        # 表现成「传了图却用不上」——那正是 R13 要治的那个病。
+        # 三类分开说，因为**它们的去处不是同一处**：视频走 load_media、音频走 bgm 参数、
+        # 位图**哪条腿都不去**（不上屏，只当参考）。混成一句「把以上全部 material_id
+        # 传给 load_media」，位图会被送去一条不收它的腿（load_media 的 kinds 是
+        # video/audio），表现成「传了图却用不上」——而今天正确的说法是「图本来就不上屏」。
         media = [r for r in rows
                  if str(r.get("kind") or "video") not in ("audio", "image")]
         audio = [r for r in rows if str(r.get("kind") or "video") == "audio"]
@@ -168,17 +156,13 @@ def render_attachments_section(rows: Sequence[Mapping[str, Any]],
                 "有素材的剪辑链先调 select_BGM(query=歌名) 拿到引用，再交给渲染节点。"
             )
         if image:
-            # R13-T66：位图**能直接摆进某一镜**，路是 shots[].assets 那三键。
-            # 这一段存在的唯一理由：模型手上没有完整 sha256 与 ext 时，只有「猜」与
-            # 「放弃」两条路，而两条都表现为「传了图也用不上」。
+            # 2026-10-16：位图不再有任何上屏的路。这一段的旧版本教模型把三键填进
+            # `shots[].assets`，那条腿已经拆掉；留着它会让模型去填一个早不存在的字段。
             lines.append(
-                "其中位图（kind=image）**能直接摆进某一镜**，不要传给 load_media："
-                "把它的三键原样填进 `shots[].assets`——`name` 用上面那一行的文件名、"
-                "`sha256` 用完整 64 位（上面那行给了）、`ext` 用不带点的扩展名，"
-                "镜头代码里再用 `staticFile(\"<name>\")` 引用同一个名字。"
-                "**但只有用户指名才能用**：用户说了「第 N 镜用我这张图」才填；"
-                "用户没指名就不要自己挑一张塞进去（闸㉛ 会拿它跟本会话里用户带进来的图比对，"
-                "对不上直接打回），也**不许凭记忆填一个 sha**。"
+                "其中位图（kind=image）**不上屏**：图形片的每一镜都由你写 TSX 代码画出来，"
+                "没有任何摆图的通道。可以参考它（用看的：构图、配色、笔触），照着把画面画出来，"
+                "但不要把它当成某一镜的画面，也不要传给 load_media（那条腿只收视频/音频）。"
+                "用户若明确要求「用我这张图」，如实说明这条路已经没有了、可以照着它的样子画。"
             )
     if rejected:
         lines.append("以下附件无法使用（不存在或无权访问），请向用户说明并忽略："
@@ -495,8 +479,6 @@ class ContextBuilder:
         self,
         system_prompt: str | None = None,
         *,
-        bootstrap_dir: str | Path | None = None,
-        bootstrap_files: Sequence[str | Path] | None = None,
         context_sources: Sequence[ContextSource] | None = None,
         runtime_context: RuntimeContext | None = default_runtime_context,
         compressor: ContextCompressor | None = None,
@@ -510,8 +492,17 @@ class ContextBuilder:
             system_prompt = (prompt_library.system_prompt(DEFAULT_SYSTEM_PROMPT)
                              if prompt_library is not None else DEFAULT_SYSTEM_PROMPT)
         self.system_prompt = system_prompt
-        self.bootstrap_dir = Path(bootstrap_dir) if bootstrap_dir else None
-        self.bootstrap_files = list(bootstrap_files or [])
+        # 这里原先还有一层 Bootstrap 文件（``bootstrap_dir`` / ``bootstrap_files`` →
+        # 目录下 *.md 按文件名排序、各自包成 ``<文件名>`` 段常驻注入）。2026-10-16 删：
+        #   · 生产**从来没有传过**这两个参数（``build_runtime`` 的口子一直空着，
+        #     命令行也没有对应开关），所以那一段永远是空的——正是 prompts.py 开头
+        #     点名过的那种失败：「写了但没人接」；
+        #   · 它想干的事（运维不改代码就能换掉角色 / 约定这类静态文字）现在由
+        #     **提示词库**干：``prompts/*.md`` 一样从磁盘读、一样可热替换，但多一道
+        #     ``manifest.json`` 自检（盘上与清单对不上就直接不让服务起来）。
+        #     两条路并存，只会让「改了没生效」再回来一次。
+        # 以后要注入**部署专属**的文字，正路是加一个 ``ContextSource``：它有名字、
+        # 有消费者声明（``referenced_by``）、进账面，比一个不受清单管的目录诚实。
         self.context_sources: list[ContextSource] = list(context_sources or [])
         self.runtime_context = runtime_context
         self.compressor = compressor
@@ -534,25 +525,6 @@ class ContextBuilder:
     def fingerprint(self) -> str:
         """当前 system_prompt 的指纹（版本号 + 内容哈希）。eval 回归据此归因。"""
         return prompt_fingerprint(self.system_prompt)
-
-    # ---- Bootstrap 文件（角色 / 约定等静态文件）----
-
-    def _bootstrap_sections(self) -> list[str]:
-        paths: list[Path] = []
-        if self.bootstrap_dir and self.bootstrap_dir.is_dir():
-            paths.extend(sorted(self.bootstrap_dir.glob("*.md")))
-        for p in self.bootstrap_files:
-            paths.append(Path(p))
-
-        sections: list[str] = []
-        for path in paths:
-            try:
-                text = path.read_text(encoding="utf-8").strip()
-            except OSError:
-                continue
-            if text:
-                sections.append(f"<{path.name}>\n{text}\n</{path.name}>")
-        return sections
 
     def add_source(self, source: ContextSource) -> None:
         self.context_sources.append(source)
@@ -595,9 +567,6 @@ class ContextBuilder:
 
         _add(Section(name="system_prompt", text=self.system_prompt,
                      kind="always", condition_key=None, referenced_by=ASSEMBLY_REF))
-        for text in self._bootstrap_sections():
-            _add(Section(name=section_name(text), text=text, kind="always",
-                         condition_key=None, referenced_by=ASSEMBLY_REF))
 
         if self.runtime_context:
             rt = self.runtime_context()

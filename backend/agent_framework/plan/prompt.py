@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from ..prompts import prompt_text, read_prompts_file, render_blocks
-from .knobs import knob_facts_for_round, knob_lines
+from .knobs import knob_facts_for_round, knob_hint, knob_lines
 from .support import clean, neutralize
 
 if False:  # TYPE_CHECKING
@@ -257,6 +257,7 @@ async def planning_section_blocks(gate: PlanGate, *, feedback: str = "",
     """
     nodes = sorted(gate.whitelist())
     must_include = _explicit_nodes(gate)
+    must_include_notes = await _explicit_node_notes(gate, must_include)
     # 「谁该发」的判据在 `plan/knobs.py`（T40）：只发本轮计划命中的那几个节点，
     # 无命中就一条都不发（判据见 `knobs.plan_node_hits`）——这里只负责把它排进段里。
     facts = await knob_facts_for_round(gate, nodes, prior=prior, pending=pending,
@@ -267,6 +268,7 @@ async def planning_section_blocks(gate: PlanGate, *, feedback: str = "",
     values: dict[str, Any] = {
         "nodes": "、".join(nodes) if nodes else "（当前没有可用的剪辑节点）",
         "must_include": "、".join(must_include),
+        "must_include_notes": "\n".join(must_include_notes),
         "knobs": "\n".join(knob_lines(facts)),
         "has_pending_plan": bool(has_pending_plan),
         "prior_cards": "\n".join(brief),
@@ -295,7 +297,12 @@ async def planning_section_blocks(gate: PlanGate, *, feedback: str = "",
 
 
 def _explicit_nodes(gate: Any) -> list[str]:
-    """必须显式写进 steps 的节点名（执行期不会自动补齐的那几个）。
+    """**建议**写进 steps 的节点名（不写也会被拦截器按默认参数补齐的那几个）。
+
+    契约里那几个 ``require_explicit_call`` 的节点原本配着一条硬判据（没写进卡就
+    打回），2026-10-16 撤了：架构总纲里只有「拦截器递归补齐」，没有「某些节点必须
+    显式调用否则报错」。它们在这里降级成一句**建议**——写进去才由模型定参数，
+    不写就按默认值补，模型事后在回执里看得见是哪几步。
 
     取不到就回空表：模板用 ``{?must_include}`` 守卫，空表整段不出现——没接契约的
     进程（离线替身、旧装配）不该凭空多出一句「其中 必须显式写进 steps」。
@@ -307,6 +314,33 @@ def _explicit_nodes(gate: Any) -> list[str]:
         return sorted(str(n) for n in getter() if n)
     except Exception:  # noqa: BLE001 - 契约读不到只是少一句提示，不该让规划轮拼不出提示
         return []
+
+
+async def _explicit_node_notes(gate: Any, nodes: Sequence[str]) -> list[str]:
+    """「那几步各自能配什么开关」——按节点一句，跟着上面那句建议一起给。
+
+    为什么非给不可（真机实测，14 镜「薄肌理论」那条 run）：上一版是把这三个前置
+    （``片段分组`` / ``片段筛选`` / ``脚本模板推荐``）**打回**，让模型补进 steps，
+    却没说它们能配什么。模型补上步骤的同时给它们各造了一个开关（``grouping``
+    / ``keep`` / ``template``），第二枪的 21 条意见里 9 条是这一条引出来的——
+    **上一枪的忠告，直接生产了下一枪的错误**，而 ``max_retries=1`` 只给两次机会。
+    建议与「建议写的是这些开关」必须同屏出现；这份说明原先挂在打回消息上，
+    打回撤了就得跟着搬到提示段来。
+
+    取不到开关事实只少一行（读它要走一遍 ``enum_source``，曲库标签那一路是真去
+    取标签的）：一句建议不该因为一个节点问不出开关就整段拼不出来。
+    """
+    out: list[str] = []
+    for node in nodes:
+        try:
+            fact = await gate.knob_facts_for(node)
+        except Exception:  # noqa: BLE001 - 同上：少一行说明好过拼不出提示
+            continue
+        head = knob_hint(fact, prefix=f"「{node}」")
+        # 两种处境两种收尾：本来就没开关的，写上这一步就行；有开关的，只许用这些。
+        out.append(head + ("写上这一步即可，不要为它配参数。" if not fact.get("knobs")
+                           else "只写这些，别的名字不要造。"))
+    return out
 
 
 def _prior_brief(prior: Sequence[Mapping[str, Any]]) -> list[str]:

@@ -1,9 +1,11 @@
 /**
- * 闸① 的自定义规则（六条文件级 + 三条字段对账）。
+ * 闸① 的自定义规则（文件级 + 三条字段对账）。
  *
  * 为什么禁项走 ESLint 内置的 `no-restricted-*`，而这些要自研：
  * 它们问的不是「用了哪个危险 API」，而是「这个文件整体上像不像一个合法镜头」——
- * 白名单、包裹、外链都是**文件级**事实，选择器表达不了。
+ * 白名单、导出、外链都是**文件级**事实，选择器表达不了。
+ * （原先还有第五条「顶层必须包住 `<FilmLayout>`」；母版下线那一轮删了它——
+ * 镜头代码现在自包含，包不包壳是写法不是合法性。）
  *
  * 三条字段对账规则另有一层：它们要拿**分镜契约里声明的字段名清单**比，而那份清单
  * 不在代码字节里。所以 lint 的入参是 `(code, declaredFields)`（`lint.mjs` 把它
@@ -44,7 +46,7 @@ try {
   );
 } catch {}
 
-/** webfont 字节的落点。`DG_PUBLIC_ROOT` 只给测试用（与 assetgate 同一个口子）：
+/** webfont 字节的落点。`DG_PUBLIC_ROOT` 只给测试用（与 shipped 同一个口子）：
  *  想造「loadFont 指着一个不存在的文件」这个红样，不该先往真 public/ 里摆假货。 */
 const PUBLIC_ROOT = (() => {
   const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -142,6 +144,24 @@ export const ALLOWED_IMPORTS = new Set([
   '@dg/lib/helpers/rand',
   '@dg/lib/helpers/shake',
   '@dg/lib/helpers/camera',
+  // 简笔画零件库（2026-10-17）。**逐件列，与 `@dg/lib/*` 同一口径**：每件是一个
+  // 文件级的入口，模型 import 一件就拿到一支能被认出的东西的轮廓（人、机器、厂房、
+  // 齿轮、图表…）。它们底下走的是 roughjs 的手绘线，所以这些件的 import 在
+  // `code_spec.PICTORIAL_CHANNELS` 里记成 `rough` 通道——闸⑦「每镜必画」与闸⑯
+  // 「主体具名」认的就是那一条，不然「用库里的人偶画画」会被记成「只画了文字与色块」。
+  '@dg/lib/draw/Figure',
+  '@dg/lib/draw/Face',
+  '@dg/lib/draw/Machine',
+  '@dg/lib/draw/Building',
+  '@dg/lib/draw/Vehicle',
+  '@dg/lib/draw/Gear',
+  '@dg/lib/draw/Chart',
+  '@dg/lib/draw/Arrow',
+  '@dg/lib/draw/Coin',
+  '@dg/lib/draw/Book',
+  '@dg/lib/draw/Scale',
+  '@dg/lib/draw/Clock',
+  '@dg/lib/draw/Crown',
   '@dg/themes/palettes.json',
 ]);
 
@@ -425,40 +445,6 @@ export const dgPlugin = {
       },
     },
 
-    'must-wrap-film-layout': {
-      meta: {
-        type: 'problem',
-        schema: [],
-        messages: {
-          noImport:
-            '镜头代码必须 import 母版：`import { FilmLayout } from "@dg/film"`。' +
-            '排版权（字幕带、安全区、字阶、配色）只在母版里，各镜自己排版必然逐镜漂。',
-          noWrap:
-            '顶层 JSX 必须被 <FilmLayout> 包住。渲染只画母版给的那条画面带，' +
-            '不包就等于这一镜没有字幕、没有安全区，且闸⑤ 读不到它的 token。',
-        },
-      },
-      create(context) {
-        let imported = false;
-        let wrapped = false;
-        return {
-          ImportDeclaration(node) {
-            if (node.source.value !== '@dg/film') return;
-            if (node.specifiers.some((s) =>
-              s.type === 'ImportSpecifier' && s.imported.name === 'FilmLayout')) imported = true;
-          },
-          JSXOpeningElement(node) {
-            const name = node.name && node.name.name;
-            if (name === 'FilmLayout' || name === 'dg:FilmLayout') wrapped = true;
-          },
-          'Program:exit'() {
-            if (!imported) context.report({ loc: { line: 1, column: 0 }, messageId: 'noImport' });
-            else if (!wrapped) context.report({ loc: { line: 1, column: 0 }, messageId: 'noWrap' });
-          },
-        };
-      },
-    },
-
     'needs-shot-export': {
       meta: {
         type: 'problem',
@@ -661,36 +647,19 @@ export const dgPlugin = {
         '这是一个假指针：盒指着这个字段，像素却来自别处，改值时画面上动的不是它。',
     }),
 
-    'staticfile-asset-check': {
-      // options[0] 从「一个名字数组」改成 { declared, staged }：
-      //   · declared —— 这一镜在分镜里**声明**了哪些素材名（调用方传的名单）；
-      //   · staged   —— 这些素材**真投到渲染容器了没有**的账（`assets/<sid>/_manifest.json`）。
-      // staged 是 null 表示「看不见投递账」（比如只问代码合不合规的 /lint 口），
-      // 此时那一半不判——把「没看见」当成「没投递」会误杀，把「没投递」当成通过
-      // 才是这条规则要防的，两种错事重量不一样。
-      meta: { type: 'problem',
-              schema: [{ type: 'object', properties: {
-                declared: { type: 'array', items: { type: 'string' } },
-                staged: { type: ['array', 'null'], items: { type: 'string' } },
-              }, additionalProperties: false }],
+    'staticfile-font-only': {
+      // 供图通道撤掉后，随镜铺进 `public/` 的只剩 `fonts/`。所以 `staticFile` 还能指的
+      // 就只有字体——指别的名字，运行时那个文件根本不在，渲出来是一张空图。原先这条规则
+      // 是「声明 vs 投递两份账对账」（`dg/staticfile-asset-check`）；那两份账（分镜里的
+      // `assets` 与投递 manifest）随通道一起没了，判据就缩成这一条还留得下对象的话。
+      meta: { type: 'problem', schema: [],
               messages: {
-                undeclared: 'staticFile("{{arg}}") 引用了未声明的资产。本镜可用：{{alt}}',
-                nonLiteral: 'staticFile 的实参必须是字符串字面量，变量拼路径让机器无法核对',
-                unstaged: 'staticFile("{{arg}}") 的名字声明了，但**没投到渲染容器**——'
-                  + '这一镜的 public/assets/<镜号>/ 里没有它。声明与投递是两条腿：'
-                  + '声明归分镜，投递归 Python 侧按 sha256 取字节那一步。'
-                  + '此时渲染出来的是空白图，闸⑬ 也会拒。',
-                unused: '声明了资产 "{{name}}" 但代码里没有对应的 staticFile 调用',
+                notFont: 'staticFile("{{arg}}") 指的不是字体。供图通道撤掉后，随镜像铺进这一镜 '
+                  + 'public/ 的只有 `public/fonts/`；画面得由你自己写代码画出来，摆一张图不叫画'
+                  + '（闸⑦「每镜必画」）。要取字体请写 staticFile(\'fonts/….woff2\')。',
+                nonLiteral: 'staticFile 的实参必须是字符串字面量，变量拼路径让机器核对不了它指的是不是字体。',
               } },
       create(context) {
-        const opts = context.options[0] ?? {};
-        const declared = Array.isArray(opts.declared) ? opts.declared : [];
-        const staged = opts.staged == null ? null : opts.staged;   // null = 未判
-        const used = new Set();
-        // `fonts/` 是**随镜像发出去**的命名空间（R5-T16），与「这一镜的素材」是两件事：
-        // 素材按镜投递、按镜声明，而字体是构建产物，任何一镜都能用、也不需要谁声明。
-        // 不豁免的话，母版加载字体会让**每一镜**都报「引用了未声明的资产」——一条
-        // 天天误红的规则等于没有规则，人很快学会忽略它。
         const SHIPPED = 'fonts/';
         return {
           CallExpression(node) {
@@ -700,19 +669,8 @@ export const dgPlugin = {
               context.report({ node, messageId: 'nonLiteral' });
               return;
             }
-            used.add(arg.value);
-            if (arg.value.startsWith(SHIPPED)) return;
-            if (!declared.includes(arg.value)) {
-              context.report({ node, messageId: 'undeclared',
-                data: { arg: arg.value, alt: declared.join(', ') || '（本镜未声明任何资产）' } });
-            } else if (staged !== null && !staged.includes(arg.value)) {
-              context.report({ node, messageId: 'unstaged', data: { arg: arg.value } });
-            }
-          },
-          'Program:exit'() {
-            for (const name of declared) {
-              if (!used.has(name))
-                context.report({ loc: { line: 1, column: 0 }, messageId: 'unused', data: { name } });
+            if (!arg.value.startsWith(SHIPPED)) {
+              context.report({ node, messageId: 'notFont', data: { arg: arg.value } });
             }
           },
         };
@@ -801,8 +759,7 @@ export const dgPlugin = {
             '然后浏览器拿回落字族把这一镜画完。',
           outsideFonts:
             'loadFont 指向 `{{path}}`，但 webfont 的落脚点是 public/fonts/（`staticFile` 的根是 ' +
-            'public/）。放别处的字体进不了镜像的约定位置——.dockerignore 只挡 `public/assets/*`，' +
-            '别的目录没人保证会跟着走。',
+            'public/）。放别处的字体进不了镜像的约定位置——只有 public/fonts/ 是随镜像发出去的。',
           missingFile:
             'loadFont 指向 `{{path}}`，但 public/ 下没有这个文件。**这条不会在渲染时报错**：' +
             '浏览器静默回落到别的字族，出片看着正常，只是字不对。要发字体先跑 ' +
@@ -912,9 +869,8 @@ export const RESTRICTED_SYNTAX = [
   { selector: "CallExpression[callee.object.name='process']",
     message: '镜头代码拿不到宿主进程。' },
 ];
-// R2: staticFile 双向对账规则
-// 闸① 新规则：staticFile 引用必须与本镜 assets 声明对账
-export const STATICFILE_RULE = 'dg/staticfile-asset-check';
+// R2: staticFile 只许指字体（供图通道撤掉后，随镜铺进 public/ 的只剩 fonts/）
+export const STATICFILE_RULE = 'dg/staticfile-font-only';
 // R4: 字体白名单规则
 export const FONT_RULE = 'dg/font-family-whitelist';
 // R5: webfont「加载即断言」规则（loadFont 指的字节必须在 public/fonts/ 里真存在）

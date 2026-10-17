@@ -31,24 +31,9 @@ SEARCH_BASE_KEY = "search_base_url"       # searxng 实例地址；填了才生�
 ENV_SEARCH_KEY_NAME = "SEARCH_API_KEY"
 ENV_SEARCH_PROVIDER = "SEARCH_PROVIDER"
 ENV_SEARCH_BASE = "SEARCH_BASE_URL"
-# 图像出图后端三件套（R3 §5.3）：照 search_* 那套模式，含"自建实例有地址无 key"那一档。
-# provider 为空 = 没配出图后端，整条出图路径优雅降级为素材库检索。
-IMAGE_PROVIDER_KEY = "image_provider"     # siliconflow|minimax|zhipu|aliyun|volc（空 = 降级为素材库检索）
-IMAGE_API_KEY_NAME = "image_api_key"
-IMAGE_BASE_KEY = "image_base_url"         # 自建实例地址；填了才生效
-# 出图模型名与尺寸（R6-T24）。以前这两个值是**写死在请求体里的常量**
-# （`server.py` 的 `"model": "doubao-seedream-5-0-pro"` + `"size": "1024x1024"`），
-# 于是「换一家后端」必须改代码，而火山那条默认值会被原样发给硅基流动——换后端的人第一
-# 次调用就拿到 404/400，还得回来读源码才知道哪里写死了。改成与 provider 同一套热读后，
-# 「换后端」与「换模型」是两件独立可配的事；空值 = 用该 provider 的默认模型（见
-# `image_backend.PROVIDER_DEFAULT_MODELS`），不是「不传 model」。
-IMAGE_MODEL_KEY = "image_model"
-IMAGE_SIZE_KEY = "image_size"
-ENV_IMAGE_KEY_NAME = "IMAGE_API_KEY"
-ENV_IMAGE_PROVIDER = "IMAGE_PROVIDER"
-ENV_IMAGE_BASE = "IMAGE_BASE_URL"
-ENV_IMAGE_MODEL = "IMAGE_MODEL"
-ENV_IMAGE_SIZE = "IMAGE_SIZE"
+# 图像出图后端那一套（`IMAGE_PROVIDER_KEY` / `IMAGE_API_KEY_NAME` / `IMAGE_BASE_KEY` /
+# `IMAGE_MODEL_KEY` / `IMAGE_SIZE_KEY` 与两个 `resolve_image_*`）2026-10-16 删了：
+# 出图这条路已从产品里拿掉，图形片的画面只有一路——模型逐镜写代码画。
 # 配额也走同一套按身份热读：以前它只有 env 一处，超限的用户只能改编排文件 + 重建容器，
 # 而页面上一句「配额已用尽」连出路都没有。现在页面填的值压过 env，保存即生效。
 QUOTA_LIMIT_KEY = "quota_limit"           # 窗口内 token 上限，0 或空 = 只记账不拦
@@ -153,14 +138,10 @@ async def resolve_api_key(user_id: str = "", *, fallback: str = "") -> tuple[str
 __all__ = ["API_KEY_NAME", "CACHE_TTL_SEC", "ENV_KEY_NAME", "ENV_KEY_NAMES", "SOURCE_PG",
            "SOURCE_ENV", "SOURCE_FALLBACK", "SOURCE_NONE", "bind_storage", "unbind_storage",
            "bound_storage", "current_user_id", "env_api_key", "invalidate",
-           "resolve_api_key", "resolve_search_config", "resolve_image_config",
-           "resolve_image_options",
+           "resolve_api_key", "resolve_search_config",
            "resolve_quota", "parse_int", "mask",
            "SEARCH_PROVIDER_KEY", "SEARCH_API_KEY_NAME", "SEARCH_BASE_KEY",
            "ENV_SEARCH_KEY_NAME", "ENV_SEARCH_PROVIDER", "ENV_SEARCH_BASE",
-           "IMAGE_PROVIDER_KEY", "IMAGE_API_KEY_NAME", "IMAGE_BASE_KEY",
-           "IMAGE_MODEL_KEY", "IMAGE_SIZE_KEY", "ENV_IMAGE_MODEL", "ENV_IMAGE_SIZE",
-           "ENV_IMAGE_KEY_NAME", "ENV_IMAGE_PROVIDER", "ENV_IMAGE_BASE",
            "QUOTA_LIMIT_KEY", "QUOTA_WINDOW_KEY", "ENV_QUOTA_LIMIT", "ENV_QUOTA_WINDOW"]
 
 
@@ -209,66 +190,6 @@ async def resolve_search_config(user_id: str = "") -> tuple[str, str, str, str]:
     if env_provider or env_key or env_base:
         return env_provider, env_key, env_base, f"环境变量 {ENV_SEARCH_PROVIDER or ENV_SEARCH_KEY_NAME}"
     return "", "", "", SOURCE_NONE
-
-
-async def resolve_image_config(user_id: str = "", *,
-                               storage: Any = None) -> tuple[str, str, str, str]:
-    """图像出图后端的按身份热读，返回 (provider, api_key, base_url, 来源名)。
-
-    照 ``resolve_search_config`` 同一套模式：前端「设置」压过环境变量。
-    provider 为空 = 没配出图后端，调用方走**素材库检索降级**（§5.3）。
-    自建实例只有 base_url 就够（无 key）。
-
-    ``storage`` 显式给定时压过进程绑定：出图节点长在 **Storyline 那个进程**里，而
-    ``bind_storage`` 只保证「绑过的那个进程」能读——两个进程各绑各的，不能指望对方的
-    全局变量。给一个显式入参比再复制一份「页面压过 env」的判据强：判定只有一处，
-    两边的取值口径就不可能漂。
-    """
-    st = storage if storage is not None else _storage
-    uid = user_id or current_user_id()
-    provider = key = base = ""
-    if st is not None and uid:
-        try:
-            provider = ((await st.secrets.get(uid, IMAGE_PROVIDER_KEY)) or "").strip()
-            key = ((await st.secrets.get(uid, IMAGE_API_KEY_NAME)) or "").strip()
-            base = ((await st.secrets.get(uid, IMAGE_BASE_KEY)) or "").strip()
-        except Exception:  # noqa: BLE001
-            provider = key = base = ""
-        if provider or key or base:
-            return provider, key, base, SOURCE_PG
-    env_provider = os.environ.get(ENV_IMAGE_PROVIDER, "").strip()
-    env_key = os.environ.get(ENV_IMAGE_KEY_NAME, "").strip()
-    env_base = os.environ.get(ENV_IMAGE_BASE, "").strip()
-    if env_provider or env_key or env_base:
-        return env_provider, env_key, env_base, f"环境变量 {ENV_IMAGE_PROVIDER or ENV_IMAGE_KEY_NAME}"
-    return "", "", "", SOURCE_NONE
-
-
-async def resolve_image_options(user_id: str = "", *,
-                                storage: Any = None) -> tuple[str, str, str]:
-    """出图模型名与尺寸的按身份热读，返回 (model, size, 来源名)。
-
-    与 :func:`resolve_image_config` **分开**读：provider 与 model 是两件事，合成一个
-    四元组会让「换了后端但没换模型」这件事在返回值里看不出来。空 model / 空 size 不是
-    错误：调用方按 provider 的默认值补（``image_backend.default_model``），
-    「不填」与「填了个空的」在这里是同一件事。
-    """
-    st = storage if storage is not None else _storage
-    uid = user_id or current_user_id()
-    model = size = ""
-    if st is not None and uid:
-        try:
-            model = ((await st.secrets.get(uid, IMAGE_MODEL_KEY)) or "").strip()
-            size = ((await st.secrets.get(uid, IMAGE_SIZE_KEY)) or "").strip()
-        except Exception:  # noqa: BLE001
-            model = size = ""
-        if model or size:
-            return model, size, SOURCE_PG
-    env_model = os.environ.get(ENV_IMAGE_MODEL, "").strip()
-    env_size = os.environ.get(ENV_IMAGE_SIZE, "").strip()
-    if env_model or env_size:
-        return env_model, env_size, f"环境变量 {ENV_IMAGE_MODEL or ENV_IMAGE_SIZE}"
-    return "", "", SOURCE_NONE
 
 
 def parse_int(raw: str) -> int | None:

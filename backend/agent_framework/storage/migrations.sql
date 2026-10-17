@@ -118,3 +118,8 @@ ALTER TABLE asset_library ADD COLUMN IF NOT EXISTS scale_facts jsonb NOT NULL DE
 ALTER TABLE checkpoint_entries DROP CONSTRAINT IF EXISTS checkpoint_entries_kind_check;
 ALTER TABLE checkpoint_entries ADD CONSTRAINT checkpoint_entries_kind_check
   CHECK (kind IN ('delta','full','summary'));
+
+-- 文字库：会话级偏好（用户在「文字库」里挑过的字幕样式档与音色）。
+-- 只存用户真挑过的原始取值，不存派生的档名——理由见 schema.sql 的 conversations 那段。
+-- 形状与 schema.sql 的建表期定义一致（本文件是唯一执行口：新库走 schema.sql、老库走这里）。
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS prefs jsonb NOT NULL DEFAULT '{}';

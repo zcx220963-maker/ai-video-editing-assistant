@@ -1,19 +1,19 @@
 [
   {
     "relpath": "_fixtures/Brand.tsx",
-    "bytes": 6181
+    "bytes": 6131
   },
   {
     "relpath": "_fixtures/Fixtures.tsx",
-    "bytes": 35948
+    "bytes": 35872
   },
   {
     "relpath": "_fixtures/Look.tsx",
-    "bytes": 18440
+    "bytes": 18389
   },
   {
     "relpath": "_fixtures/Motion.tsx",
-    "bytes": 3582
+    "bytes": 4191
   },
   {
     "relpath": "_fixtures/PageCam2D.tsx",
@@ -21,7 +21,7 @@
   },
   {
     "relpath": "_fixtures/Polish.tsx",
-    "bytes": 13719
+    "bytes": 14453
   },
   {
     "relpath": "camera/basic-3d-scene/Basic3DScene.tsx",
@@ -360,8 +360,24 @@
     "bytes": 6332
   },
   {
+    "relpath": "science/compare-duel/CompareDuel.tsx",
+    "bytes": 10966
+  },
+  {
     "relpath": "science/cross-section-reveal/CrossSectionReveal.tsx",
     "bytes": 11360
+  },
+  {
+    "relpath": "science/curve-function-trace/CurveFunctionTrace.tsx",
+    "bytes": 11398
+  },
+  {
+    "relpath": "science/exploded-assembly/ExplodedAssembly.tsx",
+    "bytes": 10140
+  },
+  {
+    "relpath": "science/growth-morph/GrowthMorph.tsx",
+    "bytes": 13622
   },
   {
     "relpath": "science/map-terrain-build/MapTerrainBuild.tsx",
@@ -376,24 +392,8 @@
     "bytes": 14967
   },
   {
-    "relpath": "science/compare-duel/CompareDuel.tsx",
-    "bytes": 10966
-  },
-  {
-    "relpath": "science/exploded-assembly/ExplodedAssembly.tsx",
-    "bytes": 10140
-  },
-  {
-    "relpath": "science/growth-morph/GrowthMorph.tsx",
-    "bytes": 13622
-  },
-  {
-    "relpath": "science/curve-function-trace/CurveFunctionTrace.tsx",
-    "bytes": 11398
-  },
-  {
     "relpath": "science/timeline-evolution/TimelineEvolution.tsx",
-    "bytes": 11074
+    "bytes": 11090
   },
   {
     "relpath": "transition/bottom-push-stack-wipe/BottomPushStackWipe.tsx",
@@ -480,6 +480,14 @@
     "bytes": 6262
   },
   {
+    "relpath": "typography/caption-in-frame/CaptionPillRelocated.tsx",
+    "bytes": 5869
+  },
+  {
+    "relpath": "typography/caption-in-frame/TextOverArt.tsx",
+    "bytes": 7408
+  },
+  {
     "relpath": "typography/countdown-arc-scatter/CountdownArcScatter.tsx",
     "bytes": 11178
   },
@@ -496,12 +504,20 @@
     "bytes": 12637
   },
   {
+    "relpath": "typography/keyword-color-caption/KeywordColorCaption.tsx",
+    "bytes": 5812
+  },
+  {
     "relpath": "typography/lead-word-zoom-assemble/LeadWordZoomAssemble.tsx",
     "bytes": 10715
   },
   {
     "relpath": "typography/marker-underline-title/MarkerUnderlineTitle.tsx",
     "bytes": 6138
+  },
+  {
+    "relpath": "typography/outline-caption/OutlinedCaption.tsx",
+    "bytes": 6025
   },
   {
     "relpath": "typography/outline-word-fill/OutlineWordFill.tsx",

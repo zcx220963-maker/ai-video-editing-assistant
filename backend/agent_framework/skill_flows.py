@@ -78,7 +78,7 @@ def _args_line(args: dict[str, Any]) -> str:
 # 这些不是创作步骤：规划/问询/查询/技能加载/协作面调用，进技能只会教模型绕路
 NON_FLOW_TOOLS = frozenset({
     "submit_plan", "confirm_plan", "ask_user",
-    "render_status", "read_node_history", "load_skill",
+    "render_status", "read_node_history", "preview_voice", "preview_caption", "load_skill",
     "read_memory", "update_memory",
     "send_message", "read_inbox", "spawn_subagent", "start_subagent",
     "team_status", "plan_editing_team", "list_tasks", "claim_task",

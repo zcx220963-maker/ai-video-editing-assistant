@@ -171,6 +171,26 @@ class RunState:
             if n and n not in self.render_gate_asked:
                 self.render_gate_asked.append(n)
 
+    def forget_render_gate_asked(self, *nodes: str) -> None:
+        """把这几道出片门从「已经问过」里**撤回来**——因为用户那一答不是批准。
+
+        真机代价（2026-10-16，run 9272c7f59501 那 20 镜）：用户在那张确认卡上答的是
+        「要改」并写了新要求（年份不对、风格不够统一），不是批准。可
+        ``note_render_gate_asked`` 是**发问那一刻**就记的，于是这道门被记成"问过了"，
+        ``ungated_render_nodes`` 从此跳过这个通道——模型按新要求改完之后，
+        第 109 轮再出片时**一道门都没过，直接烧像素**。用户在界面上再没看到过任何
+        可确认的东西，只能问「怎么这轮没有先预览确认」。
+
+        「问过」不等于「答准」。答复若非批准（要改 / 自定义 / 未识别），这次提问就该
+        作废：模型重做之后，下一次出片**必须重新过门**。
+
+        而**批准过的通道照旧留在名单里**——那正是这条记录要保的性质：渲染失败后模型
+        重交同一条，不该再弹第二张一模一样的卡（见 ``_suppress_repeat_render``）。
+        """
+        for n in nodes:
+            if n and n in self.render_gate_asked:
+                self.render_gate_asked.remove(n)
+
 
 def tool_names_in(messages: Any) -> list[str]:
     """消息列表里已经发生过的工具调用名（按 ``role == "tool"`` 的回执算）。

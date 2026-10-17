@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from .identity import session_key
 from .messages import Message, assistant, user
 from .summary_store import SummaryStore
 
@@ -56,7 +57,9 @@ class Session:
 
     @property
     def session_id(self) -> str:
-        return f"{self.user_id}:{self.conversation_id}"
+        # 拼法住在 identity.session_key 一处：同一个串还是 checkpoints / MQ 分区 /
+        # Web 侧查产物的键，各拼一份就会「查得到历史、查不到产物」而没有任何报错。
+        return session_key(self.user_id, self.conversation_id)
 
     def add(self, message: Message) -> None:
         self.messages.append(message)
@@ -88,7 +91,7 @@ class SessionManager:
         self.summaries = summaries or SummaryStore(storage)
 
     async def get_or_create(self, user_id: str, conversation_id: str) -> Session:
-        key = f"{user_id}:{conversation_id}"
+        key = session_key(user_id, conversation_id)
         session = self._sessions.get(key)
         if session is None:
             session = Session(user_id=user_id, conversation_id=conversation_id)

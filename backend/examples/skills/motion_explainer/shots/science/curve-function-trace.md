@@ -1,4 +1,10 @@
-# curve-function-trace｜函数曲线逐笔绘制
+---
+name: curve-function-trace
+一句话: 函数曲线逐笔绘制——坐标轴与包络线先入，主曲线用 clipPath 从左到右一笔笔画出，关键点等曲线"画到"它才弹出标注
+适用: 讲"这个函数长什么样"的段落：阻尼振荡、抛物线、指数衰减、波形演化（数学/物理/数据叙事）
+时长: 198f（6.6s）；轴 18f + 包络 22f + 绘制 120f + 标注滞后 8f + 收尾 30f
+能量: 中高（一笔笔长出来的期待感）
+---
 
 ## 机制
 
@@ -40,6 +46,6 @@
 3. **关键点的 x 必须在 `X_RANGE` 内**：超出范围的点永远不会被画到，标注也永远不会弹出——判据在 `kpFrame = DRAW_START + (kp.x / X_MAX) * (DRAW_END - DRAW_START)`；
 4. **包络线的 dasharray 用预估值**：`2000` 是经验值，如果函数定义改成 x 范围很大的曲线（如 [0, 20]），需要调大这个数，否则包络线画不完。
 
-## Demo
-
-`demos/science/curve-function-trace/CurveFunctionTrace.tsx`
+## 参考实现
+demos/science/curve-function-trace/
+（CurveFunctionTrace.tsx）

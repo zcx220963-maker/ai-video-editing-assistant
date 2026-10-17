@@ -150,6 +150,32 @@ _DEFAULT_RECOVERY_HINT = ("用更窄的参数重取一次（读文件带 offset/
 #: 截断那头仍然只切中间（头尾都留），所以就算被折叠，id 也还在预览的开头。
 NEVER_FOLD_TOOLS = frozenset({"submit_plan", "confirm_plan", "ask_user"})
 
+#: ``load_skill`` 整份输出里「索引到此为止」的分隔行。折叠时**切在它前面**，于是留下来
+#: 的恰好是附件清单 + 分段目录，正文（几十 KB）整段丢掉。
+#:
+#: 它是生产者（``skill.LoadSkillTool``）与消费者（本模块 ``shrink``）之间唯一的约定，
+#: 所以两边引的是同一个常量，不各写一份。
+SKILL_INDEX_END = "── 以上是索引（附件清单 + 分段目录），以下是正文 ──"
+
+#: 折叠后要**整段保留索引**的工具，而不是只留开头 ``fold_preview`` 个字符。
+#:
+#: 通用折叠对绝大多数工具够用：参数是已知的，重调一次就回来了。对 ``load_skill``
+#: 不成立——它的开头是「位置行 + 附件清单 + 章节目录」，**那就是这份结果的索引**，
+#: 而「换个更窄的参数重取」这条路**唯一需要的东西正是它**。切掉索引，等于把恢复路径
+#: 和走这条路要用的钥匙一起拿走。
+#:
+#: 真机代价（2026-10-16，run b7df827ebed4，「薄肌理论」20 镜那条）：模型拿到的折叠回执
+#: 说「需要原文就重新调用一次该工具（用更窄的参数）」，可它手里只有 200 字符——够看见
+#: 3 个附件名（共 315 个）、一个 section 键名都没有。于是它照着「更窄的参数」去猜：
+#: `references/film-api.md`（这个技能根本没有 references/ 目录）、`references/palettes.json`、
+#: `section=film-api`、`section=palettes`——四次全错，熔断提示随即出现。它转而用 `grep`
+#: 在会话工作区找 `CaptionText`（工具说明白纸黑字写着技能文件不在工作区里，找不到），
+#: 最后得出**假结论**：「技能附件读不到，这是环境限制，不是我的检索方式问题」——
+#: 把整条 20 镜片子的阻塞归因到一个并不存在的问题上，还写进了给用户的答复。
+#:
+#: 真答案就在被切掉的那几行里：`demos/_fixtures/Fixtures.tsx`（35 KB，`CaptionText` 在那里）。
+INDEX_FOLD_TOOLS = frozenset({"load_skill"})
+
 
 def truncate_result(text: str, limit: int, *, tool: str = "") -> str:
     """结果文本超过 ``limit`` 字节时截成「头 + 回执 + 尾」；没超就原样返回。
@@ -254,11 +280,22 @@ class ToolResultGate:
             # 才有意义，那才是要治的东西。
             if before <= self.fold_preview + 200:
                 continue
-            preview = content[: self.fold_preview]
+            preview, kept_index = self._fold_preview(m.get("name", ""), content)
+            # 回执那半句「怎么把原文拿回来」**按工具分**——表就在上面，与
+            # ``truncate_result`` 用的是同一张。原先这里硬写着「用更窄的参数」，
+            # 对 ``load_skill`` 恰好是条走不通的路（索引已经被切掉了，见
+            # ``INDEX_FOLD_TOOLS``）：模型照着它去猜参数，四次全错。
+            if kept_index:
+                how = ("**索引整份留在下面**，需要哪一份就照它上面的名字取：附件用 path=，"
+                       "分段用 section=，或按章节目录里的行号用 offset= 直取那一节。"
+                       "技能文件不在会话工作区里，read_file / grep 找不到它们")
+            else:
+                how = ("需要原文就"
+                       + _RECOVERY_HINT.get(str(m.get("name") or ""),
+                                             _DEFAULT_RECOVERY_HINT))
             folded = (
                 f"[{FOLD_MARKER}｜{m.get('name', '')}｜这条是更早一轮的调用结果，"
-                f"原文 {before} 字节，此处只留开头。需要原文就重新调用一次该工具"
-                f"（用更窄的参数）。]\n{preview}…"
+                f"原文 {before} 字节，正文已省掉。{how}。]\n{preview}…"
             )
             messages[i] = {**m, "content": folded}
             delta = before - size(i)
@@ -267,6 +304,21 @@ class ToolResultGate:
             stats["freed_bytes"] += delta
         stats["total_bytes"] = total
         return stats
+
+    def _fold_preview(self, name: str, content: str) -> tuple[str, bool]:
+        """折叠后保留的那一段 → ``(预览, 是否保留了整份索引)``。
+
+        默认是开头 ``fold_preview`` 个字符。列入 ``INDEX_FOLD_TOOLS`` 的工具改留
+        **整份索引**（切在 ``SKILL_INDEX_END`` 前面）——理由见那个常量的注释。
+
+        索引分隔行不在（老结果、或者这条本来就是按 ``path``/``offset`` 取回来的
+        分页结果）时**退回通用行为**：不能因为找不到记号就整条原样留着，那等于白折。
+        """
+        if name in INDEX_FOLD_TOOLS:
+            cut = content.find(SKILL_INDEX_END)
+            if cut > 0:
+                return content[:cut], True
+        return content[: self.fold_preview], False
 
 
 class ContextCompressor:

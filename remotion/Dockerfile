@@ -42,10 +42,9 @@ COPY . .
 # 这类错误镜像能烤成功、运行时才炸，所以必须在构建期拦）；闸① 真能加载
 # （ESLint 配置与自定义规则都在这一层）；母版文件真在。
 #
-# public/assets/ 那一验（R1-T4）：`.dockerignore` 里 `public/assets/*` 把素材字节挡在
-# 上下文外，只留 `.gitkeep` 这个脚手架——两行规则谁写漏一行，`COPY . .` 都会静静地
-# 什么都不带，镜像照样烤成功，而 `/stage-assets` 到运行时才发现没有落脚点。
-# 所以「目录真在」由构建层自己说话，不靠人记得。
+# （原来这里还有一验：`.dockerignore` 的 `public/assets/*` + `!public/assets/.gitkeep`
+#  两行是否把脚手架留进了上下文。供图通道撤掉后 `public/assets/` 不再随镜像发，
+#  那一验连同 `/stage-assets` 的落脚点一起删了。）
 #
 # 白名单 ↔ node_modules 这一条也在构建期：ALLOWED_IMPORTS 是「模型可以写哪些 import」，
 # package.json 是「镜像里真装了哪些包」，两份名单各写一遍、不在同一个进程里。
@@ -64,16 +63,11 @@ RUN node -e "const{execSync}=require('child_process');const fs=require('fs');con
     && node -e "const p=require('./package.json'); if (!p.dependencies.remotion) throw new Error('remotion 没进依赖'); console.log('remotion', p.dependencies.remotion)" \
     && node --input-type=module -e "const m = await import('./lint-rules.mjs'); const bad = []; for (const p of m.ALLOWED_IMPORTS) { if (p.startsWith('@dg/')) continue; try { import.meta.resolve(p); } catch (e) { bad.push(p + '（' + (e.code || e.message) + '）'); } } if (bad.length) throw new Error('import 白名单里的包镜像里没装：' + bad.join('、') + '——要么装进 package.json，要么从白名单删掉'); console.log('import 白名单', m.ALLOWED_IMPORTS.size, '项全部可解析')" \
     && test -f src/FilmLayout.tsx && test -f src/index.ts \
-    && test -d public/assets \
     && test -d public/fonts \
-    && node tests/gate1-lint.mjs \
-    && node tests/gate13-assets.mjs \
-    && node tests/shipped-namespace.mjs
+    && node tests/gate1-lint.mjs
 
-# 闸⑬ 的三张红样（1×1 / 全白 / manifest 有记录但文件缺）也在构建期跑：判据里的
-# 阈值（纯色占比、主色档数）是可调的旋钮，调坏了不会让任何功能挂掉，只会让闸
-# 永远放行——那种失效在任何一次真渲染里都看不出来，只有红样会说话。测试把
-# public/ 指到临时目录（DG_PUBLIC_ROOT），不碰镜像里的 public/assets/。
+# （原来这里还在构建期跑闸⑬ 的三张红样——1×1 / 全白 / manifest 有记录但文件缺。
+#  供图通道撤掉后闸⑬ 本身没了，这一步随之删掉。）
 
 # DG_GL 是实测出来的，不是猜的（容器内 Chromium 154 + 一段 three.js 四棱锥探针，
 # 见 tests/gl-probe.mjs）：angle / egl / swiftshader 三档全部

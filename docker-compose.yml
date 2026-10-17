@@ -117,6 +117,19 @@ services:
     environment:
       # 同时逐帧渲染的镜数（软件 WebGL 吃内存，16 GB 机器 2 路稳妥）
       DG_RENDER_SLOTS: ${DG_RENDER_SLOTS:-2}
+    # /dev/shm 默认只有 64M，而 chromium 的渲染进程拿它当共享内存用。软件 WebGL 连渲
+    # 二十来帧就能把它耗光，表现是渲染中途 `ProtocolError (Target.closeTarget):
+    # Target closed`——**不是**「服务不可达」，是浏览器进程已经死了。
+    # 真机代价（2026-10-16，run 9272c7f59501 那 20 镜）：20 镜连续求静帧时 remotion
+    # 整个容器退出，那一刻之后所有出片都报 「creation-remotion 不可达
+    # （http://remotion:8010/healthz）：[Errno -2] Name or service not known」
+    # ——那是容器没了、Docker 顺手撤掉了它的 DNS 记录，是**后果**不是原因。
+    shm_size: "1gb"
+    # 崩了要能自己回来。原先没有这一位：remotion 一退出就永久躺平，而且**没人会立刻发现**
+    # ——app 只在真正出片那一刻才去连它，于是故障可以潜伏几个小时，直到用户点「出片」。
+    # `unless-stopped`：手动 stop 的不自动拉起，崩溃的自动拉起（且带上限退避）。
+    # 这是**安全网**，不是修复：上面那条 shm 才是修复。
+    restart: unless-stopped
     healthcheck:
       # 镜像里没有 curl,用 node 自带的全局 fetch 真打一次 /healthz
       # （端口开着不等于服务应答，探针要问同一个口）。

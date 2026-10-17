@@ -54,7 +54,7 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from . import image_backend, model_probe, secrets, uploads
+from . import model_probe, secrets, uploads
 from .agent import Agent
 from .auth import Authenticator
 from .catalog import get_catalog
@@ -64,7 +64,6 @@ from .storage import Cond
 from .consumer import CHAT_TOPIC, SessionConsumer, session_key
 from .heartbeat import Heartbeat
 from .ingest import IngestRejected, ingest_bytes
-from .library_pick import pick_library_asset
 from .memory import CATEGORIES, MemoryContextSource, MemoryStore
 from .memory_compact import MemoryCompactor
 from .prompts import (DEFAULT_PROMPTS_DIR, PHASES, load_manifest, placeholders_in,
@@ -76,14 +75,14 @@ from .hooks import quota_status
 from .tools.web import (KEYED_SEARCH_PROVIDERS, auto_provider, keyed_provider,
                         provider_refusal)
 
-KEYED_IMAGE_PROVIDERS = ("siliconflow", "minimax", "zhipu", "aliyun", "volc")
 from .llm_openai import (DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_THINKING,
                          get_default_llm)
 from .media_fetch import FetchPolicy, FetchRejected, fetch_media
+from . import motion_prefs
 from .mcp_manager import McpManagerError
 from .mq import MessageQueue
 from .tools.mcp import MCPServerConfig
-from .storage import IntegrityConflict, Storage
+from .storage import IntegrityConflict, Storage, ref_key
 from .tool import is_tool_error
 from .checkpoint import STATUS_AWAITING_APPROVAL, CheckpointManager
 from .skill_flows import (clean_steps, draft_body, extract_steps,
@@ -175,6 +174,16 @@ class FetchMediaRequest(BaseModel):
 class RenameRequest(BaseModel):
     conversation_id: str
     title: str
+
+
+class ConvPrefsRequest(BaseModel):
+    """「文字库」的一次写入。**只带要改的那几维**，值是原始取值或 ``None``。
+
+    合并语义（不改的键保持原样）在 ``ConversationsRepo.set_prefs`` 里；``None`` 表示
+    取消这一维、回到「交给模型定」——面板上「恢复默认」用的就是它。
+    值由端点按契约的枚举校验，所以这里只声明形状，不列取值（列了就是第二份词表）。
+    """
+    prefs: dict[str, Any]
 
 
 class ApiKeyRequest(BaseModel):
@@ -385,6 +394,7 @@ _TOOL_CATEGORIES = {
     "select_BGM": "剪辑工具", "plan_timeline": "剪辑工具", "plan_timeline_pro": "剪辑工具",
     "plan_timeline_ai_transition": "剪辑工具", "render_video": "剪辑工具",
     "read_node_history": "剪辑工具", "render_status": "剪辑工具",
+    "preview_voice": "剪辑工具", "preview_caption": "剪辑工具",
     "write_file": "文件工具", "read_file": "文件工具", "edit_file": "文件工具", "grep": "文件工具",
     "fetch_url": "联网工具", "web_search": "联网工具", "fetch_media": "联网工具",
     "spawn_subagent": "子助手", "load_skill": "技能管理",
@@ -661,33 +671,6 @@ class SearchTestRequest(BaseModel):
     """POST /settings/search/test：测试查询词可自带，留空则用一句固定的中文查询。"""
 
     query: str = ""
-
-
-class ImageBackendRequest(BaseModel):
-    """POST /settings/image：图像出图后端五件套。api_key 传空 = 清除已存密钥。
-
-    ``model`` / ``size`` 从 T24 起也按身份热读：以前它们写死在请求体里
-    （`doubao-seedream-5-0-pro`），换一家后端就会把火山那个模型名发给别家。
-    空串 = 清除页面覆盖 → 用该 provider 的默认模型 / 默认尺寸（不是「不传 model」）。
-    """
-
-    provider: str = ""      # siliconflow|minimax|zhipu|aliyun|volc；空 = 降级为素材库检索
-    base_url: str = ""      # 自建实例地址；填了才生效
-    api_key: str = ""
-    model: str = ""         # 模型名；空 = 该 provider 的默认模型
-    size: str = ""          # 尺寸，如 1024x1024；空 = 默认尺寸
-
-
-class ImageTestRequest(BaseModel):
-    """POST /settings/image/test：出图自检——真发一条出图请求，把回来的字节落盘。
-
-    ``prompt`` 可自带；``model`` / ``size`` 可临时压过设置里那两栏，用来在页面上
-    「换一个模型试试」而不必先保存。
-    """
-
-    prompt: str = ""
-    model: str = ""
-    size: str = ""
 
 
 class QuotaRequest(BaseModel):
@@ -1833,25 +1816,8 @@ def create_app(
             })
         return {"materials": items}
 
-    @app.post("/library/pick")
-    async def library_pick(asset_id: str, conversation_id: str = "",
-                           user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """把内置库的一条素材投进本会话的素材库（R3/T11-T45），回 material_id。
-
-        这是「库 132 行 → 链上可见」的唯一投递口：投完 ``materials`` 多一行
-        ``origin='library'``，渲染链那条只认 material_id 的路才走得通。
-        归属人由 token 反查（客户端改不掉），库那份共享底本不动，只复制字节。
-        """
-        material_id, note = await pick_library_asset(
-            storage, storyline_session_id(user_id, conversation_id), asset_id,
-            conversation_id=conversation_id or None)
-        if not material_id:
-            # 库里没有 / 已停用 / 需署名 → 409（调用方选错了）；其余（存储不可用等）→ 502
-            status = 409 if ("不存在" in note or "已停用" in note
-                             or "需要署名" in note) else 502
-            raise HTTPException(status, note)
-        return {"material_id": material_id, "note": note}
-
+    # `/library/pick`（把内置库的一条素材投进本会话）2026-10-16 删了：库里那份
+    # 策展素材的检索面已经不存在，这条投递口随之没有调用方。
     @app.delete("/materials/{material_id}")
     async def delete_material(material_id: str,
                               user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
@@ -2193,14 +2159,6 @@ def create_app(
         s_key_row = await storage.secrets.row(user_id, secrets.SEARCH_API_KEY_NAME)
         s_key = (s_key_row or {}).get("value", "")
         eff_provider, _, _, s_source = await secrets.resolve_search_config(user_id)
-        i_provider = await secrets.get_user_key(user_id, secrets.IMAGE_PROVIDER_KEY)
-        i_base = await secrets.get_user_key(user_id, secrets.IMAGE_BASE_KEY)
-        i_key_row = await storage.secrets.row(user_id, secrets.IMAGE_API_KEY_NAME)
-        i_key = (i_key_row or {}).get("value", "")
-        i_model = await secrets.get_user_key(user_id, secrets.IMAGE_MODEL_KEY)
-        i_size = await secrets.get_user_key(user_id, secrets.IMAGE_SIZE_KEY)
-        _, _, _, i_source = await secrets.resolve_image_config(user_id)
-        eff_model, eff_size, _ = await secrets.resolve_image_options(user_id)
         q_limit, q_window, q_source = await secrets.resolve_quota(
             user_id, default_limit=quota_limit, default_window=quota_window)
         q_status = await quota_status(storage.db, user_id, limit=q_limit, window=q_window)
@@ -2234,24 +2192,8 @@ def create_app(
                 "overridden": bool(s_provider or s_base or s_key),
                 "providers": list(KEYED_SEARCH_PROVIDERS),
             },
-            "image": {
-                "provider": i_provider or "",
-                "base_url": i_base or "",
-                "model": i_model or "",
-                "size": i_size or "",
-                # 生效值（页面 → env → provider 默认）与页面原文分开给：页面那两栏为空
-                # 时输入框该是空的（用户没填），而「会用哪个模型」得能显示出来——
-                # 只给生效值会让「我没填但怎么有个模型名」变成一团雾。
-                "effective_model": eff_model,
-                "effective_size": eff_size,
-                "default_model": image_backend.default_model(
-                    (i_provider or "").strip().lower(), i_model or ""),
-                "configured": bool(i_key or i_base),
-                "masked": secrets.mask(i_key) if i_key else "",
-                "source": i_source,
-                "overridden": bool(i_provider or i_base or i_key or i_model or i_size),
-                "providers": list(KEYED_IMAGE_PROVIDERS),
-            },
+            # 这里曾经有一块 `image`（出图后端五件套的现状）。2026-10-16 与出图那条路
+            # 一起删了：设置页上再没有那一组输入框，视图里也就没有可回报的东西。
             "quota": {
                 "limit": q_limit,
                 "window_sec": q_window,
@@ -2602,98 +2544,8 @@ def create_app(
                 "message": ("后端有响应" if rows else "后端连通但这条查询没回结果——"
                             "换关键词再试，或改走别的路")}
 
-    @app.post("/settings/image")
-    async def settings_image(req: ImageBackendRequest,
-                             user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """图像出图后端五件套：provider/base_url/api_key/model/size 各写各的，
-        空串即清除该项。
-
-        与 /settings/search 同一套模式：provider 为空 = 没配出图后端，整条出图路径
-        优雅降级为素材库检索（§5.3）。model/size 是 T24 新增的两栏——它们与 provider
-        **分开**读写，所以「换了后端但没换模型」在页面上是看得见的一件事。
-        """
-        provider = (req.provider or "").strip().lower()
-        base = (req.base_url or "").strip().rstrip("/")
-        key = (req.api_key or "").strip()
-        model = (req.model or "").strip()
-        size = (req.size or "").strip()
-        if model and any(c.isspace() for c in model):
-            raise HTTPException(400, "模型名格式不对：不能包含空格或换行")
-        if size and not re.fullmatch(r"\d{2,5}x\d{2,5}", size):
-            raise HTTPException(400, "尺寸要写成 宽x高，例如 1024x1024")
-        if provider and provider not in KEYED_IMAGE_PROVIDERS:
-            raise HTTPException(
-                400, f"不认识的出图后端 {provider!r}（可用：{', '.join(KEYED_IMAGE_PROVIDERS)}；"
-                     f"留空 = 降级为素材库检索）")
-        if base and not base.startswith(("http://", "https://")):
-            raise HTTPException(400, "自建实例地址要带协议：http:// 或 https://")
-        if any(c.isspace() for c in key):
-            raise HTTPException(400, "密钥格式不对：不能包含空格或换行")
-        if (key or base) and not provider:
-            raise HTTPException(400, "填了密钥或实例地址但没选后端——无法判断该把 key 交给谁")
-        for name, value in ((secrets.IMAGE_PROVIDER_KEY, provider),
-                             (secrets.IMAGE_BASE_KEY, base),
-                             (secrets.IMAGE_API_KEY_NAME, key),
-                             (secrets.IMAGE_MODEL_KEY, model),
-                             (secrets.IMAGE_SIZE_KEY, size)):
-            if value:
-                await secrets.put_user_key(user_id, name, value)
-            else:
-                await secrets.drop_user_key(user_id, name)
-        secrets.invalidate(user_id)
-        view = await _settings_view(user_id)
-        view["status"] = "saved"
-        return view["image"]
-
-    @app.post("/settings/image/test")
-    async def settings_image_test(req: ImageTestRequest,
-                                  user_id: str = Depends(auth.http_user_id)
-                                  ) -> dict[str, Any]:
-        """出图自检：真发一条出图请求，**把回来的字节落盘**，再回 ok。
-
-        自检口径照 L2 教训，并往前推一步。原实现只判 ``bool(data["data"][0]["url"])``
-        ——「后端回了个 URL」就算成功；那张 URL 可能 404、可能指向一张 1×1 占位图、
-        也可能根本拉不动。那种「自检绿、链上取不到图」的组合正是最难查的假绿。
-        现在：字节必须真的拿回来、认得出是位图、写进 ``<cache_root>/image-selftest/``
-        （**落盘**），并把路径/字节数/sha16 一起回报——判据从「有响应」变成「有图」。
-        请求由 ``image_backend`` 构造，与 ``imagegen`` 节点**同一个函数**，自检过的
-        就是链上跑的那条。密钥只在这里被读出来交给后端，绝不进返回值。
-        """
-        provider, key, base, source = await secrets.resolve_image_config(user_id)
-        provider = (provider or "").strip().lower()
-        cfg_model, cfg_size, _ = await secrets.resolve_image_options(user_id)
-        model = (req.model or "").strip() or cfg_model
-        size = (req.size or "").strip() or cfg_size
-        prompt = (req.prompt or "").strip() or "一只蓝色的鸟站在树枝上"
-        if not (provider or key or base):
-            return {"ok": False, "provider": "", "source": source,
-                    "message": "未配出图后端，当前走素材库检索降级（§5.3）"}
-        if not provider:
-            return {"ok": False, "provider": "", "source": source,
-                    "message": "填了密钥或实例地址但没选后端，无法判断该把 key 交给谁"}
-        try:
-            result = await asyncio.to_thread(
-                image_backend.generate, provider=provider, key=key, base=base,
-                prompt=prompt, model=model, size=size)
-        except image_backend.ImageBackendError as exc:
-            return {"ok": False, "provider": provider, "source": source,
-                    "model": model, "size": size, "message": str(exc)}
-
-        # 落盘：自检的意义就是「这条路走到底了」。目录挂在 workspace 根下（可丢弃的
-        # 中转区，见 spec §3.6），不占对象存储——它只是一次探针的产物。
-        out_dir = Path(storage.workspace.root) / "image-selftest"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out = out_dir / f"{user_id[:24] or 'anon'}-{result.sha16}.{result.ext}"
-        out.write_bytes(result.data)
-        return {"ok": True, "provider": provider, "source": source,
-                "model": result.model, "size": result.size,
-                "latency_ms": result.latency_ms,
-                "bytes": result.bytes, "sha16": result.sha16,
-                "width": result.width, "height": result.height,
-                "artifact": str(out),
-                "notes": list(result.notes),
-                "message": (f"出图成功：{result.provider}/{result.model} "
-                            f"{result.bytes} 字节，已落盘 {out.name}")}
+    # `/settings/image` 与 `/settings/image/test`（出图后端五件套与自检）2026-10-16
+    # 删了：出图这条路已从产品里拿掉，图形片的画面由模型逐镜写代码画。
 
     @app.websocket("/ws/{conversation_id}")
     async def ws_endpoint(websocket: WebSocket, conversation_id: str) -> None:
@@ -2916,6 +2768,137 @@ def create_app(
                            user_id: str = Depends(auth.http_user_id)) -> Response:
         """某一键的代表帧（图形科普片按镜号）。"""
         return await _frame_png(artifact_id, shot, conv_id, user_id)
+
+    def _text_library() -> dict[str, Any]:
+        """剪辑服务端声明的「文字库」清单（命名字幕样式档 + 各维枚举与中文标签 + 音色分组）。
+
+        从契约取、**主服务不抄一份**：卡片上的 radio 文字来自契约的 ``value_labels``，
+        文字库面板的取值也来自同一处。前端自己列一遍的后果不是报错，是界面上写着
+        「撕纸条·逐词点亮」而渲染认的是另一个字符串——那种不一致不会红，只会渲成别的。
+        拿不到（剪辑服务端还没连上）回空表，面板据此显示「暂时拿不到，稍后重试」。
+        """
+        contract = getattr(editing_contract, "contract", None)
+        lib = getattr(contract, "text_library", None)
+        return dict(lib) if isinstance(lib, Mapping) else {}
+
+    @app.get("/motion/text-library")
+    async def motion_text_library(user_id: str = Depends(auth.http_user_id)
+                                  ) -> dict[str, Any]:
+        """左侧「文字库」面板要的全部内容。不依赖任何产物——分镜还没出就该能挑。"""
+        return _text_library()
+
+    @app.get("/tts/preview")
+    async def tts_preview(voice: str, rate: str = "",
+                          user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """试听一个音色：用固定的一句中文合成，回可播的签名直链。
+
+        合成在剪辑服务端做（``preview_voice`` 那个口）——edge-tts 装在那边，
+        主服务不为一次试听多引一个依赖。返回的是**签名的临时直链**而不是字节流：
+        浏览器 ``<audio>`` 直接播它，主服务不用为一个几秒的试听开一条流式转发。
+
+        ``rate`` 不传就用剪辑服务端配置里的默认语速——试听回答的是「这个音色什么味道」，
+        语速是个次要维度，面板上改了语速才会带过来。
+        """
+        reg = getattr(getattr(agent, "runner", agent), "registry", None)
+        if reg is None or "preview_voice" not in reg:
+            raise HTTPException(503, "剪辑服务还没连上，暂时试听不了")
+        try:
+            raw = await reg.execute("preview_voice", {"voice": voice, "rate": rate})
+        except Exception as e:  # noqa: BLE001 - 注册表已把节点异常包成 ToolError
+            raise HTTPException(502, f"试听合成失败：{e}") from e
+        if is_tool_error(raw):
+            raise HTTPException(502, str(raw))
+        try:
+            got = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(502, f"试听回执不是合法 JSON：{e}") from e
+        key = ref_key(got.get("ref"))
+        if key is None:
+            raise HTTPException(502, "试听回执里没有可用的音频引用")
+        return {"url": await storage.objects.presign_get(key),
+                "voice": got.get("voice", voice), "rate": got.get("rate", rate)}
+
+    @app.get("/motion/caption-preview")
+    async def motion_caption_preview(palette: str = "",
+                                     caption: str = "",
+                                     highlight: str = "",
+                                     color: str = "",
+                                     user_id: str = Depends(auth.http_user_id)
+                                     ) -> dict[str, Any]:
+        """字幕样式样张：按一对（字幕样式 × 高亮样式 × 强调色）渲一张静帧，回可播的签名直链。
+
+        字体与画面在剪辑服务端那侧排（``preview_caption`` 那个口）——样片代码与渲染链都在
+        那边，主服务这一层只把引用换成直链。返回**签名的临时直链**而不是字节流：浏览器
+        就该自己从对象存储取图。
+
+        ``palette`` 空串＝「默认」那一档（`tokens.ts` 的底色）。``caption`` / ``highlight``
+        空串或认不出时由剪辑服务端落缺省（贴画面 · 关键词换色）。``color`` 是用户钉的
+        强调色（``#rrggbb``，空＝跟色板走）——它进的是**内容地址的一部分**，所以换一个色
+        就是另一张图，不会取到上一枚颜色渲出来的那张。选哪套色板只影响这一张样张，
+        成片里每一镜跟着它自己的色板走——面板上那句话不是客套，是这一层的事实。
+        """
+        reg = getattr(getattr(agent, "runner", agent), "registry", None)
+        if reg is None or "preview_caption" not in reg:
+            raise HTTPException(503, "剪辑服务还没连上，暂时渲不了样式样张")
+        try:
+            raw = await reg.execute("preview_caption", {"palette": palette,
+                                                        "caption_style": caption,
+                                                        "highlight_style": highlight,
+                                                        "highlight_color": color})
+        except Exception as e:  # noqa: BLE001 - 注册表已把节点异常包成 ToolError
+            raise HTTPException(502, f"样式样张渲染失败：{e}") from e
+        if is_tool_error(raw):
+            raise HTTPException(502, str(raw))
+        try:
+            got = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(502, f"样张回执不是合法 JSON：{e}") from e
+        stills: list[dict[str, str]] = []
+        for item in got.get("stills") or []:
+            key = ref_key((item or {}).get("ref"))
+            if key is None:
+                continue
+            stills.append({"key": str((item or {}).get("key") or ""),
+                           "url": await storage.objects.presign_get(key)})
+        if not stills:
+            raise HTTPException(502, "样张回执里没有可用的图片引用")
+        return {"palette": got.get("palette", palette), "stills": stills}
+
+    @app.get("/convs/{conversation_id}/prefs")
+    async def conv_prefs(conversation_id: str,
+                         user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """本对话在「文字库」里挑过的开关。空表 = 一维都没挑过（全归模型定）。"""
+        await storage.conversations.claim(user_id, conversation_id)
+        return {"prefs": await storage.conversations.prefs(conversation_id)}
+
+    @app.put("/convs/{conversation_id}/prefs")
+    async def conv_prefs_set(conversation_id: str, req: ConvPrefsRequest,
+                             user_id: str = Depends(auth.http_user_id)
+                             ) -> dict[str, Any]:
+        """改本对话的文字库偏好。→ 合并后的全表。
+
+        **校验在这里，不在出片那一刻**：写进来一个母版不认的字幕形态（``torn`` 那种），
+        下游要到几分钟的渲染里才打回，而那时用户已经以为设置成功了。所以取值一律
+        按剪辑服务端声明的枚举拒——契约拿不到就**拒绝这次写入**而不是收下，
+        收下一个没法校验的值等于把不确定性推到最贵的那一步。
+
+        **这一处要建行（``ensure``），不能只 ``claim``**：会话行本来由落第一条消息时
+        创建，而「开一册新卷 → 进文字库挑一档」这条路走不到发消息那一步。只 claim 的话
+        ``set_prefs`` 的 UPDATE 命中零行、**静默不落盘**，可回执里还带着那份合并结果，
+        于是面板上四张卡都亮着「已选」、刷新一下就全灭了。读口（GET）反过来不建行：
+        没挑过就是空表，不该因为点开面板就凭空多出一个会话。
+        """
+        await storage.conversations.ensure(user_id, conversation_id)
+        library = _text_library()
+        names, rules = motion_prefs.pref_keys_from_contract(library)
+        if not names:
+            raise HTTPException(503, "剪辑服务还没连上，拿不到可选的字幕样式与音色清单，"
+                                     "这次设置没有保存——请稍后重试")
+        patch, errs = motion_prefs.check_patch(req.prefs, names=names, rules=rules)
+        if errs:
+            raise HTTPException(422, "；".join(errs))
+        merged = await storage.conversations.set_prefs(conversation_id, patch)
+        return {"prefs": merged}
 
     @app.get("/timeline/frame")
     async def timeline_frame(artifact_id: str, shot: str, conv_id: str = "",

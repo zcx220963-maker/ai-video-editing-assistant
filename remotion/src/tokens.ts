@@ -99,21 +99,22 @@ export const FILM_GEOMETRY: Record<Aspect, FilmGeometry> = {
   },
 } as const;
 
-/** 字幕形态：与旧链同一套语义，值从整片开关注入，镜头代码碰不到。
+/** 字幕样式：这一行字长什么样、站在哪。与 `code_spec.CAPTION_STYLES` 是同一份枚举，
+ *  两处一起改（`tests/test_code_spec.py` 第 ⑤ 节拿正则把这一行抠出来逐项比）。
  *
- *  R14 加第四档 `inline`：**母版不画字幕条**，把 text/highlight/words 交回镜头代码
- *  自己排（那三个值本来就在 `props` 里，镜头代码一直拿得到）。这是「文字进画面、
- *  随构图摆」那一档——参考片普遍这么做，而前三档里它做不到：
- *  `full`/`torn_highlight` 都是母版在画面带下方那条固定白底圆角条里画，
- *  `none` 是整片没有字幕。`inline` 是唯一能让「这一镜的字压在画面上」成立的档。 */
-export const SUBTITLE_MODES = ['full', 'torn_highlight', 'none', 'inline'] as const;
+ *  2026-10-16 面板重做那一轮，原先揉在 `subtitle_mode`/`caption_position`/`caption_anim`
+ *  三个旋钮里的选择拆成两件不相干的事——「字长什么样」（这里）与「被点名的词怎么被
+ *  点出来」（`HIGHLIGHT_STYLES`）。拆开之后「要关键词换色、但不要纸条」这类组合才说得出口。
+ *
+ *  每一档落到画面上是什么样，由本文件下方 `CAPTION_LOOK` **一处**说了算。 */
+export const CAPTION_STYLES = ['on_picture', 'outlined', 'paper', 'film_line',
+                               'big_center', 'top_banner', 'none'] as const;
+export type CaptionStyle = (typeof CAPTION_STYLES)[number];
 
-/** 字幕位置与入场动画：模型按构图与片子气质逐镜选（整片给默认值）。
- *  与 `code_spec.CAPTION_POSITIONS / CAPTION_ANIMS` 是同一份枚举，两处一起改。 */
-export const CAPTION_POSITIONS = ['bottom', 'center', 'top'] as const;
-export type CaptionPosition = (typeof CAPTION_POSITIONS)[number];
-export const CAPTION_ANIMS = ['fade', 'rise', 'pop', 'karaoke'] as const;
-export type CaptionAnim = (typeof CAPTION_ANIMS)[number];
+/** 高亮样式：被点名的词怎么被点出来。与上面那一维**正交**，取值域互不相干。
+ *  落到 `CaptionText` 上就是把 `emphasis` 与「要不要逐字点亮」定下来（见 `HIGHLIGHT_LOOK`）。 */
+export const HIGHLIGHT_STYLES = ['color', 'karaoke', 'block', 'ink', 'plain'] as const;
+export type HighlightStyle = (typeof HIGHLIGHT_STYLES)[number];
 
 /** 闸⑤ 回读行的行首标记。server.mjs 里是同名字面量，两处必须一起改。 */
 export const TOKEN_LOG_MARKER = 'DG_TOKENS:';
@@ -146,6 +147,12 @@ export const LAYOUT_LOG_MARKER = 'DG_LAYOUT:';
  * - `anchor_ratio` / `anchor_min_px`：引线端点算「挨着某物」的容差，按画面带短边
  *   的比例给（横竖屏同一判据），再兜一个绝对下限。
  * - `leader_min_px`：短于这条长度的线不叫引线（那是下划线/分隔线），不判悬空。
+ * - `subject_overlap_ratio`（2026-10-16 新增）：一块字**被图形件压掉**的面积占
+ *   **这块字自己**的比例门槛。分母取文字盒而不是图形件：一件铺得很开的装饰形状
+ *   会把「÷ 图形件」压到接近 0，于是这条判据永远不响——问的必须是「这块字还读得出吗」。
+ * - `subject_max_share`（同上）：面积占画面带 **超过**这个比例的图形件不算主体，是**底色**。
+ *   没有这一道，每一镜那层铺满整帧的 `<rect>` 会让**每一条字幕**都报「字压图」，
+ *   而这条通道的产出是账不是拦截——一开始误报，模型与用户会一起无视整条通道。
  * - `max_findings`：一行 JSON 最多带几条，多了只报条数——响应要进逐镜账，
  *   一段狂叠的版式不该把整镜的账撑大。
  */
@@ -156,39 +163,30 @@ export const LAYOUT_PROBE = {
   anchor_ratio: 0.02,
   anchor_min_px: 20,
   leader_min_px: 40,
+  subject_overlap_ratio: 0.3,
+  subject_max_share: 0.85,
   max_findings: 8,
 } as const;
-
-/** 闸⑪ 资产动效回读的行首标记。与闸⑧ 同一条 console.log 通道。
- *  在首帧与探针帧各扫一遍 <img>/<video>，记录盒与 transform；
- *  server.mjs 比对两帧的快照，判定三态。 */
-export const ASSET_LOG_MARKER = 'DG_ASSETS:';
-
-/** 闸㉗ 分区揭示回读的行首标记（R12-T60/T61，与闸⑧⑪ 同一条 console.log 通道）。
- *
- *  与其它几条回读最大的不同：它**不在探针帧上扫地**，而是只在 Python 点名的
- *  那几个帧（`revealProbeFrames`）各报一行——㉗ 要的是「区域到点/未到点的那一刻
- *  画面上是什么」，那一刻是**算出来的**（区域自己的 start/duration + fps），
- *  不是末帧那一格。母版报的是**它自己算出来的允许掩码**（成片像素、带内坐标），
- *  Python 拿它去采样比色——「区域落在哪儿」只有一处实现，就是这里（两处各算一遍
- *  就是两把尺：母版按 img 的实时盒换算，Python 没有那个盒）。 */
-export const REVEAL_LOG_MARKER = 'DG_REVEAL:';
 
 /**
  * R14 风格档：把母版的三件事（底色 / 画面带 / 字幕形态）从常量改成**按档排**。
  *
- * 为什么走**注入**而不是 props：与 `reveal` / `entrance` 同一条理由——它不是
+ * 为什么走**注入**而不是 props：与 `entrance` 同一条理由——它不是
  * 「镜头代码自己的数据」，而是整片（或这一镜）的一个观感决定。镜头代码转交不了它，
  * 所以母版自己从 `getInputProps()` 里取，`useBody()` 也取同一份，两侧不可能不一致。
  *
- * 为什么只有两个字段、**没有 palette**：色板今天由镜头代码 `import
+ * 为什么**没有 palette 名**、只有三个颜色值：色板由镜头代码 `import
  * "@dg/themes/palettes.json"` 自己选（闸⑩ 就是照代码里绑的名字去解析颜色的）。
- * 母版再收一个 palette 名，同一件事就有两个出处，迟早对不上。母版真正缺的只是
- * 「底色是什么」——知道底色，它就能按亮度自己算字幕条该用深墨还是浅墨。
+ * 母版再收一个 palette 名，同一件事就有两个出处，迟早对不上。所以 Python 侧
+ * 拿这一镜申报的 `bg` 去 `palettes.json` 反查（唯一出处），命中就把该色板的
+ * `surface/text/accent` 三个**值**塞进来——母版不认名字，只认色值。
+ * 没命中（自造底色）时三栏缺席，字幕条退回按亮度二档的老行为。
  *
- * 为什么不进 `used` 的跨镜比对：`bleed`/`bg` **允许逐镜不同**（那正是它们存在的
- * 理由），而闸⑤ 判的是「20 镜排版有没有漂移」。Python 侧 `check_token_drift` 有一份
- * 显式的逐镜白名单 `TOKEN_PER_SHOT_KEYS`，这两个键在里面。
+ * 为什么不进 `used` 的跨镜比对：`bleed`/`bg` 与它们派生的字幕条四色
+ * （`paper`/`captionInk`/`accent`/`hl`）**允许逐镜不同**（那正是它们存在的理由），
+ * 而闸⑤ 判的是「20 镜排版有没有漂移」。Python 侧 `check_token_drift` 有一份显式的
+ * 逐镜白名单 `TOKEN_PER_SHOT_KEYS`，这些键在里面；`used.ink`（母版的正文常量）不在，
+ * 它正是闸⑤ 要比的那一类。
  */
 export interface FilmStyle {
   /** 满幅：画面带 = 整帧，去掉 gutter 与上下安全区。
@@ -199,10 +197,14 @@ export interface FilmStyle {
    *  必须是 `#rrggbb`：闸④ 拿它当判空的基准色，读不到基准色它拒绝判（见
    *  `code_render._bg_of`）。 */
   bg: string;
+  /** 字幕条底色（色板的 surface）。缺省 = 按 `bg` 亮度二档（`captionTone`）。 */
+  paper?: string;
+  /** 字幕条字色（色板的 text）。与 `paper` 成对出现才生效。 */
+  ink?: string;
+  /** 强调色（色板的 accent）：高亮词块＝它加 40% 透明，撕纸下划线＝它原色。 */
+  accent?: string;
 }
 
 /** 风格档的缺省值 —— **逐字等于今天**：不传 `film_style` 时母版读到的就是这一份，
  *  于是既有片子的像素与 token 读数一个字节都不变。 */
 export const FILM_STYLE_DEFAULT: FilmStyle = { bleed: false, bg: '' };
-
-export type SubtitleMode = (typeof SUBTITLE_MODES)[number];

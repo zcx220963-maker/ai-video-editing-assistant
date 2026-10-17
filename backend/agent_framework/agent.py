@@ -1,7 +1,11 @@
-"""Agent 循环核心：AgentOnceRun（内层 ReAct）与 Agent（外层 Main Loop）。
+"""Agent 循环核心：AgentOnceRun（内层 ReAct）与 Agent（外层入口）。
 
 设计对应：
-- Main Loop：``while True`` 常驻，持续消费各 Session 的用户请求。
+- Main Loop：常驻消费各 Session 的用户请求。**进程里只有一处**——MQ 那条路
+  （``SessionConsumer`` 订阅 chat topic，key=session_id 分区；见 mq.py/consumer.py），
+  ``Agent`` 这一层只提供同步语义的 ``handle`` / ``plan`` / ``resume`` / ``fork`` /
+  ``approve``，每个入口按 session 加锁（``_lock_for``）。这里原先还自带一套
+  进程内队列的 ``while True``，没有调用方，已删（见类尾那段注释）。
 - AgentOnceRun：单次请求内、带最大迭代保护的 ReAct 循环
   （LLM → 需要工具？→ Registry 执行 → 回填 → 再 LLM …… → 最终结果）。
 - 工具并发：被 LLM 选中的工具二次判定 concurrency_safe，只读安全的进 Batch
@@ -16,7 +20,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
@@ -35,6 +39,8 @@ from .identity import (current_identity, rebind_artifact_scope,
                        storyline_session_id, use_identity, use_identity_or_inherit)
 from .llm import LLMClient, LLMResponse
 from .messages import ToolCall, assistant, system, tool_result, user
+from .motion_prefs import MOTION_KNOB_NODES
+from .motion_prefs import pin_tool_calls as pin_motion_prefs
 from .prompts import prompt_text, read_prompts_file
 from .plan import (SubmitPlanTool, ConfirmPlanTool, claims_plan_card, claims_step_executed,
                         pending_continuation, planning_section_blocks,
@@ -64,6 +70,18 @@ _ACTIONABLE_MARKERS = ("没有入库", "照清单改", "改完重调", "改完�
                        "一帧都没开始渲")
 #: 反馈类打回的上限：防的是「改来改去总不对」的死循环，给得比真失败宽得多。
 _MAX_FEEDBACK_ROUNDS = 8
+
+
+def _call_fingerprint(tc: Any) -> str:
+    """一次工具调用的参数指纹——用来判「这次提交和上次是不是同一个东西」。
+
+    只取参数、不取 ``id``（``id`` 每次调用都新，拿它比等于永远不重复）。
+    排序键，免得同一个 dict 因键序不同算出两个指纹。
+    """
+    args = getattr(tc, "arguments", None)
+    if not isinstance(args, str):
+        args = json.dumps(args or {}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(args.encode("utf-8")).hexdigest()[:16]
 
 
 def _last_render_failed(messages: Sequence[Any], node: str) -> bool:
@@ -110,12 +128,21 @@ _MAX_REFUSALS_BEFORE_FAILURE = 2   # 同样的事实告过两次还照打 → �
 # 撞上 ``max_iterations`` failed，后者 158 次工具调用里 **144 次是 load_skill**、
 # 读了 45 张不同的卡，**一次都没调用 submit_plan**，零张计划卡。
 #
-# 而这个上限不是新纪律，是 SKILL.md:65 早就写死、只是没人执行的那一条：
-# 「**不要读超过 15 张卡。** 124 张卡不需要全看，INDEX.md 的一句话描述足够选卡。」
+# 而这个上限不是新纪律，是 SKILL.md 早就写死、只是没人执行的那一条：
+# 「**不要读超过 30 张卡。** 133 张卡不需要全看，INDEX.md 的一句话描述足够选卡。」
 # 索引够用这句禁令才成立——2026-10-14 上半场索引是空的（§9-Q140），禁令就只剩
 # 「凭卡名猜」，模型只能逐张打开；下半场索引修好了，模型**照样**逐张打开。
 # 所以这条闸不能只靠「把索引修好」的道德劝说，要在执行层拦住。
-_MAX_SHOT_CARDS = 15
+#
+# 2026-10-16 改成**两档**（原来只有一档硬拦，30 就是它）：软线到了**照跑**、只在越过
+# 的那一刻往回执之后补一句提醒；硬线 60 才是老行为（不执行 + 升级成真失败，让
+# `_MAX_CONSECUTIVE_FAILURES` 接手）。为什么不硬停：模型读几张卡是它的选择（§2.2），
+# 服务端该做的是把「索引够选卡了」说给它听，而不是替它把路封掉；而「无限读下去」
+# 那个真事故（144 次 load_skill / 零张计划卡）由硬线接住。
+# 软线取 30 是为了与 SKILL.md 那句话同一个数——正文说 30、代码拦在别处，模型读到的
+# 就是两份规矩（15 那一版已经踩过：正文写 15、代码拦在 15，看着对，改一处就散）。
+_MAX_SHOT_CARDS = 30
+_MAX_SHOT_CARDS_HARD = 60
 
 # ---- 读技能正文的分页上限（同一族的第二条家族级闸）----
 #
@@ -127,9 +154,12 @@ _MAX_SHOT_CARDS = 15
 #
 # 上限不能压到「只许整份取一次」：正文过 24 KB 会被压缩闸从中间切掉，
 # 模型按行续读是 compress.py `_RECOVERY_HINT["load_skill"]` 亲手教的做法。
-# 10 页放得下老实地把一份千行正文翻完（每页一两百行），放不下的是同一区间换个
-# 行数再来一遍。
-_MAX_SKILL_BODY_PAGES = 10
+# 两档同上一族的理由，取值按「一份千行正文老实翻完要几页」定：
+# 软线 16 页（每页一两百行够翻完整份）过了就提醒一句「再换起始行不会有新信息」；
+# 硬线 32 页只用来接住打转——真机那条 26 枪的形状（19 个重叠窗口）在软线之下，
+# 今天一枪不拦，只多一句提醒，这正是 §2.2 要的「读多少由模型定」。
+_MAX_SKILL_BODY_PAGES = 16
+_MAX_SKILL_BODY_PAGES_HARD = 32
 
 
 def _digest(obj: Any) -> str:
@@ -561,14 +591,6 @@ class AgentConfig:
 
 
 @dataclass
-class _Request:
-    session: Session
-    message: str
-    attachments: list[str] = field(default_factory=list)
-    run_id: str | None = None
-
-
-@dataclass
 class _Round:
     """一次 ``_drive`` 的循环账：原先散在三百行里的局部量收敛成一份有名字的状态。
 
@@ -642,7 +664,18 @@ class AgentOnceRun:
         # 那是另一笔不可逆的算力。
         # 放内存即可：它只影响「同一进程、同一条 run 内要不要再弹一次」，
         # 跨重启后重弹一次无害（用户顶多再看一眼同一份编排），不值得为它加一列。
-        self._render_confirmed: set[tuple[str, str]] = set()
+        #
+        # 第三位是**这一次提交的参数指纹**，不是多余的精确度，是这条守卫能不能自救的关键。
+        # 只按 (run, 通道) 记账时的真机事故（2026-10-16，run b7df827ebed4「薄肌理论」）：
+        # 第一次 render_web 出了片——**但是个 20 秒全黑的废片**（html 参数填成了文件路径）。
+        # 模型看出来了，改好 HTML 重交 → 这里回「已经确认并提交，无需再次提交」→
+        # 再改名重交 → 还是同一句。`_last_render_failed` 那道失败放行口救不了它：
+        # 上一次**返回的是成功**，只不过产物是垃圾。于是模型改好了代码却一个字节都送不进去，
+        # 整条 run 只能停在那里向用户解释。
+        #
+        # 判据改成「同一通道 + 逐字相同的参数」才是重复提交。参数变了就是**另一个东西**，
+        # 该让它跑——用户已经批准过「这条路出片」，他批准的不是「只准出一次」。
+        self._render_confirmed: set[tuple[str, str, str]] = set()
         # 工具结果闸门：一次 run 内部每轮都把全部历史结果重发，那段此前完全没有闸门
         # （压缩器只在 ``ContextBuilder.build()`` 里跑，那时工具结果一条都还没有）。
         # 它只改消息**内容**、不删消息，所以 tool_calls 的配对不受影响。
@@ -851,7 +884,8 @@ class AgentOnceRun:
                     # HITL：从审批断点续跑——先把挂起的那批 tool_calls 按用户决策收口。
                     if r.approval_decision is not None:
                         r.asked_this_run |= await self._settle_pending(
-                            r.ctx, r.cp, r.reg, r.approval_decision, r.approval_note)
+                            r.ctx, r.cp, r.reg, r.approval_decision, r.approval_note,
+                            state=r.state)
                         r.approval_decision = None
                         r.approval_note = ""
                         r.iteration += 1
@@ -1027,6 +1061,23 @@ class AgentOnceRun:
         check_tools_budget(entry["tools"])
         state.qa_parts.append(entry)
 
+    async def _session_prefs(self, r: "_Round") -> dict[str, Any]:
+        """本对话在「文字库」里挑过的整片开关。读不到、没连库、没挑过都回空表。
+
+        每次要用的那一轮读一次（**不缓存**）：读的是一次主键查询，而缓存的收益是
+        省下每轮不到一毫秒、代价是「用户改了偏好看不到」——一个会被用户当成 bug
+        的、只在长 run 上复现的错。只在**这一轮真有出片调用**时才读，所以整条 run
+        通常只发生个位数次。
+        """
+        conv = getattr(r.ctx.session, "conversation_id", "") or ""
+        if not conv or self.storage is None:
+            return {}
+        try:
+            return await self.storage.conversations.prefs(conv)
+        except Exception as exc:  # noqa: BLE001 - 偏好是加成，读不到不该拦住出片
+            logger.warning("会话偏好读取失败（按「没挑过」继续）：%s", exc)
+            return {}
+
     async def _tool_round(self, r: "_Round", resp: LLMResponse) -> str | None:
         """模型这一轮要调工具：记账 → 三类挂起 → 真执行 → 分叉交接或推进迭代。
 
@@ -1034,6 +1085,16 @@ class AgentOnceRun:
         返回 ``None`` 表示接着跑下一轮（迭代计数已在里面推进）。
         """
         qa_parts = r.state.qa_parts
+        # 钉偏好**必须排在这里**：记账（下面那个循环）与渲染确认门读的都是同一份
+        # ``resp.tool_calls``，钉在它们之前，账、卡、真执行的参数才是同一个值。
+        # 放到 ``before_tool_call`` 钩子里（执行阶段）会出现「卡上写 A、实际渲 B」，
+        # 而那正是这一步存在的理由。详见 ``motion_prefs`` 的模块注释。
+        if any(getattr(tc, "name", None) in MOTION_KNOB_NODES for tc in resp.tool_calls):
+            prefs = await self._session_prefs(r)
+            pinned = pin_motion_prefs(resp.tool_calls, prefs)
+            if pinned:
+                logger.info("本对话在文字库里挑过 %s——已盖进这一轮的出片参数",
+                            "、".join(sorted(set(pinned))))
         if resp.content:
             qa_parts.append({"type": "think", "content": resp.content})
         for tc in resp.tool_calls:
@@ -1151,18 +1212,35 @@ class AgentOnceRun:
     async def _suppress_repeat_render(self, r: "_Round", resp: LLMResponse) -> bool:
         """本轮里的重复渲染：逐条回填「已经在渲了」，不再走任何一道门。
 
-        认的是 **(这条 run, 这个通道)**：确认过 ``render_video`` 只压制它自己，
-        模型若改提另一个出片通道，那是一次未确认的新渲染，该交给门。
+        认的是 **(这条 run, 这个通道, 这一次提交的参数)**：确认过 ``render_video``
+        只压制它自己，模型若改提另一个出片通道，那是一次未确认的新渲染，该交给门。
+
+        参数为什么要进键：只认前两位时，**渲染成功了但产物是废片**这条路上模型是死的
+        ——改好代码重交也被回「已经提交渲染」（真机 run b7df827ebed4，见
+        ``_render_confirmed`` 的注释）。参数变了就是另一个东西，放它跑。
+
+        **这笔的代价如实记**：参数只要变一个字符就能再烧一次像素，而门那一位
+        （``render_gate_asked``）已经记成"问过了"，所以这一次**不会再弹确认卡**。
+        换句话说，一个把参数改来改去、又没真改对东西的模型，能在一次 run 里连烧好几版。
+        换来的是一条更要紧的性质：模型自己看出废片之后**有路可走**（那次它没有，
+        整条 run 死在解释上）。用户的原话是「老是处处碰壁」，所以这一边是刻意选的：
+        白烧几分钟算力可恢复，交不出去不可恢复。若真机上出现连烧多版，该谈的是
+        「同一通道一版之内只放行一次改动」，而不是把模型重新堵死。
         """
         # 上一次确认过的渲染**失败了**就不算「已经在渲」：放行这次重交（门已答过，不再问）。
         # 真机 run d27b37bf1419：render_web 第一次失败（file:// 取不到），模型改成内联 HTML
         # 重交，被这里回了一句「已经提交渲染」——其实什么都没在渲，进度永远是 0。
+        # 失败时把这条通道的**全部**指纹一起撤掉（不只是当前这一个）：失败意味着上一次
+        # 那份也没成，模型接下来交的哪一版都该能进去。
         for tc in resp.tool_calls:
-            if (tc.name in RENDER_NODES and (r.run_id, tc.name) in self._render_confirmed
+            if (tc.name in RENDER_NODES
                     and _last_render_failed(r.messages, tc.name)):
-                self._render_confirmed.discard((r.run_id, tc.name))
+                self._render_confirmed = {
+                    k for k in self._render_confirmed
+                    if not (k[0] == r.run_id and k[1] == tc.name)}
         repeat = [tc for tc in resp.tool_calls
-                  if tc.name in RENDER_NODES and (r.run_id, tc.name) in self._render_confirmed]
+                  if tc.name in RENDER_NODES
+                  and (r.run_id, tc.name, _call_fingerprint(tc)) in self._render_confirmed]
         if not repeat:
             return False
         repeat_ids = {tc.id for tc in repeat}
@@ -1512,7 +1590,7 @@ class AgentOnceRun:
 
     async def _settle_pending(
         self, ctx: AgentHookContext, cp: Checkpoint | None, reg: ToolRegistry,
-        decision: str, note: str = "",
+        decision: str, note: str = "", state: RunState | None = None,
     ) -> bool:
         """把挂起的那批 tool_calls 按用户决策收口（批准=执行，拒绝=回喂拒绝结果）。
 
@@ -1533,6 +1611,35 @@ class AgentOnceRun:
         pending = list(approval.get("pending_calls") or [])
         fallback_options = approval.get("fallback_options") or []
         asked = approval.get("ask")
+        # 这道门问的是哪条出片通道（普通主动提问没有这一位，撤回就是空操作）。
+        #
+        # 只有下面**非批准**的那几条出口才用它，而且只用在一种情形上：**用户要的是
+        # 「改」而不是「答」**。批准那几条出口**不许**碰它——那正是「渲染失败后重交
+        # 同一通道不再弹第二张卡」所依赖的记录。见 ``RunState.forget_render_gate_asked``。
+        gated_node = str((asked or {}).get("render_node") or "")
+        # 用户这一答是「我还要改」，还是「答了这道门」？
+        #
+        # 这个区分就是这条记录的全部要害（真机代价 2026-10-16，run 9272c7f59501 那 20 镜）：
+        #   · 答的是出片门自己那几句（确认渲 / 保完整 / 按原时长截断）→ **答了就是答了**。
+        #     这一位留着，模型重交同一条通道不再弹第二张卡——那正是用户骂过的
+        #     「为什么老是问我这个问题，我回答无数遍了」。
+        #   · 「我还要改」或用户自己写的自由文本 → **这次提问作废**。模型重做完必须
+        #     重新过门，否则用户再也看不到确认卡。``decision_text`` 对这两种答复都
+        #     白纸黑字写着「再弹一次计划确认卡给用户过目」——修复前那句话是假的。
+        #
+        # 自由文本的判别很直接：前端 ``qSubmit`` 在用户自己打字时把**原文**当 decision
+        # 发过来（`decideApproval(c.approval, first.answer, …)`，见 App.vue），
+        # 所以它必然既不在卡片的选项 key 里、也不在出片门的词汇表里。
+        #
+        # 认「出片门的词汇表」而不是只认卡片选项，是因为时长冲突那两个选项
+        # （``KEEP_FULL_OPTION`` / ``TRUNCATE_OPTION``）只在**有冲突时**才上卡；
+        # 不认它就会出现「用户明明点着卡上的按钮答的，却被当成没答」。
+        _gate_answered = {CONFIRM_OPTION, KEEP_FULL_OPTION, TRUNCATE_OPTION}
+        # ``asked`` 可能是 None（这条 run 挂着的是别的挂起点 ／ 审批已经收过口）——
+        # 那种情况下 ``gated_node`` 本来就是空串，撤回是空操作，这里取空表即可。
+        _offered = {str(o.get("key") or "") for o in ((asked or {}).get("options") or [])}
+        _wants_change = (decision == ADJUST_OPTION) or (
+            decision not in _offered and decision not in _gate_answered)
         cp.approval = {}
         calls = [ToolCall(id=str(c.get("id") or ""), name=str(c.get("name") or ""),
                           arguments=c.get("arguments") or {}) for c in pending]
@@ -1584,7 +1691,8 @@ class AgentOnceRun:
                     else:
                         batch.append(tc)
                 self._render_confirmed.update(
-                    (run_id, tc.name) for tc in batch if tc.name in RENDER_NODES)
+                    (run_id, tc.name, _call_fingerprint(tc))
+                    for tc in batch if tc.name in RENDER_NODES)
                 for tc in deferred:
                     ctx.messages.append(tool_result(
                         tc.id, tc.name, ToolError(
@@ -1611,6 +1719,8 @@ class AgentOnceRun:
                               f"（服务端没有登记任务）。"
                               f"请先按上面的要求完成该做的事，再重新调用它；"
                               f"不要声称它已经提交或完成。")))
+            if state is not None and _wants_change:
+                state.forget_render_gate_asked(gated_node)
             await self.hooks.after_execute_tools(ctx)
             return asked_now
         if fallback_options and decision in {o.get("key") for o in fallback_options}:
@@ -1625,6 +1735,9 @@ class AgentOnceRun:
         for tc in calls:
             ctx.messages.append(tool_result(
                 tc.id, tc.name, ToolError(tc.name, _APPROVAL_DECISION_TEXT["reject"])))
+        # 明确的「拒绝」同样不是批准：这次提问作废，模型重做后要重新过门。
+        if state is not None and _wants_change:
+            state.forget_render_gate_asked(gated_node)
         await self.hooks.after_execute_tools(ctx)
         return False
 
@@ -1730,6 +1843,11 @@ class AgentOnceRun:
                 dup_ids.add(str(tc.id))
 
         repeat_warnings: list[str] = []
+        # 两道**软线**的提醒（都在家族级闸里攒、在全部回执之后一并插一条 system）：
+        # 过了软线照跑不拦，只把「够了」这句话说到模型眼前（§2.2：读几张卡是它的选择，
+        # 服务端不该替它封路；硬线仍拦，见 `_shot_card_gate` 的注释）。
+        over_cards: list[str] = []
+        over_pages: list[str] = []
 
         def _refused(tc: ToolCall, times: int) -> ToolError:
             return ToolError(
@@ -1771,29 +1889,47 @@ class AgentOnceRun:
             return None
 
         def _shot_card_gate(tc: ToolCall) -> ToolError | None:
-            """读卡上限：放行时**当场把这张卡记进账**，超了就不执行。
+            """读卡上限**两档**：软线到了照跑、只提醒；硬线才不执行。
 
             记账放在放行这一刻、而不是跑完之后：一次回复里的几枪是并发打的
-            （实测一轮 4–5 枪），「先查后记」会让同批里每一张都以为自己是第 15 张，
+            （实测一轮 4–5 枪），「先查后记」会让同批里每一张都以为自己是第 30 张，
             一轮就把上限撑破。这一小段没有 await，不会交错。
 
-            告话按 `_MAX_REFUSALS_BEFORE_FAILURE` 升级成真失败，让
-            `_MAX_CONSECUTIVE_FAILURES` 那道老闸接手把 `load_skill` 停掉——
-            否则模型可以一直刷便宜回执，40 轮照样烧完（只是不再烧 3.4M token）。
+            为什么软线不拦（2026-10-16，§2.2）：读几张卡、读到什么时候够，是**模型的
+            选择**——服务端该做的是把「索引够选卡了」这句话说到它眼前，而不是替它把路
+            封掉。越过软线的那一刻记**一句**（判据是「正好第 SOFT+1 张」，不是「超过
+            SOFT 张」），全部回执之后再插一条 system 提示（与「无进展重复」同一条通道）。
+            说一次而不是每张一句：`over_cards` 每轮重建，按「超过」判就会每轮都重说一遍，
+            同一句话在上下文里堆三十遍只会挤掉别的东西。
+
+            硬线仍是老行为（不执行 + 按 `_MAX_REFUSALS_BEFORE_FAILURE` 升级成真失败，
+            让 `_MAX_CONSECUTIVE_FAILURES` 接手）——守的是那个真事故：144 次 load_skill、
+            一张计划卡都没出。**提醒拦不住的那种模型，只有硬线拦得住。**
             """
             card = _shot_card_path(tc.name, tc.arguments)
             if not card:
                 return None                        # 不是卡（索引/技能正文/别的工具）
             if card in cards_read:
                 return None                        # 重读同一张：归参数级那两条闸管
-            if len(cards_read) < _MAX_SHOT_CARDS:
+            if len(cards_read) < _MAX_SHOT_CARDS_HARD:
                 cards_read.add(card)
+                if len(cards_read) == _MAX_SHOT_CARDS + 1:
+                    # 正好越过软线这一张：照跑，但把话说给模型听。只说这一次——
+                    # 每多读一张就说一遍的话，上下文里会堆满同一句话。
+                    over_cards.append(
+                        f"这一轮已经打开 {len(cards_read)} 张 shot 卡（超过 SKILL.md 里"
+                        f"那句「不要读超过 {_MAX_SHOT_CARDS} 张卡」）。"
+                        f"索引 `shots/INDEX.md` 每行都带着卡名、能量、一句话描述、时长、适用，"
+                        f"以及 demo 的**文件名**与字节——选卡、填 `derived_from` 看那一份就够。"
+                        f"手上这几张看完就交计划（`submit_plan`）：把选中的卡名照抄进行首的"
+                        f"`<类别>/<卡名>` 填进 `card`。"
+                        f"到 {_MAX_SHOT_CARDS_HARD} 张就不再执行了。")
                 return None
             n = ctx.extras["_shot_card_refusals"] = ctx.extras.get("_shot_card_refusals", 0) + 1
             return ToolError(
                 tc.name,
                 f"Error: 这一轮已经读过 {len(cards_read)} 张 shot 卡，到上限了"
-                f"（SKILL.md:65：「不要读超过 {_MAX_SHOT_CARDS} 张卡」），"
+                f"（SKILL.md：「不要读超过 {_MAX_SHOT_CARDS} 张卡」，硬线 {_MAX_SHOT_CARDS_HARD}），"
                 f"`{card}` 这次不执行。索引 `shots/INDEX.md` 每行都带着卡名、能量、"
                 f"一句话描述、时长、适用，以及 demo 的**文件名**与字节——"
                 f"**选卡、填 `derived_from` 都看那一份就够**（`derived_from` 照抄 demo 栏里的"
@@ -1803,7 +1939,7 @@ class AgentOnceRun:
                 counts_as_failure=n > _MAX_REFUSALS_BEFORE_FAILURE)
 
         def _skill_body_gate(tc: ToolCall) -> ToolError | None:
-            """同一份技能正文的重叠窗口上限：放行时**当场记账**（理由同 `_shot_card_gate`）。
+            """同一份技能正文的重叠窗口上限：**两档**，理由与 `_shot_card_gate` 同。
 
             回执必须把「已经取过哪些窗口」摆出来再打回：这一枪不是工具坏了，而是
             模型在同一段里换行数重来一遍。只说「到上限了」它只会换个 offset 再试——
@@ -1816,8 +1952,17 @@ class AgentOnceRun:
             pages = body_pages.setdefault(skill, set())
             if key in pages:
                 return None                        # 同一窗口重取：归参数级那两条闸管
-            if len(pages) < _MAX_SKILL_BODY_PAGES:
+            if len(pages) < _MAX_SKILL_BODY_PAGES_HARD:
                 pages.add(key)
+                if len(pages) == _MAX_SKILL_BODY_PAGES + 1:
+                    # 只说越过软线的那一次，理由同 `_shot_card_gate`。
+                    over_pages.append(
+                        f"技能 `{skill}` 的正文这一轮已经按 {len(pages)} 个不同的行窗口取过"
+                        f"（超过 {_MAX_SKILL_BODY_PAGES} 个）。这些窗口合起来基本就是整份正文，"
+                        f"**再换一个起始行不会带来新信息**——直接用已经读到的内容往下走；"
+                        f"确实缺某一节，就照整份加载时给的那份**章节目录**取行号，"
+                        f"或用分段目录里的 section 键名单独取那一块。"
+                        f"到 {_MAX_SKILL_BODY_PAGES_HARD} 个窗口就不再执行了。")
                 return None
             n = ctx.extras["_skill_body_refusals"] = \
                 ctx.extras.get("_skill_body_refusals", 0) + 1
@@ -1833,7 +1978,8 @@ class AgentOnceRun:
             return ToolError(
                 tc.name,
                 f"Error: 技能 `{skill}` 的正文这一轮已经按 {len(pages)} 个不同的行窗口"
-                f"取过（{covered}），到上限了（一份正文最多 {_MAX_SKILL_BODY_PAGES} 个窗口），"
+                f"取过（{covered}），到上限了（一份正文最多 {_MAX_SKILL_BODY_PAGES} 个窗口，"
+                f"硬线 {_MAX_SKILL_BODY_PAGES_HARD} 个），"
                 f"这次不再执行。"
                 f"这些窗口合起来基本就是整份正文——**再换一个起始行不会带来新信息**。"
                 f"请直接用已经读到的内容交计划（规划轮调用 submit_plan）；"
@@ -1965,7 +2111,7 @@ class AgentOnceRun:
             ))
         # 无进展重复的预告：闸已经攒到第二次，下一次就不真执行了。
         # 放在全部回执之后——理由同上面那批守卫提示（tool_calls 未收口时插别的角色直接 400）。
-        for note in dict.fromkeys(repeat_warnings):
+        for note in dict.fromkeys([*repeat_warnings, *over_cards, *over_pages]):
             ctx.messages.append(system(f"⚠️ {note}"))
 
         await self.hooks.after_execute_tools(ctx)
@@ -2256,9 +2402,9 @@ class Agent:
         # 执行轮按计划裁过的工具面（T41）与它的签名缓存，见 _round_registry。
         self._round: ToolRegistry | None = None
         self._round_sig: tuple[Any, ...] | None = None
-        self._queue: asyncio.Queue[_Request] = asyncio.Queue()
+        # 每个 session 一把锁：同一会话串行、异会话并行。生产那一层由 MQ 的
+        # key=session_id 分区语义保证（见 mq.py），这把锁是同一语义的兜底。
         self._locks: dict[str, asyncio.Lock] = {}
-        self._running = False
 
     def _planning_registry(self, gate: Any) -> ToolRegistry:
         """规划轮注册表：按主注册表的名字清单当签名缓存，外部工具接入后自动换一张。
@@ -2417,9 +2563,9 @@ class Agent:
                 has_pending_plan = False
         async with self._lock_for(session.session_id):
             # R13：出计划卡**之前**先看一眼这台机器手里真有什么。这一段是**事实**，
-            # 不是判据——它不拦计划（拦的事由 T68 的可见面收口去做），只保证「模型看到的
-            # 事实与机器的事实是同一个」。没有它，本机没配出图后端时模型照样把 `imagegen`
-            # 排进 steps，一路烧到第 9、10 步才停下来问用户。
+            # 不是判据——它不拦计划，只保证「模型看到的事实与机器的事实是同一个」。
+            # 今天它只剩一条读数（用户手上有几件可上屏的位图）：取材那三条路
+            # （检索库 / 出图 / 上传件上屏）已从产品里拿掉，见 `plan/capability.py` 模块头。
             #
             # 只读、读不到就记未判（`capability.py` 里逐条兜住），所以它不会让规划轮变脆；
             # 递空串时模板里那一块整块不出现，与加这一段之前**逐字相同**。
@@ -2583,28 +2729,18 @@ class Agent:
                                user_id, conversation_id))],
             user_id=user_id, conversation_id=conversation_id)
         sections = list(render_injections(compiled))
-        # 技能正文**按本片计划取块**（T42/§5.7②）：默认集 + 本轮点名要的那几块。
+        # 技能正文**按本片计划取块**（T42/§5.7②）：默认集随这份发，其余块只进一行
+        # **分段目录**并标出「本轮计划用得上哪几块」，读不读由模型自己点
+        # （``load_skill(name, section=…)``）——§2.2「技能的视角还给模型」。
         # 卡面一并传进去，只为一件事——读 `param_options[].default` 判「整片开关动没动过」
         # （编译结果看不出用户勾没勾）；拿不到卡面时按「动过」算（见 plan.skills 的注释）。
         #
-        # `imagegen_visible`（R13-T68）：**这台机器这一轮调不调得到出图**。没配后端时
-        # `imagegen` 从节点集里摘掉，于是出图那一节（`whiteboard-imagegen`）连同伴生的
-        # 两块供给正文一起不注入。为什么在这里现查而不是缓存：密钥写在设置页、按用户
-        # 失效（`secrets.invalidate`），「用户刚填好」与「重启服务」都能让同一台机器
-        # 的读数翻过来——缓存的读数会把这台机器**已经修好**的那段时间继续当坏的。
-        imagegen_visible = True
-        if self.storage is not None:
-            try:
-                imagegen_visible = bool(
-                    (await probe_capabilities(storage=self.storage, user_id=user_id,
-                                              conv_id=conversation_id))
-                    .get("image_backend"))
-            except Exception:      # noqa: BLE001 - 探活是增益，读不到就按「看得见」算
-                imagegen_visible = True
+        # 这里曾经现查一次「这台机器这一轮调不调得到出图」并把它当 `imagegen_visible`
+        # 传进去（R13-T68），好让没配后端的那一轮连供给正文一起不发。出图节点与那几块
+        # 正文 2026-10-16 都删了，这个现查随之删掉——它判的那件事已经不存在了。
         sections += await preload_skills(
             self.skill_loader, compiled.get("skills_hint") or (),
-            sections=sections_for_plan(compiled, plan,
-                                       imagegen_visible=imagegen_visible))
+            sections=sections_for_plan(compiled, plan))
         # 工具面按这张计划裁（T41）：只发计划用得到的剪辑节点 + 通用件，被裁的节点名
         # 进「如何请求扩面」那一小节（裁的是 schema 字节，不是可发现性，Q56）。
         steps = compiled.get("steps") or []
@@ -2704,28 +2840,11 @@ class Agent:
             return []
         return await self.runner.checkpoint.pending()
 
-    async def submit(
-        self, user_id: str, conversation_id: str, message: str,
-        *, attachments: Sequence[str] = (), run_id: str | None = None,
-    ) -> None:
-        """投递到 Main Loop 队列，由 worker 异步消费。"""
-        session = await self.session_manager.get_or_create(user_id, conversation_id)
-        await self._queue.put(
-            _Request(session, message, [str(m) for m in attachments], run_id)
-        )
-
-    async def run_forever(self) -> None:
-        """常驻消费队列；不同 Session 并发、同一 Session 串行。"""
-        self._running = True
-        while self._running:
-            req = await self._queue.get()
-            asyncio.create_task(self._process(req))
-
-    async def _process(self, req: _Request) -> None:
-        async with self._lock_for(req.session.session_id):
-            await self.runner.run(
-                req.session, req.message, attachments=req.attachments, run_id=req.run_id
-            )
-
-    def stop(self) -> None:
-        self._running = False
+    # 这里原先还有一套「外层常驻循环」：`submit()` 往进程内 `asyncio.Queue` 投递、
+    # `run_forever()` 起个 `while True` 取出来跑、`stop()` 收摊。**全仓没有一个调用方**
+    # ——生产的外层循环是 MQ 那条路（`SessionConsumer` 订阅 chat topic，按
+    # key=session_id 分区，同一会话在同一个分区里 FIFO 串行，见 mq.py/consumer.py），
+    # `run_server.py` 起的是它。两套并存的坏处不只是多一份死代码：那个 `while True`
+    # 里 `asyncio.create_task` 起的任务没人 await，单条跑挂只会落一句
+    # "Task exception was never retrieved"，而调用方早已拿到（或永远等不到）一个空结果。
+    # 删掉它，外层循环只有一条路，语义（同会话串行/异会话并行）也只有一个出处。

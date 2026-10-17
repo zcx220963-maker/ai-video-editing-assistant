@@ -24,6 +24,18 @@ _MUTATING_TOOLS = frozenset({"rerun_from", "start_subagent"})
 # 没有镜头描述），怎么走、每镜写什么、哪些字段必填全在那份技能正文里；而真机实测
 # 模型交这张卡时 skills_hint 就是空的——只靠卡面声明，整轮都拿不到那份约束。
 # 于是这条对应关系由服务端记着，校验器据此把技能补进卡面，执行轮照卡预注入。
+#
+# 2026-10-16（§2.2「技能归模型挑」）逐条过过这份表的另外两种写法，都留着不动：
+#   · 改成 `always`（常驻注入）——**不可行**：`motion_explainer_skill` 正文 42 KB，
+#     常驻就是每一轮（包括问一句「多久」那种）都发一次；
+#   · 只靠节点 description 触发（在描述里写「先 load_skill(…)」）——**不够**：这些
+#     节点的描述本来就顶到 600 B 截断线，再加一句会把别的内容挤出去，而
+#     `round.unbacked_truncations`（「移出即须有载体」）问的正是「被挤掉的那半句有
+#     技能兜着吗」——载体就是这张表。删了它，那条判据只剩「截了就截了」。
+# 所以这份表留着当**默认**，但不再当「偷偷替模型决定」：`preload_skills` 现在会在
+# 注入的正文后面写明「其中有的是节点默认带的，不是你点名的」，并把
+# `<skills>` 全部候选与 `load_skill(name, section=…)` 的读法一起摆出来——
+# 视角给模型，安全网不动（与 §5 的 `require_explicit_call` 同一条处置）。
 _IMPLICIT_SKILLS: dict[str, tuple[str, ...]] = {
     "plan_motion": ("motion_explainer_skill",),
     # 出片与局部改带的是同一份技能：零素材通道没有任何素材事实可依赖（没有 ASR 文本、
@@ -284,11 +296,14 @@ class PlanVocabulary:
             return []
 
     def explicit_call_nodes(self) -> set[str]:
-        """既在 DAG 里、又标了「必须 LLM 显式调用」的节点集合。
+        """既在 DAG 里、又标了「创意决策由调用方给」的节点集合。
 
         标记来自 ``dag_contract``（``NodeContract.explicit``）——与执行期拦截器
         （``orchestration.Interceptor._ensure_deps``）读的是服务端同一个
         ``require_explicit_call``，所以两边不会各说一套。
+
+        2026-10-16 起这个集合只喂**提示段的一句建议**（写进卡才由模型定参数，
+        不写就按默认参数补齐），不再喂任何打回判据。
         """
         return {n for n in self.contract.names
                 if (self.contract.get(n) is not None and self.contract.get(n).explicit)}

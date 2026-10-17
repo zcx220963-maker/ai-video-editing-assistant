@@ -12,10 +12,16 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 -- 会话：取代 localStorage 的 ca.convs（含 50 条截断）
+-- prefs：这个对话里用户显式挑过的整片开关（目前是「文字库」那几维：字幕形态/位置/
+-- 动画、音色、语速）。**只存用户真挑过的键**——没挑过的维度归模型，存一个默认值
+-- 上去就等于替模型做了决定。值一律是原始取值（如 subtitle_mode="torn_highlight"），
+-- **不存派生出来的档名**：档名是前端拿取值算出来的显示，落库就成了「档→取值」那张表
+-- 的第二份，两处迟早对不上。
 CREATE TABLE IF NOT EXISTS conversations (
   id            text PRIMARY KEY,
   user_id       text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   title         text NOT NULL DEFAULT '新对话',
+  prefs         jsonb NOT NULL DEFAULT '{}',
   created_at    timestamptz NOT NULL DEFAULT now(),
   updated_at    timestamptz NOT NULL DEFAULT now()
 );
@@ -59,8 +65,11 @@ CREATE INDEX IF NOT EXISTS mat_conv_idx   ON materials(conv_id);
 CREATE INDEX IF NOT EXISTS mat_origin_idx ON materials(origin);
 
 -- R2: 内置素材库（全局，不属任何用户）。§6.2-1 的 schema 决定。
--- materials.origin='art' 是用户产出的图（出图服务/上传/抠图中间产物），属用户；
+-- materials.origin='art' 是用户产出的图（代码/抠图生成的素材、上传中间产物），属用户；
 -- asset_library 是内置库（Wikimedia Commons/Iconify 等），全局共享。
+-- 2026-10-16 起**没有运行期读者**：取材那三条路（检索库 / 出图 / 上传件上屏）已从产品
+-- 里拿掉，图形片的画面由模型逐镜写代码画。表与这一份 schema **一个字都不动**（删一个
+-- CHECK 值要迁移、还可能留下孤儿行，换不到任何东西），只把上面那句旧注释改对。
 CREATE TABLE IF NOT EXISTS asset_library (
   id                   text PRIMARY KEY,
   sha256               text NOT NULL UNIQUE,
@@ -96,7 +105,9 @@ CREATE TABLE IF NOT EXISTS asset_library (
 CREATE INDEX IF NOT EXISTS asset_subject_idx ON asset_library(subject, enabled);
 CREATE INDEX IF NOT EXISTS asset_style_idx   ON asset_library(style_family, enabled);
 CREATE INDEX IF NOT EXISTS asset_source_idx  ON asset_library(source, enabled);
--- 角色过滤是检索侧真在用的路径（`search_illustration` 的 asset_role 过滤）。
+-- 角色过滤曾经是检索侧真在用的路径（`search_illustration` 的 asset_role 过滤）。
+-- 检索节点 2026-10-16 删了，这条索引**留着**：索引是表的一部分，与表同进退；
+-- 单独摘一条既不省空间也不省维护，只会让「表是什么样的」在中途改口。
 CREATE INDEX IF NOT EXISTS asset_role_idx    ON asset_library(asset_role, enabled);
 
 -- 分片续传账本：一行 = 一次「谁、往哪个会话、传多大文件、切成几块」。

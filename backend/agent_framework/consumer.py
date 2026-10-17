@@ -11,6 +11,12 @@ from typing import Any
 
 from .agent import Agent
 from .connection_manager import OUTBOUND_TOPIC
+# ``session_key`` = MQ 的分区 key = Agent 侧的会话键（同一 (user, conversation) 落到
+# 同一分区 → 同会话有序、异会话并行）。拼法只住在 ``identity.session_key`` 一处——
+# 同一条 key 同时还是 checkpoints / token_usage 与 Web 侧查产物的键，两处各拼一遍
+# 就会「工具查得到、快照查不到」而没有任何报错（这类事故在剪辑侧的
+# ``storyline_session_id`` 上已经发生过一次）。这里只 import，不另写一份。
+from .identity import session_key
 from .mq import MessageQueue
 
 CHAT_TOPIC = "chat"
@@ -21,11 +27,6 @@ ENTRY_AUTO = "auto"
 ENTRY_PLAN = "plan"
 _ENTRIES = frozenset({ENTRY_AUTO, ENTRY_PLAN})
 CONSUMER_GROUP = "agent-workers"
-
-
-def session_key(user_id: str, conversation_id: str) -> str:
-    """MQ 分区 key：同一 (user, conversation) 落到同一分区，保证有序。"""
-    return f"{user_id}:{conversation_id}"
 
 
 def _same_intent(previous: str | None, incoming: str) -> bool:

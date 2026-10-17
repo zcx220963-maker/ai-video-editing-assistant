@@ -32,9 +32,13 @@ from agent_framework.orchestration import NodeState, _safe
 
 from .. import mediaops
 from ..mediaops import MediaError
-from .core_nodes import StoryNode, _obj
+from .core_nodes import StoryNode, _frame_spotcheck, _obj
 
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+#: 成片帧数上限。**每一帧都要起一次无头浏览器**，所以这个数是墙钟时间的闸：
+#: 600 帧 @2 路并发在真机上已是分钟量级，再往上一条片子要等十几分钟。
+WEB_MAX_FRAMES = 600
 
 
 def _run(cmd: list[str], timeout: float) -> None:
@@ -149,15 +153,23 @@ class RenderWebNode(StoryNode):
     input_schema = _obj(
         "网页出片", {
             "html": {"type": "string",
-                     "description": "完整 HTML 文档(内联 CSS/JS 动画);与 url 二选一。"
+                     "description": "**HTML 文档本身**（以 `<` 开头的那整段），不是文件路径、"
+                                    "也不是 URL；模型自己 write_file 写出来的文件要先把内容"
+                                    "读出来再传。内联 CSS/JS 动画;与 url 二选一。"
                                     "**动画必须写成「给定时刻的纯函数」**：每帧的 URL 会带上 "
                                     "?t=毫秒，页面要在解析期读 location.search 的 t 直接把画面"
                                     "摆成那个时刻的样子；不要靠 requestAnimationFrame 自走——"
                                     "headless 的虚拟时钟下 rAF 只回调一两次就饿死，那样整片会"
                                     "停在第一帧"},
             "url": {"type": "string", "description": "网页地址(与 html 二选一)"},
-            "duration_sec": {"type": "number", "description": "成片时长(秒),默认 5,0.5~60"},
-            "fps": {"type": "integer", "description": "帧率,默认 10(1~30)"},
+            # 这两位的**真正约束是乘起来的**：每帧起一次无头浏览器，所以
+            # duration_sec × fps ≤ 600。原先两条各写各的区间（0.5~60 与 1~30），
+            # 60 秒 × 30fps = 1800 帧远超上限——**schema 自己承诺了一个它给不出的组合**。
+            "duration_sec": {"type": "number",
+                             "description": "成片时长(秒),默认 5。硬上限 60，且与 fps 相乘"
+                                            "后不得超过 600 帧——长片请用别的出片节点"},
+            "fps": {"type": "integer",
+                    "description": "帧率,默认 10(1~30)。与 duration_sec 相乘不得超过 600 帧"},
             "width": {"type": "integer", "description": "画布宽,默认 1280"},
             "height": {"type": "integer", "description": "画布高,默认 720"},
             "title": {"type": "string", "description": "成片标题"},
@@ -189,11 +201,40 @@ class RenderWebNode(StoryNode):
         url = str(inputs.get("url") or "").strip()
         if not html and not url:
             raise ValueError("render_web：html 与 url 至少给一个")
+        # html 要的是**文档本身**。真机事故（2026-10-16，run b7df827ebed4）：模型把
+        # `thin-muscle/index.html`（它自己刚 write_file 落盘的文件**路径**）填进了 html，
+        # 而这里原先一字不检地 `page.write_text(html)`——那 22 个字符就成了整个"网页"。
+        # 空白页 + `--default-background-color=00000000` → 透明 PNG → `format=yuv420p`
+        # 把透明转成黑 → **600 帧全黑，20 秒全黑成片**。全过程零报错，回执还写着
+        # source=html。谁也没法从产物反推出参数填错了。
+        #
+        # 静默通过比报错坏得多（同判据见「未判 ≠ 通过」）：这里宁可当场拒绝。
+        if html and not html.startswith("<"):
+            raise ValueError(
+                f"render_web：html 要的是 **HTML 文档本身**（以 `<` 开头），"
+                f"不是一个文件路径或任意文本——收到的是 {len(html)} 字符、"
+                f"以 {html[:60]!r} 开头的一段。"
+                f"把文档内容内联进来（先用 write_file 写好、read_file 读出来再传），"
+                f"或改用 url= 指一个真的能被浏览器打开的地址。")
 
-        fps = min(max(int(inputs.get("fps") or 10), 1), 30)
-        dur = min(max(float(inputs.get("duration_sec") or 5.0), 0.5), 60.0)
-        frames = min(int(round(dur * fps)), 600)      # 上限防失控:600 帧 = 60s@10fps
-        frames = max(frames, 1)
+        want_fps = int(inputs.get("fps") or 10)
+        want_dur = float(inputs.get("duration_sec") or 5.0)
+        fps = min(max(want_fps, 1), 30)
+        dur = min(max(want_dur, 0.5), 60.0)
+        # 上限防失控：**每帧起一次 headless 浏览器**，帧数直接是墙钟时间。
+        frames = max(min(int(round(dur * fps)), WEB_MAX_FRAMES), 1)
+        # 夹取过就说出来。原先一声不吭：模型要 152 秒，这里先夹到 60、再被 600 帧夹成
+        # 20 秒（600/30），而回执同时写着 planned_sec=60.0 和 frames=600——**两个数自相
+        # 矛盾**，且都没提"你要的 152 被砍了"。模型只能从 duration=20.0 反推。
+        capped: list[str] = []
+        if want_fps != fps:
+            capped.append(f"fps 要 {want_fps}，允许 1~30，按 {fps} 跑")
+        if want_dur != dur:
+            capped.append(f"duration_sec 要 {want_dur}，允许 0.5~60，按 {dur} 跑")
+        if int(round(dur * fps)) > WEB_MAX_FRAMES:
+            capped.append(
+                f"总帧数要 {int(round(dur * fps))}，本节点上限 {WEB_MAX_FRAMES} 帧"
+                f"（每帧起一次无头浏览器），实际只出 {frames} 帧 = {frames / fps:.1f} 秒")
         w = min(max(int(inputs.get("width") or 1280), 64), 3840)
         h = min(max(int(inputs.get("height") or 720), 64), 2160)
         title = str(inputs.get("title") or "网页出片")[:80]
@@ -217,9 +258,51 @@ class RenderWebNode(StoryNode):
         object_key = (f"renders/{_safe(state.session_id)}/"
                       f"{_safe(state.artifact_id)}/web.mp4")
         await self.storage.workspace.publish(out, object_key, content_type="video/mp4")
+
+        # 像素级读数：真从**要发布的那个文件**里取几个点看亮度。
+        # 为什么必须在这里做（真机事故 2026-10-16，run b7df827ebed4）：那条 20 秒全黑的
+        # 成片，从 node 到用户手上**每一环都说"完成"**——截图成功、ffmpeg 成功、probe
+        # 量出 duration=20.0、字节也确实发布了。唯一的真相在像素里，而没人去看。参数填错
+        # 可以当场拒（见上面 html 那段），但"页面本身渲染出来是空的"这一类只有像素知道，
+        # 而它同样会一声不吭地出片。三出口纪律：**未判 ≠ 通过**，没量到的就说没量到。
+        pixel: dict[str, Any] | None = None
+        pixel_note = ""
+        try:
+            pixel = await asyncio.to_thread(
+                _frame_spotcheck, out, float(info["duration"] or 0.0),
+                work / "spot")
+        except Exception as exc:  # noqa: BLE001 - 证据降级，不改判这次渲染
+            pixel_note = (f"抽帧这一步没跑成（{type(exc).__name__}: {str(exc)[:160]}），"
+                          "所以「不是黑屏」**没有**像素级证据——没量到不等于通过")
+        else:
+            dark = pixel["black_indices"]
+            if len(dark) == len(pixel["luma"]):
+                pixel_note = ("取样的每一帧都是全黑（亮度 "
+                              f"{pixel['luma']}，0~255）。片子按参数出成了，但屏幕上什么都"
+                              "没有：页面渲染出来是空的（画布没铺满、内容依赖的脚本没跑起来、"
+                              "或靠 rAF 自走的动画在无头虚拟时钟下没动）。**别把它当成做完了**"
+                              "——改页面重出，不要拿这条成片交差")
+            elif dark:
+                pixel_note = (f"取样点里第 {[i + 1 for i in dark]} 帧是黑的"
+                              f"（亮度 {pixel['luma']}）——成片中间有一段没画面，值得看一眼")
+            elif not pixel["distinct"]:
+                # 这一条是**未判**，不是判过：取样点撞上同一个循环相位、或片子里真有静止段，
+                # 都会读成"几帧完全相同"。所以只说读数、说它像什么，不说它一定是什么
+                # ——断言了就在冤判；一声不吭就是让"整片停在第一帧"这条静默通过。
+                pixel_note = ("取样点的画面**完全相同**（像定格一张）——未判，值得看一眼："
+                              "若整片确实停在开头，通常是动画没写成「给定时刻的纯函数」，"
+                              "靠 rAF 自走的那种在无头虚拟时钟下只来得及画一帧")
+
         return {"video": object_key, "duration": info["duration"],
                 "width": info["width"], "height": info["height"], "title": title,
+                # planned_sec 报**真正拍板的那一个数**（frames/fps），不是夹取前的 dur：
+                # 两个数打架时（真机上 planned_sec=60.0 配 frames=600@30fps=20 秒），
+                # 模型没法判断到底哪个是真的。
                 "web_render": {"frames": frames, "fps": fps,
-                               "planned_sec": dur,
-                               "source": "url" if not html else "html"},
+                               "planned_sec": round(frames / fps, 3),
+                               "requested_sec": want_dur, "requested_fps": want_fps,
+                               "capped": capped,
+                               "source": "url" if not html else "html",
+                               "pixel": pixel,
+                               "pixel_note": pixel_note},
                 "media_url": await self.storage.objects.presign_get(object_key)}

@@ -9,8 +9,8 @@
 import React from 'react';
 import { ShotcraftMark } from './Brand';
 
-const SANS = '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Inter, Arial, sans-serif';
-const MONO = '"SF Mono", "JetBrains Mono", Menlo, monospace';
+const SANS = '"Noto Sans CJK SC", sans-serif';
+const MONO = '"Noto Sans Mono CJK SC", monospace';
 
 // 调色板：前 10 个键是历史值，demo 大量直接引用，键名与取值永远不改；
 // 后面是 Phase 0 新增的精致 UI 令牌，per-demo 自绘元素可直接取用。

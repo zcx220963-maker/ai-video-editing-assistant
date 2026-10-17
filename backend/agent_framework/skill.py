@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Sequence
 
+from .compress import SKILL_INDEX_END
 from .storage import StorageUnavailable
 from .tool import Tool
 
@@ -206,6 +207,68 @@ def assemble_sections(body: str, sections: Iterable[str] = ()) -> str:
     out = [text for name, text in pieces
            if text and (name is None or name in want)]
     return "\n\n".join(out)
+
+
+def section_text(body: str, name: str) -> str | None:
+    """**单取一块**：那个分段键对应的正文，没有这一块时回 ``None``。
+
+    与 ``assemble_sections`` 的分工：那一个是「默认集 + 点名的块」——它服务的场景是
+    **整份注入**（模型还没开口，服务端先替它把该带的带上）；这一条服务的场景是
+    **模型自己点名**（``load_skill(name, section=…)``），回的就该只是那一块：
+    想省字节才点名，再顺手把默认集塞回去就等于没省。
+    """
+    key = str(name or "").strip()
+    if not key:
+        return None
+    for piece, text in _section_pieces(body):
+        if piece == key:
+            return text
+    return None
+
+
+def section_catalog(body: str) -> list[tuple[str, str, int]]:
+    """分段目录：``[(键名, 小节标题, 字节数)]``（按正文原序）；没标记就回空表。
+
+    为什么服务端要主动给这份目录（而不是等模型去问）：分段键是**服务端与技能之间的
+    约定**（``<!-- section: film-knobs -->``），模型在白名单、schema、附件清单里都
+    查不到它。不给目录，模型只知道「有一份技能」，不知道里面还有几块可以单取——
+    那就退化成整份加载，分块等于没分。
+    """
+    out: list[tuple[str, str, int]] = []
+    for name, text in _section_pieces(body):
+        if not name:
+            continue
+        title = next((ln.strip().lstrip("#").strip()
+                      for ln in text.splitlines() if ln.startswith("#")), "")
+        out.append((name, title[:40], len(text.encode("utf-8"))))
+    return out
+
+
+def section_directory_line(body: str, *, planned: Iterable[str] = (),
+                           included: bool = True) -> str:
+    """一行式的分段目录（含「本轮计划用得上哪几块」），没标记就回空串。
+
+    ``planned`` 是 ``plan.skills.sections_for_plan`` 的读法（本轮计划命中的那几块）。
+    它从「强制注入」降成这里的**一句提示**：计划读了哪几步就该用到哪些块，这件事
+    服务端知道、模型不知道，所以必须说出来；但**要不要取、取哪几块由模型自己定**
+    （§2.2：技能的视角还给模型）。取法就写在同一行里。
+
+    ``included``：这一行跟着的那份正文里**有没有**这几块。两条路两种真话——
+    ``preload_skills`` 给的是默认集（不含），整份加载给的是全文（含），
+    说反了模型会拿"上面那份里就有"去上面找。
+    """
+    rows = section_catalog(body)
+    if not rows:
+        return ""
+    want = {str(s).strip() for s in (planned or ()) if str(s).strip()}
+    parts = [f"{name}（{title or '—'}，{size} B）" + ("**本轮计划用得上**" if name in want
+                                                   else "")
+             for name, title, size in rows]
+    where = ("这一份正文里也有它们" if included
+             else "**上面这份正文里没有它们**，要就照下面取")
+    return (f"\n\n（这份技能按小节分了几块：{'；'.join(parts)}。{where}——"
+            f'要哪一块单独取：load_skill(name=..., section=键名)；'
+            f"为其中一块翻整份（40 KB 上下、会被压缩闸从中间切）不划算。）")
 
 
 async def _one_chunk(data: bytes) -> AsyncIterator[bytes]:
@@ -483,7 +546,7 @@ class LoadSkillTool(Tool):
     **分页之后紧接着暴露的第二处**（同一条 run 修完重跑）：模型翻得动，就一路翻下去
     ——674 行顺读了 11 页，又回头重取其中 9 页，**四十几轮工具调用一个计划都没交出来**。
     它缺的不是「怎么续读」，是**「这一节在第几行」**与**「哪几行已经看过了」**：它明确
-    知道自己要闸⑦ 通道表 / ㉑ 动效锚定 / reveal / 数据镜 / 节点参数，却只能按 120 行一段
+    知道自己要闸⑦ 通道表 / ㉑ 动效锚定 / ⑯ 主体具名 / 数据镜 / 节点参数，却只能按 120 行一段
     顺读，读完凭印象回头猜（offset 240 / 359 / 478 / 597 全是猜的，真值在 335 / 631 /
     481 / 596）。所以：
 
@@ -507,7 +570,9 @@ class LoadSkillTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "按名称加载技能的完整说明。缺省返回 SKILL.md 正文（并列出附件清单）；"
+            "按名称加载技能的完整说明。缺省返回 SKILL.md **整份**正文（其中「另分了几块」"
+            "的块也在里面，末尾附分段目录与附件清单）；只想要其中一块就传 section"
+            "（分段键，比读整份省得多）；"
             "传 path（如 references/x.md、scripts/y.py）返回该附件内容；"
             "正文与附件都可以用 offset（1 起始的行号）与 limit（行数）按行分页续读，"
             "回执末尾会写明共有多少行。长正文在**整份给出时**还附一份带行号的章节目录，"
@@ -522,6 +587,9 @@ class LoadSkillTool(Tool):
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "技能名称（来自 <skills> 清单）"},
+                "section": {"type": "string",
+                            "description": "可选：只取正文里的一个分段块（键名见整份加载时"
+                                           "给的分段目录），比读整份省得多"},
                 "path": {"type": "string",
                          "description": "可选：技能目录内附件的相对路径；缺省取正文"},
                 "offset": {"type": "integer",
@@ -536,7 +604,8 @@ class LoadSkillTool(Tool):
         return True
 
     async def execute(self, name: str, path: str | None = None,
-                      offset: int | None = None, limit: int | None = None) -> str:
+                      offset: int | None = None, limit: int | None = None,
+                      section: str | None = None) -> str:
         skill = await self._loader.get(name)
         if skill is None:
             return f"Error: 未找到技能 {name}"
@@ -547,6 +616,8 @@ class LoadSkillTool(Tool):
             return await self._read_file(skill, rel, offset=offset, limit=limit)
         if not skill.body:
             return f"技能 {name} 无正文内容。location={skill.location}"
+        if str(section or "").strip():
+            return self._read_section(skill, str(section).strip())
         head = f"[skill:{name} location={skill.location}]"
         if skill.files:
             head += (f"\n附件（{len(skill.files)} 个，用 "
@@ -557,12 +628,40 @@ class LoadSkillTool(Tool):
             return err
         if body is None:
             return (f"{head}{self._outline(skill.body)}"
-                    f"\n{skill.body}{self._paging_note(name, skill.body)}")
+                    f"\n{SKILL_INDEX_END}"
+                    f"\n{skill.body}{self._paging_note(name, skill.body)}"
+                    f"{section_directory_line(skill.body, included=True)}")
         # 分页那头**不重复整份附件清单**（几百字节到 1 KB 的目录，跟着每一页发一遍
         # 就是按页数翻倍）与**整份章节目录**（它在第一次加载时给过）。名字与位置留着
         # ——模型得能对上「这是刚才那份技能的正文切片」。
         return (f"[skill:{name} location={skill.location}]"
-                f"{self._outline(skill.body, only_from=offset)}\n{body}")
+                f"{self._outline(skill.body, only_from=offset)}"
+                f"\n{SKILL_INDEX_END}\n{body}")
+
+    @staticmethod
+    def _read_section(skill: "Skill", section: str) -> str:
+        """只取某一块正文（``load_skill(name, section=…)``）。
+
+        为什么单开这一条而不是让 offset/limit 顶着用：分段键**不是行号**，模型无从知道
+        `film-knobs` 在第几行（真机那条 run 就是这么按 120 行顺读、读完再猜着回取的）。
+        知道键名与知道行号是两件事，工具得能接住前一种。
+
+        键名写错时不猜、不模糊匹配：把**在案的键名**列出来（键名是服务端与技能的约定，
+        模型没有别的途径查得到），它照着改一个词就行——与附件路径那条错误同一形状。
+        """
+        text = section_text(skill.body, section)
+        if text is None:
+            names = [f"`{name}`" for name, _title, _size in section_catalog(skill.body)]
+            if not names:
+                return (f"Error: 技能 {skill.name} 的正文没有分段标记，"
+                        f"没有 section 可点名——按整份或按 offset/limit 取。")
+            return (f"Error: 技能 {skill.name} 没有 section「{section}」。"
+                    f"在案的键名：{'、'.join(names[:_MISSING_LIST_MAX])}"
+                    + ("…" if len(names) > _MISSING_LIST_MAX else "")
+                    + "（键名见整份加载时给的分段目录）。")
+        return (f"[skill:{skill.name} location={skill.location} section={section}]"
+                f"\n{text}\n\n（这只是其中一块，共 {len(text.encode('utf-8'))} 字节；"
+                f"要别的块照分段目录换 section 键名，不要整份重读。）")
 
     @staticmethod
     def _page(text: str, offset: int | None, limit: int | None) -> tuple[str | None, str]:
@@ -642,7 +741,7 @@ class LoadSkillTool(Tool):
         """长正文的**章节目录**：标题 + 行号。短正文不给（几十行加张目录纯属噪音）。
 
         为什么非给不可（真机实测，14 镜「薄肌理论」那条 run）：这份技能 674 行、44 个小节，
-        模型明确知道自己要哪几节（闸⑦ 通道表 / ㉑ 动效锚定 / reveal / 数据镜 / 节点参数），
+        模型明确知道自己要哪几节（闸⑦ 通道表 / ㉑ 动效锚定 / ⑯ 主体具名 / 数据镜 / 节点参数），
         **却无从知道它们在文件里的哪一行**——于是它按 120 行一段顺读，读完再回头猜着取
         （offset 240 / 359 / 478 / 597 全是猜的，真值在 335 / 631 / 481 / 596），四十几轮
         工具调用一个计划都没交出来。**"要哪一节在哪一行"是这一份文档唯一查不到的事实**，
@@ -688,9 +787,10 @@ class LoadSkillTool(Tool):
                 return err
             if body is not None:
                 return (f"[skill:{skill.name} location={skill.location}]"
-                        f"{self._outline(skill.body, only_from=offset)}\n{body}")
+                        f"{self._outline(skill.body, only_from=offset)}"
+                        f"\n{SKILL_INDEX_END}\n{body}")
             return (f"[skill:{skill.name} location={skill.location}]"
-                    f"{self._outline(skill.body)}\n{skill.body}"
+                    f"{self._outline(skill.body)}\n{SKILL_INDEX_END}\n{skill.body}"
                     + self._paging_note(skill.name, skill.body))
         found = self._loader._find_file(skill, rel) if hasattr(self._loader, "_find_file")             else next((f for f in skill.files if f["relpath"] == rel), None)
         if found is not None:
