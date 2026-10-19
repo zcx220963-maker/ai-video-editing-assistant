@@ -75,6 +75,8 @@ class ScriptedLLM:
         self._i = 0
         self.stream_chunk_size = max(1, stream_chunk_size)
         self.calls: list[list[Message]] = []  # 记录每次入参，便于测试断言
+        #: 每次调用实际发给模型的工具 schema。测试用它验「熔断的工具不再出现」。
+        self.tools_seen: list[list[dict[str, Any]]] = []
 
     def _next(self) -> LLMResponse:
         idx = min(self._i, len(self._steps) - 1) if self._steps else -1
@@ -102,6 +104,7 @@ class ScriptedLLM:
         tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         self.calls.append(messages)
+        self.tools_seen.append(list(tools or []))
         return self._next()
 
     async def complete_stream(
@@ -111,6 +114,7 @@ class ScriptedLLM:
     ):
         """把脚本响应按 stream_chunk_size 切块下发，末块携带完整 tool_calls。"""
         self.calls.append(messages)
+        self.tools_seen.append(list(tools or []))
         resp = self._next()
         text = resp.content or ""
         for i in range(0, len(text), self.stream_chunk_size):

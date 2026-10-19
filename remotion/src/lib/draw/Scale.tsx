@@ -15,7 +15,7 @@ export interface ScaleProps extends Inked {
   y: number;
   /** 横梁跨度（成片像素），缺省 520 */
   w?: number;
-  /** 倾斜：-1 左沉、0 平、1 右沉 */
+  /** 倾斜：-1 左沉、0 平、1 右沉；直接给角度（如 `tilt={12}`）也认，按 sin 折算 */
   tilt?: number;
   seed?: number;
 }
@@ -27,11 +27,17 @@ export const Scale: React.FC<ScaleProps> = (props) => {
   const half = w / 2;
   const top = -w * 0.62;                     // 横梁离地的高度
   const u = w / 100;
-  const t = Math.max(-1, Math.min(1, tilt));
+  // 写手有时把「倾斜 11 度」直接当 `tilt` 传（见 2026-10-18 真机预览：0→11 被钳成
+  // 瞬间满倾）。超出 -1~1 的按角度折算，让「慢慢斜」真的慢慢斜。
+  const raw = Math.abs(tilt) > 1 ? Math.sin((tilt * Math.PI) / 180) : tilt;
+  const t = Math.max(-1, Math.min(1, raw));
   const lx = x - half;                       // 横梁两端
   const rx = x + half;
-  const ly = y + top + t * half * 0.22;
-  const ry = y + top - t * half * 0.22;
+  // 文档说「1 右沉」，所以 t>0 时**右端 y 变大（下沉）、左端变小（抬起）**。
+  // 原先两行写反了：表格让镜头代码传正数把天平压向右边，画面上却左边沉
+  // （2026-10-18 真机预览：面粉那一侧翘着）。
+  const ly = y + top - t * half * 0.22;
+  const ry = y + top + t * half * 0.22;
   const out: Stroke[] = [];
 
   // 底座 + 立柱

@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 from ..hooks import _current_hook_ctx
+from ..identity import current_identity
 from ..tool import Tool, ToolError
 from .support import PLAN_MAX_CANDIDATES
 
@@ -213,6 +214,13 @@ class SubmitPlanTool(Tool):
                              "计划校验未通过，把所有问题一次性修正后再交一次：\n- "
                              + listed,
                              counts_as_failure=False)
+        # 计划卡要带上本轮的风格包：执行轮从卡上取回它，浏览器不必再传一遍，
+        # 刷新/换设备/重放同一张卡也不会丢。放在候选上而不是 state 上，是因为
+        # 候选会被整份落进 checkpoint 指针行。
+        ident = current_identity()
+        if ident is not None and ident.style_skill:
+            for p in normalized:
+                p["style_skill"] = ident.style_skill
         ctx = _current_hook_ctx.get()
         if ctx is not None:
             ctx.state.plan_candidates = normalized

@@ -22,7 +22,7 @@ export interface ChartProps extends Inked {
   kind?: 'line' | 'bar';
   /** 0~1 的序列；给几段就画几段 */
   values?: number[];
-  /** 画到第几个点为止（镜头代码可以把帧喂进来做「逐点长出来」） */
+  /** 画到哪为止：0~1 的比例（推荐，镜头代码把帧喂进来）或点数（>1 时按点数） */
   upto?: number;
   /** Y 轴刻线几条，缺省 4 */
   ticks?: number;
@@ -38,7 +38,11 @@ export const Chart: React.FC<ChartProps> = (props) => {
   const b = pen(ink, seed + 101);
   const out: Stroke[] = [];
   const vs = values.length ? values : [0.5];
-  const n = Math.max(1, Math.min(vs.length, upto ?? vs.length));
+  // `upto` 两种写法都认：0~1 是「长到几成」（与 `<Arrow/>` 同一套，镜头代码直接喂帧），
+  // >1 是「画到第几个点」。原先只认点数，`upto={grow}`（0~1）在整段动画里只画出 1 个点，
+  // 曲线整条消失（2026-10-18 真机预览）。
+  const u = upto ?? vs.length;
+  const n = Math.max(1, Math.min(vs.length, u <= 1 ? Math.ceil(u * vs.length) : Math.round(u)));
   const rc = (px: number, py: number, pw: number, ph: number, fill?: Fill) =>
     b.rect(x + px, y + py, pw, ph, fill);
   const px = (i: number) => (i / Math.max(1, vs.length - 1)) * w;

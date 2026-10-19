@@ -203,7 +203,49 @@ export interface FilmStyle {
   ink?: string;
   /** 强调色（色板的 accent）：高亮词块＝它加 40% 透明，撕纸下划线＝它原色。 */
   accent?: string;
+  /** 整片美术方向。**只有 spec 真写了 `art` 才出现**（Python：`code_spec.norm_art`
+   *  → `code_render.shot_input_props` 的 `artDirection`）。没写的片子这一栏缺席，
+   *  于是所有既有镜的 `film` 读数与像素一个字节都不变。 */
+  art?: ArtDirection;
 }
+
+/** 整片美术方向的取值（与 `backend/.../code_spec.py` 的 `ART_*` 逐项一致）。 */
+export const ART_BRUSHES = ['graphite', 'marker', 'watercolor', 'ink'] as const;
+export const ART_LIGHTS = ['top-left', 'top', 'top-right', 'left', 'front',
+  'right', 'bottom-left', 'bottom', 'bottom-right', 'soft'] as const;
+export const ART_TEXTURES = ['none', 'paper', 'grain'] as const;
+export const ART_TYPES = ['serif-display', 'serif-editorial', 'sans-display',
+  'sans-editorial'] as const;
+export const ART_MOTIONS = ['spring', 'linear'] as const;
+
+export type ArtBrush = (typeof ART_BRUSHES)[number];
+export type ArtLight = (typeof ART_LIGHTS)[number];
+export type ArtTexture = (typeof ART_TEXTURES)[number];
+export type ArtType = (typeof ART_TYPES)[number];
+export type ArtMotion = (typeof ART_MOTIONS)[number];
+
+/** 各栏都可省：镜头代码读到的这一份**已经补全**（见 `ART_DEFAULT`），
+ *  所以 `film.art.brush` 永远是一个合法枚举值，不必再判 undefined。 */
+export interface ArtDirection {
+  /** 整片画风那句自由描述（模型自己组合出来的语言，不受枚举限制）。 */
+  look?: string;
+  brush?: ArtBrush;
+  light?: ArtLight;
+  texture?: ArtTexture;
+  type?: ArtType;
+  motion?: ArtMotion;
+  palette_note?: string;
+}
+
+/** 美术方向的缺省补齐。只在一镜**真写了 art** 时使用——没写 `art` 的片子
+ *  `film.art` 整个缺席，所以这份缺省不会给老片子加一层「默认笔触」。 */
+export const ART_DEFAULT: Required<Omit<ArtDirection, 'look' | 'palette_note'>> = {
+  brush: 'graphite',
+  light: 'top-left',
+  texture: 'paper',
+  type: 'serif-editorial',
+  motion: 'spring',
+};
 
 /** 风格档的缺省值 —— **逐字等于今天**：不传 `film_style` 时母版读到的就是这一份，
  *  于是既有片子的像素与 token 读数一个字节都不变。 */

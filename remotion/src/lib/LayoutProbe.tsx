@@ -397,14 +397,25 @@ export function probeLayout(root: Element, band: PxBox, convert: Convert) {
   });
 
   // 1) 文字盒
-  const texts: { text: string; box: PxBox; el: Element }[] = [];
+  //
+  // `box` 是并集外接盒（裁切 / 字压图要用它）；`rects` 是**逐行**的盒
+  // （`getClientRects()` 对行内元素给每个行盒一段）。两者都要：
+  // 自动排版字幕是若干个相邻的行内片段，换行那个片段的**并集盒**会把左边那段
+  // 整块罩住（第二行从行首起，外接盒于是从行首一直框到行尾）——拿并集去判叠字，
+  // 「蒸汽机 / 把煤里的力量…」这种正常换行会被报成 ratio 1 的叠字。逐行比就没有
+  // 这个问题：第一行两段相邻、第二行在下面，谁也不压谁。
+  const texts: { text: string; box: PxBox; rects: PxBox[]; el: Element }[] = [];
   for (const el of Array.from(root.querySelectorAll('*'))) {
     const text = ownText(el);
     if (!text) continue;
     if (!paintedWithin(root, el)) continue;
     const raw = measureBox(el);
     if (!raw || raw.w < LAYOUT_PROBE.min_box_px || raw.h < LAYOUT_PROBE.min_box_px) continue;
-    texts.push({ text: text.slice(0, 24), box: convert(raw), el });
+    const box = convert(raw);
+    const rects = Array.from(el.getClientRects())
+      .map((r) => convert({ x: r.left, y: r.top, w: r.width, h: r.height }))
+      .filter((b) => b.w >= LAYOUT_PROBE.min_box_px && b.h >= LAYOUT_PROBE.min_box_px);
+    texts.push({ text: text.slice(0, 24), box, rects: rects.length ? rects : [box], el });
   }
 
   // 2) 叠字：两处各写各的文字压在一起
@@ -414,8 +425,14 @@ export function probeLayout(root: Element, band: PxBox, convert: Convert) {
       const b = texts[j];
       // 父子不重复报：容器盒本来就罩住自己的文字，那不是「两处标签互相盖」
       if (a.el.contains(b.el) || b.el.contains(a.el)) continue;
-      const smaller = Math.max(1, Math.min(areaOf(a.box), areaOf(b.box)));
-      const ratio = interArea(a.box, b.box) / smaller;
+      // 逐行配对取最大交叠比例：并集盒会把「相邻的行内片段」误报成叠字（见第 1 段）
+      let ratio = 0;
+      for (const ra of a.rects) {
+        for (const rb of b.rects) {
+          const smaller = Math.max(1, Math.min(areaOf(ra), areaOf(rb)));
+          ratio = Math.max(ratio, interArea(ra, rb) / smaller);
+        }
+      }
       if (ratio < LAYOUT_PROBE.overlap_ratio) continue;
       push({ kind: 'overlap', texts: [a.text, b.text], box: toBand(b.box), ratio: round(ratio) });
     }
@@ -617,7 +634,26 @@ export const LayoutProbe: React.FC<{ children?: React.ReactNode }> = ({ children
     if (frame !== probeFrame) return;
     const root = ref.current;
     if (!root) return;
-    emitLayout(root, { x: 0, y: 0, w: width, h: height }, (b) => b, frame, 'shell');
+    const base: PxBox = { x: 0, y: 0, w: width, h: height };
+    // **必须等一个 tick 再量。** Remotion 在提交帧那一瞬把画布放在
+    // `position: fixed; top: -999999px`，而且**尺寸还是 0×0**；下一个 tick 才归位
+    // （2026-10-18 实测：effect 里量到 `top=-999999, w=0`，`setTimeout(0)` 里是
+    // `top=0, w=1920`）。同步量的后果不是「量不到」，而是**量到一份偏移了一百万像素
+    // 的读数**：真机上每一条字幕都成了 `clipped top 999397px`，两段字还互相「叠」在
+    // 一起——模型会去挪一处根本没问题的字。假的版面账比没有账更坏。
+    //
+    // 为什么不是「用带子折回去」（母版那条路）：此刻镜头根节点是 0×0，`liveBand`
+    // 返回 null，没有可折的原点。归位之后再量，这一步就退回恒等变换。
+    //
+    // `setTimeout(0)` 而不是 `requestAnimationFrame`：后者在 Remotion 的 headless
+    // 截图流程里不保证在截图前跑完；宏任务实测会被 `onBrowserLog` 收到（见
+    // `render-stills` 的 `layoutLines`）。
+    setTimeout(() => {
+      const shot = root.firstElementChild as HTMLElement | null;
+      const live = shot ? liveBand(shot) : null;
+      const convert: Convert = live ? (b: PxBox) => toCodeSpace(b, live, base) : (b: PxBox) => b;
+      emitLayout(root, base, convert, frame, 'shell');
+    }, 0);
   }, [frame, probeFrame, width, height]);
 
   // `display: contents`：这一层不成盒子，子元素在它里面与没有它时同样排版。

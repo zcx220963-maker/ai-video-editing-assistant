@@ -123,3 +123,10 @@ ALTER TABLE checkpoint_entries ADD CONSTRAINT checkpoint_entries_kind_check
 -- 只存用户真挑过的原始取值，不存派生的档名——理由见 schema.sql 的 conversations 那段。
 -- 形状与 schema.sql 的建表期定义一致（本文件是唯一执行口：新库走 schema.sql、老库走这里）。
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS prefs jsonb NOT NULL DEFAULT '{}';
+
+-- token_usage 增缓存命中 / 未命中与花费（元）。形状与 schema.sql 的建表期定义一致
+-- （本文件是唯一执行口：新库走 schema.sql、老库走这里）。不设 NOT NULL：老行没有这三项，
+-- NULL 的意思是「当时没记」，不是 0。
+ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS cache_hit_tokens integer;
+ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS cache_miss_tokens integer;
+ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS cost_yuan double precision;

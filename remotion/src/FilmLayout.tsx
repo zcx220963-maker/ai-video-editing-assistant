@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   AbsoluteFill,
   Easing,
@@ -14,6 +14,12 @@ import { fitText as remotionFitText } from '@remotion/layout-utils';
 // 直接回落——这正是第六根因。现在它由 @dg/fonts 当场加载进来，名字与字节都对得上。
 import '@dg/fonts';
 import {
+  ART_BRUSHES,
+  ART_DEFAULT,
+  ART_LIGHTS,
+  ART_MOTIONS,
+  ART_TEXTURES,
+  ART_TYPES,
   ASPECTS,
   CAPTION_STYLES,
   HIGHLIGHT_STYLES,
@@ -24,7 +30,9 @@ import {
   TOKENS,
   TOKEN_LOG_MARKER,
 } from './tokens';
-import type { Aspect, CaptionStyle, FilmStyle, HighlightStyle } from './tokens';
+import type {
+  ArtDirection, Aspect, CaptionStyle, FilmStyle, HighlightStyle,
+} from './tokens';
 // 版面那一套（判据 + 阈值 + 那一行 JSON 的形状）2026-10-16 整体搬到 `./lib/LayoutProbe`：
 // `LAYOUT_PROBE` / `LAYOUT_LOG_MARKER` 不再从这里 import——母版与新测量壳共用同一份，
 // 免得「母版改了阈值、壳还在用旧的」这种一比就分叉的两把尺。
@@ -116,7 +124,39 @@ export function resolveFilmStyle(injected: unknown): FilmStyle {
   if (paper && ink) { style.paper = paper; style.ink = ink; }
   const accent = hex(s.accent);
   if (accent) style.accent = accent;
+  // 整片美术方向（2026-10-18）：只在注入里真有 `artDirection` 时才合并，
+  // 且**补全每一栏**——镜头代码读 `film.art.brush` 时不必再判 undefined。
+  // 认不出的值一律落缺省（与上面风格档同一条纪律：写坏一栏不该让整镜渲不出来）。
+  const rawArt = src.artDirection;
+  if (rawArt && typeof rawArt === 'object') {
+    const a = rawArt as Record<string, unknown>;
+    const pickArt = <T extends string>(v: unknown, allowed: readonly T[], dflt: T): T => {
+      const t = String(v ?? '').trim().toLowerCase();
+      return (allowed as readonly string[]).includes(t) ? (t as T) : dflt;
+    };
+    const look = String(a.look ?? '').trim().slice(0, 160);
+    const note = String(a.palette_note ?? '').trim().slice(0, 120);
+    const art: ArtDirection = {
+      brush: pickArt(a.brush, ART_BRUSHES, ART_DEFAULT.brush),
+      light: pickArt(a.light, ART_LIGHTS, ART_DEFAULT.light),
+      texture: pickArt(a.texture, ART_TEXTURES, ART_DEFAULT.texture),
+      type: pickArt(a.type, ART_TYPES, ART_DEFAULT.type),
+      motion: pickArt(a.motion, ART_MOTIONS, ART_DEFAULT.motion),
+    };
+    if (look) art.look = look;
+    if (note) art.palette_note = note;
+    style.art = art;
+  }
   return style;
+}
+
+/** `#rrggbb` + 透明度 → `rgba()`。字幕的压暗层要用这一镜自己的墨色：牛皮纸底上
+ *  压纯黑会显脏，压同一套的墨才是「一张印刷品」。认不出的色按黑色回退（原行为）。 */
+function rgba(hex: string, a: number): string {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/.exec(hex.toLowerCase());
+  if (!m) return `rgba(0,0,0,${a})`;
+  const [r, g, b] = [1, 2, 3].map((i) => parseInt(m[i], 16));
+  return `rgba(${r},${g},${b},${a})`;
 }
 
 /** `#rrggbb` → 相对亮度 0~1（sRGB 加权）。够用来判「这个底是深的还是浅的」。 */
@@ -205,21 +245,23 @@ export interface CaptionStyleLook {
 
 export const CAPTION_LOOK: Record<CaptionStyle, CaptionStyleLook> = {
   // 用户否掉纸条之后的缺省：无底、下沿、淡入。字与画面共用一块底。
-  on_picture: { band: false, position: 'bottom', anim: 'fade', size: 1, weight: 700, lineHeight: 1.35 },
+  // 字号系数 0.66（2026-10-19）：参考片里那条中文字幕约占画面高 4%，
+  // 原先把两行 78px 的字压到 97px，像横幅不像字幕。这一档缩到约 51px。
+  on_picture: { band: false, position: 'bottom', anim: 'fade', size: 0.66, weight: 700, lineHeight: 1.35 },
   // 白字黑边：亮底上也读得出来。底压一层下深上透的渐隐（不是纸条：没边界、不是色块）。
-  outlined: { band: false, position: 'bottom', anim: 'fade', size: 1, weight: 800, lineHeight: 1.3,
+  outlined: { band: false, position: 'bottom', anim: 'fade', size: 0.66, weight: 800, lineHeight: 1.3,
               outline: '#000000', ink: '#ffffff' },
   // 老观感，留成选项、不当缺省。
-  paper: { band: true, position: 'bottom', anim: 'fade', size: 1, weight: 500, lineHeight: 1.35 },
+  paper: { band: true, position: 'bottom', anim: 'fade', size: 0.72, weight: 500, lineHeight: 1.35 },
   // 整句电影感：字号略小、行距松、慢淡入。
-  film_line: { band: false, position: 'bottom', anim: 'fade', size: 0.9, weight: 500, lineHeight: 1.62 },
+  film_line: { band: false, position: 'bottom', anim: 'fade', size: 0.60, weight: 500, lineHeight: 1.62 },
   // 大字压屏：画面正中、字号放大、pop 入场。
-  big_center: { band: false, position: 'center', anim: 'pop', size: 1.34, weight: 700, lineHeight: 1.24 },
+  big_center: { band: false, position: 'center', anim: 'pop', size: 1.18, weight: 700, lineHeight: 1.24 },
   // 顶部横幅：纸条挪到顶部安全区、rise 入场。
-  top_banner: { band: true, position: 'top', anim: 'rise', size: 1, weight: 500, lineHeight: 1.35 },
+  top_banner: { band: true, position: 'top', anim: 'rise', size: 0.72, weight: 500, lineHeight: 1.35 },
   // 不上字幕：母版与 `<CaptionLayer/>` 都自守不画（见闸㉜）。仍旧给一份配方——
   // `Record` 要铺满，取值取最素的那一档。
-  none: { band: false, position: 'bottom', anim: 'fade', size: 1, weight: 500, lineHeight: 1.35 },
+  none: { band: false, position: 'bottom', anim: 'fade', size: 0.66, weight: 500, lineHeight: 1.35 },
 };
 
 /** 被点名的词怎么被点出来（「高亮样式」那一维的落点，与字幕样式**正交**）。 */
@@ -603,6 +645,8 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   // 用户在「文字库」钉过「强调色」时，`captionLook` 里那一枚盖过色板的 accent
   // （只管强调色，条底与字色照旧）。
   const { tone, hl: hlColor, accent: accentColor } = captionLook(style, bg);
+  // 浅底 + 成对注入的色板：白字黑边那一档改用这一镜的纸/墨（见 `<Caption>` 里的说明）。
+  const paletteLight = Boolean(style.paper && style.ink && luma(bg) >= 0.5);
   const body = filmBody(width, height, aspect, style.bleed);
   // 满幅时字幕条**叠在画面上**，非满幅时仍旧站在下安全区正中——今天的行为逐字不变。
   const captionBottom = captionBottomOf(geo, style.bleed);
@@ -777,6 +821,7 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
             tone={tone}
             hl={hlColor}
             accent={accentColor}
+            paletteLight={paletteLight}
           />
         ) : null}
       </AbsoluteFill>
@@ -803,7 +848,12 @@ const Caption: React.FC<{
   hl: string;
   /** 强调色：`emphasis: 'color'` 时是高亮词的字色，`'ink'` 时是那条笔触的颜色。 */
   accent: string;
-}> = ({ text, highlight, words, look, hlLook, opacity, geo, bottom, tone, hl, accent }) => {
+  /** 浅色底**且**认得出这一镜的色板（注入里有成对的 paper/ink）。为真时，
+   *  「白字黑边」那一档改用这一镜的纸色与墨色——纯白配纯黑压在牛皮纸上，
+   *  读起来是「综艺花字贴在海报上」。深色底与没色板的镜一切照旧。 */
+  paletteLight?: boolean;
+}> = ({ text, highlight, words, look, hlLook, opacity, geo, bottom, tone, hl, accent,
+       paletteLight = false }) => {
   const frame = useCurrentFrame();
   const { height, fps } = useVideoConfig();
   const cap = geo.caption;
@@ -821,6 +871,14 @@ const Caption: React.FC<{
     position === 'center' ? { top: 0, bottom: 0 }
       : position === 'top' ? { top: geo.topSafe + Math.round(height * 0.02) }
         : { bottom };
+
+  // 白字黑边这一档的配色：深色底上白字黑边（原样）；**浅色底且认得出色板**时换成
+  // 这一镜的纸色与墨色——两层描边压在一张牛皮纸上，纯白纯黑是另一个设计语言。
+  // 底上的压暗层也跟着用墨色而不是纯黑：它要与画面属于同一套印刷，而不是一块脏印子。
+  const paletteOutline = Boolean(look.outline && paletteLight);
+  const textColor = paletteOutline ? tone.paper : (look.ink ?? tone.ink);
+  const ringColor = paletteOutline ? tone.ink : look.outline;
+  const scrimInk = paletteOutline ? tone.ink : null;
 
   return (
     <div
@@ -848,8 +906,10 @@ const Caption: React.FC<{
             left: -cap.side, right: -cap.side,
             top: -Math.round(cap.height * 1.7),
             bottom: -Math.round(cap.height * 0.9),
-            background: 'linear-gradient(to top, rgba(0,0,0,0.66) 0%, '
-              + 'rgba(0,0,0,0.36) 34%, rgba(0,0,0,0.12) 66%, rgba(0,0,0,0) 100%)',
+            background: `linear-gradient(to top, ${rgba(scrimInk ?? '#000000', 0.66)} 0%, `
+              + `${rgba(scrimInk ?? '#000000', 0.36)} 34%, `
+              + `${rgba(scrimInk ?? '#000000', 0.12)} 66%, `
+              + `${rgba(scrimInk ?? '#000000', 0)} 100%)`,
             pointerEvents: 'none',
           }}
         />
@@ -864,7 +924,7 @@ const Caption: React.FC<{
           padding: look.band ? `${cap.padY}px ${cap.padX}px` : 0,
           background: look.band ? tone.paper : 'transparent',
           borderRadius: look.band ? cap.radius : 0,
-          color: look.ink ?? tone.ink,
+          color: textColor,
           // 字号不在这里给：纸条只管底、内衬与圆角，字号归 `CaptionText`（一处）。
           // 行高/字重仍旧写在这里，由字继承——它们是这一档的排版。
           fontWeight: look.weight,
@@ -879,7 +939,7 @@ const Caption: React.FC<{
         <CaptionText text={text} highlight={highlight} words={words}
                      emphasis={hlLook.emphasis} karaoke={hlLook.karaoke}
                      hl={hl} accent={accent} cap={cap}
-                     sizeScale={look.size} outline={look.outline} />
+                     sizeScale={look.size} outline={ringColor} />
       </div>
     </div>
   );
@@ -1014,6 +1074,10 @@ export interface CaptionTextProps {
   sizeScale?: number;
   /** 八向描边色（白字黑边那一档）。给了就用 `ring()` 画一圈，字形自己一个像素不吃。 */
   outline?: string;
+  /** 「字幕样式」那一维。不传＝注入那一档（`<CaptionFrame/>` 用它把外框的决定传进来）。 */
+  captionStyle?: CaptionStyle;
+  /** 「高亮样式」那一维。不传＝注入那一档。 */
+  highlightStyle?: HighlightStyle;
 }
 
 /**
@@ -1027,13 +1091,15 @@ export interface CaptionTextProps {
 export const CaptionText: React.FC<CaptionTextProps> = ({
   text, highlight, words, emphasis: emphasisProp, karaoke: karaokeProp,
   hl: hlProp, accent: accentProp, cap: capProp, fitWidth, fontSize: sizeProp,
-  sizeScale = 1, outline,
+  sizeScale: sizeScaleProp, outline,
+  captionStyle: captionStyleProp, highlightStyle: highlightStyleProp,
 }) => {
-  const { width } = useVideoConfig();
+  const { width, height } = useVideoConfig();
+  const frame = useCurrentFrame();
   const t = useCaptionTiming({ text, highlight, words });
   // 两维都不给 prop 时跟着**注入**那一档走：镜头代码把字摆进画面时，「高亮怎么显示」
   // 本来就是整片（或这一镜）的一个观感决定，不该由每一份现写的代码各答一次。
-  const hlLook = HIGHLIGHT_LOOK[pickInjected<HighlightStyle>(undefined, 'highlightStyle',
+  const hlLook = HIGHLIGHT_LOOK[pickInjected<HighlightStyle>(highlightStyleProp, 'highlightStyle',
                                                              HIGHLIGHT_STYLES, 'color')];
   const emphasis = emphasisProp ?? hlLook.emphasis;
   const karaoke = karaokeProp ?? hlLook.karaoke;
@@ -1046,16 +1112,78 @@ export const CaptionText: React.FC<CaptionTextProps> = ({
   // 渲出来不是」正是这一处要治的病）。没钉过时这一枚是 `undefined`，一切照旧。
   const accentColor = injectedAccent() ?? accentProp ?? look.accent;
   const cap = capProp ?? FILM_GEOMETRY[injectedAspect()].caption;
-  const fontSize = Math.round((sizeProp ?? fitCaptionFontSize(t.text, cap, width, fitWidth))
-                              * sizeScale);
+  // 字幕样式那一维：`<CaptionText/>` 从前只认 `outline` 这个 prop，于是「文字库」里
+  // 选了「白字黑边」，镜头代码自己摆的字照旧继承外层写的 `color: ink`——界面上选了、
+  // 片子里还是黑字。这里让它与母版 `<Caption>` 走同一个配方：没传 `outline` 时取注入
+  // 那一档的描边与字色；浅底 + 成对色板时按母版的规矩换成这一镜的纸/墨（同一套印刷）。
+  const capStyle = pickInjected<CaptionStyle>(captionStyleProp, 'captionStyle', CAPTION_STYLES,
+                                              'on_picture');
+  const capLook = CAPTION_LOOK[capStyle];
+  const paletteLight = Boolean(style.paper && style.ink && luma(style.bg || TOKENS.bg) >= 0.5);
+  const ringColor = outline
+    ?? (capLook.outline ? (paletteLight ? style.ink : capLook.outline) : undefined);
+  const textColor = ringColor
+    ? (paletteLight ? style.paper : (capLook.ink ?? '#ffffff'))
+    : undefined;
+  const sizeScale = sizeScaleProp ?? capLook.size;
+  // 字号：先按可用宽度求（最多两行），**再按画面高兜一次**。自排字幕（给了 `fitWidth`）
+  // 的盒宽由镜头代码挑，字就跟着宽度一路长到 1.25 倍：真机上横屏两行 90px、高 245px，
+  // 压住大半台手机。两行总高不超过画面高的 20%（横屏满字号下约等于几何表的 78px）是
+  // 「字是画面的一部分、但不吃掉画面」的那条线。母版那条不带 `fitWidth`，不受这条。
+  const autoSize = fitCaptionFontSize(t.text, cap, width, fitWidth);
+  const bounded = fitWidth ? Math.min(autoSize, (height * 0.2) / (2 * 1.4)) : autoSize;
+  const fontSize = Math.round((sizeProp ?? bounded) * sizeScale);
   // 描边宽度按**字号**给（不是 `em`）：字号是上面求出来的，`em` 在外层先解析成外层的
   // 字号，写出来的与求出来的不是一回事。系数搬自 `outline-caption` 那份 demo。
-  const shadow = outline
-    ? ring(outline, Math.max(3, Math.round(fontSize * 0.085)))
+  const shadow = ringColor
+    ? ring(ringColor, Math.max(3, Math.round(fontSize * 0.085)))
     : undefined;
 
+  // ---- 字幕安全网：**任何摆法都不许把字切在画外** ----
+  //
+  // 2026-10-18 真机成片：镜头代码把字幕盒写在 `top: height*0.86`，两行字落到底边
+  // 之外，第二行被整条切掉；有的镜还把 0.62 宽的盒子从 0.45 宽处起排，右边出画。
+  // 这不是某一镜的笔误——写手对「两行字有多高」没有可靠的数是常态，而预览版面
+  // 读数只报不拦，最后只能让用户在看片时发现。
+  //
+  // 所以把兜底放在**字自己的组件**里：量一次真实包围盒，超出的部分平移回来。
+  // 平移而不是改字号/改父盒：字号是 `fitCaptionFontSize` 一处的产物，父盒是镜头
+  // 代码的构图；只有「整体挪一点」不改这两件事。量到的 `rect` 里包含祖先的入场
+  // 动画（上浮/缩放）与自己的位移，先减掉 `shift` 才是**没有我们这一层**的位置。
+  const boxRef = useRef<HTMLSpanElement>(null);
+  const [shift, setShift] = useState({ x: 0, y: 0 });
+  useLayoutEffect(() => {
+    const el = boxRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    if (!r.width && !r.height) return;
+    const mx = 24;
+    const my = 24;
+    const left = r.left - shift.x;
+    const right = r.right - shift.x;
+    const top = r.top - shift.y;
+    const bottom = r.bottom - shift.y;
+    let dx = 0;
+    let dy = 0;
+    if (right > width - mx) dx = width - mx - right;
+    if (left + dx < mx) dx = mx - left;
+    if (bottom > height - my) dy = height - my - bottom;
+    if (top + dy < my) dy = my - top;
+    if (Math.abs(dx - shift.x) > 0.5 || Math.abs(dy - shift.y) > 0.5) {
+      setShift({ x: Math.round(dx * 10) / 10, y: Math.round(dy * 10) / 10 });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [width, height, frame, text, fontSize, shift.x, shift.y]);
+
   return (
-    <>
+    <span
+      ref={boxRef}
+      style={{
+        display: 'inline-block',
+        maxWidth: '100%',
+        transform: shift.x || shift.y ? `translate(${shift.x}px, ${shift.y}px)` : undefined,
+      }}
+    >
       {t.pieces.map(({ p, start }, i) => {
         const isHl = t.highlight.some((h) => h && h === p);
         const on = isHl && t.reached(start);
@@ -1074,7 +1202,9 @@ export const CaptionText: React.FC<CaptionTextProps> = ({
           fontSize,
           whiteSpace: keep ? 'nowrap' : undefined,
           background: blocked ? hlColor : 'transparent',
-          color: tinted ? accentColor : undefined,
+          // 字色只在「白字黑边」那一档由这里给；其余档不写，继续继承调用方的排版
+          // （镜头代码给这一镜挑的墨色/纸色）。
+          color: tinted ? accentColor : textColor,
           textShadow: shadow,
           borderBottom: inked
             ? `${Math.max(2, Math.round(fontSize / 26))}px solid ${accentColor}`
@@ -1092,7 +1222,108 @@ export const CaptionText: React.FC<CaptionTextProps> = ({
           </span>
         );
       })}
-    </>
+    </span>
+  );
+};
+
+/** `<CaptionFrame/>` 交给画面那一格：**这一镜真正能画的地方**（成片像素，原点 0,0）。
+ *  与 `useBody()` 同一个形状，只是已经扣掉了字幕带与间距。 */
+export type ArtBox = BodyBox;
+
+export interface CaptionFrameProps {
+  /** 画面。传函数时拿到这一格的尺寸（`w`/`h` 就是可用宽高，原点在画面区左上角）；
+   *  传节点时它自己用 `useVideoConfig()` 减字幕带也可以，但函数形式是推荐写法。 */
+  children: React.ReactNode | ((art: ArtBox) => React.ReactNode);
+  /** 字幕带在哪条边：底（缺省）/ 顶。 */
+  side?: 'bottom' | 'top';
+  /** 字幕带高度（设备像素）。缺省按这一镜的字幕档算：两行字 + 内衬。 */
+  band?: number;
+  /** 画面与字幕带之间的空隙（设备像素）。缺省 = 画面高的 1.5%。 */
+  gap?: number;
+  /** 字幕带的左右内衬。画面不受影响（仍旧整宽）。 */
+  inset?: number;
+  /** `false` = 只分带、不画字（画面把字幕带也占掉）。 */
+  caption?: boolean;
+  /** 字幕在带里的对齐。缺省左对齐。 */
+  align?: 'left' | 'center' | 'right';
+  captionStyle?: CaptionStyle;
+  highlightStyle?: HighlightStyle;
+  /** 外框样式：**底色画在这一层**（画面区被裁到字幕带边上，画在里面的底色铺不到带里）。 */
+  style?: React.CSSProperties;
+}
+
+/**
+ * 画/字分带：**结构上**保证字幕与画面不互相遮挡。
+ *
+ * 为什么需要这一件。真机片里字幕压在插画上，不是「字太大了」这一件事，而是镜头代码
+ * 把画面画满整帧、再把字绝对定位到 0.86 高的地方——两者都是绝对值，撞不撞全看写手
+ * 那一刻的估算。评审会报、安全网会平移，但那两条都是事后补救：一个把字挪到主体上，
+ * 一个只是记一笔。
+ *
+ * 分带把这件事变成**布局**：这一镜先划出字幕带（高度由字幕档算，不由写手估），画面
+ * 只拿到剩下的那一格，并且**被裁在这一格里**（`overflow:hidden`）。于是「字压图」在
+ * 结构上不发生，哪怕画面画得比这一格还大——超出部分被裁掉，而不是压到字上。
+ *
+ * 代价写清楚：画面会被裁（写手要按 `art.h` 排版，别按整帧高）；底色要画在 `style` 上，
+ * 画在画面区里的底色铺不到字幕带。这两条都是「分带」这张契约本身的代价，不是缺陷。
+ *
+ * 不做成母版那样自动叠一条：位置、左右内衬、带高都还是这一镜的构图决定。要与画面
+ * 咬合得更紧（字当图注、文字当图形）时，仍旧用 `<CaptionText/>` 自己摆。
+ */
+export const CaptionFrame: React.FC<CaptionFrameProps> = ({
+  children, side = 'bottom', band, gap, inset, caption = true, align = 'left',
+  captionStyle, highlightStyle, style,
+}) => {
+  const { width, height } = useVideoConfig();
+  const film = resolveFilmStyle(getInputProps());
+  const aspect = aspectFor(width, height);
+  const geo = FILM_GEOMETRY[aspect];
+  const cap = geo.caption;
+  const capStyle = pickInjected<CaptionStyle>(captionStyle, 'captionStyle', CAPTION_STYLES,
+                                              'on_picture');
+  // 字幕带高度：按这一档的字号上限算两行（与 `<CaptionText/>` 的「两行不超过画面高
+  // 20%」同一条线），再加内衬。写手不必估「两行有多高」——这是它一直在估错的那个数。
+  // 字号要乘上这一档的 `size`：`on_picture` 已经缩到 0.66，带子若仍按满字号算，
+  // 就会空出一大条黑带（真机上正是「画面被压掉四分之一」的那一版）。
+  const bandH = Math.max(1, band ?? Math.max(
+    cap.height,
+    Math.min(Math.round(height * 0.2),
+             Math.round(cap.fontSize * CAPTION_LOOK[capStyle].size * 1.25 * 2 * 1.4))
+      + cap.padY * 2,
+  ));
+  const gapPx = Math.max(0, gap ?? Math.round(height * 0.015));
+  const insetPx = Math.max(0, inset ?? cap.side);
+  // 「不上字幕」这一档不割地：带子不画，画面就用整帧（分带只在真有字要站的时候才有意义）。
+  const showCaption = caption && capStyle !== 'none';
+  // 带子 + 空隙不能吃掉整帧：留至少三分之一给画面。
+  const carve = showCaption ? Math.min(bandH + gapPx, Math.round(height * 0.66)) : 0;
+  const art: ArtBox = { x: 0, y: 0, w: width, h: Math.max(1, height - carve), aspect };
+  return (
+    <div style={{ position: 'absolute', inset: 0, background: film.bg || TOKENS.bg, ...style }}>
+      {/* 画面区：**被裁在字幕带边上**。写手按 `art` 排版时它正好铺满这一格；
+          画得比这一格大，多出来的部分裁掉，不会压到字上。 */}
+      <div style={{
+        position: 'absolute', left: 0, right: 0,
+        top: side === 'top' ? carve : 0,
+        bottom: side === 'bottom' ? carve : 0,
+        overflow: 'hidden',
+      }}>
+        {typeof children === 'function' ? children(art) : children}
+      </div>
+      {showCaption ? (
+        <div style={{
+          position: 'absolute', left: insetPx, right: insetPx,
+          ...(side === 'top' ? { top: gapPx } : { bottom: gapPx }),
+          height: bandH,
+          display: 'flex', alignItems: 'center',
+          justifyContent: align === 'center' ? 'center'
+            : align === 'right' ? 'flex-end' : 'flex-start',
+        }}>
+          <CaptionText captionStyle={capStyle} highlightStyle={highlightStyle}
+                       fitWidth={width - 2 * insetPx} />
+        </div>
+      ) : null}
+    </div>
   );
 };
 
@@ -1173,6 +1404,8 @@ export const CaptionLayer: React.FC<CaptionLayerProps> = ({
       tone={toneProp ?? look.tone}
       hl={hlProp ?? look.hl}
       accent={injectedAccent() ?? accentProp ?? look.accent}
+      paletteLight={Boolean(style.paper && style.ink
+                            && luma(style.bg || TOKENS.bg) >= 0.5)}
     />
   );
 };

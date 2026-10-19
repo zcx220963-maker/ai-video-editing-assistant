@@ -60,8 +60,11 @@ from . import hitmap as m_hit
 #: `TRANSITION_STYLES` 逐条校验，写坏的档名会被点名打回。
 EDITABLE_SHOT_FIELDS = ("code", "text", "highlight", "fields",
                         "min_duration_sec", "texture", "source", "bleed", "bg",
-                        "caption_style", "highlight_style",
-                        "transition")
+                        "caption_style", "highlight_style", "transition",
+                        # 2026-10-18：画面描述也是这一镜的一栏。整镜改写里只给
+                        # `brief` 而不再给 `code`＝**重画这一镜**（旧代码会被丢掉，
+                        # 由写手按新 brief 重写，见下面 ② 的 `redraw`）。
+                        "brief")
 
 #: 白名单五条的**人话形状**。指针被拒时把这行交给用户——他能改的就这五样，
 #: 猜第六样（比如 `/shots/0/fields/radius/min`）只会得到另一条错误。
@@ -234,7 +237,13 @@ def plan_code_patch(base: dict[str, Any], *,
                          f"（可改：{'、'.join(EDITABLE_SHOT_FIELDS)}）")
             continue
         i = current.index(sid)
-        doc["shots"][i] = {**doc["shots"][i], **copy.deepcopy(dict(raw_set))}
+        new_set = copy.deepcopy(dict(raw_set))
+        merged = {**doc["shots"][i], **new_set}
+        if "brief" in new_set and not str(new_set.get("code") or "").strip():
+            # 只改画面描述＝重画这一镜：留着旧代码，这一镜的缓存键不变、一个像素都
+            # 不会动，而模型以为自己改了。把旧代码扔掉，交给写手按新 brief 重写。
+            merged.pop("code", None)
+        doc["shots"][i] = merged
         sets_applied += 1
 
     if errors:

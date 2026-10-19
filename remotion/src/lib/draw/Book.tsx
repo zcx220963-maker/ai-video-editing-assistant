@@ -45,8 +45,8 @@ export const Book: React.FC<BookProps> = (props) => {
                     { color: ink.paper }));
     for (let i = 0; i < 4; i++) {
       const yy = top * 0.72 + i * h * 0.09;
-      ln(-half * 0.72, yy, -half * 0.2, yy + h * 0.02);
-      ln(half * 0.2, yy + h * 0.02, half * 0.72, yy);
+      out.push(ln(-half * 0.72, yy, -half * 0.2, yy + h * 0.02));
+      out.push(ln(half * 0.2, yy + h * 0.02, half * 0.72, yy));
     }
     // 翻起来的那一页：以交线为轴，按 flip 转到另一侧
     if (flip > 0) {

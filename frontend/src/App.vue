@@ -391,6 +391,494 @@ function toggleEntryMode() {
   entryMode.value = entryMode.value === "auto" ? "plan" : "auto";
   localStorage.setItem("ca.entryMode", entryMode.value);
 }
+// —— 风格包：入口选一套视觉，随 /chat 送到服务端，由 plan_motion 注入分镜 ——
+// 只列 `kind=style` 的技能；留空＝自动（模型按选题自己定）。选择本身不改变流程，
+// 只改变画面契约——所以它不占计划卡旋钮、也不需要在卡上逐项确认。
+const styleSkill = ref(localStorage.getItem("ca.styleSkill") || "");
+watch(styleSkill, (v) => localStorage.setItem("ca.styleSkill", v || ""));
+const styleOptions = computed(() =>
+  (skillsAdmin.value || []).filter((s) => s && s.kind === "style"));
+function styleLabel(name) {
+  const hit = (skillsAdmin.value || []).find((s) => s && s.name === name);
+  return (hit && (hit.display || hit.name)) || name;
+}
+// —— 风格模板库：从参考片沉淀出来的**可执行模板**（TSX） ——
+// 与素材库分开列：素材是原料，模板是已经过闸、能直接复用的成品。系统模板随镜像
+// 发布；用户模板只对本人可见，删它的时候连渲染容器里的那份一起删。
+const styleTemplates = ref([]);
+const loadingTemplates = ref(false);
+const templateBusy = ref("");          // 正在沉淀的 material_id（按钮禁用 + 文案）
+// {material_ids: [], filenames: [], slug, note}——可一次沉淀多条同风格参考片
+const templateForm = ref(null);
+const templateMsg = ref("");
+const templateErr = ref("");
+
+async function loadStyleTemplates() {
+  loadingTemplates.value = true;
+  try {
+    await ensureIdentity();
+    const r = await fetch("/style/templates", { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    styleTemplates.value = j.templates || [];
+  } catch (e) {
+    styleTemplates.value = [];
+    templateErr.value = "模板库加载失败：" + e.message;
+  } finally {
+    loadingTemplates.value = false;
+  }
+}
+
+// 文件名 → 合法短名：只留小写字母数字与 `-`，截 20 位。服务端还会再校验一次。
+function slugFromFilename(name) {
+  const slug = String(name || "").replace(/\.[^.]+$/, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "").slice(0, 20);
+  return slug || "style";
+}
+
+function openTemplateDeposit(items) {
+  const picked = (Array.isArray(items) ? items : [items])
+    .filter((x) => x && x.kind === "video" && x.material_id);
+  if (!picked.length) {
+    templateErr.value = "只能拿视频沉淀模板（音频在「音乐库」，图片不能当参考片）";
+    return;
+  }
+  templateForm.value = {
+    material_ids: picked.map((x) => x.material_id),
+    filenames: picked.map((x) => x.filename || x.material_id),
+    // 多条时用第一条的文件名起短名，用户仍可改。
+    slug: slugFromFilename(picked[0].filename),
+    note: "",
+  };
+  templateMsg.value = "";
+  templateErr.value = "";
+}
+
+// 素材库勾选里挑出视频，供工具栏「沉淀选中的 N 个视频」用。
+function selectedLibraryVideos() {
+  return (libraryItems.value || []).filter(
+    (x) => x.kind === "video" && libSelected[x.material_id]);
+}
+
+function cancelTemplateDeposit() {
+  if (templateBusy.value) return;   // 读片/过闸还在跑，关掉只会让人以为没开始
+  templateForm.value = null;
+}
+
+async function depositTemplate() {
+  const f = templateForm.value;
+  if (!f || templateBusy.value) return;
+  templateBusy.value = f.material_ids[0];
+  templateMsg.value = f.material_ids.length > 1
+    ? `正在读 ${f.material_ids.length} 条参考片、提炼共同语法、写模板、过闸——通常 2~5 分钟…`
+    : "读片、写模板、过闸中——通常 1~3 分钟…";
+  templateErr.value = "";
+  try {
+    await ensureIdentity();
+    // 先提交任务、再轮询：沉淀是分钟级任务，长连接很容易被浏览器/代理提前掐断
+    // （表现为 HTTP 499，而后端连请求都没看到）。提交只返回 job_id，连接很短。
+    const r = await fetch("/style/templates/deposit/jobs", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ material_ids: f.material_ids, slug: f.slug.trim(),
+                             name_hint: f.slug.trim(), note: f.note.trim() }),
+    });
+    const submitted = await r.json().catch(() => ({}));
+    if (!r.ok || submitted.ok === false) {
+      throw new Error(submitted.error || submitted.detail || ("HTTP " + r.status));
+    }
+    const jobId = submitted.job_id;
+    let j = null;
+    for (let i = 0; i < 600; i += 1) {          // 每 3 秒一次，最多等 30 分钟
+      await new Promise((done) => setTimeout(done, 3000));
+      const pr = await fetch(`/style/templates/deposit/jobs/${jobId}`,
+                             { headers: authHeaders() });
+      if (pr.status === 404) {
+        throw new Error("任务不存在了（服务可能重启过），请重新点一次沉淀");
+      }
+      const pj = await pr.json().catch(() => ({}));
+      if (!pr.ok) throw new Error(pj.detail || ("HTTP " + pr.status));
+      const secs = Math.round(Number(pj.elapsed) || 0);
+      templateMsg.value = `正在读片、写模板、过闸……已 ${Math.floor(secs / 60)} 分 `
+        + `${secs % 60} 秒（通常 2~5 分钟）`;
+      if (pj.status === "done") { j = pj.result || {}; break; }
+      if (pj.status === "error") {
+        const res = pj.result || {};
+        // `detail` 可能是字符串（FastAPI 的 HTTPException），也可能是字符串数组；
+        // 直接展开字符串会把它拆成一个个字，所以先判形状再拼。
+        const details = Array.isArray(res.detail) ? res.detail : [];
+        const head = res.error || pj.error
+          || (typeof res.detail === "string" ? res.detail : "")
+          || ("HTTP " + (pj.status_code || ""));
+        throw new Error([head, ...details]
+          .filter((x) => typeof x === "string" && x).join("；"));
+      }
+    }
+    if (!j) {
+      throw new Error("等待超时，任务可能仍在后台运行；稍后刷新模板库查看");
+    }
+    templateForm.value = null;
+    const refs = Number(j.references || 0);
+    templateMsg.value = `已沉淀模板《${j.display || j.name}》`
+      + (refs > 1 ? `（${refs} 条参考片）` : "")
+      + "，已加入入口的「风格」下拉";
+    // 刚沉淀的就是用户想要的：直接选上，省一次下拉操作。
+    if (j.name) styleSkill.value = j.name;
+    await Promise.all([loadStyleTemplates(), loadSkillsAdmin()]);
+  } catch (e) {
+    templateMsg.value = "";     // 失败时别把「正在读片」和错误一起挂着
+    templateErr.value = "沉淀失败：" + e.message;
+  } finally {
+    templateBusy.value = "";
+  }
+}
+
+async function deleteStyleTemplate(t) {
+  if (!t || t.system) return;
+  if (!confirm(`删除模板「${t.display || t.name}」？对应的风格包也会一起删除，且不可撤销。`)) return;
+  try {
+    const r = await fetch(`/style/templates/${encodeURIComponent(t.name)}`,
+                          { method: "DELETE", headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    if (styleSkill.value === t.name) styleSkill.value = "";
+    templateMsg.value = "已删除：" + (t.display || t.name);
+    await Promise.all([loadStyleTemplates(), loadSkillsAdmin()]);
+  } catch (e) {
+    templateErr.value = "删除失败：" + e.message;
+  }
+}
+function styleTemplateLabel(name) {
+  const hit = (styleTemplates.value || []).find((t) => t && t.name === name);
+  return (hit && (hit.display || hit.name)) || name;
+}
+
+// —— 换件：模板的每个导出组件都是一个可替换零件 ——
+// 只换零件、不换外壳：替换件必须导出同一个组件名、收同一套 props。新零件单独过闸，
+// 登记进基模板后，聊天里说「用XX风格，人物换成一鹿」时规划层就能把它绑进本片。
+//
+// 用户不该被要求懂 props。「换成别的 / 改画法 / 跟着每一镜变」三种改法各自带
+// 例子，服务端再把一句话解读成按哪个参数分档；界面只负责把零件画出来、让用户点。
+const variantForm = ref(null);         // {template, display, slots, preview, component, mode, follow, target, quick}
+const variantBusy = ref(false);
+const variantMsg = ref("");
+const variantErr = ref("");
+//: 换完的预览：{display, request, items: [{label, component, spec, preview}], failures}
+//: 一句话可以同时改好几个零件，所以结果是一组，不是一个。
+const variantResult = ref(null);
+//: 按当前模板/零件生成的建议（服务端调用一次模型）。缓存按「模板::零件」，
+//: 同一次打开面板里来回点零件不重复烧模型。
+const variantOptions = ref([]);
+const variantOptionAxes = ref([]);
+const variantOptionsBusy = ref(false);
+const variantOptionCache = new Map();
+
+//: 零件类型 → 图标。可视化用，不参与任何提示词。沉淀出来的模板 kind 可能是
+//: 中英文任意一种叫法，这里多收几种别名；认不出就退回中性图标，不挡事。
+const VARIANT_PART_ICONS = {
+  subject: "🚶", character: "🚶", person: "🚶", figure: "🚶",
+  object: "🧩", prop: "🧩", item: "🧩",
+  background: "🏞️", scene: "🏞️", sky: "🌅", landscape: "🏞️",
+  light: "✨", glow: "✨", lamp: "💡", fire: "🔥",
+  text: "🔤", caption: "🔤", subtitle: "🔤", title: "🔤", label: "🔤",
+  inscription: "🔖", date: "📅",
+  decor: "▦", particle: "✦", texture: "▦", overlay: "▦", grain: "▦",
+  other: "◻️",
+};
+//: 参数名 → 人话。界面上让用户选「跟着什么变」，不要求他知道 `wardrobe` 是什么。
+const VARIANT_AXIS_LABELS = {
+  wardrobe: "服饰", carried: "持物", sceneType: "场景", facing: "朝向",
+  walking: "行走", phase: "步态", strideSec: "步频",
+  skyColors: "天色", farColor: "远景颜色", midColor: "中景颜色",
+  groundColor: "地面颜色", windowLights: "窗光", horizon: "地平线",
+  groundY: "地平线高度", accent: "强调色", accentColor: "光色",
+  intensity: "亮度", radius: "光晕大小", text: "文案", position: "位置",
+  x: "横向位置", y: "纵向位置", heightRatio: "身高比例",
+};
+//: 不限定某一种模板：这里只是「改法」的四种意图，具体换成什么、按什么变，
+//: 由上面点中的零件和用户那句话决定。key 为空＝让服务端按原话判断。
+const VARIANT_MODES = [
+  { key: "", title: "让系统判断",
+    hint: "按你写的那句话来，不预设" },
+  { key: "replace", title: "换成别的东西",
+    hint: "把这个对象本身换掉" },
+  { key: "restyle", title: "改画法 / 轮廓",
+    hint: "对象不变，改形状与细节" },
+  { key: "by_shot", title: "跟着每一镜变",
+    hint: "每一镜按镜头内容分别长" },
+];
+
+function variantPartIcon(kind) {
+  return VARIANT_PART_ICONS[kind] || VARIANT_PART_ICONS.other;
+}
+function variantAxisLabel(prop) {
+  const hit = (variantOptionAxes.value || []).find((a) => a.prop === prop);
+  return (hit && hit.label) || VARIANT_AXIS_LABELS[prop] || prop;
+}
+// 零件现在能画什么：`values` 是能原样传给组件的取值；`reference` 只是参考片里
+// 见过的中文叫法（「山峦」「军装」），不能当参数值传，所以分开显示。
+function variantContentLabel(c) {
+  const values = (c && c.values ? c.values : []).filter((x) => String(x || "").trim());
+  const ref = (c && c.reference ? c.reference : []).filter((x) => String(x || "").trim());
+  if (values.length) {
+    return ref.length && ref.join("|") !== values.join("|")
+      ? `${values.join(" / ")}（参考片：${ref.join(" / ")}）`
+      : values.join(" / ");
+  }
+  return ref.length ? `参考片用过 ${ref.join(" / ")}` : "";
+}
+function variantContentText(slot) {
+  return ((slot && slot.content) || [])
+    .map((c) => {
+      const text = variantContentLabel(c);
+      return text ? `${variantAxisLabel(c.prop)}：${text}` : "";
+    })
+    .filter(Boolean)
+    .join("；");
+}
+function variantAxes() {
+  const f = variantForm.value;
+  if (!f || !f.component) return [];
+  const slot = (f.slots || []).find((s) => s.component === f.component);
+  const out = [];
+  const add = (p) => {
+    const name = String(p || "");
+    if (name && !out.includes(name)) out.push(name);
+  };
+  // 模板自己声明的轴优先；建议器从合约里另外挑出来的轴（比如背景的 sceneType）
+  // 也放出来——否则「跟着每一镜变」只能改颜色，改不了形状。
+  ((slot && slot.varies) || []).forEach(add);
+  (variantOptionAxes.value || []).forEach((a) => add(a && a.prop));
+  add(f.follow);
+  return out;
+}
+//: 当前选中的零件（自动判断时为 null）。卡面要显示它的默认画法和可变的轴。
+const variantSlot = computed(() => {
+  const f = variantForm.value;
+  if (!f || !f.component) return null;
+  return (f.slots || []).find((s) => s.component === f.component) || null;
+});
+//: 建议是「按这个模板、这个零件」现生成的，不是写死的风格例子。
+function applyVariantOptionsPayload(f, component, j) {
+  variantOptions.value = (j && j.options) || [];
+  variantOptionAxes.value = (j && j.axes) || [];
+  // 自动判断：把模型挑中的那个零件也点亮，用户看得见建议是给谁的。
+  if (!component && j && j.component && !f.component
+      && (f.slots || []).some((s) => s.component === j.component)) {
+    f.component = j.component;
+  }
+}
+let variantOptionsSeq = 0;
+async function loadVariantOptions(component) {
+  const f = variantForm.value;
+  if (!f) return;
+  const key = `${f.template}::${component || ""}`;
+  const seq = ++variantOptionsSeq;
+  variantOptions.value = [];
+  variantOptionAxes.value = [];
+  if (variantOptionCache.has(key)) {
+    applyVariantOptionsPayload(f, component, variantOptionCache.get(key));
+    return;
+  }
+  variantOptionsBusy.value = true;
+  try {
+    await ensureIdentity();
+    const r = await fetch(
+      `/style/templates/${encodeURIComponent(f.template)}/variant-options`,
+      {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ component: component || "" }),
+      });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) return;
+    variantOptionCache.set(key, j);
+    if (seq !== variantOptionsSeq || variantForm.value !== f) return;
+    applyVariantOptionsPayload(f, component, j);
+  } catch (e) {
+    // 建议失败不挡自己写：零件卡片、输入框与「开始换件」照常可用。
+  } finally {
+    if (seq === variantOptionsSeq) variantOptionsBusy.value = false;
+  }
+}
+
+function applyVariantOption(o) {
+  const f = variantForm.value;
+  if (!f || !o) return;
+  f.target = o.text || "";
+  f.mode = o.mode || "";
+  f.follow = o.follow || "";
+  f.suggested = "";
+}
+
+//: 点零件时先给一句能直接改的话——用户不用从空白框开始想怎么描述。
+function variantSuggestion(slot) {
+  const f = variantForm.value;
+  if (!f || !slot) return "";
+  const name = slot.label || slot.component || "这个零件";
+  if (f.mode === "by_shot") {
+    return `每一镜按镜头内容改变${name}的轮廓与形态（例如按时代换服饰、持物）`;
+  }
+  if (f.mode === "restyle") {
+    return `改${name}的画法与轮廓：`;
+  }
+  if (f.mode === "replace") return `把${name}换成`;
+  return `改${name}：`;
+}
+function applyVariantSuggestion() {
+  const f = variantForm.value;
+  if (!f) return;
+  const slot = (f.slots || []).find((s) => s.component === f.component) || null;
+  const tip = variantSuggestion(slot);
+  // 只在空白、或还是上一次自动填的那句时覆盖；用户自己写的话绝不吞掉。
+  if (tip && (!f.target.trim() || f.target === f.suggested)) f.target = tip;
+  f.suggested = tip;
+}
+function pickVariantPart(component) {
+  const f = variantForm.value;
+  if (!f) return;
+  f.component = component || "";
+  // 换零件后，变化轴跟着这个零件重选，避免拿着上一个零件的参数去分档。
+  if (f.mode === "by_shot") f.follow = variantAxes()[0] || "";
+  applyVariantSuggestion();
+  loadVariantOptions(component || "");
+}
+function setVariantMode(mode) {
+  const f = variantForm.value;
+  if (!f) return;
+  f.mode = mode;
+  if (mode === "by_shot") f.follow = variantAxes()[0] || "";
+  else f.follow = "";
+  applyVariantSuggestion();
+}
+function variantPlaceholder() {
+  const f = variantForm.value;
+  if (!f) return "";
+  if (f.mode === "by_shot") {
+    return "可选补充：例如第一镜和最后一镜要明显不同；其余交给系统按镜头内容画";
+  }
+  if (f.mode === "restyle") {
+    return "想怎么改？例如：轮廓更简洁、材质更粗糙、颜色更冷";
+  }
+  if (f.mode === "replace") {
+    return "换成什么？例如：一头鹿 / 一朵菊花 / 一个骑自行车的人";
+  }
+  return "想怎么改？例如：把主角换成一头鹿 / 不要头盔 / 每一镜跟着时代变";
+}
+
+function openVariantForm(t) {
+  if (!t || t.system) return;
+  const slots = (t.slots || []).filter((s) => s && s.component);
+  variantForm.value = {
+    template: t.name,
+    display: t.display || t.name,
+    slots,
+    preview: t.preview_url || "",
+    // 默认让系统判断：用户只说一句人话，服务端解读出换哪个零件、按什么分档。
+    // 不预设「换成别的」——那会把「每一镜变」的诉求悄悄压成整片一种。
+    component: "",
+    mode: "",
+    follow: "",
+    target: "",
+    suggested: "",
+    //: 一句话改整片：可以同时说人物和背景，服务端拆成多个零件。
+    quick: "",
+  };
+  variantResult.value = null;
+  variantMsg.value = "";
+  variantErr.value = "";
+  loadVariantOptions("");
+}
+
+function cancelVariantForm() {
+  if (variantBusy.value) return;   // 写替换件+过闸在跑，关掉只会让人以为没开始
+  variantForm.value = null;
+}
+
+async function submitVariant(quick = false) {
+  const f = variantForm.value;
+  if (!f || variantBusy.value) return;
+  const typed = quick ? (f.quick || "").trim() : f.target.trim();
+  // 「跟着每一镜变」可以一句话不说：默认要求就是按每镜内容变。
+  const target = typed || (!quick && f.mode === "by_shot"
+    ? "按每一镜的时代背景与内容改变这个零件的轮廓、形态与服饰" : "");
+  if (!target) return;
+  // 一句话改整片：不预设零件，让服务端把原话拆成几个零件；
+  // 精细改：只改点中的那一个（没点＝也让系统判断）。
+  const components = quick ? [] : (f.component ? [f.component] : []);
+  const mode = quick ? "" : (f.mode || "");
+  const follow = quick ? "" : (f.follow || "");
+  variantBusy.value = true;
+  variantErr.value = "";
+  variantMsg.value = mode === "by_shot"
+    ? "正在理解「每一镜怎么变」、写替换件与过闸……通常 1~3 分钟，请不要关闭页面…"
+    : "正在理解这句话、逐个零件写替换件与过闸……通常 1~3 分钟/件，请不要关闭页面…";
+  try {
+    await ensureIdentity();
+    // 与沉淀同一套「提交任务 → 轮询」：写替换件也是分钟级，别让长连接被掐断。
+    // 统一走 edits：一句话可以同时改人物和背景；只点一个零件时它就是单件。
+    const base = `/style/templates/${encodeURIComponent(f.template)}`;
+    const r = await fetch(`${base}/edits/jobs`, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ components, target, mode, follow }),
+    });
+    const submitted = await r.json().catch(() => ({}));
+    if (!r.ok || submitted.ok === false) {
+      throw new Error(submitted.error || submitted.detail || ("HTTP " + r.status));
+    }
+    const jobId = submitted.job_id;
+    let j = null;
+    for (let i = 0; i < 600; i += 1) {
+      await new Promise((done) => setTimeout(done, 3000));
+      const pr = await fetch(`${base}/edits/jobs/${jobId}`,
+                             { headers: authHeaders() });
+      if (pr.status === 404) {
+        throw new Error("任务不存在了（服务可能重启过），请重新点一次换件");
+      }
+      const pj = await pr.json().catch(() => ({}));
+      if (!pr.ok) throw new Error(pj.detail || ("HTTP " + pr.status));
+      const secs = Math.round(Number(pj.elapsed) || 0);
+      variantMsg.value = `正在逐个零件写替换件、过闸……已 ${Math.floor(secs / 60)} 分 `
+        + `${secs % 60} 秒（通常 1~3 分钟/件）`;
+      if (pj.status === "done") { j = pj.result || {}; break; }
+      if (pj.status === "error") {
+        const res = pj.result || {};
+        const details = Array.isArray(res.detail) ? res.detail : [];
+        const head = res.error || (typeof res.detail === "string" ? res.detail : "")
+          || ("HTTP " + (pj.status_code || ""));
+        throw new Error([head, ...details]
+          .filter((x) => typeof x === "string" && x).join("；"));
+      }
+    }
+    if (!j) throw new Error("等待超时，任务可能仍在后台运行；稍后刷新模板库查看");
+    const items = (j.edits || []).map((e) => ({
+      label: e.label || target,
+      component: e.component || "",
+      spec: ((e.intent || {}).spec) || "",
+      preview: e.preview_url || "",
+    }));
+    if (!items.length) {
+      throw new Error(j.error || "这次没有换成任何零件，请把要求写得更具体一点");
+    }
+    variantForm.value = null;
+    variantResult.value = {
+      display: f.display,
+      request: target,
+      items,
+      failures: Array.isArray(j.failures) ? j.failures : [],
+    };
+    variantMsg.value = "";
+    await loadStyleTemplates();
+  } catch (e) {
+    variantMsg.value = "";
+    variantErr.value = "换件失败：" + e.message;
+  } finally {
+    variantBusy.value = false;
+  }
+}
+
 // —— 工具库两级导航:父列表(分类) → 二级清单 ——
 const toolView = ref(null);       // null=父列表;'tools'|'skills'|'mcp'=已进入的分类
 const catManage = ref(null);      // 分类管理弹窗:null|'tools'|'skills'|'mcp'
@@ -493,7 +981,8 @@ async function loadMaterials() {
 
 async function toggleLibrary() {
   activePanel.value = activePanel.value === 'library' ? null : 'library';
-  if (activePanel.value === 'library') await loadMaterials();
+  // 模板库与素材库同屏：一个列原料，一个列「已经沉淀好的可复用成品」。
+  if (activePanel.value === 'library') await Promise.all([loadMaterials(), loadStyleTemplates()]);
 }
 
 // ---- 音乐库：GD Studio 在线搜索 + 试听 + 指定配乐 ----
@@ -1299,8 +1788,10 @@ async function deleteSelected() {
 }
 
 // 工具库：从后端拉取全部已注册工具、技能和 MCP 节点，中文展示作用说明。
-async function loadTools() {
-  if (toolLib.value) return;
+// `force`：技能保存后必须重拉——`/tools` 里带着技能清单与词表，缓存一次就永远不刷新，
+// 新建的风格包在入口下拉里要等到刷新页面才出现。
+async function loadTools(force = false) {
+  if (toolLib.value && !force) return;
   loadingTools.value = true;
   try {
     await ensureIdentity();
@@ -1588,17 +2079,106 @@ function editSkillForm(create) {
   const d = itemModal.value.detail;
   skillForm.value = (create || !d) ? {
     name: "", display: "", always: false, description: "", requires: "", body: "",
+    kind: "workflow", sectionsText: "", excludeText: "",
+    manifestText: "{}",
   } : {
     name: d.name, display: d.display || "", always: !!d.always,
     description: d.description || "", requires: (d.requires || []).join(", "),
-    body: d.body || "",
+    body: d.body || "", kind: d.kind || "workflow",
+    // 这两栏保存时必须带回去——从前 PUT 不带它们，保存一次就把技能的分段声明
+    // 与排除规则静默清空了。表单里给一行逗号清单，解析仍在服务端做。
+    sectionsText: (d.sections || []).join(", "),
+    excludeText: (d.exclude || []).join(", "),
+    manifestText: JSON.stringify(d.style_manifest || {}, null, 2),
   };
   skillsMsg.value = "";
+}
+
+// 「填入剪影模板」不在这里抄一份默认值：从已入库的系统风格包读真 manifest，
+// 前端就不必维护第四份副本，库里改了这里跟着变。
+async function fillStyleTemplate() {
+  const f = skillForm.value;
+  if (!f) return;
+  try {
+    await ensureIdentity();
+    const r = await fetch("/skills/style_silhouette_history", { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    const m = j.style_manifest || {};
+    if (!Object.keys(m).length) throw new Error("系统风格包没有 manifest（镜像里的种子没同步？）");
+    f.manifestText = JSON.stringify(m, null, 2);
+    if (f.kind !== "style") f.kind = "style";
+    skillsMsg.value = "已填入「剪影年轮」的 manifest";
+  } catch (e) {
+    skillsMsg.value = "填模板失败：" + e.message;
+  }
+}
+
+// 逗号清单 → 数组（中英文逗号、顿号都认）。空串就是空数组，不是 [""]。
+function splitList(text) {
+  return String(text || "").split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
+}
+
+const SKILL_KINDS = { workflow: "工作流", capability: "能力", style: "风格包" };
+function kindLabel(kind) {
+  return SKILL_KINDS[kind] || SKILL_KINDS.workflow;
+}
+
+function manifestPretty(m) {
+  try {
+    return JSON.stringify(m || {}, null, 2);
+  } catch (e) {
+    return String(m || "");
+  }
+}
+
+// 系统内置只读：复制成一份属于本人的风格包。名字必须换一个——
+// 同名 PUT 会被服务端的系统技能只读校验挡回来。
+function duplicateAsMine() {
+  const d = itemModal.value.detail;
+  if (!d) return;
+  editSkillForm(true);
+  const f = skillForm.value;
+  f.name = `${d.name}_mine`;
+  f.display = (d.display || d.name) + "（我的）";
+  f.description = d.description || "";
+  f.body = d.body || "";
+  f.kind = d.kind || "workflow";
+  f.manifestText = JSON.stringify(d.style_manifest || {}, null, 2);
+  f.sectionsText = (d.sections || []).join(", ");
+  f.excludeText = (d.exclude || []).join(", ");
+  skillsMsg.value = "已复制一份草稿；改完点保存即成你自己的风格包。";
+}
+
+// 教程里那条「Studio 改动会写回代码，调参前先留版本」的最小实现：
+// 服务端在 manifest 变化时把旧值存进 `style_manifest_prev`，这里把它填回表单。
+function restorePrevManifest() {
+  const d = itemModal.value.detail;
+  if (!d || !d.style_manifest_prev) return;
+  editSkillForm(false);
+  skillForm.value.manifestText = JSON.stringify(d.style_manifest_prev, null, 2);
+  if (skillForm.value.kind !== "style") skillForm.value.kind = "style";
+  skillsMsg.value = "已把上一版 manifest 填回表单；点保存才生效。";
 }
 
 async function saveSkillForm() {
   const f = skillForm.value;
   if (!f || !f.name.trim()) { skillsMsg.value = "技能名必填"; return; }
+  const kind = f.kind || "workflow";
+  let manifest = {};
+  if (kind === "style") {
+    // 风格包 manifest 是**数据**：解析失败就地提示，不发出去——服务端只收 dict。
+    try {
+      manifest = JSON.parse(f.manifestText || "{}");
+    } catch (e) {
+      skillsMsg.value = "manifest 不是合法 JSON：" + e.message;
+      return;
+    }
+    if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+      skillsMsg.value = "manifest 必须是一个 JSON 对象（{…}）";
+      return;
+    }
+  }
   skillBusy.value = true;
   try {
     const r = await fetch(`/skills/${encodeURIComponent(f.name.trim())}`, {
@@ -1606,13 +2186,16 @@ async function saveSkillForm() {
       headers: { ...authHeaders(), "Content-Type": "application/json" },
       body: JSON.stringify({ display: f.display, always: !!f.always,
                              description: f.description, requires: f.requires,
-                             body: f.body }),
+                             body: f.body, kind,
+                             style_manifest: manifest,
+                             sections: splitList(f.sectionsText),
+                             exclude: splitList(f.excludeText) }),
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
     skillsMsg.value = "已保存：" + j.saved;
     await loadSkillsAdmin();
-    await loadTools();                      // /tools 技能清单与词表同步刷新
+    await loadTools(true);                  // /tools 技能清单与词表同步刷新
     await openSkillModal(f.name.trim());    // 回到查看态,展示刚保存的内容
   } catch (e) {
     skillsMsg.value = "保存失败：" + e.message;
@@ -2232,6 +2815,9 @@ function planCardOf(src) {
     plan_id: String(p.plan_id || ""),
     label: p.label || "",
     goal: p.goal || "",
+    // 服务端把本轮风格包挂在每份候选上（见 `SubmitPlanTool`）：刷新、换设备、
+    // 从执行记录重放同一张卡，都能显示它是按哪套视觉排的。
+    style_skill: p.style_skill || "",
     steps: (p.steps || []).map((s) => ({
       seq: s.seq,
       node_display: s.node_display || toolLabel(s.node),
@@ -2262,6 +2848,7 @@ function planCardOf(src) {
     // 帧上的 run_id（= 规划轮的 run）：提问卡的签名、冷启动补弹都按它对齐
     frame_run_id: src.run_id || "",
     plans, warnings: src.warnings || [],
+    style: src.style_skill || plans[0].style_skill || "",
     chosen: plans[0].plan_id,
     final: {}, custom: {}, skip: {}, general: "",
     feedback: "", askFeedback: false, submitting: false, error: "", exec_run: "",
@@ -2754,6 +3341,9 @@ async function send() {
         conversation_id: cid, message: text,
         attachments: atts0.map((a) => a.material_id),
         mode: entryMode.value,
+        // 选中的风格包名（空串＝自动）。服务端会校验归属与 kind，
+        // 不可用时只回一句「按默认视觉继续」，不会让这次请求失败。
+        style_skill: styleSkill.value || "",
       }),
     });
     const j = await r.json().catch(() => ({}));
@@ -3886,6 +4476,9 @@ async function scrollDown() {
 onMounted(() => {
   ensureIdentity().catch(() => {}).then(loadConvs);   // 身份 → 会话列表，都是服务端的真相
   ensureCatalog();    // 词表预热：剪辑进度卡/流水线的中文名不靠用户先打开工具库
+  // 风格包要**一进来就拉**：入口那个下拉只列 `kind=style`，等用户打开工具库
+  // 才加载的话，第一次进页面根本看不到「剪影年轮」。
+  ensureIdentity().catch(() => {}).then(loadSkillsAdmin);
 });
 onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()));
 </script>
@@ -4115,6 +4708,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <div class="plan-inline" :class="m.state">
                 <span class="pi-ico">🗂</span>
                 <b>{{ planChosen(m).label || '剪辑方案' }}</b>
+                <span v-if="m.style" class="pi-tag style">风格 · {{ styleLabel(m.style) }}</span>
                 <button
                   v-if="m.state === 'waiting'"
                   class="clip pi-open"
@@ -4317,6 +4911,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       <div v-if="planModal && planModal.state === 'waiting'" class="plan-banner">
         <span class="pb-icon">🗂</span>
         <span class="pb-label">{{ planChosen(planModal).label || '剪辑方案' }}</span>
+        <span v-if="planModal.style" class="pb-style">风格 · {{ styleLabel(planModal.style) }}</span>
         <span class="pb-hint">已在右侧列出完整链路，确认后即执行</span>
         <button class="pb-btn primary" :disabled="planModal.submitting" @click="confirmPlan(planModal)">
           {{ planModal.submitting ? '提交中…' : '按此执行' }}
@@ -4346,6 +4941,14 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                   ? '全自动：一句话直接做到出片，没提到的由助手自己定，渲染前弹一张计划确认卡'
                   : '先出计划：先给计划卡逐项确认，再开始执行'"
                 @click="toggleEntryMode">{{ entryMode === "auto" ? "全自动" : "先出计划" }}</button>
+        <select v-model="styleSkill" class="clip style-pick"
+                :class="{ on: !!styleSkill }"
+                title="风格包：选一套已经定好的视觉；留空＝按你说的选题自己定">
+          <option value="">风格：自动</option>
+          <option v-for="s in styleOptions" :key="s.name" :value="s.name">
+            风格：{{ s.display || s.name }}
+          </option>
+        </select>
         <textarea
           v-model="draft"
           rows="1"
@@ -4784,6 +5387,10 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <template v-else-if="itemModal.detail">
                 <div class="kv"><span>机器名</span><b>{{ itemModal.detail.name }}</b></div>
                 <div class="kv"><span>中文名</span><b>{{ itemModal.detail.display || "—" }}</b></div>
+                <div class="kv"><span>类型</span><b>{{ kindLabel(itemModal.detail.kind) }}
+                  <span v-if="itemModal.detail.system">· 系统内置（只读）</span></b></div>
+                <div v-if="itemModal.detail.kind === 'style'" class="kv top"><span>manifest</span>
+                  <pre class="skill-pre">{{ manifestPretty(itemModal.detail.style_manifest) }}</pre></div>
                 <div class="kv"><span>状态</span><b>
                   <span :class="itemModal.detail.available ? 'st-ok' : 'st-bad'">
                     {{ itemModal.detail.available ? "可用" : (itemModal.detail.unavailable_reason || "不可用") }}</span>
@@ -4794,8 +5401,14 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                 <div class="kv top"><span>正文（SKILL.md）</span>
                   <pre class="skill-pre">{{ itemModal.detail.body }}</pre></div>
                 <div class="td-row-btns">
-                  <button class="help" @click="editSkillForm(false)">✎ 编辑</button>
-                  <button class="help danger" @click="delSkillFromModal()">删除</button>
+                  <button v-if="!itemModal.detail.system" class="help"
+                          @click="editSkillForm(false)">✎ 编辑</button>
+                  <button v-if="itemModal.detail.system" class="help"
+                          @click="duplicateAsMine">另存为我的风格</button>
+                  <button v-if="itemModal.detail.style_manifest_prev" class="help"
+                          @click="restorePrevManifest">↶ 恢复上一版 manifest</button>
+                  <button v-if="!itemModal.detail.system" class="help danger"
+                          @click="delSkillFromModal()">删除</button>
                 </div>
               </template>
             </template>
@@ -4805,7 +5418,25 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <input v-model="skillForm.display" placeholder="中文名（界面显示）" />
               <input v-model="skillForm.description" placeholder="description（触发关键，写清何时用）" />
               <input v-model="skillForm.requires" placeholder="依赖（可选），如 CLI: curl, ENV: KEY" />
+              <label class="kv chk">
+                类型
+                <select v-model="skillForm.kind" class="style-pick">
+                  <option value="workflow">工作流（一条出片流程）</option>
+                  <option value="capability">能力</option>
+                  <option value="style">风格包（一套视觉契约）</option>
+                </select>
+              </label>
               <label class="kv chk"><input type="checkbox" v-model="skillForm.always" /> 常驻注入（每次对话都带上正文）</label>
+              <input v-model="skillForm.sectionsText" placeholder="分段声明（可选，逗号分隔，如 image-channel, sound-design）" />
+              <input v-model="skillForm.excludeText" placeholder="排除的附件前缀（可选，逗号分隔，如 demos/, shots/）" />
+              <template v-if="skillForm.kind === 'style'">
+                <div class="kv chk">
+                  <button class="help" type="button" @click="fillStyleTemplate">填入剪影模板</button>
+                  <span class="lib-empty" style="display:inline">manifest 是给镜头写手的视觉契约：同一构图、同一光位、字幕位置。</span>
+                </div>
+                <textarea v-model="skillForm.manifestText" rows="12"
+                          placeholder='{"template": "silhouette-history", "repeat_composition": true, …}'></textarea>
+              </template>
               <textarea v-model="skillForm.body" rows="14"
                         placeholder="SKILL.md 正文（markdown，不含 frontmatter）"></textarea>
               <div v-if="skillsMsg" class="lib-empty">{{ skillsMsg }}</div>
@@ -4835,9 +5466,15 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             :disabled="deletingLib"
             @click="deleteSelected"
           >{{ deletingLib ? "删除中…" : `删除选中 ${libSelCount()} 项` }}</button>
+          <button
+            v-if="selectedLibraryVideos().length"
+            class="lib-add-btn"
+            :disabled="!!templateBusy"
+            @click="openTemplateDeposit(selectedLibraryVideos())"
+          >沉淀选中 {{ selectedLibraryVideos().length }} 个视频为模板</button>
         </div>
         <div v-if="!libraryItems.length && !loadingLibrary" class="lib-empty">
-          还没有素材。上传后会自动出现在这里。
+          还没有画面素材。上传视频或图片后会出现在这里（音频在「音乐库」）。
         </div>
         <div class="lib-grid">
           <div
@@ -4862,13 +5499,256 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <span>{{ fmtSize(item.bytes) }}<template v-if="item.duration"> · {{ Math.round(item.duration) }}s</template></span>
             </div>
             <button class="lib-add" @click="addFromLibrary(item)">加入本会话</button>
+            <button v-if="item.kind === 'video'" class="lib-add tpl-deposit-btn"
+                    :disabled="!!templateBusy"
+                    @click="openTemplateDeposit(item)">
+              {{ templateBusy === item.material_id ? "沉淀中…" : "沉淀为风格模板" }}
+            </button>
+          </div>
+        </div>
+
+        <!-- 参考片 → 模板：抽帧读片、写 TSX、过闸后才发布。
+             用弹窗而不是列表末尾的内联块：素材一多，表单会长在滚动区外，
+             点按钮看起来像「没反应」。 -->
+        <div v-if="templateForm" class="modal-mask" @click.self="cancelTemplateDeposit">
+          <div class="modal-card tpl-card">
+            <div class="modal-head">
+              <b>沉淀为风格模板</b>
+              <button class="help" :disabled="!!templateBusy"
+                      @click="cancelTemplateDeposit">取消</button>
+            </div>
+            <div class="modal-body">
+              <p v-if="templateForm.filenames.length > 1" class="modal-note">
+                参考片 {{ templateForm.filenames.length }} 条：{{ templateForm.filenames.join("、") }}。
+                会提炼它们的共同视觉语法，再写 TSX、过闸后才发布，通常 2~5 分钟。
+              </p>
+              <p v-else class="modal-note">
+                参考片：{{ templateForm.filenames[0] }}。会读片、写 TSX、过闸后才发布，通常 1~3 分钟。
+              </p>
+              <label>模板名（中文可以；内部短名由系统生成）</label>
+              <input v-model="templateForm.slug"
+                     placeholder="例：人影风格 / firelight" />
+              <label>补充说明（可选）</label>
+              <textarea v-model="templateForm.note" rows="2"
+                        placeholder="例如「剪影风格，人物不要画写实」"></textarea>
+              <div class="td-row-btns">
+                <button class="help" :disabled="!!templateBusy || !templateForm.slug.trim()"
+                        @click="depositTemplate">
+                  {{ templateBusy ? "读片与写模板中…" : "开始沉淀" }}
+                </button>
+              </div>
+              <div v-if="templateMsg" class="lib-empty">{{ templateMsg }}</div>
+              <div v-if="templateErr" class="lib-empty bad">{{ templateErr }}</div>
+            </div>
+          </div>
+        </div>
+        <div v-if="templateErr && !templateForm" class="lib-empty bad">{{ templateErr }}</div>
+        <div v-if="templateMsg && !templateForm" class="lib-empty">{{ templateMsg }}</div>
+        <div v-if="variantErr && !variantForm" class="lib-empty bad">{{ variantErr }}</div>
+        <div v-if="variantMsg && !variantForm" class="lib-empty">{{ variantMsg }}</div>
+
+        <!-- 换件结果：一句话可能改了好几个零件，每个都给一张画出来的样子。 -->
+        <div v-if="variantResult" class="variant-result">
+          <div class="variant-result-body">
+            <b>已给《{{ variantResult.display }}》改好 {{ variantResult.items.length }} 个零件</b>
+            <span v-if="variantResult.request">你的要求：{{ variantResult.request }}</span>
+            <div v-for="(it, i) in variantResult.items" :key="i"
+                 class="variant-result-item">
+              <img v-if="it.preview" :src="it.preview"
+                   class="variant-result-img" :alt="it.label" />
+              <div class="variant-result-text">
+                <b>{{ it.label }}</b>
+                <span>零件：{{ it.component }}</span>
+                <span v-if="it.spec">理解为：{{ it.spec }}</span>
+              </div>
+            </div>
+            <span v-if="variantResult.failures.length" class="bad">
+              没换成的：{{ variantResult.failures
+                .map((x) => x.label + "（" + x.error + "）").join("；") }}
+            </span>
+            <span>之后的影片会自动用上它们；想回到模板自带的画法，在对话里说「用回默认的」即可。</span>
+            <button class="help" @click="variantResult = null">知道了</button>
+          </div>
+        </div>
+
+        <!-- 换件：挑一个零件，说清换成什么。写出来的只是这一个组件，外壳不动。 -->
+        <div v-if="variantForm" class="modal-mask" @click.self="cancelVariantForm">
+          <div class="modal-card tpl-card">
+            <div class="modal-head">
+              <b>换件 · {{ variantForm.display }}</b>
+              <button class="help" :disabled="variantBusy"
+                      @click="cancelVariantForm">取消</button>
+            </div>
+            <div class="modal-body">
+              <div v-if="variantForm.preview" class="variant-hero">
+                <img :src="variantForm.preview" :alt="variantForm.display" />
+                <span>外壳不动：构图、运镜、配色、字幕都保留，只换画面里的东西。</span>
+              </div>
+
+              <label>① 直接说你想要的效果（可以一次改好几样）</label>
+              <textarea v-model="variantForm.quick" rows="3"
+                        :disabled="variantBusy"
+                        placeholder="例如：我要做一条从古至今娱乐方式进化的片子——背景要能从洞穴、雅典广场、罗马竞技场、宋代街市，一路画到客厅、街机厅、网吧、地铁、出租屋；人物衣服跟着时代变；发光的东西从篝火、火炬、灯笼、煤气灯，变成电视、示波器、街机屏幕、显示器、手机"></textarea>
+              <div class="td-row-btns">
+                <button class="help"
+                        :disabled="variantBusy || !variantForm.quick.trim()"
+                        @click="submitVariant(true)">
+                  {{ variantBusy ? "理解需求、逐个零件写替换件与过闸中…"
+                                 : "按这句话改（系统自己找零件）" }}
+                </button>
+              </div>
+              <p class="modal-note">
+                一句话里同时说人物和背景，系统会拆成几个零件分别改；某个没换好不影响其它。
+                不用写参数名，也不用知道模板里有哪些零件。
+                要做一整片时，直接把整片的想法贴进来：系统会按片子里出现的时代和场景，
+                把每个零件能画的档位一次性补齐，之后这套模板就能反复用。
+              </p>
+
+              <div class="lib-divider"></div>
+              <label>② 或者点一个零件精细改（不点就由系统按你的话判断）</label>
+              <div v-if="variantForm.slots.length" class="variant-parts">
+                <button class="variant-part"
+                        :class="{ on: !variantForm.component }"
+                        :disabled="variantBusy"
+                        @click="pickVariantPart('')">
+                  <span class="vp-icon">🤖</span>
+                  <b>自动判断</b>
+                  <small>按你的话选零件</small>
+                </button>
+                <button v-for="s in variantForm.slots" :key="s.component"
+                        class="variant-part"
+                        :class="{ on: variantForm.component === s.component }"
+                        :disabled="variantBusy"
+                        @click="pickVariantPart(s.component)">
+                  <span class="vp-icon">{{ variantPartIcon(s.kind) }}</span>
+                  <b>{{ s.label }}</b>
+                  <small :title="s.component">{{ s.default || s.component }}</small>
+                  <em v-if="(s.variants || []).length">换过 {{ s.variants.length }} 次</em>
+                </button>
+              </div>
+              <div v-else class="lib-empty bad">这个模板没有可换的零件。</div>
+              <p v-if="variantSlot" class="modal-note variant-part-note">
+                画法（固定）：{{ variantSlot.default || "按模板默认画法" }}
+                <span v-if="variantAxes().length">
+                  · 内容可随镜头变：{{ variantAxes().map(variantAxisLabel).join("、") }}
+                </span>
+                <span v-if="variantContentText(variantSlot)">
+                  · 现在能画：{{ variantContentText(variantSlot) }}
+                </span>
+              </p>
+
+              <div v-if="variantOptions.length" class="variant-suggest">
+                <span class="vs-head">可以直接点，也可以自己写：</span>
+                <button v-for="(o, i) in variantOptions" :key="i"
+                        class="variant-suggest-chip"
+                        :class="{ on: variantForm.target === o.text }"
+                        :disabled="variantBusy"
+                        @click="applyVariantOption(o)">{{ o.text }}</button>
+              </div>
+              <p v-else-if="variantOptionsBusy" class="modal-note">
+                正在按这个模板想几种改法…
+              </p>
+
+              <label>③ 怎么改</label>
+              <div class="variant-modes">
+                <button v-for="m in VARIANT_MODES" :key="m.key"
+                        class="variant-mode"
+                        :class="{ on: variantForm.mode === m.key }"
+                        :disabled="variantBusy"
+                        @click="setVariantMode(m.key)">
+                  <b>{{ m.title }}</b>
+                  <small>{{ m.hint }}</small>
+                </button>
+              </div>
+
+              <template v-if="variantForm.mode === 'by_shot'">
+                <label>跟着什么变（不选就让系统挑）</label>
+                <div v-if="variantAxes().length" class="variant-axes">
+                  <button class="variant-axis"
+                          :class="{ on: !variantForm.follow }"
+                          :disabled="variantBusy"
+                          @click="variantForm.follow = ''">
+                    让系统挑
+                  </button>
+                  <button v-for="a in variantAxes()" :key="a"
+                          class="variant-axis"
+                          :class="{ on: variantForm.follow === a }"
+                          :disabled="variantBusy"
+                          @click="variantForm.follow = a">
+                    {{ variantAxisLabel(a) }}<small>{{ a }}</small>
+                  </button>
+                </div>
+                <p v-else class="modal-note">
+                  这个零件还没有声明「可随镜头变化」的参数；系统会从它的可调项里
+                  挑一个能表达变化的，再按每镜内容逐档画。
+                </p>
+                <p class="modal-note">
+                  换了之后，同一套模板在每一镜会按镜头内容分别传值：这个零件逐镜变化，
+                  不必整片一种；其它零件与外壳不动。
+                </p>
+              </template>
+
+              <label>④ 自己写一句（{{ variantForm.mode === "by_shot" ? "可选" : "必填" }}）</label>
+              <textarea v-model="variantForm.target" rows="3"
+                        :disabled="variantBusy"
+                        :placeholder="variantPlaceholder()"></textarea>
+              <p class="modal-note">
+                说人话就行，不用写参数名。系统会把这句话翻译成画法，
+                画完会告诉你它「理解为：…」。
+              </p>
+
+              <div class="td-row-btns">
+                <button class="help"
+                        :disabled="variantBusy || (variantForm.mode !== 'by_shot'
+                                                  && !variantForm.target.trim())"
+                        @click="submitVariant(false)">
+                  {{ variantBusy ? "理解需求、写替换件与过闸中…"
+                                 : (variantForm.mode === "by_shot"
+                                    ? "按每一镜变" : "开始换件") }}
+                </button>
+              </div>
+              <div v-if="variantMsg" class="lib-empty">{{ variantMsg }}</div>
+              <div v-if="variantErr" class="lib-empty bad">{{ variantErr }}</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="lib-divider"></div>
+        <div class="lib-head">
+          <span class="lib-count">风格模板 · {{ styleTemplates.length }}</span>
+          <button class="help" @click="loadStyleTemplates" :disabled="loadingTemplates">
+            {{ loadingTemplates ? "刷新中…" : "刷新" }}
+          </button>
+        </div>
+        <div v-if="!styleTemplates.length && !loadingTemplates" class="lib-empty">
+          还没有模板。上传一条参考视频，点「沉淀为风格模板」。
+        </div>
+        <div class="lib-grid">
+          <div v-for="t in styleTemplates" :key="t.name" class="lib-item">
+            <img v-if="t.preview_url" :src="t.preview_url" class="lib-thumb"
+                 :alt="t.display || t.name" />
+            <div v-else class="lib-thumb tpl-thumb-empty">无预览</div>
+            <div class="lib-meta">
+              <b>{{ t.display || t.name }}</b>
+              <span v-if="t.variant_of" class="tpl-variant-tag">
+                替换件 · 给《{{ styleTemplateLabel(t.variant_of.template) }}》的
+                {{ t.variant_of.component }} 换成了「{{ t.variant_of.label }}」
+              </span>
+              <span v-else>{{ t.system ? "系统内置" : "我的模板" }} · v{{ t.version }} ·
+                {{ (t.components || []).length }} 个组件</span>
+              <span v-if="t.description" class="tpl-desc">{{ t.description }}</span>
+            </div>
+            <button v-if="!t.system && !t.variant_of" class="lib-add tpl-deposit-btn"
+                    @click="openVariantForm(t)">换件</button>
+            <button v-if="!t.system" class="lib-del-btn"
+                    @click="deleteStyleTemplate(t)">删除</button>
           </div>
         </div>
       </div>
 
       <div v-if="activePanel === 'bgm'" class="library">
         <div class="lib-head">
-          <span class="lib-count">已导入曲库 · {{ bgmImported.length }} 首</span>
+          <span class="lib-count">音乐库 · {{ bgmImported.length }} 首</span>
           <button class="help" @click="loadBgmImported" :disabled="loadingBgmImported">
             {{ loadingBgmImported ? "刷新中…" : "刷新" }}
           </button>
@@ -4877,7 +5757,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <div v-for="item in bgmImported" :key="item.material_id" class="lib-item">
             <div class="lib-meta">
               <b>🎵 {{ item.filename }}</b>
-              <span>{{ fmtSize(item.bytes) }}<template v-if="item.duration"> · {{ Math.round(item.duration) }}s</template></span>
+              <span>{{ item.origin === "bgm" ? "曲库导入" : "本地上传" }} ·
+                {{ fmtSize(item.bytes) }}<template v-if="item.duration"> · {{ Math.round(item.duration) }}s</template></span>
             </div>
             <audio v-if="item.url" :src="item.url" class="lib-aud" controls preload="none"></audio>
             <button class="lib-add" @click="addBgmImported(item)">加入本会话</button>
@@ -4887,7 +5768,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           </div>
         </div>
         <div v-else-if="!loadingBgmImported" class="lib-empty">
-          曲库还没有导入歌曲。在下方搜索框搜到喜欢的歌，点「导入并做配乐」即可加入曲库。
+          音乐库还没有音频。可以在下方搜索导入，或直接在对话里上传音频文件——它们都会出现在这里。
         </div>
         <div class="lib-divider"></div>
         <div class="lib-head">
@@ -5241,8 +6122,9 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                   class="clip ghost" :disabled="savingSearch" @click="clearSearchOverride">清除页面覆盖</button>
         </div>
         <p class="set-note">
-          brave / tavily / serpapi 要 API Key；searxng 是自建实例、只要地址（它的
-          settings.yml 得打开 json_format）。留空即回到免 key 回落链，保存即生效不重启。
+          模型用的是 DeepSeek 时，留空就自动走 DeepSeek 官方检索与抓取（沿用模型密钥，
+          每千次 5 元）；deepseek 也可以单独填一把 Key。brave / tavily / serpapi 要 API Key；
+          searxng 是自建实例、只要地址（它的 settings.yml 得打开 json_format）。保存即生效不重启。
         </p>
         <div v-if="testSearchResult" class="probe">
           <div>
@@ -6076,6 +6958,17 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .clip:hover { color: var(--vermilion); border-color: var(--vermilion); }
 .clip.busy { color: var(--vermilion); border-style: solid; cursor: wait; }
+/* 风格下拉：外形与旁边的 .clip 一致，但它是 <select>——原生小三角收进内边距里。 */
+.style-pick {
+  appearance: none; -webkit-appearance: none;
+  max-width: 190px; padding-right: 26px;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+                    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+.style-pick option { color: var(--ink); background: var(--paper); }
 .clip .spin { animation: pulse 0.9s infinite; }
 .paper { position: relative; }
 .paper.dropping { outline: 2px dashed var(--vermilion); outline-offset: -8px; background: rgba(200, 64, 31, 0.04); }
@@ -6246,6 +7139,112 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   transition: all 0.18s;
 }
 .lib-add:hover { color: #fff8ec; background: var(--vermilion); border-style: solid; }
+/* 模板沉淀：参考片 → 可执行模板（与素材库同屏，但它是成品、不是原料） */
+.tpl-deposit-btn { border-style: solid; opacity: 0.85; }
+.tpl-deposit-btn:disabled { opacity: 0.45; cursor: wait; }
+.tpl-card { width: min(460px, calc(100vw - 32px)); }
+.tpl-card .modal-body label { font-size: 12px; color: var(--ink-soft); }
+.tpl-thumb-empty {
+  display: grid; place-items: center; min-height: 96px;
+  font-family: var(--serif); font-size: 12px; letter-spacing: 2px; color: var(--ink-soft);
+}
+.tpl-desc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 换件：替换件不是一套新风格，只是基模板里的一个零件——行内小标签说清归属。 */
+.tpl-variant-tag { color: var(--ink-soft); font-size: 11px; line-height: 1.4; }
+/* 换件面板：先看外壳，再点零件，再选改法——不让用户面对一个空白输入框。 */
+.variant-card { width: min(600px, calc(100vw - 32px)); }
+.variant-hero { position: relative; margin-bottom: 10px; border-radius: 6px; overflow: hidden; }
+.variant-hero img { display: block; width: 100%; max-height: 190px; object-fit: cover; }
+.variant-hero span {
+  position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 10px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.72));
+  color: #fff8ec; font-size: 11px;
+}
+.variant-parts {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
+  gap: 8px; margin: 6px 0 4px;
+}
+.variant-part {
+  display: grid; grid-template-columns: auto 1fr; grid-template-rows: auto auto;
+  column-gap: 8px; align-items: center; text-align: left; min-width: 0;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: transparent; color: var(--ink); cursor: pointer; transition: all 0.18s;
+}
+.variant-part:hover:not(:disabled) { border-color: var(--vermilion); }
+.variant-part.on {
+  border-color: var(--vermilion); background: rgba(196, 60, 40, 0.06);
+  color: var(--vermilion-deep);
+}
+.variant-part:disabled { opacity: 0.5; cursor: wait; }
+.variant-part .vp-icon { grid-row: 1 / span 2; font-size: 20px; line-height: 1; }
+.variant-part b { font-family: var(--serif); font-size: 13px; font-weight: normal; }
+.variant-part small {
+  font-size: 10px; color: var(--ink-soft);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.variant-part em {
+  grid-column: 1 / -1; margin-top: 4px; font-style: normal;
+  font-size: 10px; color: var(--ink-soft);
+}
+.variant-part-note {
+  margin: 2px 0 8px; padding: 6px 8px; border-left: 2px solid var(--vermilion);
+  background: rgba(196, 60, 40, 0.04); line-height: 1.5;
+}
+.variant-modes {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 6px 0 8px;
+}
+/* 建议：按当前模板/零件现生成，点一句就填进输入框——不是写死的风格例子。 */
+.variant-suggest { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0 4px; }
+.variant-suggest .vs-head { font-size: 12px; color: var(--ink-soft); }
+.variant-suggest-chip {
+  padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px;
+  background: transparent; color: var(--ink); font-size: 12px; cursor: pointer;
+  max-width: 100%; text-align: left; transition: all 0.18s;
+}
+.variant-suggest-chip:hover:not(:disabled) { border-color: var(--vermilion); }
+.variant-suggest-chip.on { border-color: var(--vermilion); color: var(--vermilion-deep); }
+.variant-suggest-chip:disabled { opacity: 0.5; cursor: wait; }
+.variant-mode {
+  display: block; text-align: left; padding: 8px 9px;
+  border: 1px solid var(--line); border-radius: 6px; background: transparent;
+  cursor: pointer; transition: all 0.18s;
+}
+.variant-mode:hover:not(:disabled) { border-color: var(--vermilion); }
+.variant-mode.on { border-color: var(--vermilion); background: rgba(196, 60, 40, 0.06); }
+.variant-mode:disabled { opacity: 0.5; cursor: wait; }
+.variant-mode b {
+  display: block; font-family: var(--serif); font-size: 12px; font-weight: normal;
+}
+.variant-mode small {
+  display: block; margin-top: 3px; font-size: 10px;
+  color: var(--ink-soft); line-height: 1.4;
+}
+.variant-axes { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.variant-axis {
+  padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px;
+  background: transparent; color: var(--ink-soft); font-size: 12px; cursor: pointer;
+}
+.variant-axis.on { border-color: var(--vermilion); color: var(--vermilion); }
+.variant-axis small { opacity: 0.65; margin-left: 4px; font-size: 10px; }
+.variant-result {
+  display: flex; gap: 10px; align-items: flex-start; margin: 8px 0;
+  padding: 8px; border: 1px solid var(--line); border-radius: 6px;
+}
+.variant-result-img { width: 132px; border-radius: 4px; flex: 0 0 auto; }
+.variant-result-body {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 11px; color: var(--ink-soft);
+}
+.variant-result-body b {
+  font-family: var(--serif); font-size: 13px; font-weight: normal; color: var(--ink);
+}
+.variant-result-body button { align-self: flex-start; }
+.variant-result-body > .bad { color: var(--vermilion); }
+.variant-result-item {
+  display: flex; gap: 8px; align-items: flex-start; padding-top: 6px;
+  border-top: 1px dashed var(--line);
+}
+.variant-result-text { display: flex; flex-direction: column; gap: 2px; }
 
 /* 文字库：语速那一格 + 音色分组 */
 .tl-rate {
@@ -6270,11 +7269,23 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 /* 文字库：左右两栏（左边样张，右边要挑的卡）。样张 440px 高、右栏的卡更长，
    不把它钉在左边的话，滚到音色那一段去挑就再也看不见自己正在配的那张图了。
    抽屉拖窄到放不下两栏时它自己折回上下的老样子（`flex-wrap` 兜的），不必另写一套。 */
-.tl-body { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+.tl-body {
+  display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start;
+  /* 折行是**容器宽度**决定的，不是视口宽度：抽屉可以拖宽拖窄。用容器查询让
+     「钉住样张」只发生在两栏真的并排时——否则折行后样张独占一行，sticky 仍把它
+     钉在滚动容器顶部，后面的卡片会从它底下滚过去，看起来就是样张叠在卡片上
+     （真机截图里那次重叠）。 */
+  container-type: inline-size;
+}
 /* 宽度**写死**成样张那一栏的宽（248px ＝ 竖屏图限高 440 时的宽）。不写死会出事：
    `flex: 0 0 auto` 的基准是 max-content，而这一栏里那句说明是一整段中文——按「一行放得下
    整段」算出来是一千多像素，整栏会把右边挤没。写死这一栏，段子在栏内自己折行。 */
-.tl-rail { flex: 0 0 248px; width: 248px; position: sticky; top: 0; }
+.tl-rail { flex: 0 0 248px; width: 248px; }
+/* 248（样张）+16（间距）+300（右栏最小宽）＝564；留一点余量取 600。
+   低于这个宽度时两栏折成上下两行，这里**不能** sticky。 */
+@container (min-width: 600px) {
+  .tl-rail { position: sticky; top: 0; }
+}
 /* 栏名与那句说明在这个宽度里竖着排（横排时标题要占掉一半，说明被挤成一条条窄的） */
 .tl-rail .lib-head { display: block; }
 .tl-rail .lib-head b { display: block; margin-bottom: 6px; }
@@ -6557,6 +7568,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 .pi-open { margin-left: auto; }
 .pi-tag { margin-left: auto; font-size: 11.5px; color: var(--ink-soft); padding: 1px 7px; border: 1px solid var(--line); border-radius: 10px; }
 .pi-tag.ok { border-color: var(--gold); color: var(--gold); }
+/* 风格徽章排在标题后面；它自己不要再吃 `margin-left:auto`，否则会把确认按钮挤到它前面。 */
+.pi-tag.style { margin-left: 8px; color: var(--vermilion); border-color: var(--vermilion); }
 
 /* 计划确认窄横条（输入框上方） */
 .plan-banner {
@@ -6567,6 +7580,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .pb-icon { font-size: 16px; }
 .pb-label { font-family: var(--serif); font-weight: 600; font-size: 14px; }
+.pb-style { font-size: 11.5px; color: var(--vermilion); padding: 1px 7px;
+            border: 1px solid var(--vermilion); border-radius: 10px; }
 .pb-hint { font-size: 12px; color: var(--ink-light); flex: 1; min-width: 120px; }
 .pb-btn {
   padding: 4px 12px; border: 1px solid var(--line); border-radius: 6px;

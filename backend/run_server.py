@@ -78,6 +78,7 @@ from agent_framework.mq import MessageQueue, build_message_queue
 from agent_framework.server import create_app
 from agent_framework.session import SessionManager
 from agent_framework.storage import Storage, build_storage
+from agent_framework import style_templates as style_tpl
 from agent_framework.summary_store import SummaryStore
 from agent_framework.skill import (
     SkillLoader,
@@ -286,7 +287,7 @@ def build_runtime(
     heartbeat_interval: int = 30,
     # 12 镜代码链一轮就要 12 次取 demo 全文 + 逐镜重写 + plan_motion 打回重交，实测
     # 40 轮在半路耗尽（run b0b16f5b1506 停在第 40 轮、正在写 s2，零条渲染任务）。
-    max_iterations: int = 120,
+    max_iterations: int = 200,
     # 渲染前确认门：编排就绪、即将渲染时先把编排结果给用户看，确认后才渲。
     # 用户明确要求「不确认绝不渲染」，所以默认为 True。置 False 即回到直接渲染的老行为
     # （不是砍功能——是给「我已经确认过、别再问我」留一条明确的路）。
@@ -566,6 +567,18 @@ def build_runtime(
                     _warn(f"技能库导入失败（沿用库里已有内容）：{exc}")
             else:
                 _info(f"技能导入源 {skills_import_dir} 不存在，仅使用库里已有的技能")
+
+        # (0b1) 模板库：种子只补缺；已发布的用户模板推给渲染容器。
+        #      推送失败只告警——渲染容器可能还在起，真正用到时 `ensure_remote()` 会补。
+        try:
+            added = await style_tpl.seed_system_templates(storage)
+            pushed = await style_tpl.sync_validated(storage)
+            if added or pushed.get("pushed"):
+                _info(f"模板库：新增系统模板 {added} 条，推送 {pushed.get('pushed')} 条")
+            if pushed.get("failed"):
+                _warn(f"模板推送失败（用到时会重试）：{pushed['failed']}")
+        except Exception as exc:  # noqa: BLE001 - 模板库不该拖垮主服务启动
+            _warn(f"模板库同步失败（沿用库里已有内容）：{exc}")
 
         # (0c) 子 Agent 租约对账：上个进程被 kill 时正在干活的行不再谎报 working
         if team_obj is not None:
@@ -901,11 +914,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-context-tokens", type=int, default=DEFAULT_MAX_CONTEXT_TOKENS,
                    help="上下文压缩阈值 token（<=0 表示不压缩）")
     p.add_argument("--heartbeat-interval", type=int, default=30)
-    # 默认值与 build_runtime 的 max_iterations=120 对齐：原先这里是 20、build_runtime 是 40，
+    # 默认值与 build_runtime 的 max_iterations 对齐：原先这里是 20、build_runtime 是 40，
     # 而 main() 用 args 覆盖 → 实际永远跑 20，比函数默认值更小。整链剪辑（切镜头 → 理解 →
     # 筛选 → 分组 → 文案 → 配音 → 时间线 → 渲染，再加轮询与纠错）十几步工具调用、每步一轮
     # LLM，20 轮必然在半路耗尽，用户看到的是「[已达最大迭代次数 20，提前结束]」。
-    p.add_argument("--max-iterations", type=int, default=120,
+    # 120 → 200（2026-10-18）：有了按钱封顶（`agent_framework/cost.py`，每条 3 元）之后，
+    # 「最多亏多少」由预算说了算，迭代上限只剩「别无限转」这一个用处。图形科普片一条要
+    # 查资料（真机 ≈50 轮）+ 读技能 + 交骨架 + 写码 + 出片轮询，120 轮会把正常的 run 也截在
+    # 半路——那是「堵死比白烧更坏」的那一种：钱已经花了一半，产物一个都没有。
+    p.add_argument("--max-iterations", type=int, default=200,
                    help="单次请求内 Agent 的最大迭代轮数；整链剪辑（十余次工具调用）需调大")
     p.add_argument("--no-render-gate", dest="gate_render", action="store_false",
                    help="关掉「渲染前确认」：编排完直接渲染，不再先给用户看编排结果")

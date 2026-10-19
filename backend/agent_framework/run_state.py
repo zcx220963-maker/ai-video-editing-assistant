@@ -28,6 +28,14 @@ from typing import Any, Mapping
 STATE_FIELD = "state"
 
 
+def _as_float(value: Any) -> float:
+    """落盘里的数可能是 int / float / 字符串 / 缺席——一律收成非负浮点，读不出就是 0。"""
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @dataclass
 class RunState:
     """本 run 跨挂起仍然成立的事实。字段即清单——新增状态只能加在这里。"""
@@ -65,6 +73,18 @@ class RunState:
     # 本轮 think / tool call 片段（QA .jsonl 与 assistant 行的 qa 字段用）。
     # 挂起那半截也要进最后那条 assistant 行，否则历史里只剩续跑之后的片段。
     qa_parts: list[dict[str, Any]] = field(default_factory=list)
+    # 花费账（2026-10-17，元）：这条 run 到目前为止花了多少（主循环 + 节点里的模型调用），
+    # 与本条**当前**的预算上限。必须跨挂起：撞了上限停下、用户点续跑，账得接着记——
+    # 归零的话续跑等于把上限清空，正是「续跑一路往后延、两条 run 烧了十块钱」那个形状。
+    # 预算为 0 表示还没开账（第一轮由 `agent` 按 `cost.run_budget_yuan()` 填上）。
+    spent_yuan: float = 0.0
+    budget_yuan: float = 0.0
+    # 因「原地打转」停下时消息序列有多长（见 `agent._stop_reason`）。续跑之后只看这之后的
+    # 新轮次——末尾那几轮失败还留在历史里，不记这一位续跑第一轮就又被判成打转。
+    stall_floor: int = 0
+    # 节点回执里的花费（`node_cost_yuan`，节点自己调模型花的钱，如出片前的带图风格对照）
+    # 已经记到第几条消息了。跨挂起：续跑时不重复记。
+    node_scan: int = 0
 
     # ---- 序列化 ----
 
@@ -80,6 +100,10 @@ class RunState:
             "plan_audit": (dict(self.plan_audit)
                            if isinstance(self.plan_audit, Mapping) else None),
             "qa_parts": [dict(p) for p in self.qa_parts],
+            "spent_yuan": float(self.spent_yuan),
+            "budget_yuan": float(self.budget_yuan),
+            "stall_floor": int(self.stall_floor),
+            "node_scan": int(self.node_scan),
         }
 
     @classmethod
@@ -98,6 +122,10 @@ class RunState:
             plan_audit=(dict(d["plan_audit"])
                         if isinstance(d.get("plan_audit"), Mapping) else None),
             qa_parts=[dict(p) for p in (d.get("qa_parts") or []) if isinstance(p, Mapping)],
+            spent_yuan=_as_float(d.get("spent_yuan")),
+            budget_yuan=_as_float(d.get("budget_yuan")),
+            stall_floor=int(_as_float(d.get("stall_floor"))),
+            node_scan=int(_as_float(d.get("node_scan"))),
         )
 
     # ---- 与指针行的往来 ----

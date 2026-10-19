@@ -22,6 +22,7 @@ import os
 from typing import Any
 
 from . import secrets as runtime_secrets
+from .cost import usage_from_raw
 from .llm import LLMResponse, StreamChunk
 from .messages import Message, ToolCall
 
@@ -311,15 +312,39 @@ class OpenAICompatClient:
         self,
         messages: list[Message],
         tools: list[dict[str, Any]] | None = None,
+        *,
+        max_tokens: int | None = None,
+        timeout: float = 60.0,
+        model_override: str | None = None,
     ) -> LLMResponse:
+        """一次非流式补全。
+
+        ``max_tokens`` / ``timeout`` 是给**写代码这类长输出短任务**留的口子（见
+        ``motion/shot_writer.py``）：默认 60 秒是给「一次工具调用决策」的预算，而写
+        一镜 TSX 经常要更久。两者都是关键字参数、缺省值不变，既有调用方一个字节不用动。
+
+        ``model_override`` 是**这一次调用的模型覆盖**（2026-10-18，写代码那条链要能挑
+        更强的模型）：不传就按用户设置解析（``_resolve_request``）。密钥仍走同一位用户的
+        配置——覆盖的只是模型名，不是身份。
+        """
         client, model = await self._resolve_request()
+        override = str(model_override or "").strip()
+        if override:
+            model = override
         last_err: Exception | None = None
         for attempt in range(_MAX_ATTEMPTS):
             try:
+                kwargs = self._kwargs(messages, tools)
+                if max_tokens:
+                    kwargs["max_tokens"] = max_tokens
                 resp = await client.chat.completions.create(
-                    **{**self._kwargs(messages, tools), "model": model}, timeout=60
+                    **{**kwargs, "model": model}, timeout=timeout
                 )
-                return self._parse(resp)
+                parsed = self._parse(resp)
+                if parsed.usage is not None:
+                    # 计价要按**这一次实际用的模型**（模型按用户现解析，见 `_resolve_request`）。
+                    parsed.usage["model"] = model
+                return parsed
             except Exception as e:
                 last_err = e
                 if not _is_retryable(e):
@@ -385,11 +410,9 @@ class OpenAICompatClient:
         async for event in stream:
             raw_usage = getattr(event, "usage", None)
             if raw_usage is not None:
-                usage = {
-                    "prompt_tokens": getattr(raw_usage, "prompt_tokens", 0) or 0,
-                    "completion_tokens": getattr(raw_usage, "completion_tokens", 0) or 0,
-                    "total_tokens": getattr(raw_usage, "total_tokens", 0) or 0,
-                }
+                # 缓存命中/未命中一并取（见 `cost.usage_from_raw`）：命中与未命中差 50 倍价，
+                # 只记总数就永远看不出钱烧在哪。
+                usage = usage_from_raw(raw_usage)
             choices = getattr(event, "choices", None)
             if not choices:
                 continue
@@ -413,6 +436,8 @@ class OpenAICompatClient:
                 ToolCall(id=s["id"] or f"call_{idx}", name=s["name"],
                          arguments=_parse_tool_args(s["args"]))
             )
+        if usage is not None:
+            usage["model"] = model
         yield StreamChunk(tool_calls=tool_calls, usage=usage)
 
     @staticmethod
@@ -425,14 +450,7 @@ class OpenAICompatClient:
             fn = call.function
             tool_calls.append(ToolCall(id=call.id, name=fn.name,
                                        arguments=_parse_tool_args(fn.arguments)))
-        usage = None
-        raw_usage = getattr(resp, "usage", None)
-        if raw_usage is not None:
-            usage = {
-                "prompt_tokens": getattr(raw_usage, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(raw_usage, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(raw_usage, "total_tokens", 0) or 0,
-            }
+        usage = usage_from_raw(getattr(resp, "usage", None))
         return LLMResponse(content=content, tool_calls=tool_calls, usage=usage)
 
 

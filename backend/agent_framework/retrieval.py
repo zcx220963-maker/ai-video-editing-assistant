@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable, Mapping
 
 #: 模型自认「没查证」的写法。闸只认这几个字面，别的都当它声称查证过。
@@ -95,9 +96,17 @@ def cite_fields(source: Any) -> tuple[str, str]:
 
 
 def claims_verified(source: Any) -> bool:
-    """这条出处是不是在**声称**「我查证过」。留空或自带未核实标记的不算。"""
-    title, url = cite_fields(source)
-    text = f"{title} {url}".strip().lower()
+    """这条出处是不是在**声称**「我查证过」。留空或自带未核实标记的不算。
+
+    扫的是**所有值**，不只是标题/链接：系统降级一条对不上账的出处时，可能会在没有
+    标题键的那一格里补一个「核实」字段（见 `motion_plan._mark_source_unverified`），
+    只看标题/链接就会把这条明写的未核实重新读成「声称查证过」。
+    """
+    if isinstance(source, Mapping):
+        text = " ".join(str(v) for v in source.values() if v is not None)
+    else:
+        text = "" if source is None else str(source)
+    text = text.strip().lower()
     if not text:
         return False
     return not any(mark in text for mark in UNVERIFIED_MARKS)
@@ -106,6 +115,21 @@ def claims_verified(source: Any) -> bool:
 def _same_url(a: str, b: str) -> bool:
     norm = lambda s: (s or "").strip().rstrip("/").lower().removeprefix("https://").removeprefix("http://")  # noqa: E731
     return bool(norm(a)) and norm(a) == norm(b)
+
+
+#: 标题里「站点名」常挂在分隔符之后、期号/年份常括在括号里。这两处是同一篇文献在
+#: 检索结果与模型复述之间最常见、也最没信息量的差异（真机 2026-10-19：同一篇
+#: Notes and Queries 的文章，模型多写了「（Notes and Queries, 2018）」，就被判成没查过）。
+_TITLE_PAREN_RE = re.compile(r"[（(][^）)]*[）)]")
+_TITLE_SPLIT_RE = re.compile(r"\s*[|｜]\s*|\s+[—–-]\s+|：|:\s")
+_TITLE_NOISE_RE = re.compile(r"[^\w一-鿿]+")
+
+
+def _norm_title(title: str) -> str:
+    """标题归一到「只剩下字」：去括号补充、去站点后缀、去标点与空白、小写。"""
+    text = _TITLE_PAREN_RE.sub(" ", title or "")
+    head = _TITLE_SPLIT_RE.split(text.strip())[0] if text.strip() else ""
+    return _TITLE_NOISE_RE.sub("", head.lower())
 
 
 def matches_ledger(source: Any, rows: list[dict[str, Any]]) -> bool:
@@ -120,6 +144,14 @@ def matches_ledger(source: Any, rows: list[dict[str, Any]]) -> bool:
             hit = str(row.get("title") or "").lower()
             if hit and (hit in low or low in hit):
                 return True
+        # 归一后再比一次：只认够长的标题（≥8 字），避免「某报告」「首页」这种短标题
+        # 在整张账上到处命中。
+        norm = _norm_title(title)
+        if len(norm) >= 8:
+            for row in rows or []:
+                other = _norm_title(str(row.get("title") or ""))
+                if len(other) >= 8 and (norm in other or other in norm):
+                    return True
     return False
 
 

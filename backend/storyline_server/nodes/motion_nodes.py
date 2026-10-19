@@ -36,7 +36,7 @@ from ..motion import hitmap as mhit
 from ..motion import render as motion
 from .core_nodes import (StoryNode, _ev, _frame_spotcheck,
                          _resolve_target_duration, new_patch_scope_id)
-from .motion_plan import source_gate
+from .motion_plan import settle_sources
 
 #: 目标时长的硬闸倍数：估算区间整体偏离到这个份上就别开工——一次渲染是分钟级，
 #: 「先渲二十分钟再告诉你比目标长一倍」不是把关。
@@ -132,27 +132,28 @@ class MotionRenderBase(StoryNode):
 
     async def _gate_inline(self, state: NodeState, inputs: dict[str, Any],
                            spec: dict[str, Any], errors: list[str]) -> None:
-        """渲染口拿到的是**没过过分镜闸的那一份**时，就地补走一次出处闸。
+        """渲染口拿到的是**没过过分镜闸的那一份**时，就地补走一次出处对账。
 
         为什么需要：``required_nodes=["plan_motion"]`` 保证的是「这个会话分过镜」，
         不是「本次渲的就是那份分镜」。``read_spec_input`` 的第一层回落是**入参里的
         inline spec**，它盖在 Store 那份上面——于是「分镜时查过出处，渲时换成一套没查过的
         数字」这条路本来一直畅通（真机查出来时两条图形链都通）。这不是往渲染节点里再写
-        一遍判据：判据只有 ``motion_plan.source_gate`` 这一份，这里多出来的只是一个调用点。
+        一遍判据：判据只有 ``motion_plan.settle_sources`` 这一份，这里多出来的只是一个调用点。
 
-        分镜本身已经不合法时不走这一步：那种 spec 交给闸只会把「校验没通过」掩盖成
+        2026-10-19 起这里也**只降级、不打回**：对不上账的出处被标成「未核实」后照常
+        渲染（理由与代价见 ``motion_plan._mark_source_unverified``）——出片口拦一次，
+        烧的是一整轮已经写好的镜头与十分钟等待；账面上那一句「未核实」同样不会被观众
+        误读成查证过。
+
+        分镜本身已经不合法时不走这一步：那种 spec 交给对账只会把「校验没通过」掩盖成
         「出处有问题」，而调用方需要先看到前者。
         """
         inline = inputs.get("spec")
         if errors or not (isinstance(inline, Mapping) and inline):
             return
-        cited, _states = await source_gate(state.session_id, spec.get("shots") or [])
-        if cited:
-            raise ValueError(
-                "出处闸未通过，一帧都没开始渲（这次传的是 inline 分镜，没经过 plan_motion，"
-                "所以在这里当场对账；本会话真打开过的页面才算出处）：\n"
-                + "\n".join(f"  · {e}" for e in cited[:12])
-                + (f"\n  · …另有 {len(cited) - 12} 条同类错误" if len(cited) > 12 else ""))
+        notes, _states = await settle_sources(state.session_id, spec.get("shots") or [])
+        for note in notes:
+            state.summary.notes.append(note)
 
     async def _bgm_ref(self, state: NodeState, value: str) -> str:
         """bgm 入参 → 能取到字节的引用。三种写法都收：``obj:`` 引用、素材 material_id、曲名。
@@ -306,18 +307,25 @@ class MotionPatchBase(MotionRenderBase):
         # 必须跑在校验之后（字段名单要取归一后的那份）、分叉之前（验不过的字节一寸不落）。
         await self._pre_gate(state, base=spec_base, spec=spec, report=report,
                              errors=errors)
-        # 出处闸只管**本次改到的**镜：闸的职责是拦住「新写上去的猜测冒充查证过的出处」，
-        # 而不是替整片重新审计一遍旧账（旧版里那些出处当初已经过一次这道闸）。
+        # 出处对账只管**本次改到的**镜：职责是拦住「新写上去的猜测冒充查证过的出处」，
+        # 而不是替整片重新审计一遍旧账（旧版里那些出处当初已经过一次这道账）。
+        # 2026-10-19 起对不上账的出处就地降级成「未核实」，提醒随补丁回执带回去，
+        # 不再把这次局部改退回去重交（理由与代价见 `motion_plan._mark_source_unverified`）。
         cited_ids = [sid for sid in report["changed_shots"]
                      if any(shot.get("id") == sid and shot.get("source")
                             for shot in spec["shots"])]
-        gate_err, gate = await self._sources(state, spec, cited_ids)
-        errors = errors + gate_err
+        source_notes, gate = await self._sources(state, spec, cited_ids)
 
         target = _resolve_target_duration(
             state, inputs, await self._base_target(sess, base))
+        # 这一趟在分叉之前花掉的钱（写手按新 brief 重写镜头代码）随补丁回执带回去。
+        extra_cost = ({"node_cost_yuan": report["node_cost_yuan"]}
+                      if report.get("node_cost_yuan") else None)
+        if source_notes:
+            extra_cost = dict(extra_cost or {})
+            extra_cost["source_notes"] = source_notes
         artifact = await self._fork(state, sess=sess, base=base, spec=spec,
-                                    target=target, gate=gate)
+                                    target=target, gate=gate, extra=extra_cost)
 
         jobs = self.storage.render_jobs
         # 与出片同一条口径：先开任务行再校验，失败必须留下一行 failed，
@@ -439,14 +447,16 @@ class MotionPatchBase(MotionRenderBase):
 
     async def _sources(self, state: NodeState, spec: dict[str, Any],
                        ids: list[str]) -> tuple[list[str], dict[str, str]]:
-        """→ (打回清单, 每镜判定)。
+        """→ (提醒清单, 每镜判定)。
 
-        闸只对**本次改到**的镜走（闸的本体在分镜那一层，旧版里那些出处当初已经过一次），
+        对账只对**本次改到**的镜走（判据本体在分镜那一层，旧版里那些出处当初已经过一次），
         判定却整片都标：这一趟之后要把逐镜行改写回 ``plan_motion``，漏标的镜在账上会
         显示成「没出处」——那是把「查过」写丢，另一种假。
+
+        2026-10-19 起只降级、不打回：第一项是提醒（进补丁回执），不再累进 `errors`。
         """
-        return await source_gate(state.session_id, spec["shots"],
-                                 audit_ids=set(str(i) for i in ids))
+        return await settle_sources(state.session_id, spec["shots"],
+                                    audit_ids=set(str(i) for i in ids))
 
     async def _base_target(self, sess: str, base: str) -> float | None:
         row = await self.storage.render_jobs.get(sess, base)
@@ -466,7 +476,8 @@ class MotionPatchBase(MotionRenderBase):
 
     async def _fork(self, state: NodeState, *, sess: str, base: str,
                     spec: dict[str, Any], target: float | None,
-                    gate: dict[str, str] | None = None) -> str:
+                    gate: dict[str, str] | None = None,
+                    extra: Mapping[str, Any] | None = None) -> str:
         """换一份产物作用域，并把改动同步成「会话当前分镜」；→ 新产物号。
 
         为什么必须换作用域：渲染任务行、成片字节、命中表、代表帧全都按 artifact_id 落位，
@@ -485,6 +496,8 @@ class MotionPatchBase(MotionRenderBase):
             artifact = new_patch_scope_id()
         payload = self.payload_builder(
             spec, target=target, next_hint=self.patch_next_hint, gate=gate)
+        if extra:
+            payload.update(dict(extra))
         repo = self.storage.artifacts(sess, artifact)
         try:
             # 上游产物整份带进新作用域（拦截器看到 has(dep) 命中，才谈得上只跑这一步）

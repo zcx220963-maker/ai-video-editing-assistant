@@ -916,6 +916,10 @@ class MCPTool(Tool):
             # 上游复用与「不污染父版本」两条语义都会落空。
             if "artifact_id" in props and ident.artifact_id:
                 kwargs["artifact_id"] = ident.artifact_id
+            # 风格包同一口径：只有声明了这个参数的节点（今天只有 plan_motion）才收，
+            # 且值来自本轮身份，模型自填的值被覆写。
+            if "style_skill" in props and ident.style_skill:
+                kwargs["style_skill"] = ident.style_skill
         result = await self._client.call_tool(self._raw_name, kwargs, self._timeout)
         return extract_text(result)
 

@@ -309,6 +309,11 @@ def motion_summary(source: Mapping[str, Any] | None,
     palette = str(src.get("palette") or "").strip().lower()
     if palette and palette != "none":
         out["底色"] = word("palette", palette, _PALETTE_LABELS)
+    # 模型从用户的话里读出来的整片风格（一句话，2026-10-17）。风格由用户的要求定、不是
+    # 枚举，所以这里原样回显——确认卡是用户在烧像素之前唯一能看出「它理解歪了」的地方。
+    style = str(src.get("style") or "").strip()
+    if style:
+        out["风格"] = style[:80] + ("…" if len(style) > 80 else "")
     # R7-T22：接缝与进出场。只在**不是硬切/不动**时才出一行——「硬切」是默认，
     # 每张确认卡上都写一句「镜镜直接接」只会把真正要批的那几行淹掉。
     trans_style = str(src.get("transition") or "none").strip().lower()

@@ -663,6 +663,57 @@ def _int_or_none(value: Any) -> int | None:
     return int(value)
 
 
+def _near_peaks(diffs: Any, thresholds: Any, sample_hz: Any,
+                events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """「差一点」的那几处：亚门槛、但已经明显在动的峰值。→ `[{start_sec, peak_diff}]`
+
+    门槛取容器回传的那一份（`diff_min`），不在这里另写一个数；亚门槛的下沿用
+    `motionsample.mjs` 里同一条回落线（地板线的 0.4 倍）——低于它的那些读数连
+    「在动」都算不上，报给写手只会多一条噪声。
+
+    只留**局部峰**、并且跳过已经进了 `events` 的那段时间：同一个动效不该既算「过线」，
+    又在这里再报一遍。最多三处（时间顺序），够写手定位，又不会把回执撑长。
+    """
+    if not isinstance(diffs, Sequence) or isinstance(diffs, (str, bytes)) or len(diffs) < 3:
+        return []
+    th = thresholds if isinstance(thresholds, Mapping) else {}
+    floor = th.get("diff_min")
+    if not isinstance(floor, (int, float)) or isinstance(floor, bool):
+        floor = 1.5
+    hz = sample_hz if isinstance(sample_hz, (int, float)) and sample_hz > 0 else 8.0
+    inside = []
+    for e in events:
+        a, b = e.get("start_sec"), e.get("end_sec")
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            inside.append((float(a), float(b)))
+
+    def _in_event(t: float) -> bool:
+        return any(a - 0.06 <= t <= b + 0.06 for a, b in inside)
+
+    vals = [float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+            for v in diffs]
+    picks: list[dict[str, Any]] = []
+    for i, v in enumerate(vals):
+        if not (floor * 0.4 <= v < floor):
+            continue
+        prev = vals[i - 1] if i else 0.0
+        nxt = vals[i + 1] if i + 1 < len(vals) else 0.0
+        if v < prev or v < nxt:          # 只取局部峰（一段上升沿里报一次就够）
+            continue
+        at = round((i + 0.5) / hz, 2)
+        if _in_event(at):
+            continue
+        if picks and at - picks[-1]["start_sec"] < 0.25:   # 挨得太近的并成一个
+            if v > picks[-1]["peak_diff"]:
+                picks[-1] = {"start_sec": at, "peak_diff": round(v, 2)}
+            continue
+        picks.append({"start_sec": at, "peak_diff": round(v, 2)})
+    if len(picks) > 3:
+        keep = sorted(picks, key=lambda p: -p["peak_diff"])[:3]
+        picks = sorted(keep, key=lambda p: p["start_sec"])
+    return picks
+
+
 def summarize_motion(shot_id: str, motion: Any) -> dict[str, Any]:
     """闸⑭：把容器回传的动效采样收成一镜一份稳定的账。
 
@@ -682,6 +733,12 @@ def summarize_motion(shot_id: str, motion: Any) -> dict[str, Any]:
     原始差值曲线**不进账**（8 Hz × 20 s 就是一两百个数）：账要能被人读，而红的时候那句
     `reason` 已经把段数、间隔、帧号一并报出来了。这里只留 `events`（逐段起止帧与峰值）
     与 `min_gap_frames`——回执要能回答「它到底数到几段、最紧的一对隔多少」。
+
+    **但「差一点」的那几处要留**（`near`）：2026-10-18 真机抓到的曲线是
+    `[14.05, 10.24, 1.40, 0.50, … 0.19, 1.15, 1.23, 0.87, …]`——第二处动效（4.4 s 的
+    大面板）其实**画了**，峰值 1.23，只差地板线 1.5 一点点，却被「数到 1 段」这句
+    话吞掉。写手看到「只有一段」只会再排一遍时间轴，而它真正该做的是把那一处做大。
+    所以这里留最响的几处**亚门槛**峰值（起止秒 + 峰值），给重写要求当抓手。
     """
     if motion is None:
         return {"shot": shot_id, "status": "undetermined", "events": [], "samples": 0,
@@ -713,6 +770,8 @@ def summarize_motion(shot_id: str, motion: Any) -> dict[str, Any]:
            "thresholds": _thresh(motion.get("thresholds")),
            "reason": (str(motion.get("reason"))[:600] or None)
                      if motion.get("reason") else None}
+    out["near"] = _near_peaks(motion.get("diffs"), out["thresholds"],
+                              out["sample_hz"], events)
     if status == "undetermined" and not out["reason"]:
         out["reason"] = f"容器报了个不认识的状态：{raw_status!r}"
     # 两份证据打架：整份状态写 ok，逐段账却数不出阈值要求的那几段。**以细的那份为准**，
@@ -727,12 +786,16 @@ def summarize_motion(shot_id: str, motion: Any) -> dict[str, Any]:
     return out
 
 
-def motion_error(shot_id: str, motion: Mapping[str, Any] | None) -> str | None:
+def motion_error(shot_id: str, motion: Mapping[str, Any] | None, *,
+                 strict: bool = True) -> str | None:
     """账 → 「这一镜该退」的一句人话；通过或未判返回 `None`。
 
     未判在这里**不退出**（那时判据压根没跑成），但它照样不是通过——`describe_motion`
     会把它单独列一行，报告层按未判计。这一闸要拦的是「有动效但看不出动」，
     不是「容器里的 ffmpeg 不见了」：把后者也判成片的罪，等于让工具故障冒充内容缺陷。
+
+    `strict` 只管**措辞**（真正的打回在 `_qc_gate`）：预览档这一镜仍在成片里，
+    文案却写「退回」，用户会以为片里没它（2026-10-17 真机 13 镜就是这么被误读的）。
     """
     if not isinstance(motion, Mapping) or str(motion.get("status")) != "rejected":
         return None
@@ -748,7 +811,11 @@ def motion_error(shot_id: str, motion: Mapping[str, Any] | None) -> str | None:
         span = f"，跨帧 {evs[0]['start_frame']}–{end if isinstance(end, int) else '?'}"
     tight = motion.get("min_gap_frames")
     tight_txt = f"（最紧的一对的起点隔 {tight} 帧）" if isinstance(tight, int) else ""
-    return (f"闸⑭ 动效事件密度未通过，{shot_id} 退回（切片没进缓存、母带没开始）：\n"
+    head = (f"闸⑭ 动效事件密度未通过，{shot_id} 退回（切片没进缓存、母带没开始）："
+            if strict else
+            f"闸⑭ 动效事件密度未通过，{shot_id} 这一镜**仍在成片里**"
+            f"（预览档只提醒；要它退镜请切 strict）：")
+    return (head + "\n"
             f"  · {motion.get('reason') or '容器没给出理由'}\n"
             f"  · 判据：每镜 ≥{want if isinstance(want, int) else '?'} 段先后变化、"
             f"相邻段的起点 ≥{gap_sec if gap_sec is not None else '?'} s；"
@@ -826,7 +893,8 @@ def describe_layout(shot_id: str, layout: Mapping[str, Any] | None) -> list[str]
     return out
 
 
-def describe_motion(shot_id: str, motion: Mapping[str, Any] | None) -> list[str]:
+def describe_motion(shot_id: str, motion: Mapping[str, Any] | None, *,
+                    strict: bool = True) -> list[str]:
     """一镜的动效读数 → 逐条人话（整片账与回执都用这一份措辞，别处不另抄）。
 
     `ok` 不吭声（判过且过的一镜不该在回执里占一行）。`rejected` 与 `undetermined`
@@ -845,13 +913,19 @@ def describe_motion(shot_id: str, motion: Mapping[str, Any] | None) -> list[str]
     if st == "rejected":
         return [f"闸⑭ {shot_id}：像素上数不出「先后动」——{m.get('reason') or '容器没给出理由'}"
                 f"（数到 {got} 段、最紧一对隔 {tight if tight is not None else '—'} 帧，"
-                f"判据 ≥{want} 段、相邻起点 ≥{gap} s）。这一镜已经带镜号退回，没有进成片"]
+                f"判据 ≥{want} 段、相邻起点 ≥{gap} s）。"
+                + ("这一镜已经带镜号退回，没有进成片" if strict else
+                   # 预览档（产品缺省）不退镜，只记提醒——原先这里一律写「没有进成片」，
+                   # 而那 13 镜其实全在成片里（2026-10-17 真机片）。按档说实话。
+                   "预览档只提醒：这一镜**仍在成片里**，后半截看起来会停住；"
+                   "要它退镜请切 strict")]
     return [f"闸⑭ {shot_id}：动效没人判过（{m.get('reason') or '容器没回传采样行'}）——"
             "「没判」不等于「看得出动」，这一镜的动效读数在整片账上算未判"]
 
 
 def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
-                     frames: int, frame_words: list[dict[str, Any]]) -> dict[str, Any]:
+                     frames: int, frame_words: list[dict[str, Any]],
+                     film_start_sec: float = 0.0) -> dict[str, Any]:
     """`/render-shot` 的 `input_props`：母版要的排班全在这里，镜头代码一样也拿不到。
 
     `durationInFrames` 是闸② 的注入点（服务端见到 0 直接 400）；`words` 用帧刻度，
@@ -875,6 +949,12 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
         # 那一层 publicDir 切换也一并没了。
         "fps": int(spec["fps"]),
         "durationInFrames": int(frames),
+        # 这一镜在整片时间轴上的起点（秒）。逐镜切片各自从 0 帧渲染，但参考片里
+        # 「一直在走的人」是**整片连续的一层**：镜头代码用
+        # `filmStartSec + frame/fps` 取绝对时间，模板的 film 作用域轨道据此算步态，
+        # 切点处才不会换脚/重新起步。必须由**真实时间轴**注入（配音时长决定），
+        # 不能让写手在代码里写死估算值——那样每镜都会偏一点。
+        "filmStartSec": round(float(film_start_sec), 3),
         "aspect": str(spec["aspect"]),
         "width": int(spec["width"]),
         "height": int(spec["height"]),
@@ -889,12 +969,16 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
                             or spec.get("caption_style") or "on_picture"),
         "highlightStyle": str(shot.get("highlight_style")
                               or spec.get("highlight_style") or "color"),
-        # 这一镜的字幕**由代码自己摆**（代码里有 `<CaptionLayer/>`）——母版那条让位，
-        # 否则同屏两条字幕。判据是**代码的静态事实**（`cspec.caption_by_code`，与闸㉜
-        # 同一条正则）：运行期母版看不到这一镜的代码，而「有没有第二条」此时此地就定了。
+        # 这一镜的字幕**由代码自己摆**（代码里有 `<CaptionLayer/>` 或构图的
+        # `<CaptionText/>`）——母版那条让位，否则同屏两条字幕。判据是**代码的静态事实**
+        # （`cspec.caption_any_by_code`：2026-10-18 起自排字幕是缺省写法，只认整条
+        # `<CaptionLayer/>` 会让每一镜多出一条母版底部字幕）：运行期母版看不到这一镜的
+        # 代码，而「有没有第二条」此时此地就定了。
         # 一栏布尔，不按「申报了才发」那一套省——母版那侧读的是真值（`=== true`），
         # 缺席与 false 同一件事，少一个「有没有这一栏」的分支。
-        "captionFromCode": cspec.caption_by_code(str(shot.get("code") or "")),
+        "captionFromCode": cspec.caption_any_by_code(
+            str(shot.get("code") or ""),
+            template_slots=cspec.style_template_slots(spec)),
         "fields": cspec.field_values(shot),
         # 母版进出场（T22）：档名 + 窗口帧数。`none` 或者窗口不足 2 帧时是 0/0，
         # 母版据此完全不套那层动画（于是「不选进出场」的片子逐帧与从前一致）。
@@ -915,6 +999,13 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
     film_style = cspec.film_style_of(shot, film=spec)
     if film_style:
         props["film_style"] = film_style
+    # 整片美术方向（2026-10-18）。**只在真写了时才发**——理由与 `film_style` 同一条：
+    # 没写 `art` 的片子 props 逐字节不变，缓存命中的老镜一个也不会因此重烧。
+    # 读它的是两处：`resolveFilmStyle` 把归一后的缺省合进风格档，镜头代码写
+    # `film.art.brush` 就能与整片对齐；以及写手提示词里那一段（`shot_writer._film_block`）。
+    art = spec.get("art")
+    if isinstance(art, Mapping) and art:
+        props["artDirection"] = dict(art)
     # 用户钉的高亮词颜色（2026-10-16，「文字库」的「强调色」）。**只在真钉了的时候才发**
     # ——空串的意思就是「没钉，跟这一镜的色板走」，母版读不到这一栏就照老路
     # 取 `captionLook()` 的 accent。上面那两栏字幕键进的是字典字面量，因为它们
@@ -971,15 +1062,19 @@ async def _shot_texture(clip: Path, dst_dir: Path, *, shot: Mapping[str, Any],
     的话，就会出现账面写 film、画上是原片。
     """
     kind = cspec.shot_texture(shot, spec)
-    if kind == "none":
+    art = spec.get("art")
+    # 整片写了 `art` 时，即使这一镜没选质感档也要过这一趟：那一层是**整片统一**
+    # 的颗粒/暗角/色温（`render.art_grade`），跳过它就成了「同一版片子里几镜是
+    # 统一过的、几镜没统一」，而这件事在成片里没人看得出来，只能靠这里不跳。
+    if kind == "none" and not rpipe.art_grade(art):
         return clip, kind, "", frame
     out_clip = dst_dir / "clip_tex.mp4"
-    chain = await asyncio.to_thread(rpipe.apply_texture, clip, out_clip, kind)
+    chain = await asyncio.to_thread(rpipe.apply_texture, clip, out_clip, kind, art=art)
     if not chain:
         raise MediaError(
             f"{sid}：质感选的是 {kind}，却没拿到滤镜串——交付给拼接的还是原片。"
-            "请核对 render.TEXTURE_FILTERS 里有没有这一档（宁可这一镜退回，"
-            "也不出一版「账上加了、画面没加」的片子）")
+            "请核对 render.TEXTURE_FILTERS（质感档）与 render.art_grade（美术方向）"
+            "里有没有这一档（宁可这一镜退回，也不出一版「账上加了、画面没加」的片子）")
     out_frame = dst_dir / "frame_tex.png"
     await _tail_frame(out_clip, out_frame, fps=int(spec["fps"]))
     return out_clip, kind, chain, out_frame
@@ -1003,7 +1098,8 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
                            progress: Progress | None = None,
                            draft: Mapping[str, Any] | None = None,
                            narration: "asyncio.Future[dict[str, Any]] | None" = None,
-                           budget: "FrameBudget | None" = None
+                           budget: "FrameBudget | None" = None,
+                           film_start_sec: float = 0.0
                            ) -> dict[str, Any]:
     """一镜（代码）→ 带声切片 + 记账。八道闸里属于这一镜的那几道都在这条路上。
 
@@ -1026,7 +1122,8 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
 
     key = cspec.shot_cache_key(dict(shot), film=spec,
                                master_hash=str(identities["master_hash"]),
-                               lockfile_hash=str(identities["lockfile_hash"]))
+                               lockfile_hash=str(identities["lockfile_hash"]),
+                               film_start_sec=film_start_sec)
     # 草稿档：换像素档不换判据，也**换一个键**。缩过的片子若占住成片缓存键，下一次
     # 命中缓存就是在拿 0.4 倍的片冒充成片——服务端落盘名同理带 `.draft` 后缀。
     draft_scale = 1.0
@@ -1057,7 +1154,8 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
                 # 所以缓存里的那一镜只证明「按当时的判据它是绿的」。阈值一改，
                 # 复用切片的那几镜就会带着旧判据的读数直接进母带——这里补一刀，
                 # 拒因与现渲的那一路同源（同一个 `motion_error`）。
-                cached_reject = motion_error(sid, rec.get("motion"))
+                cached_reject = motion_error(sid, rec.get("motion"),
+                                             strict=qc_strict(spec))
                 if cached_reject and cached_reject not in cached_qc:
                     _qc_gate(spec, cached_qc,
                              f"{cached_reject}（这一镜来自缓存，按当前判据重判不过）")
@@ -1109,7 +1207,8 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
     # 那份。各算一遍就会出现「母版按 A 表点亮、判据按 B 表对窗口」这种只在真机上
     # 看得见的分歧（与 `shot_input_props` 里 fields 那条同规）。
     frame_words = _to_frame_words(narr["timed"], fps)
-    props = shot_input_props(shot, spec, frames=frames, frame_words=frame_words)
+    props = shot_input_props(shot, spec, frames=frames, frame_words=frame_words,
+                             film_start_sec=film_start_sec)
     resp = await _await_heartbeat(
         progress, sid=sid, index=index, total=len(spec.get("shots") or []),
         awaitable=asyncio.to_thread(
@@ -1143,7 +1242,7 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
     # **必须在切片进缓存之前判**——退回去的一镜不该在缓存里留一份「动效不合格」的切片，
     # 否则下一次同一个 cache_key 命中缓存、从缓存那一路进来（那一路只认读数不重判内容）。
     motion = summarize_motion(sid, resp.get("motion"))
-    motion_err = motion_error(sid, motion)
+    motion_err = motion_error(sid, motion, strict=qc_strict(spec))
     if motion_err:
         _qc_gate(spec, qc_warns, motion_err)
     # 闸㉑ 的后半段（T33）紧挨着闸⑭：它读的就是 ⑭ 刚数出来的那几段（触发帧），
@@ -1310,6 +1409,12 @@ def _shot_table(sid: str, index: int, size: tuple[int, int], *,
 #: （容器那侧打包串行、渲染 2 路，3 路在飞正好让一镜打包时另两镜在渲）。
 PREVIEW_AT = 0.7
 PREVIEW_PARALLEL = 3
+#: 预览静帧的分辨率系数。**2026-10-18 从 0.4 提到 1.0**：0.4 那档是「成本约整镜的
+#: 百分之一」那个年代的余数，而今天这组图是**确认卡上用户唯一看得到的东西**——真机
+#: 上 1920×1080 的片子渲成 768×432、JPEG 80，用户看完说「整体画面质量很低」，判的其实
+#: 是这张缩水图。多付的是每帧几十到一两百毫秒（打包 1~3 秒才是固定成本），换的是
+#: 「看到的就是会渲出来的那一帧」。成片那一趟不走这里（`render.scale` 缺省 1）。
+PREVIEW_SCALE = 1.0
 
 
 def _preview_frames(shot: Mapping[str, Any], spec: Mapping[str, Any]) -> int:
@@ -1324,16 +1429,34 @@ def _preview_frames(shot: Mapping[str, Any], spec: Mapping[str, Any]) -> int:
 
 
 async def preview_stills(spec: Mapping[str, Any], *, client: dict[str, Any],
-                         work: Path, storage: Any = None) -> tuple[dict[str, Path], list[str]]:
-    """每镜渲一张预览静帧（小 JPEG）→ ({镜号: 文件}, 没出成的说明)。
+                         work: Path, storage: Any = None
+                         ) -> tuple[dict[str, Path], list[str], dict[str, dict[str, Any]]]:
+    """每镜渲一张预览静帧（小 JPEG）→ ({镜号: 文件}, 没出成的说明, {镜号: 版面账})。
 
     这是渲染前计划确认卡上的那几张图：人看一眼就知道画面对不对，成本约是整镜渲染的
     百分之一。任何一镜失败只记一句说明、不拦——预览是增益，硬闸在渲染那一趟。
+
+    版面账（`summarize_layout` 那一份形状）是这一趟顺带回来的：字压字、字压图、出画，
+    在**还没烧像素**的时候就能点名——那是修一处版面最便宜的时刻（改一镜代码、几秒钟），
+    烧完再发现就是重烧那一镜。客户端没有带读数的那个口（离线用例的假服务）时版面账为空。
     """
     out: dict[str, Path] = {}
     notes: list[str] = []
+    layouts: dict[str, dict[str, Any]] = {}
+    stills_fn = client.get("stills_layout")
     gate = asyncio.Semaphore(PREVIEW_PARALLEL)
     work.mkdir(parents=True, exist_ok=True)
+    # 预览帧也按同一把「估算时长」的尺给全片时钟：模板的 film 轨道（一直在走的人）
+    # 在确认卡上就该是正确的一步，而不是每镜都从 0 帧抬起脚。
+    planned_starts: list[float] = []
+    acc = 0.0
+    shots_for_clock = list(spec.get("shots") or [])
+    overlaps = _seam_overlaps(spec, shots_for_clock)
+    for i, s in enumerate(shots_for_clock):
+        planned_starts.append(round(acc, 3))
+        acc += _preview_frames(s, spec) / float(spec["fps"])
+        if i < len(overlaps):
+            acc -= overlaps[i]
 
     async def one(i: int, shot: Mapping[str, Any]) -> None:
         sid = str(shot.get("id") or f"s{i + 1:02d}")
@@ -1341,11 +1464,22 @@ async def preview_stills(spec: Mapping[str, Any], *, client: dict[str, Any],
         if not code.strip():
             return
         frames = _preview_frames(shot, spec)
-        props = shot_input_props(shot, spec, frames=frames, frame_words=[])
+        props = shot_input_props(shot, spec, frames=frames, frame_words=[],
+                                 film_start_sec=planned_starts[i])
         async with gate:
             try:
-                stills = await asyncio.to_thread(
-                    client["stills"], code, props, [int(frames * PREVIEW_AT)])
+                if stills_fn is not None:
+                    got = await asyncio.to_thread(
+                        stills_fn, code, props, [int(frames * PREVIEW_AT)],
+                        scale=PREVIEW_SCALE)
+                    stills = list((got or {}).get("stills") or [])
+                    raw_layout = (got or {}).get("layout")
+                    if raw_layout is not None:
+                        layouts[sid] = summarize_layout(sid, raw_layout)
+                else:
+                    stills = await asyncio.to_thread(
+                        client["stills"], code, props, [int(frames * PREVIEW_AT)],
+                        scale=PREVIEW_SCALE)
             except Exception as exc:  # noqa: BLE001 - 预览缺一张不拦
                 notes.append(f"{sid}：预览静帧没出成（{type(exc).__name__}: {str(exc)[:120]}）")
                 return
@@ -1358,7 +1492,59 @@ async def preview_stills(spec: Mapping[str, Any], *, client: dict[str, Any],
         out[sid] = dst
 
     await asyncio.gather(*(one(i, s) for i, s in enumerate(spec.get("shots") or [])))
-    return out, notes
+    return out, notes, layouts
+
+
+#: 预览版面读数里**值得模型当场改**的那几类（字压字、字压图、出画）。
+#: 引线落空（`dangling`）不在此列：它在静帧上常是「引线还在画、终点还没到」的中间态，
+#: 拿一帧去要求改，误报多于真病——整镜渲染那一趟的读数照旧会报它。
+PREVIEW_LAYOUT_KINDS = frozenset({"overlap", "overlap_subject", "clipped"})
+
+
+def _layout_trustworthy(lay: Mapping[str, Any]) -> bool:
+    """这一份版面读数的坐标可信吗：有盒子落在画面之外**一整个画面那么远**就不可信。
+
+    2026-10-17 实测：`/render-stills` 那一路量出来的盒子整体偏了约 -1,000,000 px，
+    而且宽度塌了（四个字被量成 40 px 宽、232 px 高的竖排）——量的那一刻画面不在正常的
+    排版状态里。同一镜走 `/render-shot` 量是对的。这种读数会给每一镜报十几条
+    「出画 / 字压字」的假警报，模型照着去改本来没问题的代码，比没有读数更坏。
+    所以整镜作废、一条不报；等探针在静帧那一路修好，这一关自然放行。
+    """
+    # `summarize_layout` 把 band 提到了顶层（不在 `scanned` 里）。
+    band = lay.get("band") if isinstance(lay.get("band"), Mapping) else None
+    w = float((band or {}).get("w") or 0)
+    h = float((band or {}).get("h") or 0)
+    if w <= 0 or h <= 0:
+        return False
+    for f in lay.get("findings") or []:
+        box = f.get("box") if isinstance(f, Mapping) else None
+        if not isinstance(box, Mapping):
+            continue
+        try:
+            x, y = float(box.get("x", 0)), float(box.get("y", 0))
+        except (TypeError, ValueError):
+            return False
+        if not (-w <= x <= 2 * w and -h <= y <= 2 * h):
+            return False
+    return True
+
+
+def preview_layout_findings(layouts: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    """预览版面账 → 只留可执行的那几类，逐条人话（措辞与 `describe_layout` 同一份）。
+
+    坐标不可信的那几镜（见 `_layout_trustworthy`）整镜跳过——一条假警报都不发。
+    """
+    out: list[str] = []
+    for sid in sorted(layouts):
+        lay = layouts[sid]
+        if str(lay.get("status")) != "scanned" or not _layout_trustworthy(lay):
+            continue
+        kept = [f for f in (lay.get("findings") or [])
+                if isinstance(f, Mapping) and f.get("kind") in PREVIEW_LAYOUT_KINDS]
+        if not kept:
+            continue
+        out.extend(describe_layout(sid, {**lay, "findings": kept}))
+    return out
 
 
 class FrameBudget:
@@ -1437,6 +1623,32 @@ async def _render_shots(shots: list[dict[str, Any]], *, spec: Mapping[str, Any],
             fut = loop.create_future()
             fut.set_result(n)
             prefetch.append(fut)
+    # 全片时钟：参考片里「一直在走的人」是整片连续的一层，模板的 film 作用域轨道
+    # 按 `filmStartSec + frame/fps` 算步态。逐镜并发渲染时，每一镜只知道自己，
+    # 不知道前面几镜真实有多长——所以先把所有旁白时长收齐、算出每镜起点，再开始烧。
+    # 配音本来就在开头全部并行预取，这里只是把「开始烧第一镜」等到时长齐，**不增加
+    # 一次 TTS 请求**；换来的是切点处相位/位移真的接得上，而不是每镜都偏一点。
+    film_starts: list[float] = []
+    # 拼接层是 xfade：后一镜提前 overlaps[i] 秒进场，真实起点要减掉累计交叠，
+    # 否则全片时钟会越走越偏（硬切时 overlaps 全 0，与从前一致）。
+    overlaps = _seam_overlaps(spec, shots)
+    clock_narrs = ([await t for t in prefetch]
+                   if prefetch and all(t is not None for t in prefetch) else None)
+    if clock_narrs is not None:
+        acc = 0.0
+        for i, n in enumerate(clock_narrs):
+            film_starts.append(round(acc, 3))
+            acc += float((n or {}).get("sec") or 0.0)
+            if i < len(overlaps):
+                acc -= overlaps[i]
+    else:
+        fps_i = float(spec["fps"])
+        acc = 0.0
+        for i, shot in enumerate(shots):
+            film_starts.append(round(acc, 3))
+            acc += _preview_frames(shot, spec) / fps_i
+            if i < len(overlaps):
+                acc -= overlaps[i]
     # 多镜并发烧（RENDER_PARALLEL 路）。结果按镜号顺序装配；某一镜红了，还没开始的镜
     # 不再开（与串行版「红在第 k 镜、后面不渲」同语义），已在烧的照常烧完进缓存。
     budget = FrameBudget(used=frames_used, limit=rpipe.max_frames_total(
@@ -1456,7 +1668,8 @@ async def _render_shots(shots: list[dict[str, Any]], *, spec: Mapping[str, Any],
                                              identities=identities, client=client,
                                              storage=storage,
                                              cache=cache, progress=progress,
-                                             narration=prefetch[i], budget=budget)
+                                             narration=prefetch[i], budget=budget,
+                                             film_start_sec=film_starts[i])
             except BaseException:
                 stop.set()
                 raise

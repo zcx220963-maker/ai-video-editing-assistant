@@ -18,8 +18,10 @@ import codecs
 import gzip
 import ipaddress
 import json
+import os
 import re
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -367,10 +369,51 @@ class FetchTool(Tool):
     def read_only(self) -> bool:
         return True
 
+    async def _deepseek_fetch(self, url: str, max_bytes: int) -> tuple[str, str]:
+        """先试 DeepSeek 官方 Fetch → (回执, 说明)。回执为空 = 没走成，调用方照旧直接抓。
+
+        只在「没注入 transport」且模型密钥是 DeepSeek 的时候走（见 `deepseek_auto_key`）。
+        官方抓不到（403 安全策略 / 404 无正文 / 限流重试用完）就退回直接抓——那条路免费，
+        而且有时正好抓得到；402 余额不足也退回，但把这件事写进说明，让模型与用户看得见。
+        """
+        if self._transport is not default_transport:
+            return "", ""
+        key = await deepseek_auto_key()
+        if not key:
+            return "", ""
+        try:
+            page = await asyncio.to_thread(_deepseek_call, "/v1/tools/fetch", {"url": url},
+                                           key, self.timeout)
+        except DeepSeekToolError as e:
+            return "", f"（DeepSeek 抓取没成：HTTP {e.status}，{e}；已改为直接抓取）\n"
+        except Exception as e:  # noqa: BLE001 - 网络异常也退回直接抓
+            return "", f"（DeepSeek 抓取没成：{type(e).__name__}；已改为直接抓取）\n"
+        content = _scrub_control(str(page.get("content") or "").strip())
+        if not content:
+            return "", "（DeepSeek 抓取没拿到正文；已改为直接抓取）\n"
+        title = str(page.get("title") or "").strip()
+        raw = content.encode("utf-8")
+        tail = ""
+        if len(raw) > max_bytes:
+            content = raw[:max_bytes].decode("utf-8", errors="ignore")
+            tail = f"\n...（内容超过 {max_bytes} 字节，已截断）"
+        from ..retrieval import note_hit
+        await note_hit(url, title, backend="fetch_url")
+        head = f"# {title}\n" if title and not content.lstrip().startswith("#") else ""
+        return (f"[200·DeepSeek Fetch] {url}\n{head}{content}{tail}\n"
+                + COST_LINE.format(DEEPSEEK_CALL_YUAN)), ""
+
     async def execute(self, url: str, max_bytes: int = 200_000) -> str:
         err = ensure_safe_url(url)
         if err:
             return err
+        via_api, note = await self._deepseek_fetch(url, max_bytes)
+        if via_api:
+            return via_api
+        return note + await self._direct_fetch(url, max_bytes)
+
+    async def _direct_fetch(self, url: str, max_bytes: int) -> str:
+        """直接用 HTTP 抓目标站（免费；官方 Fetch 没走成、或没有 DeepSeek 密钥时的那一路）。"""
         try:
             fetched = await asyncio.to_thread(self._transport, url, max_bytes, self.timeout)
         except Exception as e:  # noqa: BLE001 - 网络异常回喂给 LLM
@@ -537,7 +580,112 @@ def duckduckgo_provider(
 # --------------------------------------------------------------------------
 
 #: 四路的共同点：结果是 JSON、按 key 或实例地址鉴权、不看这台机器的 IP 像不像爬虫。
-KEYED_SEARCH_PROVIDERS = ("brave", "tavily", "serpapi", "searxng")
+KEYED_SEARCH_PROVIDERS = ("deepseek", "brave", "tavily", "serpapi", "searxng")
+
+
+# --------------------------------------------------------------------------
+# DeepSeek 官方 Search / Fetch（2026-10-18 接入）
+#
+# 与 DeepSeek 模型 API 同一个 Bearer 鉴权，所以**默认沿用模型密钥**：模型地址是
+# api.deepseek.com、又没在设置页另配搜索后端时，联网检索与抓取都走它（见
+# `deepseek_auto_key`）。为什么要换：原先的免 key 回落链（维基 + Bing RSS + DuckDuckGo）
+# 中文长尾召回差，直接抓取又常被反爬挡（真机 run 里知乎 403、抓不到正文）；官方 Fetch
+# 直接回 Markdown 正文，Search 自带 600~800 字的长摘要（给模型读的那一档）。
+#
+# 价目：Search / Fetch 各 **5 元 / 千次成功请求**（失败、无结果、超时不计费）。每次成功
+# 的回执末尾带一行 `node_cost_yuan=0.005`，主循环据此记进这条 run 的预算（见
+# `agent._charge_nodes`）。限速：账号级各 5 QPS，Fetch 另有按目标域名的限速。
+# --------------------------------------------------------------------------
+
+DEEPSEEK_TOOLS_BASE = "https://api.deepseek.com"
+DEEPSEEK_CALL_YUAN = 0.005
+#: 官方说明：408 / 429 / 5xx 等一下再重试；402 余额不足；其余 4xx 改了请求才重试。
+_DEEPSEEK_RETRY = frozenset({408, 429, 500, 502, 503, 504})
+_DEEPSEEK_RETRIES = 2
+#: 计费行的写法（主循环 `_charge_nodes` 认它）。
+COST_LINE = "[计费 node_cost_yuan={:.3f}]"
+#: 「没另配后端、沿用模型密钥走 DeepSeek」那一路的后端名（回执首行与回落判断都用它）。
+DEEPSEEK_AUTO_LABEL = "DeepSeek 官方检索（沿用模型密钥）"
+
+
+class DeepSeekToolError(RuntimeError):
+    """DeepSeek Search / Fetch 回了非 200（重试用完之后）。``status`` 留给调用方分流。"""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = int(status)
+
+
+def _deepseek_call(path: str, body: dict[str, Any], key: str, timeout: float,
+                   transport: Callable[..., _Fetched] | None = None) -> dict[str, Any]:
+    tp = transport or default_transport
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+               "Accept": "application/json"}
+    for attempt in range(_DEEPSEEK_RETRIES + 1):
+        fetched = tp(DEEPSEEK_TOOLS_BASE + path, 8_000_000, timeout, headers=headers, data=data)
+        text = fetched.body.decode("utf-8", errors="replace")
+        if fetched.status == 200:
+            try:
+                got = json.loads(text)
+            except ValueError as e:
+                raise DeepSeekToolError(200, f"返回不是 JSON（{e}）") from e
+            if not isinstance(got, dict):
+                raise DeepSeekToolError(200, "返回的 JSON 不是对象")
+            return got
+        if fetched.status in _DEEPSEEK_RETRY and attempt < _DEEPSEEK_RETRIES:
+            time.sleep(1.0 * (attempt + 1))
+            continue
+        try:
+            msg = str((json.loads(text).get("error") or {}).get("message") or "")
+        except (ValueError, AttributeError):
+            msg = ""
+        if fetched.status == 402:
+            msg = "DeepSeek 账户余额不足（402），请先充值"
+        elif fetched.status == 401:
+            msg = "DeepSeek API Key 无效或缺失（401）"
+        raise DeepSeekToolError(fetched.status, msg or f"HTTP {fetched.status}")
+    raise DeepSeekToolError(0, "重试用完")
+
+
+def deepseek_provider(query: str, max_results: int, timeout: float = 20.0,
+                      transport: Callable[..., _Fetched] | None = None, *,
+                      key: str = "", base_url: str = "") -> list[SearchResult]:
+    """DeepSeek 官方 Search：长摘要（summary）给模型读，带发布日期。"""
+    q = (query or "").strip()[:128]
+    payload = _deepseek_call("/v1/tools/search",
+                             {"query": q, "count": max(1, min(int(max_results or 5), 50)),
+                              "need_content": False}, key, timeout, transport)
+    out: list[SearchResult] = []
+    for r in (payload.get("results") or [])[:max_results]:
+        if not isinstance(r, dict):
+            continue
+        date = str(r.get("date") or "")[:10]
+        text = str(r.get("summary") or r.get("snippet") or "").strip()
+        out.append(SearchResult(
+            title=_strip_tags(str(r.get("title") or "")), url=str(r.get("url") or ""),
+            snippet=(f"（{date}）" if date else "") + text, backend="DeepSeek"))
+    return out
+
+
+async def deepseek_auto_key() -> str:
+    """没另配搜索后端时，模型密钥能不能直接拿来调 DeepSeek Search / Fetch → 那把 key（不能就空串）。
+
+    条件只有一个：这位用户的主模型地址是 api.deepseek.com（同一个账号、同一种鉴权）。
+    别家的模型 key 不许往 DeepSeek 发——那等于把 key 交到别人家门口。
+    环境变量 ``WEB_TOOLS_DEEPSEEK=0`` 关掉这一路（回到免 key 回落链）。
+    """
+    if os.environ.get("WEB_TOOLS_DEEPSEEK", "1").strip().lower() in ("0", "false", "no"):
+        return ""
+    from ..llm_openai import get_default_llm
+    from ..secrets import resolve_api_key, resolve_model_base
+    llm = get_default_llm()
+    _model, base = await resolve_model_base(fallback_model=llm.model,
+                                            fallback_base=llm.base_url)
+    if "api.deepseek.com" not in (base or "").lower():
+        return ""
+    key, _source = await resolve_api_key(fallback=getattr(llm, "api_key", "") or "")
+    return key
 
 
 def brave_provider(query: str, max_results: int, timeout: float = 20.0,
@@ -608,6 +756,7 @@ def searxng_provider(query: str, max_results: int, timeout: float = 20.0,
 
 # provider 名 → (实现, 要不要 key, 要不要自建地址)
 _KEYED: dict[str, tuple[Callable[..., list[SearchResult]], bool, bool]] = {
+    "deepseek": (deepseek_provider, True, False),
     "brave": (brave_provider, True, False),
     "tavily": (tavily_provider, True, False),
     "serpapi": (serpapi_provider, True, False),
@@ -877,7 +1026,8 @@ class SearchTool(Tool):
         return ("搜索互联网信息，返回若干条标题、链接与摘要（回执首行标出这次是哪个后端出的）。"
                 "可据结果再用 fetch_url 深入抓取。返回 0 条只代表这些后端没有命中，"
                 "不代表事实不存在：换关键词、用 fetch_url 打开已知页面，"
-                "或在设置页配置搜索后端（brave / tavily / serpapi / 自建 SearXNG）。"
+                "或在设置页配置搜索后端（deepseek / brave / tavily / serpapi / 自建 SearXNG；"
+                "模型用的是 DeepSeek 时默认就走 DeepSeek 官方检索）。"
                 "免 key 回落链按字面匹配，与查询词零重合的条目会被丢弃、也不记进检索账。"
                 "本工具与 fetch_url 真打开过的页面会记进会话的检索账，"
                 "分镜里的出处只有能对上一笔账才算查证过——没查过就标「未核实」。")
@@ -905,6 +1055,12 @@ class SearchTool(Tool):
         name, key, base, source = await resolve_search_config()
         name = (name or "").strip().lower()
         if not (name or key or base):
+            # 没另配后端：模型密钥是 DeepSeek 的就直接用官方 Search（见 `deepseek_auto_key`）。
+            # 注入了假 transport（离线用例）时不走它——用例不该打真接口。
+            ds_key = "" if self._transport is not None else await deepseek_auto_key()
+            if ds_key:
+                fn, err = keyed_provider("deepseek", ds_key, "")
+                return fn, DEEPSEEK_AUTO_LABEL, err
             return ((lambda q, n: auto_provider(q, n, self.timeout, self._transport)),
                     "免 key 回落链", "")
         if not name:
@@ -920,21 +1076,38 @@ class SearchTool(Tool):
             return err
         if runner is None:
             return "Error: 未配置可用的搜索后端"
+        note = ""
         try:
             out = await asyncio.to_thread(runner, query, max_results)
+        except DeepSeekToolError as e:
+            if e.status in (401, 402):
+                return f"Error: {e}"
+            if label != DEEPSEEK_AUTO_LABEL:
+                return f"Error: 搜索失败（DeepSeek HTTP {e.status}）: {e}"
+            # 沿用模型密钥那一路出了岔子（限流、超时、服务端错）：退回免 key 回落链，
+            # 别让一次检索因为换了后端就整个失败。
+            note = f"（DeepSeek 检索这一次没成：HTTP {e.status}，已改用免 key 回落链）\n"
+            label = "免 key 回落链"
+            try:
+                out = await asyncio.to_thread(
+                    lambda: auto_provider(query, max_results, self.timeout, self._transport))
+            except Exception as e2:  # noqa: BLE001
+                return f"Error: 搜索失败: {e2}"
         except Exception as e:  # noqa: BLE001
             return f"Error: 搜索失败: {e}"
         refusal = provider_refusal(out)
         if refusal:
-            return refusal
+            return note + refusal
         results: list[SearchResult] = out
         if not results:
-            return f"未找到结果：query={query!r}（后端：{label}）"
+            return f"{note}未找到结果：query={query!r}（后端：{label}）"
         stage = results[0].backend or label
         from ..retrieval import note_hits
         await note_hits([{"url": r.url, "title": r.title} for r in results],
                         backend=stage)
-        return f"[检索后端：{stage}]\n" + "\n".join(r.format() for r in results)
+        # 官方 Search 按「成功且有结果」计费：只在这一档带计费行。
+        cost = ("\n" + COST_LINE.format(DEEPSEEK_CALL_YUAN)) if stage == "DeepSeek" else ""
+        return (f"{note}[检索后端：{stage}]\n" + "\n".join(r.format() for r in results) + cost)
 
 
 def register_web_tools(registry, **kwargs) -> None:

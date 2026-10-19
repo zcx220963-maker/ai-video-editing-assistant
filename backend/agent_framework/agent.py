@@ -25,13 +25,17 @@ from typing import Any, Iterable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
+from . import cost as cost_mod
 from . import judge as judge_mod
+from . import style_templates
 from .ask_gate import (looks_like_asking_user, looks_like_plan_invite,
                        no_popup_note, plan_card_nudge, popup_nudge)
 from .checkpoint import Checkpoint, CheckpointManager
 from .catalog import get_catalog
 from .compress import (DEFAULT_FOLD_AT_BYTES, DEFAULT_KEEP_RECENT_RESULTS,
-                       DEFAULT_RESULT_MAX_BYTES, ToolResultGate, _repair_orphans)
+                       DEFAULT_RESULT_MAX_BYTES, FOLD_MARKER, ToolResultGate,
+                       _repair_orphans)
+from .skill import INDEX_ONLY_NOTE
 from .context import (ContextBuilder, LEDGER_ENTRY_TYPE, Section,
                       check_tools_budget, tools_box)
 from .hooks import AgentHook, AgentHookContext, CompositeHook, _current_hook_ctx, _current_hooks
@@ -107,6 +111,23 @@ def _is_actionable_feedback(r: Any) -> bool:
 # 真机规划轮靠「猜键名读产物」连着错六十次烧穿迭代预算，提示词里的「请勿重试」拦不住。
 _MAX_CONSECUTIVE_FAILURES = 4
 
+#: 撞上 ``_MAX_CONSECUTIVE_FAILURES`` 后**从工具清单里摘掉**，不再给模型发 schema。
+#: 只靠「拒绝执行」拦不住：真机 2026-10-19 run `1488197dd8a0`（娱乐史 14 镜）里
+#: ``web_search`` 同一句查询被拒 5 次，模型仍然原样再打，最后按原地打转停成 failed，
+#: 白烧 ¥0.24、一张计划卡都没出。把选项拿掉，它只能换工具或交卡。
+#: 这几个永远保留：规划轮的出口不能被摘，否则模型无处交付。
+_NEVER_HIDE_TOOLS = frozenset({"submit_plan", "ask_user"})
+
+#: 原地打转停跑之前，给「摘掉死工具、强制交付」留几轮。
+#:
+#: 为什么需要：摘 schema 发生在**叫模型之前**，而原地打转守卫也在叫模型之前；
+#: 真机 run `b0476d367741`（2026-10-19，同一份娱乐史提示词）里，第 4 次连续失败
+#: 与第 6 轮打转落在**同一轮**——守卫先停，摘工具那一轮永远没发生，于是模型至死
+#: 都在原样重打 ``web_search``，白烧 ¥0.24、零张计划卡。留一轮的好处是：停跑前
+#: 模型终于看见一张没有 ``web_search`` 的工具面，只能拿已有信息交卡或问用户。
+#: 只给 1 轮：摘掉之后还打不出交付物，就是这个模型确实走不动了，再给只是白烧。
+_MAX_STALL_RESCUES = 1
+
 # ---- 无进展重复调用熔断 ----
 #
 # 上面那道守卫只数**失败**。真机实测的另一族打转它一次都没抓到：一条规划轮里
@@ -153,13 +174,52 @@ _MAX_SHOT_CARDS_HARD = 60
 # 每份参数都是新的、每一枪都成功，参数级那两条闸一次都没响。
 #
 # 上限不能压到「只许整份取一次」：正文过 24 KB 会被压缩闸从中间切掉，
-# 模型按行续读是 compress.py `_RECOVERY_HINT["load_skill"]` 亲手教的做法。
+# 按大段续读（limit≈100 行）是 compress.py `_RECOVERY_HINT["load_skill"]` 教的
+# 正确形状——教的是大段，不是一行一行。
 # 两档同上一族的理由，取值按「一份千行正文老实翻完要几页」定：
 # 软线 16 页（每页一两百行够翻完整份）过了就提醒一句「再换起始行不会有新信息」；
 # 硬线 32 页只用来接住打转——真机那条 26 枪的形状（19 个重叠窗口）在软线之下，
 # 今天一枪不拦，只多一句提醒，这正是 §2.2 要的「读多少由模型定」。
 _MAX_SKILL_BODY_PAGES = 16
 _MAX_SKILL_BODY_PAGES_HARD = 32
+
+# ---- 读**附件**的分页上限（同一族的第三条家族级闸）----
+#
+# 正文闸与读卡闸都接不到的那一维：模型对**同一份附件**按行磨。真机 2026-10-17 的
+# 「薄肌理论」run（293 行开场 demo）与 2026-10-18 的 run `31af0aeaeda8`（397 行
+# `pipeline.md`）是同一种形状：`offset=N, limit=1` 一路加一，每枪参数都不同、每枪
+# 都成功——参数级两条闸全程没响，200 轮迭代全烧在翻行上，一个计划都没交。
+#
+# 取值与正文同族的理由：附件通常比正文短，但同样的「重叠窗口」病会发作。软线只
+# 提醒、硬线才拒；**整份一次取回（不带 offset/limit）不占窗口额度**——那正是
+# 硬线回执给出的出路，也是这个工具最省事的一条路。（它仍受「同一段已经给过、回执
+# 还在上下文里」那一条约束，见 `_page_covered`；被折叠收走之后整份重取照常放行。）
+_MAX_ATTACH_PAGES = 8
+_MAX_ATTACH_PAGES_HARD = 16
+
+# ---- 整 run 的技能阅读总量（同族第四条家族级闸）----
+#
+# 前三条家族级闸都按**一份文件**计数：正文、附件、shot 卡各有自己的窗口上限。真机
+# 2026-10-19 run `8f43a2e43fde`（auto 入口直接进执行轮，35 轮 failed）接不到这一维：
+# 模型先把 motion_explainer 的正文按 9 个窗口读完（≈104 KB），再把 6 份附件逐份整取
+# 或分页读完（又 ≈90 KB）——**每一份都在自己的上限之内、每一枪都成功，三条闸一条
+# 都没响**。随后它把 already-read 的 `aesthetic-rules.md` 第 1–190 行按
+# `1:60 / 61:60 / 121:70` 又取一遍，第三遍被「同参同结果」闸拦下后连打 6 次，
+# 整条 run 按「原地打转」停下，用户看到的是「又卡死了」。
+#
+# 这一条只看**本 run 经 load_skill 走了几枪**（与联网取材那道「全 run 总枪数」同一
+# 口径），不看单份：
+#   软线 到了照跑，只插一句 system：材料已够，去动作；
+#   硬线 起不再执行，回执点名「停止阅读、用读到的内容推进」。
+# `section=` 单取**永不受这条限制**——它是硬线之后唯一该走的路（按块取、一次几百到
+# 几 KB），也是这条闸不能堵死的那条缝。跨文件不设「整份重读也拦」的绝对禁令：
+# 早先的回执被折叠闸收走时，重取是恢复路径（见 `_page_covered` 的 visible 参数）。
+#
+# 取值按「一份千行正文 + 六份附件老实读完」估：正文 9 页 + 附件 6 次 ≈ 15 枪。
+# 软线 10 枪比「认真读完」早几枪，正好在它开始重复之前把话说给模型听；硬线 20 枪
+# 兜住「读完再读一遍」那种打转，又不至于把还没读完的附件真正卡住。
+_MAX_SKILL_READS = 10
+_MAX_SKILL_READS_HARD = 20
 
 
 def _digest(obj: Any) -> str:
@@ -245,8 +305,22 @@ def _skill_body_page(name: str, arguments: Any) -> tuple[str, str] | None:
         return None
     if _norm_path(args.get("path")).lower() not in ("", "skill.md"):
         return None
+    # `section=` 取的是**分段块**，不是行窗口：做成 `section:<键名>` 单独记账，否则
+    # 它会被当成 `1:whole`（缺省 offset/limit）——读了一块之后，整份正文就被判成
+    # 「已经给过」，反过来把还没读的部分也堵死。
+    section = str(args.get("section") or "").strip()
+    if section:
+        return (skill, f"section:{section}")
 
-    def _line(value: Any, default: int) -> int | str:
+    return (skill, _page_key(args))
+
+
+def _page_key(args: dict[str, Any]) -> str:
+    """调用参数 → 页键 ``起始行:行数``（缺省 offset=1、limit=``whole``）。
+
+    行号按整数归一，好让 ``"220"`` 与 ``220`` 同键。
+    """
+    def _line(value: Any, default: int | str) -> int | str:
         if value is None:
             return default
         try:
@@ -254,12 +328,103 @@ def _skill_body_page(name: str, arguments: Any) -> tuple[str, str] | None:
         except (TypeError, ValueError):
             return default
 
-    return (skill, f"{_line(args.get('offset'), 1)}:{_line(args.get('limit'), 'whole')}")
+    return f"{_line(args.get('offset'), 1)}:{_line(args.get('limit'), 'whole')}"
+
+
+def _page_span(key: str) -> tuple[int, int | None] | None:
+    """页键 → ``(起始行, 结束行)``；``结束行=None`` 表示到文件末尾。
+
+    ``section:`` 键不是行窗口，返回 None（由 `_page_covered` 按等值判）。
+    """
+    if key.startswith("section:"):
+        return None
+    off, _, lim = key.partition(":")
+    try:
+        start = int(off)
+    except (TypeError, ValueError):
+        return None
+    if lim == "whole":
+        return (start, None)
+    try:
+        return (start, start + int(lim))
+    except (TypeError, ValueError):
+        return None
+
+
+def _page_label(key: str) -> str:
+    """页键的人话：``220:180`` → 「220 行起 ×180 行」，``1:whole`` → 「1 行起整份」。"""
+    if key.startswith("section:"):
+        return f"section={key.split(':', 1)[1]}"
+    off, _, lim = key.partition(":")
+    return f"{off} 行起" + ("整份" if lim == "whole" else f"×{lim} 行")
+
+
+def _page_covered(pages: Mapping[str, str], key: str,
+                  visible: set[str] | None = None) -> bool:
+    """这一页是不是**整段**都落在本 run 已经给过的某一页里。
+
+    ``pages`` 是 ``{页键: 那一枪的 tool_call_id}``。``visible`` 非空时，只认结果
+    **还在上下文里**的那些页：被折叠闸收走的回执（存根只有 200 字符）不算「给过」
+    ——否则模型真把内容弄丢之后再取就被判成重读，两条机制顶牛（见
+    `test_tool_failure_guard` 的 ㉔ 那条 run d433）。
+    """
+    span = _page_span(key)
+    if span is None:
+        for page, cid in pages.items():
+            if page == key and (visible is None or cid in visible):
+                return True
+        return False
+    start, end = span
+    for page, cid in pages.items():
+        if visible is not None and cid not in visible:
+            continue
+        prior = _page_span(page)
+        if prior is None:
+            continue
+        p_start, p_end = prior
+        if p_start <= start and (p_end is None or (end is not None and end <= p_end)):
+            return True
+    return False
+
+
+def _skill_attach_page(name: str, arguments: Any) -> tuple[str, str, str] | None:
+    """这一枪读的是不是某个**附件**的某一页；是就返回 ``(技能名, 附件路径, 页键)``。
+
+    与 `_skill_body_page` 分工：正文（缺省或 ``SKILL.md``）归那一条，这里只认别的
+    相对路径。整份取也返回页键 ``1:whole``——**由闸那条豁免**（整份取是硬线之后
+    唯一的出路，不能把它封死），这样「什么算附件」只在这一个函数里定义一次。
+
+    shot 卡也归这一族：读卡闸按**张**计数，看不见同一张卡被取了几十个行窗口；
+    两条闸各数各的一维，不冲突。
+
+    真机形状（2026-10-18 run ``31af0aeaeda8``）：模型对 ``pipeline.md`` 连打
+    ``offset=N, limit=1``，N 一路加一——每枪参数都不同、每枪都成功，参数级判据
+    一次都不会响，必须由这一层按**文件 + 窗口**计数。
+    """
+    if name != "load_skill":
+        return None
+    args = _call_args(arguments)
+    if args is None:
+        return None
+    skill = str(args.get("name") or "").strip()
+    path = _norm_path(args.get("path"))
+    if not skill or path.lower() in ("", "skill.md"):
+        return None
+    return (skill, path, _page_key(args))
 
 
 # 单次工具调用硬超时（秒）：MCP tool_timeout=600s 在此之前先触发并给出更具体的错误；
 # 这里兜底的是本地工具或 MCP 传输层自身卡死的情况——不给这层就会永远挂住。
 _TOOL_CALL_TIMEOUT = 650.0
+
+# 少数工具**合法地**比一次工具决策慢得多，给它们单开一档。
+#
+# `plan_motion` 一镜一镜写代码（写手）+ 每镜真渲一版草稿数量闸⑭，耗时随镜数线性涨：
+# 2026-10-18 真机 run 8c5e161ddb20（32 镜）在 600 s 处被 MCP 口掐断，服务端其实还在写；
+# 模型看到「超时」连着重发了三次，同一份分镜的写手钱花了三遍，用户等了半个多小时。
+# 掐断**不等于**服务端停了——这条链一次调用就该跑完，所以把这一档放到整片真的写完为止。
+# 其他工具仍走 650 s：慢是 plan_motion 的形状，不是全体的形状。
+_TOOL_CALL_TIMEOUTS: dict[str, float] = {"plan_motion": 2700.0}
 
 # 渲染代查期间的心跳间隔（秒）：租约 600s，留出足够余量再续一次，
 # 避免长渲染代查跑到一半被别的实例判定为「租约过期」而抢走同一条 run。
@@ -381,6 +546,240 @@ def _planning_run(cp: Any) -> bool:
     return bool((getattr(cp, "scope", None) or {}).get("planning"))
 
 
+def _open_budget(state: RunState, *, resuming: bool,
+                 messages: Sequence[Any] | None = None) -> None:
+    """给这条 run 开花费账（见 `cost.py`）。
+
+    第一次进来填上每条的上限；**续跑**时若已经撞过上限（用户看过「花了多少、停下了」
+    那句话、点了「继续」），再往后延一份——与 `_iteration_limit` 续跑时往后延同一个道理。
+    没撞过上限的续跑（渲染确认门、弹窗提问之后）不延：那半截还在原来那份预算里。
+    上限是 0 = 关掉封顶。
+    """
+    per = cost_mod.run_budget_yuan()
+    if per <= 0:
+        state.budget_yuan = 0.0
+        return
+    if state.budget_yuan <= 0:
+        state.budget_yuan = per
+        # 新开的账：节点花费只从**这条 run 往后**的回执里读——上下文里带进来的旧对话
+        # 回执是别的 run 花的，记过一次了（见 `_charge_nodes`）。
+        if messages is not None and not resuming:
+            state.node_scan = len(messages)
+    elif resuming and state.spent_yuan >= state.budget_yuan:
+        state.budget_yuan = state.spent_yuan + per
+
+
+#: 连续这么多轮「每一次调用都失败、而且都是之前失败过的同一个调用」就停下这条 run。
+#:
+#: 2026-10-18 真机 run edd4ddb5808d：模型自己编了两个不存在的 demo 名，系统回「无此附件」
+#: 之后，它把同样两个调用又发了 150 多次——每次被拒都是完整的一轮、照样计费，而撞上
+#: 「连续失败 N 次，不再执行」那道闸也只是又回一句话，没有任何东西让这条 run 停下来。
+#: 判据刻意定窄：只认**重复**的失败。照着打回清单反复改分镜（每次报错不同、参数也不同）
+#: 是在推进，一轮都不算——那正是「堵死比白烧更坏」要护住的那一种。
+_STALL_ROUNDS = 6
+
+#: 交付前允许连续预览几次（软线 / 硬线）。**预览是自查，不是交付**。
+#:
+#: 2026-10-19 真机 run 32cd75d71fee（菊花一镜）：写手连续 6 轮「改代码 → preview_shot」，
+#: 每一版都换了花瓣画法，`_stuck_rounds` 按「参数不同就是推进」判，一次都没响；
+#: 直到迭代 27 还在调花瓣，始终没调 `plan_motion`。预览回执里的 `next` 它看见了，
+#: 但没有把它当成「下一步」。软线到了用 system 消息说一遍；硬线起 `preview_shot`
+#: 不再执行（不是拦交付——恰恰是逼它走交付那一步）。`plan_motion` /
+#: `render_motion_code` 一执行就把计数清零。
+_PREVIEW_SOFT = 3
+_PREVIEW_HARD = 6
+
+#: 一执行就算「已经交付/已经进入下一步」的工具：预览计数清零。
+#: 规划轮的 `submit_plan` 也算——交完计划再改草稿预览，是新一轮的自查，不该沿用旧账。
+_DELIVERY_TOOLS = frozenset({"plan_motion", "render_motion_code", "submit_plan"})
+
+
+#: 写文件类工具：比较「是不是重复」时**忽略写到哪个文件**、只看写了什么。
+#:
+#: 2026-10-18 真机 run 7054bfa3f503：模型说要做 26 镜，s01~s15 认真写完之后输出退化，
+#: 把同一段 4011 字符的代码原样写进 s16、s17……一直写到 s60 还没停——每一次都是「成功」、
+#: 路径也各不相同，只认重复**失败**的老判据一条都抓不到。同一段内容第二次写进别的文件，
+#: 就是在重复，不是在推进。
+_WRITE_TOOLS = frozenset({"write_file"})
+
+#: 编辑类工具：比较「是不是重复」时不看整串参数，只看**这次新增了什么**。
+#:
+#: 2026-10-19 真机 run 02cbcfb2440e：模型每轮把同一段约 380 字的光带 `<path>` 再追加
+#: 一份，`old_string` 恰好等于前面 N 份（唯一匹配）——参数逐轮变长，按整串 JSON 比
+#: 永远认不出重复，40 多轮把 7KB 的镜头文件叠到 20KB 还没停。
+#: 签名取「只增不减时新增的那一段」的哈希：同一段反复叠 → 同一个签名；
+#: 正常补码（每次新增的内容不同）→ 签名不同，不会误判。
+_EDIT_TOOLS = frozenset({"edit_file"})
+#: 成功但重复也算「不推进」的工具。轮询（`render_status`）不在其中：
+#: 同参同结果的轮询是等在途任务，不是打转。
+_REPEAT_TOOLS = _WRITE_TOOLS | _EDIT_TOOLS
+
+
+def _call_sig(name: Any, arguments: Any) -> str:
+    if name in _WRITE_TOOLS:
+        try:
+            args = json.loads(arguments) if isinstance(arguments, str) else dict(arguments or {})
+        except (ValueError, TypeError):
+            args = {}
+        body = str(args.get("content") or "")
+        return f"{name}:content#{hashlib.md5(body.encode('utf-8')).hexdigest()}"
+    if name in _EDIT_TOOLS:
+        try:
+            args = json.loads(arguments) if isinstance(arguments, str) else dict(arguments or {})
+        except (ValueError, TypeError):
+            args = {}
+        path = str(args.get("path") or "")
+        old = str(args.get("old_string") or "")
+        new = str(args.get("new_string") or "")
+        if old and new.startswith(old):
+            delta = new[len(old):]
+            return (f"{name}:{path}:grow#"
+                    f"{hashlib.md5(delta.encode('utf-8')).hexdigest()}")
+        return (f"{name}:{path}#"
+                f"{hashlib.md5((old + chr(0) + new).encode('utf-8')).hexdigest()}")
+    return f"{name}:{arguments}"
+
+
+def _call_rounds(messages: Sequence[Any]) -> list[list[tuple[str, str, str]]]:
+    """消息序列 → 每一轮工具调用的 ``[(调用签名, 结果开头, tool_call_id)]``。"""
+    rounds: list[list[tuple[str, str, str]]] = []
+    results = {str(m.get("tool_call_id")): str(m.get("content") or "")
+               for m in messages if isinstance(m, Mapping) and m.get("role") == "tool"}
+    for m in messages:
+        if not (isinstance(m, Mapping) and m.get("role") == "assistant" and m.get("tool_calls")):
+            continue
+        row = []
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function") if isinstance(tc.get("function"), Mapping) else tc
+            sig = _call_sig(fn.get("name"), fn.get("arguments"))
+            row.append((sig, results.get(str(tc.get("id")), "")[:200], str(tc.get("id"))))
+        rounds.append(row)
+    return rounds
+
+
+def _stuck_rounds(messages: Sequence[Any], *, floor: int = 0) -> int:
+    """末尾连续几轮是「全部失败、且全是重复的失败调用」（只看第 ``floor`` 条消息之后的轮次）。"""
+    rounds = _call_rounds(messages)
+    seen_before = _call_rounds(messages[:floor]) if floor else []
+    tried = {sig for row in seen_before for sig, _, _ in row}
+    flags = []
+    for row in rounds[len(seen_before):]:
+        # 一轮算「打转」：每一次调用都是之前出现过的同一个调用，并且要么失败了、要么是把
+        # 同样的内容又写/叠了一遍（写文件与编辑文件那两类成功也不算推进，见 `_REPEAT_TOOLS`）。
+        stuck = bool(row) and all(
+            sig in tried and (res.startswith("Error") or sig.split(":", 1)[0] in _REPEAT_TOOLS)
+            for sig, res, _ in row)
+        flags.append(stuck)
+        tried.update(sig for sig, _, _ in row)
+    n = 0
+    for f in reversed(flags):
+        if not f:
+            break
+        n += 1
+    return n
+
+
+def _last_failed_call(messages: Sequence[Any]) -> str:
+    """停下时那句话里点名的「在重复什么」：重复写同样的内容，或某个失败调用。"""
+    for row in reversed(_call_rounds(messages)):
+        for sig, res, _ in row:
+            if sig.split(":", 1)[0] in _WRITE_TOOLS:
+                return "把同一段内容反复写进不同的文件"
+            if sig.split(":", 1)[0] in _EDIT_TOOLS:
+                return "把同一段内容反复叠进同一个文件"
+            if res.startswith("Error"):
+                return sig[:120]
+    return "工具调用"
+
+
+def _dead_tools(fail_counts: Mapping[str, int]) -> set[str]:
+    """连续失败到上限、该从工具面上摘掉的工具名（出口工具永不摘）。"""
+    return {str(name) for name, n in fail_counts.items()
+            if int(n) >= _MAX_CONSECUTIVE_FAILURES
+            and str(name) not in _NEVER_HIDE_TOOLS}
+
+
+def _visible_tool_definitions(reg: Any, *, user_id: str | None,
+                              fail_counts: Mapping[str, int],
+                              only: set[str] | None = None
+                              ) -> list[dict[str, Any]]:
+    """本轮发给模型的工具面：连续失败到上限的工具不再出现在 schema 里。
+
+    拒绝执行是「说了不跑」，模型仍可以原样再打（真机 ``1488197dd8a0`` 连打 5 次
+    ``web_search``）。摘掉 schema 是结构性的：它没有这一项可选，只能换工具或交卡。
+    出口工具（``submit_plan`` / ``ask_user``）永远保留，见 ``_NEVER_HIDE_TOOLS``。
+
+    ``only`` 是「让位轮」用的白名单（见 ``_MAX_STALL_RESCUES``）：那一轮只剩出口，
+    模型没有别的可打，必须把已有的东西交出来。
+    """
+    defs = reg.get_definitions(user_id=user_id)
+    dead = _dead_tools(fail_counts)
+    if not dead and only is None:
+        return defs
+    kept: list[dict[str, Any]] = []
+    for d in defs:
+        fn = d.get("function") if isinstance(d, Mapping) else None
+        name = str((fn or {}).get("name") or "")
+        if name in dead or (only is not None and name not in only):
+            continue
+        kept.append(d)
+    return kept
+
+
+def _stop_reason(state: RunState, messages: Sequence[Any]) -> str:
+    """这一轮叫模型之前该不该停：``budget`` 花费到线 / ``stalled`` 原地打转 / 空串＝接着跑。"""
+    if _over_budget(state):
+        return "budget"
+    if _stuck_rounds(messages, floor=state.stall_floor) >= _STALL_ROUNDS:
+        # 记下停在哪：用户点「继续」之后只看这之后的新轮次——否则末尾那几轮失败还在，
+        # 续跑第一轮就又被判成打转、立刻停下。
+        state.stall_floor = len(messages)
+        return "stalled"
+    return ""
+
+
+def _over_budget(state: RunState) -> bool:
+    """这条 run 的花费到线了没有（`_drive` 每轮叫模型之前问一次）。
+
+    迭代上限按**轮数**数，而一轮可以是 2 万 token 也可以是 30 万——真机 run 32affa23c933
+    第 185 轮单轮就是 30.7 万输入。只有按**钱**数，「再出问题最多亏掉多少」才是一个确定的数。
+    """
+    return state.budget_yuan > 0 and state.spent_yuan >= state.budget_yuan
+
+
+def _charge(state: RunState, usage: Mapping[str, Any] | None) -> None:
+    """一次模型调用记进这条 run 的账。供应商没回缓存数时按全价算（`cost.cost_yuan`）。
+
+    **只记主循环**：节点里自己调模型的那几处（预览自查、带图判官）跑在另一个容器里，
+    钱不经过这里——它们今天都是按次、量小、默认关着的；哪天要开大量的节点内调用，
+    得让节点把 usage 随回执带回来再记到这里。
+    """
+    if not usage:
+        return
+    state.spent_yuan += cost_mod.cost_yuan(usage, model=str(usage.get("model") or ""))
+
+
+# 两种写法都认：节点 JSON 回执里的 `"node_cost_yuan": 0.12`，与联网工具文本回执末尾的
+# `[计费 node_cost_yuan=0.005]`（DeepSeek 官方 Search / Fetch，见 `tools/web.py`）。
+_NODE_COST_RE = re.compile(r'"?node_cost_yuan"?\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)')
+
+
+def _charge_nodes(state: RunState, messages: Sequence[Any]) -> None:
+    """把节点回执里报的花费（``"node_cost_yuan": 0.12``）记进这条 run 的账。
+
+    节点跑在另一个容器里，它自己调模型（出片前的带图风格对照）花的钱不经过主循环的
+    `_charge`；它把数字写进回执，这里从**新进来的**回执里读出来。``node_scan`` 记着读到
+    第几条，跨挂起不重复记。
+    """
+    start = min(state.node_scan, len(messages))
+    for m in messages[start:]:
+        if isinstance(m, Mapping) and m.get("role") == "tool":
+            got = _NODE_COST_RE.search(str(m.get("content") or ""))
+            if got:
+                state.spent_yuan += float(got.group(1))
+    state.node_scan = len(messages)
+
+
 def _iteration_limit(max_iterations: int, start_iteration: int, resuming: bool) -> int:
     """本轮迭代上限：**续跑时是「再给一轮」，不是「接着数」**。
 
@@ -421,6 +820,44 @@ def _answers_text(answers: Sequence[Mapping[str, Any]]) -> str:
     if len(lines) < 2:
         return ""
     return "用户在弹窗里逐题做的选择：\n" + "\n".join(lines)
+
+
+def _plan_style_skill(plan: Mapping[str, Any],
+                      row: Mapping[str, Any] | None) -> str:
+    """这张计划卡执行时用哪个风格包：候选优先，老卡退回规划轮 scope。
+
+    两处都没有 = 空串 = 不注入（缺省视觉）。为什么要有「退回」这一步：加上候选字段
+    之前落库的卡没有这一位，而 checkpoint scope 从一开始就记了本轮选的包——不退回，
+    老卡重放会静默换成默认视觉。
+    """
+    scope = (row or {}).get("scope")
+    return str(plan.get("style_skill")
+               or (scope if isinstance(scope, Mapping) else {}).get("style_skill")
+               or "")
+
+
+def _style_content_bits(items: Any) -> str:
+    """零件内容清单 → 一句话；`values` 是能传的字面量，`reference` 只是参考片叫法。
+
+    与 `shot_writer` 里那段同口径（两处都直接写进模型提示词，没有共享模块可以放：
+    `storyline_server/motion/*` 刻意不依赖 `agent_framework`）。
+    """
+    bits: list[str] = []
+    for c in (items or []):
+        if not isinstance(c, Mapping):
+            continue
+        prop = str(c.get("prop") or "")
+        values = [str(x) for x in (c.get("values") or []) if str(x).strip()]
+        ref = [str(x) for x in (c.get("reference") or []) if str(x).strip()]
+        if values:
+            bit = f"`{prop}` 可传 {' / '.join(values)}"
+            if ref:
+                bit += f"（参考片里对应：{' / '.join(ref)}）"
+            bits.append(bit)
+        elif ref:
+            bits.append(f"`{prop}` 参考片用过 {' / '.join(ref)}"
+                        "（按这一镜的需要传合法值）")
+    return "；".join(bits)
 
 
 def _annotate_requires(compiled: dict[str, Any], gate: Any) -> None:
@@ -630,6 +1067,13 @@ class _Round:
     iter_limit: int = 0
     final: str | None = None
     reached_limit: bool = True
+    # 这一次是因为什么提前停下的（不是迭代数）：``budget`` 花费到线 / ``stalled`` 原地打转。
+    # 收尾那句要按它写（见 `_stop_reason`）。
+    stop_reason: str = ""
+    # 打转停跑前已经用掉几轮「摘掉死工具、强制交付」的机会（见 `_MAX_STALL_RESCUES`）。
+    stall_rescues: int = 0
+    #: 下一轮是让位轮：工具面只留出口（`_NEVER_HIDE_TOOLS`），叫完即清。
+    rescue_pending: bool = False
 
 
 class AgentOnceRun:
@@ -697,6 +1141,7 @@ class AgentOnceRun:
         plan_run_id: str | None = None,
         planning: bool = False,
         interactive: bool = True,
+        style_skill: str = "",
     ) -> str:
         """正常发起一次执行；配置了 checkpoint 时先落一个初始快照。
 
@@ -713,7 +1158,8 @@ class AgentOnceRun:
         # 压缩阈值时 context_builder 里的摘要同样是一次 LLM 调用——密钥按当前身份从
         # app_secrets 热读，绑定晚一步就取到空值，整轮死在「未配置模型密钥」上
         # （真机 run=95ebb22a2be6：规划轮历史短没触发压缩，确认后的执行轮一上来就压）。
-        with use_identity_or_inherit(session.user_id, session.conversation_id):
+        with use_identity_or_inherit(session.user_id, session.conversation_id,
+                                     style_skill=style_skill):
             ids = [str(m) for m in attachments if str(m).strip()]
             rows, rejected = await self._resolve_attachments(session, ids)
             messages = await self.context_builder.build(
@@ -734,7 +1180,10 @@ class AgentOnceRun:
                         session.user_id, session.conversation_id), "artifact_id": "",
                     # 轮次身份必须**落盘**：续跑（提问作答 / 审批 / 崩溃恢复）时没人再传
                     # ``planning`` 这个形参，只能从快照里读（见 ``_planning_run``）。
-                    "planning": bool(planning)},
+                    "planning": bool(planning),
+                    # 风格包同一道理：计划卡与审批断点续跑时，浏览器不会再带一遍
+                    # 用户当初选的那个包，只能从 scope 里读回。
+                    "style_skill": str(style_skill or "")},
                     plan_run_id=plan_run_id,
                 )
             return await self._drive(
@@ -784,7 +1233,8 @@ class AgentOnceRun:
             attachments=ids)
 
     async def resume(self, cp: Checkpoint, session: Session, *, stream: bool = False,
-                     registry: ToolRegistry | None = None) -> str:
+                     registry: ToolRegistry | None = None,
+                     style_skill: str = "") -> str:
         """续跑一个快照：只重新发起 LLM 调用，不重放已提交工具。
 
         快照从哪来不在这里管——崩溃恢复取最新一致点，分叉重跑取历史某一界且已带着
@@ -798,8 +1248,10 @@ class AgentOnceRun:
         """
         pending_ids = [str(c.get("id") or "")
                        for c in ((cp.approval or {}).get("pending_calls") or [])]
+        # 显式传入的包名优先（用户在「继续」时可能刚换过），否则用快照里当初那个。
+        style = str(style_skill or (cp.scope or {}).get("style_skill") or "")
         with use_identity_or_inherit(session.user_id, session.conversation_id,
-                                     cp.artifact_id):
+                                     cp.artifact_id, style):
             return await self._drive(
                 session, cp.message,
                 _repair_orphans(list(cp.messages), keep_ids=pending_ids),
@@ -829,8 +1281,10 @@ class AgentOnceRun:
         """
         pending_ids = [str(c.get("id") or "")
                        for c in ((cp.approval or {}).get("pending_calls") or [])]
+        # 审批断点一律沿用快照里的包名：用户在这张卡上确认的是当初那一版视觉。
+        style = str((cp.scope or {}).get("style_skill") or "")
         with use_identity_or_inherit(session.user_id, session.conversation_id,
-                                     cp.artifact_id):
+                                     cp.artifact_id, style):
             return await self._drive(
                 session, cp.message,
                 _repair_orphans(list(cp.messages), keep_ids=pending_ids),
@@ -878,9 +1332,39 @@ class AgentOnceRun:
         ctx_token = _current_hook_ctx.set(r.ctx)
         limit = _iteration_limit(self.config.max_iterations, start_iteration, resuming)
         r.iter_limit = limit
+        _open_budget(r.state, resuming=resuming, messages=r.messages)
         try:
             try:
                 while r.iteration < limit:
+                    if stop := _stop_reason(r.state, r.messages):   # 花费封顶 / 原地打转
+                        # 打转停跑与「摘掉死工具」是同一轮判的（见 `_MAX_STALL_RESCUES`）：
+                        # 真机上第 4 次连续失败正好落在第 6 轮打转那一轮，守卫先停，
+                        # 摘工具的那一轮永远没发出去。这里让停跑先让位一轮，模型终于
+                        # 看见一张没有坏工具的工具面，只能交付或问用户。
+                        dead = _dead_tools(r.ctx.extras.get("_fail_counts") or {})
+                        rescue = (stop == "stalled"
+                                  and r.stall_rescues < _MAX_STALL_RESCUES
+                                  and bool(dead)
+                                  and r.reg.get("submit_plan",
+                                                user_id=r.ctx.session.user_id) is not None)
+                        if not rescue:
+                            r.stop_reason = stop
+                            break
+                        r.stall_rescues += 1
+                        r.rescue_pending = True
+                        r.messages.append(system(
+                            f"最后给你一轮：工具「{'、'.join(sorted(dead))}」已经从这一轮的"
+                            "工具清单里摘掉，再调它也不会执行。现在用**已经拿到的信息**"
+                            "交付——规划轮调用 `submit_plan`（没核实的数字删掉，不要为了"
+                            "一个数停在原地）；确实没有可交的方案，就调用 `ask_user` 说明"
+                            "卡在哪。"))
+                    elif (r.stall_rescues
+                          and _stuck_rounds(r.messages,
+                                            floor=r.state.stall_floor) > 0):
+                        # 摘掉坏工具之后还是原样打转：机会已经给过了，别再白烧一轮。
+                        r.state.stall_floor = len(r.messages)
+                        r.stop_reason = "stalled"
+                        break
                     # HITL：从审批断点续跑——先把挂起的那批 tool_calls 按用户决策收口。
                     if r.approval_decision is not None:
                         r.asked_this_run |= await self._settle_pending(
@@ -896,9 +1380,18 @@ class AgentOnceRun:
                     r.ctx.iteration = r.iteration
                     await self.hooks.before_iteration(r.ctx)
 
-                    resp = await self._invoke(r.ctx, r.messages,
-                                              r.reg.get_definitions(user_id=r.ctx.session.user_id),
-                                              stream, resuming)
+                    # 连续失败的工具有些已经「说了不跑」；把它的 schema 也摘掉，
+                    # 否则弱模型会原样再打（见 `_visible_tool_definitions`）。
+                    # 让位轮执行完即清：只留出口，逼它交付（见 `_MAX_STALL_RESCUES`）。
+                    resp = await self._invoke(
+                        r.ctx, r.messages,
+                        _visible_tool_definitions(
+                            r.reg, user_id=r.ctx.session.user_id,
+                            fail_counts=r.ctx.extras.get("_fail_counts") or {},
+                            only=_NEVER_HIDE_TOOLS if r.rescue_pending else None),
+                        stream, resuming)
+                    r.rescue_pending = False
+                    _charge(r.state, resp.usage)
                     if resp.wants_tools:
                         pause = await self._tool_round(r, resp)
                         if pause is not None:
@@ -942,6 +1435,9 @@ class AgentOnceRun:
         必须和这一条一致点上的 messages 同批，否则对账会多算或漏算；从这里续跑也避开了
         重放工具。
         """
+        # 节点自己调模型花的钱（回执里的 `node_cost_yuan`）记进这条 run 的账——**先于**折叠：
+        # 折过的回执正文没了，数字也跟着没了。
+        _charge_nodes(r.state, r.messages)
         r.ctx.extras["context_gate"] = self.tool_gate.shrink(r.messages)
         if r.cp is not None:
             r.state.persist(r.cp)
@@ -1451,7 +1947,18 @@ class AgentOnceRun:
         session = r.ctx.session
         qa_parts = r.state.qa_parts
         final = r.final
-        if r.reached_limit:
+        if r.stop_reason == "budget":
+            per = cost_mod.run_budget_yuan()
+            final = (f"[这一条已经花了 {cost_mod.fmt_yuan(r.state.spent_yuan)}，到了每条 "
+                     f"{cost_mod.fmt_yuan(r.state.budget_yuan)} 的花费上限，先停下。"
+                     "已经跑出来的产物都还在；点「继续」会再给 "
+                     f"{cost_mod.fmt_yuan(per)} 接着跑，不会从头重来。]")
+        elif r.stop_reason == "stalled":
+            final = (f"[最近 {_STALL_ROUNDS} 轮一直在重复同样的调用（"
+                     f"{_last_failed_call(r.messages)}），没有任何进展，先停下免得白花钱"
+                     f"（这一条已花 {cost_mod.fmt_yuan(r.state.spent_yuan)}）。已经跑出来的产物"
+                     "都还在；点「继续」会接着试，也可以直接告诉我换个做法。]")
+        elif r.reached_limit:
             final = (f"[已达最大迭代次数 {r.iter_limit or self.config.max_iterations}"
                      f"，提前结束]")
 
@@ -1819,9 +2326,31 @@ class AgentOnceRun:
         # 本 run 读过哪些 shot 卡（路径集合）与告过几次。上限见 `_MAX_SHOT_CARDS`：
         # 按**卡**计数，不按参数——这正是参数级那两条闸看不见的那一维。
         cards_read: set[str] = ctx.extras.setdefault("_shot_cards_read", set())
-        # 本 run 每个技能正文取过哪些行窗口（技能名 → {起始行×行数}）。同样按**窗口**
-        # 计次而不是按参数：上限见 `_MAX_SKILL_BODY_PAGES`。
-        body_pages: dict[str, set[str]] = ctx.extras.setdefault("_skill_body_pages", {})
+        # 本 run 每个技能正文取过哪些行窗口（技能名 → {页键: 那一枪的 tool_call_id}）。
+        # 同样按**窗口**计次而不是按参数：上限见 `_MAX_SKILL_BODY_PAGES`。值存调用 id
+        # 是为了分辨「还在上下文里」与「已被折叠收走」（见 `_page_covered`）。
+        body_pages: dict[str, dict[str, str]] = \
+            ctx.extras.setdefault("_skill_body_pages", {})
+        # 本 run 每份**附件**取过哪些行窗口（(技能名, 路径) → {页键: 调用 id}）。
+        # 与正文分开计数：同一份技能的正文与附件是两份互不重叠的文本。
+        attach_pages: dict[tuple[str, str], dict[str, str]] = \
+            ctx.extras.setdefault("_skill_attach_pages", {})
+        # 本 run 已经放行的 load_skill 枪数（整 run 总量，见 `_MAX_SKILL_READS`）。
+        # 与上面两个窗口账分开：那两条按**一份文件**数，这条按**整条 run**数。
+        skill_reads: int = ctx.extras.setdefault("_skill_reads", 0)
+        # 上一次交付（`plan_motion` / `render_motion_code`）之后连续预览了几次。
+        # 见 `_PREVIEW_SOFT` / `_PREVIEW_HARD`：花瓣这类审美微调会让「每版代码都不同」
+        # 的写—预览循环一直算「有进展」，只有这个计数能把它引向交付。
+        previews_since_delivery: int = ctx.extras.setdefault(
+            "_previews_since_delivery", 0)
+        # 这一轮相对**本条 run 的消息链**里还看得见的回执。折叠过的正文只剩存根，
+        # 不能再算「给过」。
+        folded_ids = {str(m.get("tool_call_id")) for m in ctx.messages
+                      if isinstance(m, Mapping) and m.get("role") == "tool"
+                      and str(m.get("content") or "").startswith(f"[{FOLD_MARKER}")}
+        visible_ids = {str(m.get("tool_call_id")) for m in ctx.messages
+                       if isinstance(m, Mapping) and m.get("role") == "tool"
+                       and str(m.get("tool_call_id")) not in folded_ids}
 
         # 结构性并批：把**同层就绪、互不依赖**的兄弟节点自动补进本批。
         #
@@ -1848,6 +2377,14 @@ class AgentOnceRun:
         # 服务端不该替它封路；硬线仍拦，见 `_shot_card_gate` 的注释）。
         over_cards: list[str] = []
         over_pages: list[str] = []
+        # 整 run 阅读总量的软线提醒（见 `_MAX_SKILL_READS`）。只说越过软线那一刻，
+        # 与 `over_pages` 同一条通道（全部回执之后插一条 system）。
+        over_reads: list[str] = []
+        # 软线提醒里点名「下一步该调哪些工具」：从注册表读，不写死节点名——
+        # 规划轮与执行轮的工具面不同，同一条话在两轮里要落到各自真实存在的名字上。
+        _action_names = [t.name for t in reg.all_tools()
+                         if not t.read_only and t.name != "load_skill"][:6]
+        action_hint = "、".join(f"`{n}`" for n in _action_names) or "本轮的下一步工具"
 
         def _refused(tc: ToolCall, times: int) -> ToolError:
             return ToolError(
@@ -1867,6 +2404,15 @@ class AgentOnceRun:
                     counts_as_failure=False)
             st = repeats.get(_repeat_key(tc.name, tc.arguments))
             if st is None:
+                return None
+            # 写文件是**幂等**的：同样的路径与内容再写一遍，磁盘状态不会变。对它回
+            # 「重复、不执行」会把模型推向更坏的路——真机 2026-10-19 run
+            # `ff8b2d9ed640`：同一份内容被判重复后，它换名新建 `shots/shot01.tsx`
+            # → `final01.tsx` → `v2_01.tsx`，一条 run 留下四套镜头文件。
+            # 取舍按「堵死比白烧更坏」：多跑一次本地覆盖几乎不花钱，拦下它却让模型
+            # 去改文件名。上限仍在：`_stuck_rounds` 把「同样的写」按打转计，连续
+            # 6 轮仍会停。**成功**写重复放行；上次是错误时照下面的规则拦。
+            if tc.name in _WRITE_TOOLS and not st.get("last_error"):
                 return None
             # 告过两次还照打：改成「记失败」，让 _MAX_CONSECUTIVE_FAILURES 那道老闸接手，
             # 否则模型可以无限刷这条便宜回执。
@@ -1949,11 +2495,24 @@ class AgentOnceRun:
             if not page:
                 return None
             skill, key = page
-            pages = body_pages.setdefault(skill, set())
+            pages = body_pages.setdefault(skill, {})
             if key in pages:
                 return None                        # 同一窗口重取：归参数级那两条闸管
+            # 整段都落在**还看得见**的旧窗口里 → 不再重发（跨文件打转真正的形状：
+            # 换个起始行/行数把同一段再取一遍，页键不同，上面那条判据接不到）。
+            if _page_covered(pages, key, visible_ids):
+                return ToolError(
+                    tc.name,
+                    f"Error: 技能 `{skill}` 的正文这一页（{_page_label(key)}）本 run 已经"
+                    f"给过，回执还在更早的上下文里——这次不再重复发送，"
+                    f"重读同一段不会带来新信息。\n"
+                    f"本 run 已取过的窗口：{'、'.join(_page_label(p) for p in pages)}。\n"
+                    f"要往下做就直接用已经读到的内容（规划轮就交计划）；"
+                    f"只缺某一节，按分段目录用 load_skill(name, section=键名) 单取那一块；"
+                    f"早先那份真被折叠收走了，就用一个**更宽**的窗口一次取回。",
+                    counts_as_failure=False)
             if len(pages) < _MAX_SKILL_BODY_PAGES_HARD:
-                pages.add(key)
+                pages[key] = str(tc.id)
                 if len(pages) == _MAX_SKILL_BODY_PAGES + 1:
                     # 只说越过软线的那一次，理由同 `_shot_card_gate`。
                     over_pages.append(
@@ -1966,15 +2525,7 @@ class AgentOnceRun:
                 return None
             n = ctx.extras["_skill_body_refusals"] = \
                 ctx.extras.get("_skill_body_refusals", 0) + 1
-
-            def _page_label(p: str) -> tuple[int, int, str]:
-                off, _, lim = p.partition(":")
-                return (int(off), -1 if lim == "whole" else int(lim), p)
-
-            covered = "、".join(
-                f"{_page_label(p)[0]} 行起"
-                + ("整份" if _page_label(p)[1] < 0 else f"×{_page_label(p)[1]} 行")
-                for p in sorted(pages, key=_page_label))
+            covered = "、".join(_page_label(p) for p in pages)
             return ToolError(
                 tc.name,
                 f"Error: 技能 `{skill}` 的正文这一轮已经按 {len(pages)} 个不同的行窗口"
@@ -1985,6 +2536,137 @@ class AgentOnceRun:
                 f"请直接用已经读到的内容交计划（规划轮调用 submit_plan）；"
                 f"确实知道缺哪一节，就照整份加载时给的那份**章节目录**取行号，"
                 f"limit 只给到下一节的前一行，别取一个和上面重叠的大窗口。",
+                counts_as_failure=n > _MAX_REFUSALS_BEFORE_FAILURE)
+
+        def _attach_gate(tc: ToolCall) -> ToolError | None:
+            """同一份附件的重叠/递增窗口上限：两档，理由与 `_skill_body_gate` 同。
+
+            这一枪的出路必须**当场可执行**：回执里写「整份一次取回」并说明它不受
+            这条限制——整份取不计页（见 `_attach_page`），所以它永远是硬线之后能
+            走通的那条路。只说「别读了」会把模型逼回逐行磨。
+            """
+            page = _skill_attach_page(tc.name, tc.arguments)
+            if not page:
+                return None
+            skill, path, key = page
+            pages = attach_pages.setdefault((skill, path), {})
+            label = f"技能 `{skill}` 的附件 `{path}`"
+            if key in pages:
+                return None                        # 同一窗口重取：归参数级那两条闸管
+            # 整段落在还看得见的旧窗口里 → 不再重发（2026-10-19 run 8f43a2e43fde：
+            # `aesthetic-rules.md` 按 1:60 / 61:60 / 121:70 重取刚给过的 1–190 行）。
+            # 「整份一次取回」这条出路照样受它约束——已经给过且还看得见，就不必再给；
+            # 早先那份被折叠收走了，`visible_ids` 里没有它，整份重取照常放行。
+            if _page_covered(pages, key, visible_ids):
+                return ToolError(
+                    tc.name,
+                    f"Error: {label}这一页（{_page_label(key)}）本 run 已经给过，"
+                    f"回执还在更早的上下文里——这次不再重复发送，"
+                    f"重读同一段不会带来新信息。\n"
+                    f"本 run 已取过的窗口：{'、'.join(_page_label(p) for p in pages)}。\n"
+                    f"要往下做就直接用已经读到的内容（该交计划就交计划）；"
+                    f"只缺某一节，按分段目录用 load_skill(name, section=键名) 单取那一块；"
+                    f"早先那份真被折叠收走了，就用一个**更宽**的窗口一次取回。",
+                    counts_as_failure=False)
+            if key == "1:whole":
+                return None                        # 整份取：不计数（它就是硬线之后的出路）
+            if len(pages) < _MAX_ATTACH_PAGES_HARD:
+                pages[key] = str(tc.id)
+                if len(pages) == _MAX_ATTACH_PAGES + 1:
+                    # 只说越过软线的那一次，理由同 `_shot_card_gate`。
+                    over_pages.append(
+                        f"{label}这一轮已经按 {len(pages)} 个不同的行窗口取过"
+                        f"（超过 {_MAX_ATTACH_PAGES} 个）。这些窗口合起来基本就是整份文件，"
+                        f"**再换一个起始行不会带来新信息**——**整份一次取回**"
+                        f"（不带 offset/limit）不受这条限制，也是最快的一条路；"
+                        f"或者直接用已经读到的内容往下走。"
+                        f"到 {_MAX_ATTACH_PAGES_HARD} 个窗口就不再执行了。")
+                return None
+            n = ctx.extras["_attach_refusals"] = \
+                ctx.extras.get("_attach_refusals", 0) + 1
+            covered = "、".join(_page_label(p) for p in pages)
+            return ToolError(
+                tc.name,
+                f"Error: {label}这一轮已经按 {len(pages)} 个不同的行窗口取过（{covered}），"
+                f"到上限了（一份附件最多 {_MAX_ATTACH_PAGES} 个窗口，"
+                f"硬线 {_MAX_ATTACH_PAGES_HARD} 个），这次不再执行。"
+                f"这些窗口合起来基本就是整份文件——**再换一个起始行不会带来新信息**。"
+                f"直接**整份一次取回**（不带 offset/limit）不受这条限制；"
+                f"或者用已经读到的内容往下走（该交计划就交计划）。",
+                counts_as_failure=n > _MAX_REFUSALS_BEFORE_FAILURE)
+
+        def _skill_read_gate(tc: ToolCall) -> ToolError | None:
+            """整 run 的 load_skill 总量：软线提醒、硬线拦（见 `_MAX_SKILL_READS`）。
+
+            这是第四维，前三条按**一份文件**数的闸一条都接不到：
+            正文读完再逐份读附件，每一份都不超自己的窗口上限。真机
+            2026-10-19 run `8f43a2e43fde` 就这样读了 29 枪、≈190 KB，随后在同一段
+            上打转，整条 run 按「原地打转」停下——用户看到的是「又卡死了」。
+
+            记账放在**放行这一刻**（与 `_shot_card_gate` 同一理由：一批里的几枪并发，
+            跑完再记会让同批每一枪都以为自己是最后一枪）。被前面三条闸拦下的枪走不到
+            这里，不计入总量。
+
+            `section=` 单取**永不拦**：它是硬线之后唯一该走的路，也是这条闸不能
+            堵死的那条缝（按块取一次几百到几 KB，不会再把整份技能重发一遍）。
+            """
+            nonlocal skill_reads
+            if tc.name != "load_skill":
+                return None
+            args = _call_args(tc.arguments)
+            if args is None:
+                return None                        # 认不出的参数：放行，不当闸
+            if str(args.get("section") or "").strip():
+                return None
+            if skill_reads >= _MAX_SKILL_READS_HARD:
+                n = ctx.extras["_skill_read_refusals"] = \
+                    ctx.extras.get("_skill_read_refusals", 0) + 1
+                return ToolError(
+                    tc.name,
+                    f"Error: 本 run 已经用 load_skill 取了 {skill_reads} 次技能材料，"
+                    f"到上限了（{_MAX_SKILL_READS} 次后只提醒，"
+                    f"{_MAX_SKILL_READS_HARD} 次起不再执行），这次不执行。"
+                    f"再翻下去不会带来新信息，只会烧钱：现在用已经读到的内容往下做——"
+                    f"调用下一步工具（{action_hint}；规划轮就交计划）。"
+                    f"确实缺某一节，用 load_skill(name, section=键名) 只取那一块。",
+                    counts_as_failure=n > _MAX_REFUSALS_BEFORE_FAILURE)
+            skill_reads += 1
+            ctx.extras["_skill_reads"] = skill_reads
+            if skill_reads == _MAX_SKILL_READS + 1:
+                # 只说越过软线的那一次（与 `over_pages` 同一条通道、同一理由）。
+                over_reads.append(
+                    f"本 run 已经用 load_skill 取了 {skill_reads} 次技能材料。"
+                    f"读得够不够，不看还能翻多少页，而看手上这些能不能开工——"
+                    f"**现在应当停读、去动作**：调用下一步工具（{action_hint}；"
+                    f"规划轮就交计划）。确实还缺某一节，用 "
+                    f"load_skill(name, section=键名) 只取那一块；"
+                    f"整份/整页重读不会带来新信息。"
+                    f"到 {_MAX_SKILL_READS_HARD} 次 load_skill 起不再执行。")
+            return None
+
+        def _preview_gate(tc: ToolCall) -> ToolError | None:
+            """交付前的预览硬线：到上限就不再渲静帧，把模型推向 `plan_motion`。
+
+            为什么这条闸是必要的：写手每轮改几个数值，参数就变了，`_stuck_rounds`
+            的「重复调用」判据一次都不会响（真机 2026-10-19 run 32cd75d71fee：到迭代
+            27 还在调花瓣，一条 `plan_motion` 都没调）。预览本身不产出片子；超过几次
+            之后它只是把同一个审美判断反复问一遍。硬线**不拦交付**：它只关预览，
+            模型仍然可以交 code、交 brief、出片。
+            """
+            if tc.name != "preview_shot":
+                return None
+            if previews_since_delivery < _PREVIEW_HARD:
+                return None
+            n = ctx.extras["_preview_refusals"] = \
+                ctx.extras.get("_preview_refusals", 0) + 1
+            return ToolError(
+                tc.name,
+                f"Error: 上一次交付之后已经预览了 {previews_since_delivery} 次，"
+                f"够多了（软线 {_PREVIEW_SOFT} 次、硬线 {_PREVIEW_HARD} 次），"
+                "这次不再渲静帧。**预览是自查，不是交付**：画面已经过闸①，"
+                "现在把这一镜交给 `plan_motion`（每镜 id + 文案 + `brief`；"
+                "想用自己写的代码就带 `code`），全部镜齐了再调 `render_motion_code`。"
+                "继续改草稿文件不会让片子开始渲染。",
                 counts_as_failure=n > _MAX_REFUSALS_BEFORE_FAILURE)
 
         def _note_repeat(tc: ToolCall, result: Any) -> None:
@@ -2002,11 +2684,26 @@ class AgentOnceRun:
             st["n"] += 1
             st["same"] = st["same"] + 1 if digest == st["last"] else 1
             st["last"] = digest
+            # 给 `_blocked_repeat` 判「幂等写」用：上一次到底是成功还是报错。
+            st["last_error"] = is_tool_error(result)
             st["refused"] = 0
-            if st["same"] == _MAX_SAME_RESULT_REPEATS:
+            # 写文件不在 `_blocked_repeat` 里拦（幂等，见那里），所以也不能放这句
+            # 「下一次不会再执行」——说了却不兑现，模型会以为闸坏了。
+            if st["same"] == _MAX_SAME_RESULT_REPEATS and tc.name not in _WRITE_TOOLS:
                 repeat_warnings.append(
                     f"「{tc.name}」最近 {st['same']} 次调用参数与返回结果逐字相同。"
                     f"下一次同样的参数不会再执行——现在就换参数、换工具，或如实说明卡点。")
+            # 写/改同一份内容的第 2、5 次：不只在内部记「无进展」，还要用**系统消息**
+            # 把交付路径说一遍。真机 2026-10-19 run `e2ec9a6969ec`：模型在草稿文件上
+            # 来回 20 多轮，`preview_shot` 回执里的 `next` 它没有采信；系统消息是它
+            # 更会照做的通道。第 5 次之后不再提醒，交给末尾的无进展守卫（6 轮）停。
+            if tc.name in _REPEAT_TOOLS and st["n"] in (2, 5):
+                repeat_warnings.append(
+                    f"同一份文件内容已经被写/改到第 {st['n']} 次，画面不会因此有任何变化。"
+                    "文件只是草稿，不是交付物：停下手上的重复编辑，把已经做好的内容交给"
+                    "**流程的下一步工具**——motion 片子就是 `plan_motion`（每镜 id + "
+                    "文案 + `brief`；想用自己写的代码就带 `code`）→ `render_motion_code`。"
+                    "这一步不做，片子永远不会开始渲染。")
 
         async def _exec_one(tc: ToolCall) -> Any:
             await self.hooks.before_tool_call(ctx, tc.name, tc.arguments, call_id=tc.id)
@@ -2018,10 +2715,16 @@ class AgentOnceRun:
                 await self.hooks.after_tool_call(
                     ctx, tc.name, tc.arguments, None, 0.0, error=r, call_id=tc.id)
                 return r
-            # 先过两道家族级闸（读卡上限、正文窗口上限），再过参数级那两条：
+            # 先过三道家族级闸（读卡上限、正文窗口上限、附件窗口上限），再过参数级那两条：
             # 一次规划轮里读 45 张**不同的**卡、或同一份正文取 19 个**重叠的**窗口时，
             # 参数级判据一次都不会响（每份参数都是新的），必须由这一层拦。
-            blocked = _shot_card_gate(tc) or _skill_body_gate(tc) or _blocked_repeat(tc)
+            blocked = (_shot_card_gate(tc) or _skill_body_gate(tc)
+                       or _attach_gate(tc) or _blocked_repeat(tc)
+                       # 总量闸排最后：被前面三条拦下的枪没真读，不该计入「本 run 读了
+                       # 几次」——否则打回几次就把整份阅读预算吃掉了。
+                       or _skill_read_gate(tc)
+                       # 预览硬线：只关预览，不关交付（见 `_preview_gate`）。
+                       or _preview_gate(tc))
             if blocked is not None:
                 # 熔断不是「工具坏了」：默认 counts_as_failure=False，别把「换个思路再来」
                 # 再压一层失败计数（第二次起才升级，见 _blocked_repeat）。
@@ -2034,12 +2737,13 @@ class AgentOnceRun:
                     ctx, tc.name, tc.arguments, None, 0.0, error=blocked, call_id=tc.id)
                 return blocked
             try:
+                call_timeout = _TOOL_CALL_TIMEOUTS.get(tc.name, _TOOL_CALL_TIMEOUT)
                 r = await asyncio.wait_for(
-                    reg.execute(tc.name, tc.arguments), timeout=_TOOL_CALL_TIMEOUT)
+                    reg.execute(tc.name, tc.arguments), timeout=call_timeout)
             except TimeoutError:
                 r = ToolError(
                     tc.name,
-                    f"Error: 工具「{tc.name}」执行超时（{_TOOL_CALL_TIMEOUT:.0f}s）——"
+                    f"Error: 工具「{tc.name}」执行超时（{call_timeout:.0f}s）——"
                     f"可能是下游服务卡死或 I/O 阻塞。请换参数或换工具，"
                     f"或告诉用户卡在哪、给个方案。")
             except ToolError as e:  # 已经定性过的失败，原样回喂
@@ -2047,7 +2751,39 @@ class AgentOnceRun:
             except Exception as e:  # noqa: BLE001 - Registry 之外再兜一层，循环不该炸
                 r = ToolError(tc.name, f"Error executing {tc.name}: {e}")
             err = r if is_tool_error(r) else None
+            # 「这一页已经给过」只在正文**真发出去**之后才算数。正文窗口闸得在调用前
+            # 记账（它要先判这一枪执不执行），两种结果必须当场撤销：
+            # ① 调用出错（越界等）——一页都没出去；
+            # ② 大正文的整份加载只回索引——回执里写明了「正文没有随附」
+            #    （run a1f66c02f3c9：把「只给了目录」记成「1 行起整份已给过」，
+            #    之后每次按行取正文都被判成重复，模型连打 6 枪同一调用，整条 run
+            #    按原地打转停成 failed）。
+            if tc.name == "load_skill":
+                page = _skill_body_page(tc.name, tc.arguments)
+                if page is not None and (
+                        err is not None
+                        or (page[1] == "1:whole" and INDEX_ONLY_NOTE in str(r))):
+                    body_pages.get(page[0], {}).pop(page[1], None)
             _note_repeat(tc, r)
+            # 预览/交付计数：见 `_PREVIEW_SOFT` / `_PREVIEW_HARD`。只在**真跑成功**时
+            # 记账；被硬线拦下的预览不算（它一帧都没渲），否则计数会自己把自己推高。
+            nonlocal previews_since_delivery
+            if err is None and tc.name in _DELIVERY_TOOLS:
+                previews_since_delivery = 0
+                ctx.extras["_previews_since_delivery"] = 0
+            elif err is None and tc.name == "preview_shot":
+                previews_since_delivery += 1
+                ctx.extras["_previews_since_delivery"] = previews_since_delivery
+                if previews_since_delivery == _PREVIEW_SOFT:
+                    # 软线只说一次。真机里 `preview_shot` 回执末尾的 `next` 模型看见了
+                    # 也不照做（run 32cd75d71fee）；system 消息是它更会采信的通道。
+                    repeat_warnings.append(
+                        f"这一镜已经连续预览了 {previews_since_delivery} 次。预览是"
+                        "**自查，不是交付**：画面已经过闸①，再改几个像素也不会让片子"
+                        "开始渲染。现在把做好的这一镜交给 `plan_motion`（每镜 id + "
+                        "文案 + `brief`；想用自己写的代码就带 `code`），全部镜齐了再调 "
+                        "`render_motion_code`。再预览到 "
+                        f"{_PREVIEW_HARD} 次，预览通道会先关上。")
             if err is None and isinstance(tc.arguments, dict) and "timeline" in tc.arguments:
                 await self._persist_timeline(ctx, tc.arguments["timeline"])
             await self.hooks.after_tool_call(
@@ -2111,7 +2847,8 @@ class AgentOnceRun:
             ))
         # 无进展重复的预告：闸已经攒到第二次，下一次就不真执行了。
         # 放在全部回执之后——理由同上面那批守卫提示（tool_calls 未收口时插别的角色直接 400）。
-        for note in dict.fromkeys([*repeat_warnings, *over_cards, *over_pages]):
+        for note in dict.fromkeys([*repeat_warnings, *over_cards, *over_pages,
+                                   *over_reads]):
             ctx.messages.append(system(f"⚠️ {note}"))
 
         await self.hooks.after_execute_tools(ctx)
@@ -2495,7 +3232,7 @@ class Agent:
     async def handle(
         self, user_id: str, conversation_id: str, message: str, *, run_id: str | None = None,
         stream: bool = False, attachments: Sequence[str] = (), resume: bool = False,
-        interactive: bool = True,
+        interactive: bool = True, style_skill: str = "",
     ) -> str:
         """直接处理一条消息并返回结果（同步语义，便于调用与测试）。
 
@@ -2514,17 +3251,28 @@ class Agent:
                 if cp is not None:
                     return await self.runner.resume(
                         cp, session, stream=stream,
-                        registry=self._resume_registry(cp))
+                        registry=self._resume_registry(cp),
+                        style_skill=style_skill)
+            # 自由对话里也可能直接调 plan_motion 写代码：同样要把风格包契约带给
+            # 模型，否则它只会收到服务端注入的 spec，而看不到模板与步态。
+            sections: list[Section] = []
+            style_text = await self._style_writing_hint(style_skill)
+            if style_text:
+                sections.append(Section(
+                    name="style_pack", text=style_text, kind="conditional",
+                    condition_key="style_pack", referenced_by=("plan_motion",)))
             return await self.runner.run(
                 session, message, run_id=run_id, stream=stream,
                 attachments=attachments, interactive=interactive,
+                extra_sections=sections,
+                style_skill=style_skill,
             )
 
     async def plan(
         self, user_id: str, conversation_id: str, message: str, *,
         run_id: str | None = None, stream: bool = False,
         attachments: Sequence[str] = (), feedback: str = "",
-        revise_of: str = "",
+        revise_of: str = "", style_skill: str = "",
     ) -> str:
         """Run A 规划轮：注册表里物理不含剪辑节点，出口只有 ``submit_plan`` 或直接回答。
 
@@ -2541,7 +3289,8 @@ class Agent:
         gate = self.plan_gate
         if gate is None or not gate.whitelist():
             return await self.handle(user_id, conversation_id, message, run_id=run_id,
-                                     stream=stream, attachments=attachments)
+                                     stream=stream, attachments=attachments,
+                                     style_skill=style_skill)
         prior = await self._prior_plans(revise_of)
         session = await self.session_manager.get_or_create(user_id, conversation_id)
         # 续跑依据：上一条确认过的计划有没有跑完。「换一版」那一轮本来就在重做卡，
@@ -2582,14 +3331,244 @@ class Agent:
                 session_history=session_history, session_artifacts=session_artifacts,
                 has_pending_plan=has_pending_plan,
                 capability_notes=capability_notes)
+            extra_sections = [Section(
+                name="planning_round", text=plan_text, kind="conditional",
+                condition_key="planning_round", referenced_by=("submit_plan",),
+                sub_blocks=plan_blocks)]
+            style_hint = await self._style_hint(style_skill)
+            if style_hint:
+                extra_sections.append(Section(
+                    name="style_pack", text=style_hint, kind="conditional",
+                    condition_key="style_pack", referenced_by=("submit_plan",)))
             return await self.runner.run(
                 session, message, run_id=run_id, stream=stream, attachments=attachments,
                 registry=self._planning_registry(gate), planning=True,
-                extra_sections=[Section(
-                    name="planning_round", text=plan_text, kind="conditional",
-                    condition_key="planning_round", referenced_by=("submit_plan",),
-                    sub_blocks=plan_blocks)],
+                extra_sections=extra_sections,
+                style_skill=style_skill,
             )
+
+    async def _style_hint(self, style_skill: str) -> str:
+        """规划轮只给风格包的「名字 + 三条要点」，正文留给 plan_motion 注入。
+
+        塞整份 manifest/正文会挤掉分镜预算，也会诱使模型把风格规格抄进 spec——
+        而规格的唯一出处必须是计划执行期的 ``style_pack``，否则两处一改就漂。
+        这里只保证模型知道「本轮有个包、别自己另发明一套视觉」。
+        """
+        name = str(style_skill or "").strip()
+        if not name or self.skill_loader is None:
+            return ""
+        try:
+            sk = await self.skill_loader.get(name)
+        except Exception:      # noqa: BLE001 - 读不到只退化成无提示，不拦规划
+            return ""
+        if sk is None or sk.kind != "style":
+            return ""
+        m = sk.style_manifest or {}
+        lines = [
+            f"本轮用户选了风格包《{sk.display or sk.name}》（{sk.name}）。",
+            "风格规格在执行期由 plan_motion 注入；分镜只按主题/时代排，"
+            "不要在 spec 里抄风格正文，也不要自己发明第二套视觉。",
+            # 用户在这一轮说的「背景换成城市」「人物穿军装」「第三镜在室内」，
+            # 必须落进对应镜的 brief；只留在旁白里，逐镜写手就只能看字幕猜画面。
+            "用户在对话里明确提出的画面内容（哪个时代/什么场景/人物穿什么/"
+            "拿什么/哪一镜要变）要写进对应镜的 `brief`，不能只留在旁白文案里。",
+        ]
+        cap = m.get("caption") if isinstance(m.get("caption"), Mapping) else {}
+        if cap:
+            lines.append(f"字幕：{cap.get('look') or 'overlay'}，"
+                         f"{cap.get('position') or 'bottom-center'}。")
+        if m.get("repeat_composition"):
+            lines.append("构图：全片刻意重复同一构图，只换时代背景与道具。")
+        if m.get("recurring_prop"):
+            lines.append(f"贯穿道具：{m.get('recurring_prop')}。")
+        if m.get("recurring_pose"):
+            lines.append(f"人物步态：{m.get('recurring_pose')}——brief 要写「人怎么动」，"
+                         "不能只写「一个人站在画面里」。")
+        # 槽位：用户说「把前景的人换成一棵松树」时，规划轮要能把它落成
+        # `style_overrides`；值必须是模板 `manifest.variants` 里登记的替换件名——
+        # 现场编一个名字只会在分镜期降级回默认组件。这里只列清单，不展开正文。
+        slots = await self._style_slots(m)
+        if slots:
+            lines.append("可换的零件（`style_overrides` 只能用这里列出的替换件名）：")
+            for s in slots[:10]:
+                got = "、".join(f"「{v.get('label') or v.get('name')}」"
+                                for v in (s.get("variants") or [])[:6]
+                                if isinstance(v, Mapping) and (v.get("name") or v.get("label")))
+                bound = s.get("bound") if isinstance(s.get("bound"), Mapping) else None
+                lines.append(f"- `{s.get('component')}`"
+                             + (f"（{s.get('label')}）" if s.get("label") else "")
+                             + (f"→ 可换成 {got}" if got else "（暂无替换件，用默认）")
+                             + (f"；已默认换用「{bound.get('label') or bound.get('name')}」，"
+                                "不用再写 style_overrides" if bound else ""))
+            lines.append("用户没有要求换件就不要写 `style_overrides`；"
+                         "模板已经标了默认替换件的槽位会自动用它，不用再写。"
+                         "要换的零件还没登记替换件时，先在入口给它换件，不要在 spec 里编名字。")
+        return "\n".join(lines)
+
+    async def _style_slots(self, manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """风格包 → 模板槽位清单。取不到模板/库抖动时返回空表（只损失一段提示）。"""
+        template = str(manifest.get("template") or "").strip()
+        if not template or self.storage is None:
+            return []
+        try:
+            row = await self.storage.style_templates.get(template)
+        except Exception:      # noqa: BLE001 - 模板库抖动不该拦规划
+            return []
+        if not isinstance(row, Mapping):
+            return []
+        slots = style_templates.template_slots(row)
+        return [s for s in slots if isinstance(s, Mapping) and s.get("component")]
+
+    async def _style_writing_hint(self, style_skill: str) -> str:
+        """执行轮写镜头代码时看的风格包**可执行契约**。
+
+        规划轮那份短提示只够让模型「知道有个包」；真正写 TSX 的是确认后的执行轮
+        模型。它拿不到 manifest 时会照技能正文自己画——真机 2026-10-19 的 3 镜
+        就是这样：构图对、光块对，但所有镜的 `figX` 都是常量，人物是一张站着的
+        剪影，用户一眼就发现「人没有在走」。
+
+        所以这里把模板 import、组件清单、步态、贯穿道具、字幕与禁区一次给全。
+        它只进执行轮（以及直接调 plan_motion 的自由对话），不挤规划轮预算。
+        """
+        name = str(style_skill or "").strip()
+        if not name or self.skill_loader is None:
+            return ""
+        try:
+            sk = await self.skill_loader.get(name)
+        except Exception:      # noqa: BLE001 - 读不到只退化成无提示，不拦执行
+            return ""
+        if sk is None or sk.kind != "style":
+            return ""
+        m = sk.style_manifest or {}
+        display = sk.display or sk.name
+        lines = [
+            f"=== 本轮风格包：《{display}》（{sk.name}）===",
+            "每一镜的代码由你写；这份契约优先于技能正文里的默认建议。"
+            "不要另发明第二套视觉：一个主角、一套贯穿道具与字幕，全片共用。",
+        ]
+        template = str(m.get("template") or "").strip()
+        row: Mapping[str, Any] | None = None
+        if template and self.storage is not None:
+            try:
+                got = await self.storage.style_templates.get(template)
+                row = got if isinstance(got, Mapping) else None
+            except Exception:      # noqa: BLE001 - 模板库抖动不该让执行轮少一段提示
+                row = None
+        # 这一整段只从**库里的模板行**取内容：换一套风格、换一个用户沉淀的模板，
+        # 提示词自动跟着变。这里不允许出现某一套模板专有的组件名。
+        comps: list[str] = []
+        rman: Mapping[str, Any] = {}
+        if row is not None:
+            module = str(row.get("module") or "").strip()
+            comps = [str(c.get("name") if isinstance(c, Mapping) else c)
+                     for c in (row.get("components") or [])]
+            comps = [c for c in comps if c.strip()]
+            if module:
+                lines.append(
+                    f"模板：`{template}`，从 `{module}` import；"
+                    f"可用组件：{' / '.join(comps) or '（见模板导出）'}。")
+            usage = style_templates.component_usage(row)
+            if usage:
+                lines.append("组件 props（照这个传参，不要猜）：\n" + usage)
+                # 写手很容易把「可选 prop」读成「不传就是空」。模板组件是从参考片
+                # 那一镜沉淀出来的，不传的 prop 会沿用参考片的内容——字幕就是参考片
+                # 的台词。真机 2026-10-19 菊花镜：`<StyleCaption>` 没传 text，预览里
+                # 显示「到山西，下雪了。新靴，还是没舍得穿。」。这条必须说破。
+                lines.append(
+                    "**不传 ≠ 空**：这些 props 的缺省值来自参考片那一镜（文字组件不传 "
+                    "`text` 就会显示参考片原文）。每一镜必须显式传这一镜的值；"
+                    "这一镜不要的零件就不要渲染那个组件，也不要用 0 / 空串 / 透明"
+                    "把它藏起来——藏起来的零件仍然是参考片的一部分。")
+            rman = row.get("manifest") if isinstance(row.get("manifest"), Mapping) else {}
+            # 沉淀出来的这一句常自带句号；原样拼会得到「…暗角。。优先…」。
+            responsible = str(rman.get("responsible") or "").strip().rstrip("。.；;，,")
+            lines.append(
+                (f"模板负责：{responsible}。" if responsible else "")
+                + "**优先 import 并复用这些组件**，不要另画第二个人、第二块光。"
+                "但这一镜的 brief 明确说不要某个零件时（例如「画面里不要人」），"
+                "就不要渲染那个组件——不要用 0 / 空串 / 透明把它藏进来，"
+                "那仍然是参考片的一部分。")
+            # 槽位：本片选了替换件的零件，import 路径与基模板不同。这里把「哪个组件、
+            # 从哪个模块 import」写死——执行期 `plan_motion` 已经解好了，不靠模型猜。
+            for s in style_templates.template_slots(row)[:12]:
+                comp = str(s.get("component") or "")
+                variants = [v for v in (s.get("variants") or []) if isinstance(v, Mapping)]
+                names = "、".join(f"「{v.get('label') or v.get('name')}」"
+                                  for v in variants[:6])
+                lines.append(
+                    f"- 槽位 `{comp}`"
+                    + (f"（{s.get('label')}）" if s.get("label") else "")
+                    + (f"：可换成 {names}" if names else "：暂无替换件")
+                    + "。没被 `style_overrides` 点名时用模板自带的那一个，"
+                      "不要自己换零件、也不要自己重画。")
+                # 这个零件能画哪些内容：写手要按这一镜的 brief 传值，
+                # 不能整片沿用参考片那一档；中文只是参考片叫法。
+                bits = _style_content_bits(s.get("content"))
+                if bits:
+                    lines.append(f"  现在能画：{bits}。每一镜按分镜传值，"
+                                 "不要整片写死；括号里的中文不要当参数值传。")
+                # 文字槽位（主字幕 / 日期铭文）：内容 prop 不传就显示参考片原文。
+                # 组件名与 prop 名都从沉淀数据里取，不写某一套模板的专有名。
+                text_kind = str(s.get("text_kind") or "").strip()
+                content_prop = str(s.get("content_prop") or "").strip()
+                if text_kind and content_prop:
+                    role = {"caption": "这一镜的主字幕",
+                            "inscription": "这一镜的日期/地点铭文"}.get(
+                                text_kind, f"文字（{text_kind}）")
+                    lines.append(
+                        f"  这是{role}：`{content_prop}` 是**内容**，渲染它就必须显式传"
+                        f"这一镜自己的文字；不传会沿用参考片原文。"
+                        "这一镜不需要这块字，就不要渲染这个组件。")
+        pose = str(m.get("recurring_pose") or "").strip()
+        if pose:
+            lines.append(f"人物步态：{pose}。")
+            # 「谁负责走路」也从组件清单里找，不点名某一套模板的导出。
+            walkers = [c for c in comps
+                       if "walk" in c.lower() or "figure" in c.lower()]
+            how = ("用模板里承担主体的组件"
+                   + ("（" + " / ".join(f"`{c}`" for c in walkers) + "），按上面的 props 传参"
+                      if walkers else
+                      "；模板里没有就 import `@dg/lib/walk` 的 `WalkingFigure`"
+                      "（`walking` 为真时由 `useCurrentFrame()` 驱动腿与臂的反相摆动）"))
+            lines.append(
+                f"**主角必须逐帧动起来**：{how}；没有合适的组件就自己按帧算肢体摆动。"
+                "**不要交一张静止站立的剪影**——"
+                "静帧看着对、成片里人是不动的，这种错只有渲出来才会被发现。"
+                "主体位置也别钉死：模板若有位移用的 props（`x` / `pan` 之类），"
+                "把它算成 `useCurrentFrame()` 的函数，让主体在镜内真的走过去。")
+        comp = m.get("composition")
+        if isinstance(comp, Mapping) and comp:
+            lines.append("构图：" + json.dumps(comp, ensure_ascii=False, separators=(",", ":")))
+        prop = str(m.get("recurring_prop") or "").strip()
+        if prop:
+            lines.append(f"贯穿道具：{prop}")
+        cap = m.get("caption")
+        if isinstance(cap, Mapping) and cap:
+            lines.append("字幕：" + json.dumps(cap, ensure_ascii=False, separators=(",", ":")))
+        palette = m.get("palette")
+        if isinstance(palette, Mapping) and palette:
+            lines.append("色板：" + json.dumps(palette, ensure_ascii=False, separators=(",", ":")))
+        avoid = m.get("avoid")
+        if isinstance(avoid, (list, tuple)) and avoid:
+            lines.append("禁区：" + "、".join(str(a) for a in avoid if str(a).strip()))
+        # 逐镜内容与风格不变量是两件事：模板组件是参考片内容的**默认画法**，不是内容
+        # 上限。执行轮自己写 TSX 时（`code` 直接交给 plan_motion 的那条路）也必须拿到
+        # 同一份不变量，否则 style 随写手心情漂。不变量从模板行的 manifest 里取，
+        # 和 shot_writer / design_review 用的是同一份沉淀数据，这里不写任何某一套
+        # 模板专有的规则。
+        try:
+            from storyline_server.motion.shot_writer import _style_invariant_lines
+            invariant_lines = _style_invariant_lines(rman)
+        except Exception:      # noqa: BLE001 - 取不到只少一段提示，不拦执行轮
+            invariant_lines = []
+        if invariant_lines:
+            lines.extend(invariant_lines)
+            lines.append(
+                "模板组件是参考片内容的**默认画法**，不是内容的上限。这一镜 brief "
+                "要求的内容（对象、外形、场景、服饰、道具、文字）模板画不出时，"
+                "照上面的风格不变量自己画那一件；其余部分继续用模板组件。"
+                "只换内容，不换风格；同一个零件只画一次。")
+        return "\n".join(lines)
 
     async def _prior_plans(self, revise_of: str) -> list[dict[str, Any]]:
         """换一版时要给模型看的旧卡：只有真跑过的那一份（指针行里已校验过的候选）。"""
@@ -2705,6 +3684,9 @@ class Agent:
             raise KeyError(
                 f"计划 {plan_run_id} 里没有选中的那张卡「{wanted or '(空)'}」"
                 f"（可选：{[c.get('plan_id') for c in candidates] or '无'}）。")
+        # 风格包：计划卡候选优先（规划轮用 SubmitPlanTool 挂上去的），老卡没有就
+        # 退回规划轮的 checkpoint scope。两处都没有 = 不注入，走缺省视觉。
+        style_skill = _plan_style_skill(plan, row)
         compiled, issues = gate.validate_execute(plan, frame)
         if not issues.ok:
             raise ValueError("确认帧未通过校验：" + "；".join(issues.errors))
@@ -2729,6 +3711,14 @@ class Agent:
                                user_id, conversation_id))],
             user_id=user_id, conversation_id=conversation_id)
         sections = list(render_injections(compiled))
+        # 执行轮就是**写镜头代码的那一轮**：风格包的可执行契约必须在这里进上下文。
+        # 只靠 plan_motion 服务端注入的 `spec.style_pack` 够不到模型手里的 TSX——
+        # 模型没看到模板 import 与步态要求时，会照技能正文画一张站着不动的剪影。
+        style_text = await self._style_writing_hint(style_skill)
+        if style_text:
+            sections.append(Section(
+                name="style_pack", text=style_text, kind="conditional",
+                condition_key="style_pack", referenced_by=("plan_motion",)))
         # 技能正文**按本片计划取块**（T42/§5.7②）：默认集随这份发，其余块只进一行
         # **分段目录**并标出「本轮计划用得上哪几块」，读不读由模型自己点
         # （``load_skill(name, section=…)``）——§2.2「技能的视角还给模型」。
@@ -2765,6 +3755,7 @@ class Agent:
                 registry=self._round_registry(steps),
                 extra_sections=sections,
                 approved_plan=compiled, plan_run_id=plan_run_id,
+                style_skill=style_skill,
             )
 
     async def resume(

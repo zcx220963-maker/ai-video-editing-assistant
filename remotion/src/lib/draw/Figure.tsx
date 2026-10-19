@@ -32,10 +32,10 @@ export interface FigureProps extends Inked {
   /** 身高，缺省 280 */
   h?: number;
   pose?: FigurePose;
-  /** 面朝：1 向右（缺省）、-1 向左 */
-  facing?: 1 | -1;
+  /** 面朝：1 向右（缺省）、-1 向左；写 `'left'`/`'right'` 也认 */
+  facing?: 1 | -1 | 'left' | 'right';
   /** 手里/身前的附作物，缺省不带 */
-  hold?: 'none' | 'tool' | 'banner' | 'book';
+  hold?: 'none' | 'tool' | 'banner' | 'book' | 'bag';
   /** 头是不是实心的（实心头在远处读起来更醒目） */
   headFill?: 'none' | 'accent' | 'paper';
   /** 整体升降（像素，正值向上）——让镜头代码把帧喂进来 */
@@ -65,6 +65,9 @@ export const Figure: React.FC<FigureProps> = (props) => {
     x, y, h = 280, pose = 'stand', facing = 1, hold = 'none',
     headFill = 'none', lift = 0, lean = 0, seed = 1,
   } = props;
+  // 写手常把朝向写成 `"left"`/`"right"`。字符串乘坐标会算出 NaN，整个人就消失了
+  // （2026-10-18 真机预览里正是这样）——这里统一收成 ±1，而不是让画面上少一个人。
+  const dir: 1 | -1 = facing === -1 || facing === 'left' ? -1 : 1;
   const ink = filmInk(props.ink);
   const b = pen(ink, seed + 11);
   const p = h / 100;                       // 1 个「身高百分点」
@@ -73,7 +76,7 @@ export const Figure: React.FC<FigureProps> = (props) => {
   const at = (px: number, py: number): [number, number] => {
     const rx = px * Math.cos(rad) - py * Math.sin(rad);
     const ry = px * Math.sin(rad) + py * Math.cos(rad);
-    return [x + facing * rx * p, y + ry * p - lift];
+    return [x + dir * rx * p, y + ry * p - lift];
   };
   const put = (points: [number, number][]) => points.map(([a, c]) => at(a, c));
 
@@ -107,12 +110,21 @@ export const Figure: React.FC<FigureProps> = (props) => {
   if (hold !== 'none') {
     const [hx, hy] = at(hands[1][0], hands[1][1]);
     if (hold === 'tool') {
-      out.push(b.line(hx, hy, hx + facing * 22 * p, hy - 26 * p));
+      out.push(b.line(hx, hy, hx + dir * 22 * p, hy - 26 * p));
     } else if (hold === 'book') {
       out.push(b.rect(hx - 10 * p, hy - 6 * p, 22 * p, 15 * p, { color: ink.paper }));
+    } else if (hold === 'bag') {
+      // 一袋东西（扛煤袋、扛粮食）：上窄下宽的袋身 + 一道扎口线，挂在**前手**上
+      const [bx, by] = at(hands[0][0], hands[0][1]);
+      const half = 14 * p;
+      out.push(b.poly([
+        [bx - half * 0.45, by], [bx - half, by + 32 * p],
+        [bx + half, by + 32 * p], [bx + half * 0.45, by],
+      ], { color: ink.paper }));
+      out.push(b.line(bx - half * 0.5, by + 2 * p, bx + half * 0.5, by + 2 * p));
     } else {
       const [topX, topY] = at(hands[1][0] + 12, hands[1][1] - 34);
-      out.push(b.line(hx, hy, topX, topY), b.line(topX, topY, topX + facing * 30 * p, topY));
+      out.push(b.line(hx, hy, topX, topY), b.line(topX, topY, topX + dir * 30 * p, topY));
     }
   }
   // 坐着：补一条座面，否则那两条折线读不出「坐在哪」

@@ -37,8 +37,10 @@ export const Building: React.FC<BuildingProps> = (props) => {
   const win = (px: number, py: number, s: number) =>
     rc(px, py, s, s, { color: ink.accent });
 
+  // 每一笔都要进 `out`。2026-10-18 真机预览里厂房只剩下锯齿屋顶：下面这些
+  // `rc()`/`win()`/`ln()`/`cc()` 原先写成了裸调用，画出来的笔画被直接丢掉。
   if (kind === 'factory') {
-    rc(-50, -52, 100, 52, { color: ink.paper });               // 主体
+    out.push(rc(-50, -52, 100, 52, { color: ink.paper }));      // 主体
     for (let i = 0; i < 4; i++) {                              // 锯齿屋顶
       const x0 = -50 + i * 25;
       out.push(b.poly([
@@ -46,38 +48,38 @@ export const Building: React.FC<BuildingProps> = (props) => {
         [x + (x0 + 25) * u, y - 74 * u],
       ], { color: ink.paper }));
     }
-    rc(28, -140, 16, 66);                                      // 烟囱
+    out.push(rc(28, -140, 16, 66));                            // 烟囱
     const puffs = Math.round(1 + smoke * 3);
     for (let i = 0; i < puffs; i++) {
       out.push(cc(36 + i * 6, -152 - i * 11, (14 + i * 8) * (0.7 + smoke * 0.3)));
     }
-    for (let i = 0; i < 3; i++) win(-42 + i * 22, -40, 11);    // 窗
-    for (let i = 0; i < 3; i++) win(-42 + i * 22, -22, 11);
-    rc(-6, -20, 14, 20, { color: ink.paper });                 // 门
+    for (let i = 0; i < 3; i++) out.push(win(-42 + i * 22, -40, 11));   // 窗
+    for (let i = 0; i < 3; i++) out.push(win(-42 + i * 22, -22, 11));
+    out.push(rc(-6, -20, 14, 20, { color: ink.paper }));       // 门
   } else if (kind === 'tower') {
     out.push(b.poly([[-16, 0], [-10, -96], [10, -96], [16, 0]], { color: ink.paper }));
     for (let i = 1; i <= 4; i++) {
       const t = i / 5;
-      ln(-13 - t * 3, -96 * t, 13 + t * 3, -96 * t);
+      out.push(ln(-13 - t * 3, -96 * t, 13 + t * 3, -96 * t));
     }
-    ln(0, -96, 0, -118);
-    cc(0, -120, 6, { color: ink.accent });
+    out.push(ln(0, -96, 0, -118));
+    out.push(cc(0, -120, 6, { color: ink.accent }));
   } else if (kind === 'house') {
-    rc(-32, -40, 64, 40, { color: ink.paper });
+    out.push(rc(-32, -40, 64, 40, { color: ink.paper }));
     out.push(b.poly([[-38, -40], [0, -70], [38, -40]], { color: ink.accent }));
-    rc(-9, -22, 18, 22, { color: ink.paper });
-    win(-24, -34, 10);
-    win(14, -34, 10);
+    out.push(rc(-9, -22, 18, 22, { color: ink.paper }));
+    out.push(win(-24, -34, 10));
+    out.push(win(14, -34, 10));
   } else {
     const tops = [-70, -104, -56, -88, -46];
     const bw = 100 / tops.length;
     tops.forEach((top, i) => {
       const x0 = -50 + i * bw + 1.5;
-      rc(x0, top, bw - 3, -top, { color: ink.paper });
+      out.push(rc(x0, top, bw - 3, -top, { color: ink.paper }));
       const rows = Math.floor(-top / 20);
       for (let r = 1; r <= rows; r++) {
-        win(x0 + bw * 0.22, top + r * 18, 4);
-        win(x0 + bw * 0.58, top + r * 18, 4);
+        out.push(win(x0 + bw * 0.22, top + r * 18, 4));
+        out.push(win(x0 + bw * 0.58, top + r * 18, 4));
       }
     });
   }

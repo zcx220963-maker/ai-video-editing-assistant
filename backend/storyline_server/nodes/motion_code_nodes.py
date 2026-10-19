@@ -53,13 +53,13 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
     name = "render_motion_code"
     display_name = "图形科普片出片（代码镜）"
     description = (
-        "没有素材也能出片：画面由模型**逐镜交 React/TSX 代码**、由渲染容器逐帧渲出来——"
+        "没有素材也能出片：画面由**逐镜 React/TSX 代码**在渲染容器里逐帧画出来——"
         "图示、手绘质感（rough.js 斜纹）、立体几何（three.js）、公式（katex）都是真代码，"
         "没有任何内置版式可退。镜头长度仍由真实 TTS 时长决定，字幕仍逐词点亮，"
         "BGM 仍在人声起时压低。适用：需要「看得见的动画/图/3D/公式」的科普片。"
-        "spec 由 plan_motion 产出（每镜的代码也在那一步过分镜闸），"
-        "也可手写（每镜必须有 code；inline 那一份照样就地过出处闸，冒充查证过的出处"
-        "会在烧像素之前带镜号打回）。渲染是分钟级到十分钟级："
+        "spec 由 plan_motion 产出（每镜代码在那一步已按 brief 写好并过分镜闸），"
+        "也可手写（每镜交 code 或 brief；只有 brief 的先补写代码再出片。inline 那一份"
+        "照样就地过出处闸，冒充查证过的出处在烧像素之前带镜号打回）。渲染是分钟级到十分钟级："
         "返回 status=queued/running 时须继续调 render_status（同 artifact_id）直到 done/failed")
 
     #: 渲染容器的四个口（``{health, lint, render, fetch}``）。缺省在**用时**才取
@@ -76,8 +76,8 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             **cspec.spec_schema(),
             "description": "分镜 spec（plan_motion 的产物；缺省从 Store 的 "
                            "plan_motion 取，也可按下面的结构手写——手写那份没过分镜闸，"
-                           "这里会就地补走一次**出处闸**）。每一镜都必须交一段真实代码——"
-                           "这条链没有默认版式可退。"
+                           "这里会就地补走一次**出处闸**）。每一镜要有 code 或 brief——"
+                           "只有 brief 的镜像 plan_motion 一样先补写代码再出片。"
                            "**别写每镜时长**：时钟归声音，min_duration_sec 只当下限。"
                            "aspect/fps/narration/voice/rate/caption_style/highlight_style/texture 也能走下面的"
                            "顶层开关，顶层的优先（用户在计划卡上勾的那一份）。"
@@ -115,10 +115,29 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         # 越界的值不许走到烧像素。
         # 质检档：spec 没写就按产品缺省（MOTION_QC，缺省 preview——渲后像素闸只提醒）。
         raw, _contrast_notes = cspec.autofix_ink_contrast(cspec.expand_code_refs(raw))
+        # 字幕重影的渲染口兜底：plan_motion 入库前已经修过一次，但**旧 checkpoint /
+        # 旧计划**里的代码不会重跑那一步。这里再修一次（幂等），免得用户点确认之后
+        # 才在成片里看到两条叠在一起的字。
+        raw, _dup_caption_notes = cspec.autofix_duplicate_caption(raw)
         spec, errors = cspec.validate_code_spec(
             cspec.overlay_knobs(cspec.with_default_qc(raw), inputs))
+        # 手写 spec 可能只带 `brief`（2026-10-18：code 可省）：在烧像素之前补写，
+        # 与 plan_motion 走的是同一个写手。已经带 code 的镜一个字节都不动。
+        if not cspec.DEMOS_ENABLED and any(
+                not str(s.get("code") or "").strip() for s in (spec.get("shots") or [])):
+            from ..motion import shot_writer
+            wrote = await shot_writer.write_shot_code(
+                spec, user_id=state.user_id or "",
+                conversation_id=state.conversation_id or "")
+            if wrote["unwritten"]:
+                raise ValueError(
+                    "出片前补写镜头代码时有几镜没写成（"
+                    + "、".join(wrote["unwritten"]) + "）：\n"
+                    + "\n".join(f"  · {n}" for n in wrote["notes"][:12])
+                    + "\n改 brief 或直接交这几镜的 code，再调 render_motion_code。")
         # 出处闸在代码链上的第二个调用点：闸的本体在 plan_motion（入库前），这里只兜住
-        # 「没经过 plan_motion、直接塞 inline 代码分镜」那一路——判据仍是同一份 source_gate。
+        # 「没经过 plan_motion、直接塞 inline 代码分镜」那一路——判据仍是同一份
+        # `motion_plan.settle_sources`（对不上账就地降级，不打回）。
         await self._gate_inline(state, inputs, spec, errors)
 
         sess, artifact = state.session_id, state.artifact_id or "_default"
@@ -407,7 +426,9 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                               if str((r.get("motion") or {}).get("status") or "undetermined")
                               != "ok")
         motion_warns = [w for r in ledger
-                        for w in code_render.describe_motion(str(r.get("id")), r.get("motion"))]
+                        for w in code_render.describe_motion(
+                            str(r.get("id")), r.get("motion"),
+                            strict=code_render.qc_strict(spec))]
         motion_tight = [r["motion"].get("min_gap_frames") for r in motion_shot
                         if isinstance(r["motion"].get("min_gap_frames"), int)]
         motion_segs = [len(r["motion"].get("events") or []) for r in motion_shot]
@@ -1004,7 +1025,9 @@ class PatchCodeMotionVideoNode(MotionPatchBase, RenderCodeMotionVideoNode):
                            f"（可改字段：{', '.join(mcode.EDITABLE_SHOT_FIELDS)}）。"
                            "与 edits 的区别是这里**允许新增**——包括给一镜补上原本没声明的"
                            "字段（fields 整份重写）；镜号 id 不许改——它是命中表、按镜缓存"
-                           "与对比帧共同的锚点。改了 code 照样重过闸①，验不过就不落盘",
+                           "与对比帧共同的锚点。只给 brief 而不给 code＝**重画这一镜**"
+                           "（系统按新 brief 重写代码）；改了 code（含重写）照样重过闸①，"
+                           "验不过就不落盘",
             "items": {"type": "object",
                       "properties": {"shot": {"type": "string"},
                                      "set": {"type": "object"}},
@@ -1066,6 +1089,25 @@ class PatchCodeMotionVideoNode(MotionPatchBase, RenderCodeMotionVideoNode):
         * **跑在 ``_fork`` 之前**：这一版新代码只要落进产物作用域，界面上就是一条可以
           播的新版本；绕过闸① 让它落盘，等于闸① 只拦第一次出片、不拦改动。
         """
+        # 只改 `brief` 的镜（2026-10-18）：旧代码在补丁规划时已被丢掉，这里按新 brief
+        # 写出来，再与其余镜一起比「哪些代码字节变了」——写出来的这一镜自然要重烧。
+        if not errors and any(not str(s.get("code") or "").strip()
+                              for s in (spec.get("shots") or [])):
+            from ..motion import shot_writer
+            wrote = await shot_writer.write_shot_code(
+                spec, user_id=state.user_id or "",
+                conversation_id=state.conversation_id or "")
+            if wrote["unwritten"]:
+                raise ValueError(
+                    "局部改：有几镜按新 brief 没写成（"
+                    + "、".join(wrote["unwritten"]) + "），这一版没有落盘：\n"
+                    + "\n".join(f"  · {n}" for n in wrote["notes"][:12])
+                    + "\n把 brief 写得更具体，或直接交这一镜的 code。")
+            if wrote["cost_yuan"]:
+                # 写手的钱随这一版回执带回去（主循环按 `node_cost_yuan` 记账）。
+                report["node_cost_yuan"] = round(
+                    float(report.get("node_cost_yuan") or 0.0)
+                    + float(wrote["cost_yuan"]), 4)
         if errors or not mcode.changed_codes(base, spec):
             return
         client = self._client()

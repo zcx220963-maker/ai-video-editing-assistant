@@ -115,8 +115,37 @@ DEFAULT_RESULT_MAX_BYTES = 60_000
 #: 活列表里全部工具结果的合计体积超过这个数，就开始折叠更早的那些（字节）。
 #: 原先的 96_000 比的是「单条的上限」：把单条改到 60_000 之后，两份完整 demo 就能把活列表撑过 96_000，
 #: 第二轮写码要用的那一批被折成 200 字符预览——模型又变回凭记忆手搓，闸⑫ 的相似度回到 0.14~0.54。
-#: 160_000 容得下十二份折半的 demo（约 120 KB）；真正的限制是模型窗口，不是这里。
-DEFAULT_FOLD_AT_BYTES = 160_000
+#:
+#: 160_000 → 400_000（2026-10-18 真机 run 66c0b56541ca）：模型写分镜要同时记着技能正文
+#: （≈86 KB）与卡库索引（≈58 KB），≈144 KB 贴着 160 KB 那条线；42 份网页一进来就越线，
+#: 折叠切掉一块正在用的材料，它只好重读——那条 run 把 1200 行正文按 120 行一窗从头读了
+#: 三遍、索引读了 8 遍，104 轮一张分镜都没交。门槛定低并不省钱：缓存命中时多带 100 KB
+#: 上下文每轮只多约 0.002 元（DeepSeek 命中价 0.02 元 / 百万），真正贵的是「折了再重读」。
+#: 再配上折叠顺序（研究结果先折、技能材料最后折，见 `ToolResultGate.shrink`），
+#: 正在用的那份设计材料就不会被几十份看过的网页挤出去。
+#:
+#: 400_000 → 1_000_000（同日，按价目表与实测算的）：这条链实测 1 token ≈ 2.7 字节，
+#: 1 MB 工具结果 ≈ 37 万 token；模型窗口 1M token。折叠只数**工具结果**，模型自己写的
+#: 代码（写文件 / 改文件 / 交分镜，真机一条约 67 万字节）另占窗口，最坏合计约 60 万 token，
+#: 仍有余量。钱的账：缓存命中 0.02 元 / 百万，30 万 token 的一轮约 0.006 元；而每折一次
+#: 就改写一次历史，那一轮按未命中计价（1 元 / 百万，贵 50 倍）。所以折得越少越省——
+#: 这条线只当「别撑爆窗口」的应急闸用，正常一条片子触发不到它。
+DEFAULT_FOLD_AT_BYTES = 1_000_000
+
+#: 看过就消化了的「原料」类工具：越线时**先折**它们。技能正文与卡库（`load_skill`）是模型
+#: 正拿着写代码的设计材料、而且重取最贵，排在**最后**折。
+RESEARCH_TOOLS = frozenset({"web_search", "fetch_url", "fetch_media"})
+
+#: 一旦触发折叠，就一口气折到这个比例（相对 ``fold_at_bytes``）才停——**回差**。
+#:
+#: 为什么非要有回差（2026-10-17，钱烧在哪）：原先的停止条件是「刚好压回门槛以下」，
+#: 于是越线之后**每来一条新结果就要回头再折一条更早的**——每一轮都在改写历史中段。
+#: 模型服务的提示词缓存是按**前缀**命中的：中间改一个字，从那里往后整段都按「未命中」
+#: 计价，而未命中是命中的 50 倍（DeepSeek：1 元 vs 0.02 元 / 百万 token）。真机 run
+#: 32affa23c933 改写了 53 次历史，估算九成的钱花在这上面。
+#: 折到一半意味着下一次要再涨 ``fold_at × 0.5`` 才会再动历史：改写从「每轮一次」
+#: 降成「偶尔一次」，代价是那一次多折掉几条——那几条本来也是更早、更不在用的。
+DEFAULT_FOLD_TO_RATIO = 0.5
 
 #: 最近这么多条工具结果永不折叠——模型当前正在用的那一批必须完整。
 DEFAULT_KEEP_RECENT_RESULTS = 3
@@ -135,9 +164,15 @@ TRUNCATE_MARKER = "结果已截断"
 #: 反复加载（每次切点还一样），十几次调用全烧在找回那段上。**回执给一条走不通的路，
 #: 比不给更坏**——模型会一条条试。默认那句是给没列在这里的通用工具用的，一字不改。
 _RECOVERY_HINT = {
-    "load_skill": ('再用 load_skill 取同一份 name（附件加 path），带 offset/limit 按行续读'
-                   '——技能文件不在会话工作区里，read_file / grep 找不到它们'),
-    "read_file": "再用 read_file 带 offset/limit 按行续读",
+    # 这句话亲手教出过「一行一行翻」：真机看到「按行续读」就写 limit=1，
+    # 一枪一行磨穿迭代预算（2026-10-17 demo 80 枪、2026-10-18 pipeline.md 200 轮）。
+    # 续读要教的是**整份 / 大页**，不是按行。
+    "load_skill": ('再用 load_skill 把同一份 name（附件加 path）**一次取回**——'
+                   '不带 offset/limit 就是整份，带分页就把 limit 给到 100 行以上；'
+                   '技能文件不在会话工作区里，read_file / grep 找不到它们；'
+                   '不要一行一行地翻'),
+    "read_file": ("再用 read_file 换一个覆盖范围（offset 定位、limit 给到 100 行以上），"
+                  "不要一行一行地翻"),
     "grep": "用 grep 换更窄的 pattern、或限定 path/glob 再检索一次",
     "fetch_url": "换一条更具体的链接（这一份太长，抓取工具没有「只取某一节」的参数），"
                  "或换一个源再抓",
@@ -229,9 +264,13 @@ class ToolResultGate:
         fold_at_bytes: int = DEFAULT_FOLD_AT_BYTES,
         keep_recent: int = DEFAULT_KEEP_RECENT_RESULTS,
         fold_preview: int = DEFAULT_FOLD_PREVIEW,
+        fold_to_ratio: float = DEFAULT_FOLD_TO_RATIO,
     ) -> None:
         self.result_max_bytes = int(result_max_bytes)
         self.fold_at_bytes = int(fold_at_bytes)
+        # 回差的下沿（见 `DEFAULT_FOLD_TO_RATIO`）。比例夹在 (0, 1]：1 = 退回「刚好压回门槛」
+        # 的老行为，只给测试与对照用。
+        self.fold_to_bytes = int(self.fold_at_bytes * min(1.0, max(0.05, float(fold_to_ratio))))
         self.keep_recent = int(keep_recent)
         self.fold_preview = int(fold_preview)
 
@@ -251,6 +290,9 @@ class ToolResultGate:
         触发条件是**累计**体积（``fold_at_bytes``）而不是条数：两条 200KB 的网页和
         两百条 200 字节的回执，前者才是要治的。合计在预算内时一条都不动——平时
         模型看到的仍是原样结果，只有真撑大时才瘦身。
+
+        触发之后折到 ``fold_to_bytes`` 才停（回差，见 `DEFAULT_FOLD_TO_RATIO`）：
+        每改写一次历史，后面整段都要按缓存未命中重算，所以要少动、一次动够。
         """
         stats = {"folded": 0, "freed_bytes": 0, "total_bytes": 0}
         idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
@@ -265,8 +307,14 @@ class ToolResultGate:
         if total <= self.fold_at_bytes:
             return stats
 
-        for i in idx[: len(idx) - self.keep_recent]:
-            if total <= self.fold_at_bytes:
+        # 折叠顺序：研究结果 → 其它工具 → 技能材料（各档内部仍按从旧到新）。
+        head = idx[: len(idx) - self.keep_recent]
+        order = ([i for i in head if messages[i].get("name") in RESEARCH_TOOLS]
+                 + [i for i in head if messages[i].get("name") not in RESEARCH_TOOLS
+                    and messages[i].get("name") not in INDEX_FOLD_TOOLS]
+                 + [i for i in head if messages[i].get("name") in INDEX_FOLD_TOOLS])
+        for i in order:
+            if total <= self.fold_to_bytes:
                 break
             m = messages[i]
             content = str(m.get("content") or "")

@@ -20,7 +20,7 @@ import re
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 # --------------------------------------------------------------------------
 # Store：按会话隔离的节点输出总线
@@ -175,6 +175,9 @@ class NodeState:
     # 发起方身份：素材按 owner 过滤的查询条件（空身份 = 什么都看不见，而不是放行全部）
     user_id: str = ""
     conversation_id: str = ""
+    # 本轮用户选的风格包名（kind=style）。服务端入口从 MCP 入参写进来，
+    # plan_motion 读它去 PG 取 manifest；其他节点只透传，不解释。
+    style_skill: str = ""
     store: Store = field(default_factory=Store)
     summary: NodeSummary = field(default_factory=NodeSummary)
     # 任一节点从客户端见过的参数在此留痕：拦截器补齐的依赖以默认入参执行，
@@ -294,7 +297,12 @@ class BaseNode(ABC):
         # 显式不落库的返回（render_video 的 dry_run：那是「将要渲成什么样」的答复，
         # 不是一次渲染产物；落进 artifacts 就成了「这步已经有产出」的假象）。
         no_store = bool(outputs.pop("__no_store__", None))
-        packed = self.pack_outputs_to_client(state, outputs)
+        # 只发给模型的那一份（2026-10-18）：长产物（逐镜 TSX）留在库里供下游渲染，
+        # 交回主对话的是一份瘦身版。不这么做，二十镜代码会整份回到上下文里——那正是
+        # 「主对话被图片/代码撑爆、开始自我复制」的形状（见 `motion/shot_writer.py`）。
+        model_view = outputs.pop("__model_view__", None)
+        packed = self.pack_outputs_to_client(
+            state, model_view if isinstance(model_view, Mapping) else outputs)
         if not no_store:
             # 入库的那份剔掉 ephemeral：会过期的直链写进共享库，就是一条注定失效的引用
             stored = ({k: v for k, v in outputs.items() if k not in self.ephemeral}

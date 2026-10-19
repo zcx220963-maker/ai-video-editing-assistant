@@ -122,7 +122,7 @@ cd ../frontend && npm install && npm run build                    # 前端产物
 | `SITE_DOMAIN` | 公网域名，配合 `deploy/Caddyfile` 启用 HTTPS | 空 |
 | `MOTION_QC` | 图形片质检档位。`preview`：渲染前由预览图人工把关，渲染后质检仅告警；`strict`：无人值守，质检不通过即打回 | `preview` |
 | `MOTION_PREVIEW_STILLS` | 分镜通过后是否为每镜渲染预览静帧 | `1` |
-| `MOTION_RENDER_PARALLEL` / `DG_RENDER_SLOTS` | 图形片并发渲染的镜数，两项需同步调整；16 GB 内存下保持 2 | `2` |
+| `MOTION_RENDER_PARALLEL` / `DG_RENDER_SLOTS` | 图形片并发渲染的镜数，两项需同步调整。每路约 5 个核、2 GB；16 GB 内存下 3 路稳妥 | `3` |
 
 剪辑能力（视觉理解模型、ASR 模型、TTS 音色、场景切分阈值等）在 `backend/examples/storyline/config.toml`（本机）
 与 `config.docker.toml`（容器）中配置，两份文件的节点白名单需保持一致。主服务的启动参数见 `python run_server.py --help`。

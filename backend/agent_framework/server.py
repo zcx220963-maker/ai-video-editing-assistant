@@ -35,8 +35,11 @@ create_app 把 Agent + MQ（+ 可选 Heartbeat）装配成一个 FastAPI 应用�
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import logging
 import os
+import tempfile
 import urllib.parse
 import urllib.request
 import re
@@ -54,7 +57,7 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from . import model_probe, secrets, uploads
+from . import model_probe, secrets, style_authoring, style_templates, uploads
 from .agent import Agent
 from .auth import Authenticator
 from .catalog import get_catalog
@@ -129,6 +132,10 @@ class ChatRequest(BaseModel):
     attachments: list[str] = []   # 已上传素材的 material_id 列表（/upload 返回值）
     resume: bool = False          # True = 续跑本会话在途的 run，而不是开新 run
     mode: str = ""                # "auto" 直接执行 / "plan" 先出计划卡；空 = 用服务端默认入口
+    # 用户在前端选的风格包（skills.name，kind=style）。空 = 不注入，走缺省视觉。
+    # 它只随这一轮走：注入 Identity 后由 MCPTool 传给声明了该参数的工具，
+    # 不写进对话历史，也不让模型自己填。
+    style_skill: str = ""
 
 
 class RunForkRequest(BaseModel):
@@ -427,6 +434,15 @@ class CatalogJSONResponse(JSONResponse):
                           indent=None, separators=(",", ":")).encode("utf-8")
 
 
+def _json(content: Any, status_code: int = 200) -> JSONResponse:
+    """handler 里手工返回 JSON 时用这个——**不要直接 new `JSONResponse`**。
+
+    直接 `JSONResponse` 会绕开 `CatalogJSONResponse`，机器名/中文名那一套就漏了；
+    错误体里又正好常带工具名与模板名。
+    """
+    return CatalogJSONResponse(status_code=status_code, content=content)
+
+
 def reject_stale_answer(row: Mapping[str, Any], decision: str,
                         answers: list[dict[str, Any]]) -> None:
     """答案必须属于**当前这道题**，否则拒绝——这是「没选完就继续」的守口。
@@ -623,6 +639,67 @@ class SkillUpsertRequest(BaseModel):
     description: str = ""
     requires: str = ""       # 如 "CLI: curl, ENV: KEY"
     body: str = ""
+    # 分段声明与排除前缀原本在表单保存时被丢掉（`sections`/`exclude` 只存在于磁盘
+    # frontmatter）。这里补回，否则「编辑一次文案」就会把分节行为改掉。
+    sections: list[str] = []
+    exclude: list[str] = []
+    # 技能类别：workflow 流程技能 / capability 能力 / style 风格包。
+    kind: str = "workflow"
+    # kind=style 时的机器可读视觉契约。允许任意 JSON 对象；结构由风格包自己约定。
+    style_manifest: dict[str, Any] = {}
+
+
+class StyleDepositRequest(BaseModel):
+    """POST /style/templates/deposit：拿已上传的参考片沉淀一套模板。
+
+    同时保留 ``material_id``（单条）与 ``material_ids``（多条同风格参考片），
+    前端新版本只发后者；``material_ids`` 优先。多条时视觉模型提炼共同语法，
+    每条参考片的特有构图不会被写成全片规则。
+
+    ``slug`` 只是短名（模板全名由服务端加用户前缀分配），``note`` 是给读片模型的
+    补充说明（比如「这是剪影风格，别把人物画成写实」），可以为空。
+    """
+
+    material_id: str = ""
+    material_ids: list[str] = []
+    slug: str = ""
+    # 用户起的名字（可以中文）。短名只是内部主键，展示名由它来引导分析结果。
+    name_hint: str = ""
+    note: str = ""
+
+
+class StyleVariantRequest(BaseModel):
+    """POST /style/templates/{name}/variants：换掉模板里的一个零件。
+
+    模板外壳（构图、相机、时间轴、字幕版式、配色）不动，只把 ``component``
+    这一个槽位换成 ``target`` 描述的东西——梅花换菊花、人影换走动的鹿。
+    ``component`` 可为空：用户只说一句自然语言时，由服务端解读出换哪个零件、
+    按哪些 props 分档（见 `style_authoring.interpret_variant_request`）。
+    替换件必须接住原组件的 props 合约；``material_ids`` 可选，用来给目标
+    对象附参考帧。
+    """
+
+    component: str = ""
+    #: 一句话改多个零件时，用户点中的全部零件；空＝交给服务端从原话拆。
+    #: `component` 保留给单件入口与老前端，两个都填时以 `components` 为准。
+    components: list[str] = []
+    target: str
+    #: 换件面板上的三种改法：replace（换成别的）/ restyle（改画法轮廓）/
+    #: by_shot（跟着每一镜变）。空＝让服务端从 `target` 自行判断。
+    mode: str = ""
+    #: by_shot 时用户点名的变化轴（如 `wardrobe`）；空＝系统从模板声明的轴里选。
+    follow: str = ""
+    material_ids: list[str] = []
+
+
+class StyleVariantOptionsRequest(BaseModel):
+    """POST /style/templates/{name}/variant-options：给换件面板生成可点选的建议。
+
+    ``component`` 为空＝用户还没点零件，由模型挑一个最值得改的并回填组件名。
+    选项只是把话填进输入框；真正执行前仍会走一次需求解读。
+    """
+
+    component: str = ""
 
 
 class AuthCredentials(BaseModel):
@@ -909,6 +986,7 @@ def create_app(
                         "name_display": sk.display or "",
                         "desc": sk.description or "",
                         "always": "是" if sk.always else "否",
+                        "kind": sk.kind,
                         "available": "可用" if sk.available else f"不可用：{sk.unavailable_reason or ''}",
                     })
             except Exception:
@@ -939,6 +1017,8 @@ def create_app(
         return {"skills": [
             {"name": s.name, "display": s.display, "description": s.description,
              "always": s.always, "available": s.available,
+             "kind": s.kind, "style_manifest": s.style_manifest,
+             "owner_user_id": s.owner_user_id, "system": s.owner_user_id is None,
              "unavailable_reason": s.unavailable_reason,
              "files": [f["relpath"] for f in s.files]}
             for s in skills]}
@@ -1003,8 +1083,15 @@ def create_app(
         sk = await skill_loader.get(name)
         if sk is None:
             raise HTTPException(404, f"技能 {name!r} 不存在")
+        row = await storage.skills.get(name) or {}
+        fm = row.get("frontmatter") or {}
         return {"name": sk.name, "display": sk.display, "description": sk.description,
                 "always": sk.always, "requires": sk.requires, "available": sk.available,
+                "kind": sk.kind, "style_manifest": sk.style_manifest,
+                "style_manifest_prev": fm.get("style_manifest_prev") or None,
+                "sections": sk.declared_sections,
+                "exclude": fm.get("exclude") or [],
+                "owner_user_id": sk.owner_user_id, "system": sk.owner_user_id is None,
                 "unavailable_reason": sk.unavailable_reason, "body": sk.body,
                 "files": [f["relpath"] for f in sk.files]}
 
@@ -1021,14 +1108,40 @@ def create_app(
         name = (name or "").strip()
         if not name or len(name) > 64 or not all(c.isalnum() or c in "_-" for c in name):
             raise HTTPException(400, "技能名只允许字母数字与 _ -（1~64 位）")
+        kind = (req.kind or "workflow").strip().lower()
+        if kind not in ("workflow", "capability", "style"):
+            raise HTTPException(400, "kind 只认 workflow / capability / style")
+        if kind == "style" and not (req.body or "").strip():
+            raise HTTPException(400, "风格包需要一段正文（说明这套视觉怎么用）")
         prev = await skill_loader.get(name)
+        # 系统内置（owner 为 NULL）只读：改风格请另存一个名字。原来这里不校验 owner，
+        # 保存后 owner 还被写成 NULL——用户新建的技能于是变成「系统内置、删不掉」。
+        if prev is not None and prev.owner_user_id is None:
+            raise HTTPException(403, "系统内置技能只读；请另存为我的风格")
+        if prev is not None and prev.owner_user_id != user_id:
+            raise HTTPException(403, "不能修改别人的技能")
         files = [dict(f) for f in (prev.files if prev else [])]
-        fm = {"name": name, "display": req.display, "description": req.description,
-              "always": "true" if req.always else "false", "requires": req.requires}
+        fm: dict[str, Any] = {
+            "name": name, "display": req.display, "description": req.description,
+            "always": "true" if req.always else "false", "requires": req.requires,
+            "kind": kind,
+            # `_parse_sections` 只认一行逗号清单（见 skill.py 的注释）；这里存 list
+            # 会被 str() 成 "['a', 'b']"，下一次读取就把方括号当名字了。
+            "sections": ", ".join(str(s).strip() for s in req.sections if str(s).strip()),
+            "exclude": [str(p).strip() for p in req.exclude if str(p).strip()],
+            "style_manifest": dict(req.style_manifest or {}),
+        }
+        # 调参前先留一版：教程里 Studio 的改动会写回代码，人得能退回去。
+        # 只保留一步（完整版本表是 P2），空 manifest 不进历史。
+        if prev is not None and prev.style_manifest and \
+                prev.style_manifest != (req.style_manifest or {}):
+            fm["style_manifest_prev"] = prev.style_manifest
         await storage.skills.upsert(name, req.body, description=req.description,
-                                    frontmatter=fm, files=files)
+                                    frontmatter=fm, files=files,
+                                    owner_user_id=user_id)
         await _sync_skill_catalog()
-        return {"saved": name, "attachments_kept": len(files)}
+        return {"saved": name, "attachments_kept": len(files),
+                "kind": kind, "style_manifest_prev": fm.get("style_manifest_prev")}
 
     @app.post("/skills/from_run")
     async def skill_from_run(req: SkillFromRunRequest,
@@ -1098,8 +1211,9 @@ def create_app(
         await storage.skills.upsert(name, body, description=description,
                                     frontmatter={"name": name, "display": display,
                                                  "description": description,
-                                                 "always": "false", "requires": ""},
-                                    files=[])
+                                                 "always": "false", "requires": "",
+                                                 "kind": "workflow"},
+                                    files=[], owner_user_id=user_id)
         await _sync_skill_catalog()
         return {"name": name, "display": display, "steps": len(steps),
                 "dropped": dropped, "llm_polished": polished}
@@ -1108,6 +1222,586 @@ def create_app(
     async def skills_ui() -> HTMLResponse:
         """技能管理页（免构建的独立小页）：列出/上传/重扫，凭证走 localStorage 的 ca.token。"""
         return HTMLResponse(_SKILLS_UI_HTML)
+
+    # ---- 风格模板沉淀：参考片 → 可执行模板 + 风格包 ----
+    #
+    # 边界：用户只能走这条产品流程「沉淀」模板，不能直接上传 TSX 绕过闸；模板名由
+    # 服务端分配（`u-<8 位>-<slug>`），别人的模板看不见、也覆盖不了。
+    #
+    # 沉淀是重活（读片 + 写码 + 真渲三帧 + 两次确定性渲染），一次只放一个进来：
+    # 渲染容器是单并发，两个沉淀挤在一起只会互相拖慢，然后一起超时。
+    _deposit_lock = asyncio.Lock()
+
+    def _style_preview_key(user_id: str, name: str) -> str:
+        uid = re.sub(r"[^A-Za-z0-9_-]", "", user_id or "")[:48] or "anon"
+        return f"style-previews/{uid}/{name}.jpg"
+
+    async def _save_style_preview(user_id: str, name: str,
+                                  stills: list[dict[str, Any]]) -> None:
+        """把中间那张预览帧存进对象存储。
+
+        预览帧只存在于沉淀响应里，刷新页面就没了；模板库要能一直显示它，就得落一份。
+        失败不阻断发布：模板本身已经过闸，丢一张缩略图不值得把成果退回去。
+        """
+        if not stills:
+            return
+        pick = stills[len(stills) // 2]
+        try:
+            data = base64.b64decode(str(pick.get("jpeg_b64") or ""))
+        except (ValueError, TypeError):
+            return
+        if not data:
+            return
+
+        async def _one() -> Any:
+            yield data
+
+        try:
+            await storage.objects.put(_style_preview_key(user_id, name), _one(),
+                                      content_type="image/jpeg", size=len(data))
+        except Exception as exc:  # noqa: BLE001 - 缩略图丢了不影响模板可用
+            logging.getLogger(__name__).warning("模板 %s 的预览帧没存上：%s", name, exc)
+
+    async def _style_preview_url(row: Mapping[str, Any]) -> str | None:
+        owner = str(row.get("owner_user_id") or "")
+        if not owner:
+            return None       # 系统模板随镜像发布，没有沉淀出来的预览帧
+        key = _style_preview_key(owner, str(row.get("name") or ""))
+        try:
+            if await storage.objects.head(key) is None:
+                return None
+            return await storage.objects.presign_get(key)
+        except Exception:  # noqa: BLE001 - 预览只是展示，取不到就当没有
+            return None
+
+    @app.post("/style/templates/deposit")
+    async def style_template_deposit(
+            req: StyleDepositRequest,
+            user_id: str = Depends(auth.http_user_id)) -> JSONResponse:
+        """参考片 → 模板：读片、写 TSX、过闸、发布，返回三张预览帧。
+
+        参考片必须是**本人素材库里的视频**（`/upload` 拿到的 material_id）。
+        可以一次给多条同风格的参考片（``material_ids``），视觉模型提炼它们的
+        共同语法；单条走 ``material_id``，两条路径同一套闸。
+        沉淀失败时库与渲染容器里已有的同名模板都不动——服务端先在临时名下过闸，
+        过不了闸就不会碰正式名。
+        """
+        ids: list[str] = []
+        for mid in (list(req.material_ids) if req.material_ids else [req.material_id]):
+            mid = str(mid or "").strip()
+            if mid and mid not in ids:
+                ids.append(mid)
+        if not ids:
+            return _json({"ok": False, "error": "没有选中参考视频"},
+                                status_code=400)
+        # 用户填的名字不要求是英文/短名：内部短名由服务端归一（中文会生成
+        # `style-xxxxxx`）。中文原名才当展示名提示——`firelight` 这类英文短名
+        # 不该把中文 `display` 逼成英文。
+        raw_name = (req.name_hint or "").strip() or (req.slug or "").strip()
+        if not raw_name:
+            return _json({"ok": False, "error": "先给模板起个名字"},
+                                status_code=400)
+        display_hint = raw_name if re.search(r"[一-鿿]", raw_name) else ""
+        slug = style_authoring.resolve_slug(user_id, req.slug or raw_name,
+                                            hint=raw_name)
+        if len(ids) > style_authoring.MAX_REFERENCE_VIDEOS:
+            return _json(
+                {"ok": False,
+                 "error": f"一次最多 {style_authoring.MAX_REFERENCE_VIDEOS} 条参考片"
+                          f"（选中了 {len(ids)} 条）"},
+                status_code=400)
+        rows, denied = await storage.materials.resolve(ids, user_id=user_id)
+        if denied or not rows:
+            return _json({"ok": False, "error": "素材不存在或无权使用"},
+                                status_code=403)
+        by_id = {row.get("id"): row for row in rows}
+        materials = [by_id[mid] for mid in ids if mid in by_id]
+        bad = [str(m.get("filename") or m.get("id")) for m in materials
+               if m.get("kind") != "video"]
+        if bad:
+            return _json(
+                {"ok": False, "error": "参考片必须是视频：" + "、".join(bad[:3])},
+                status_code=400)
+        try:
+            llm = _runtime_llm()
+        except Exception:  # noqa: BLE001 - 没有可用模型时给可读原因，不要抛栈
+            llm = None
+        if llm is None:
+            return _json({"ok": False, "error": "没有可用的模型配置"},
+                                status_code=409)
+        async with _deposit_lock:
+            with tempfile.TemporaryDirectory(prefix="style-deposit-") as tmp:
+                locals_: list[Path] = []
+                for i, material in enumerate(materials):
+                    sub = Path(tmp) / f"m{i:02d}"
+                    sub.mkdir(parents=True, exist_ok=True)
+                    try:
+                        locals_.append(await storage.workspace.localize_material(
+                            material, sub))
+                    except Exception as exc:  # noqa: BLE001 - 取不到字节 = 素材不可用
+                        return _json(
+                            {"ok": False,
+                             "error": f"参考片《{material.get('filename') or material.get('id')}》"
+                                      f"取不下来：{exc}"},
+                            status_code=502)
+                try:
+                    result = await style_authoring.author_template(
+                        storage, videos=locals_, user_id=user_id, slug=slug,
+                        note=req.note, name_hint=display_hint,
+                        llm=llm, identity_user=user_id)
+                except style_authoring.AuthoringError as exc:
+                    return _json(
+                        {"ok": False, "error": str(exc), "detail": exc.detail,
+                         "attempts": exc.attempts}, status_code=422)
+        name = str(result.get("name") or "")
+        await _save_style_preview(user_id, name, list(result.get("stills") or []))
+        await _sync_skill_catalog()
+        # 正文已经写进风格包技能，不必再回一份；原始行带 datetime，不能直接进 JSON。
+        result.pop("prose", None)
+        row = result.get("template")
+        result["template"] = (style_authoring.public_row(row)
+                              if isinstance(row, Mapping) else None)
+        result["preview_url"] = await _style_preview_url({"owner_user_id": user_id,
+                                                          "name": name})
+        return _json(result)
+
+    # 沉淀是分钟级任务：浏览器/代理很容易在出结果前把连接断掉（表现为 HTTP 499，
+    # 后端日志里连 POST 都看不到）。长请求走「提交任务 → 轮询」：任务在后端跑完，
+    # 连接只负责立刻拿到 job_id。同步入口保留给脚本与测试，不删。
+    _STYLE_JOBS: dict[str, dict[str, Any]] = {}
+    _STYLE_TASKS: set[asyncio.Task] = set()
+    _STYLE_JOBS_KEEP = 32
+
+    def _prune_style_jobs() -> None:
+        cut = time.time() - 3600
+        for jid in [j for j, v in _STYLE_JOBS.items()
+                    if float(v.get("created_at") or 0) < cut
+                    and v.get("status") != "running"]:
+            _STYLE_JOBS.pop(jid, None)
+        if len(_STYLE_JOBS) > _STYLE_JOBS_KEEP:
+            finished = sorted(
+                (j for j, v in _STYLE_JOBS.items()
+                 if v.get("status") != "running"),
+                key=lambda j: float(_STYLE_JOBS[j].get("created_at") or 0))
+            for jid in finished[:max(0, len(_STYLE_JOBS) - _STYLE_JOBS_KEEP)]:
+                _STYLE_JOBS.pop(jid, None)
+
+    async def _run_style_deposit_job(job_id: str, req: StyleDepositRequest,
+                                     user_id: str) -> None:
+        job = _STYLE_JOBS.get(job_id)
+        if job is None:
+            return
+        try:
+            resp = await style_template_deposit(req, user_id)
+            body = json.loads(bytes(resp.body).decode("utf-8"))
+            job.update(status="done" if resp.status_code < 400 else "error",
+                       status_code=int(resp.status_code), result=body)
+        except HTTPException as exc:
+            job.update(status="error", status_code=int(exc.status_code),
+                       result={"ok": False, "error": str(exc.detail)})
+        except Exception as exc:  # noqa: BLE001 - 任务失败要落进回执，不能只丢日志
+            job.update(status="error", status_code=500,
+                       result={"ok": False,
+                               "error": f"沉淀任务失败：{str(exc)[:300]}"})
+        finally:
+            job["finished_at"] = time.time()
+
+    @app.post("/style/templates/deposit/jobs")
+    async def style_template_deposit_job(
+            req: StyleDepositRequest,
+            user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """提交沉淀任务，立刻返回 job_id；用 GET 同一路径轮询结果。"""
+        _prune_style_jobs()
+        job_id = uuid.uuid4().hex
+        _STYLE_JOBS[job_id] = {"id": job_id, "user_id": user_id,
+                               "status": "running", "created_at": time.time()}
+        task = asyncio.create_task(
+            _run_style_deposit_job(job_id, req, user_id))
+        # 不持有引用的话任务可能被 GC；完成后从集合里摘掉。
+        _STYLE_TASKS.add(task)
+        task.add_done_callback(_STYLE_TASKS.discard)
+        return {"ok": True, "job_id": job_id, "status": "running"}
+
+    @app.get("/style/templates/deposit/jobs/{job_id}")
+    async def style_template_deposit_job_get(
+            job_id: str,
+            user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        job = _STYLE_JOBS.get(job_id)
+        if job is None or job.get("user_id") != user_id:
+            raise HTTPException(404, "沉淀任务不存在")
+        out = {k: v for k, v in job.items() if k != "user_id"}
+        out["elapsed"] = round(
+            time.time() - float(job.get("created_at") or time.time()), 1)
+        return out
+
+    @app.post("/style/templates/{name}/variant-options")
+    async def style_template_variant_options(
+            name: str, req: StyleVariantOptionsRequest,
+            user_id: str = Depends(auth.http_user_id)) -> JSONResponse:
+        """换件面板的建议：跟着这个模板自己的槽位生成，不预设某一种风格。
+
+        点选一条只是把话填进输入框，不会直接开写；复用同一条「提交任务」链路。
+        没有模型配置时退到通用三条，面板仍可用。
+        """
+        row = await storage.style_templates.get(name)
+        if row is None or not style_templates.visible(row, user_id):
+            raise HTTPException(404, "模板不存在")
+        if str(row.get("status") or "") != "validated":
+            raise HTTPException(409, "模板还没过闸，先沉淀成功再换件")
+        slots = style_templates.template_slots(row)
+        if not slots:
+            return _json({"ok": False, "error": "这个模板没有可换的零件"},
+                         status_code=400)
+        comp = (req.component or "").strip()
+        names = [str(s.get("component") or "") for s in slots]
+        if comp and comp not in names:
+            raise HTTPException(404, f"模板里没有组件「{comp}」")
+        focus = next((s for s in slots
+                      if str(s.get("component") or "") == comp), None)
+        try:
+            llm = _runtime_llm()
+        except Exception:  # noqa: BLE001 - 没有模型也要能点零件、自己写
+            llm = None
+        if llm is None:
+            return _json({
+                "ok": True, "component": comp if focus else "",
+                "label": str((focus or {}).get("label") or ""),
+                "options": (style_authoring.fallback_variant_options(focus)
+                            if focus else []),
+                "axes": [],
+            })
+        out = await style_authoring.suggest_variant_options(
+            llm, slots=slots, base_row=row, component=comp,
+            identity_user=user_id)
+        return _json({"ok": True, **out})
+
+    @app.post("/style/templates/{name}/variants")
+    async def style_template_variant(
+            name: str, req: StyleVariantRequest,
+            user_id: str = Depends(auth.http_user_id)) -> JSONResponse:
+        """给模板的一个槽位换件：只生成那一个组件，过同一套闸后登记进基模板。
+
+        换件不改基模板的源码与版本；替换件是另一行模板（可见、可删），
+        登记在基模板的 ``manifest.variants`` 里，运行时按槽位绑定。
+        """
+        target = (req.target or "").strip()
+        if not target:
+            return _json({"ok": False, "error": "先说想改成什么样（一句话就行）"},
+                                status_code=400)
+        row = await storage.style_templates.get(name)
+        if row is None or not style_templates.visible(row, user_id):
+            raise HTTPException(404, "模板不存在")
+        # 换件要把替换件登记进基模板的 manifest；系统模板是全站共享的一行，
+        # 不能在它上面写任何用户数据。用户想换系统模板的零件，先「另存为我的模板」。
+        if row.get("owner_user_id") is None:
+            raise HTTPException(403, "系统内置模板不能换件（请先另存为自己的模板）")
+        ids = [str(m).strip() for m in req.material_ids if str(m).strip()]
+        if len(ids) > style_authoring.MAX_REFERENCE_VIDEOS:
+            return _json(
+                {"ok": False,
+                 "error": f"一次最多 {style_authoring.MAX_REFERENCE_VIDEOS} 条参考片"},
+                status_code=400)
+        try:
+            llm = _runtime_llm()
+        except Exception:  # noqa: BLE001 - 与沉淀同口径：没有模型给可读原因
+            llm = None
+        if llm is None:
+            return _json({"ok": False, "error": "没有可用的模型配置"},
+                                status_code=409)
+        videos: list[Path] = []
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="style-variant-")
+        try:
+            if ids:
+                rows, denied = await storage.materials.resolve(ids, user_id=user_id)
+                if denied or not rows:
+                    return _json({"ok": False, "error": "素材不存在或无权使用"},
+                                        status_code=403)
+                by_id = {r.get("id"): r for r in rows}
+                for i, mid in enumerate(m for m in ids if m in by_id):
+                    sub = Path(tmp_ctx.name) / f"m{i:02d}"
+                    sub.mkdir(parents=True, exist_ok=True)
+                    try:
+                        videos.append(await storage.workspace.localize_material(
+                            by_id[mid], sub))
+                    except Exception as exc:  # noqa: BLE001 - 取不到字节=素材不可用
+                        return _json(
+                            {"ok": False, "error": f"参考片取不下来：{exc}"},
+                            status_code=502)
+            async with _deposit_lock:
+                result = await style_authoring.author_variant(
+                    storage, base_name=name, component=req.component,
+                    target=target, user_id=user_id, llm=llm,
+                    identity_user=user_id, videos=videos,
+                    mode=req.mode, follow=req.follow)
+        except style_authoring.AuthoringError as exc:
+            return _json(
+                {"ok": False, "error": str(exc), "detail": exc.detail,
+                 "attempts": exc.attempts}, status_code=422)
+        finally:
+            tmp_ctx.cleanup()
+        vname = str(result.get("name") or "")
+        await _save_style_preview(user_id, vname, list(result.get("stills") or []))
+        await _sync_skill_catalog()
+        result["preview_url"] = await _style_preview_url({"owner_user_id": user_id,
+                                                          "name": vname})
+        return _json(result)
+
+    # 换件同样是分钟级任务：与沉淀共用一套「提交任务 → 轮询」的口。同步入口保留。
+    async def _run_style_variant_job(job_id: str, name: str,
+                                     req: StyleVariantRequest,
+                                     user_id: str) -> None:
+        job = _STYLE_JOBS.get(job_id)
+        if job is None:
+            return
+        try:
+            resp = await style_template_variant(name, req, user_id)
+            body = json.loads(bytes(resp.body).decode("utf-8"))
+            job.update(status="done" if resp.status_code < 400 else "error",
+                       status_code=int(resp.status_code), result=body)
+        except HTTPException as exc:
+            job.update(status="error", status_code=int(exc.status_code),
+                       result={"ok": False, "error": str(exc.detail)})
+        except Exception as exc:  # noqa: BLE001 - 任务失败要落进回执
+            job.update(status="error", status_code=500,
+                       result={"ok": False,
+                               "error": f"换件任务失败：{str(exc)[:300]}"})
+        finally:
+            job["finished_at"] = time.time()
+
+    @app.post("/style/templates/{name}/variants/jobs")
+    async def style_template_variant_job(
+            name: str, req: StyleVariantRequest,
+            user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """提交换件任务，立刻返回 job_id；用 GET 同一路径轮询结果。"""
+        _prune_style_jobs()
+        job_id = uuid.uuid4().hex
+        _STYLE_JOBS[job_id] = {"id": job_id, "user_id": user_id,
+                               "status": "running", "created_at": time.time()}
+        task = asyncio.create_task(
+            _run_style_variant_job(job_id, name, req, user_id))
+        _STYLE_TASKS.add(task)
+        task.add_done_callback(_STYLE_TASKS.discard)
+        return {"ok": True, "job_id": job_id, "status": "running"}
+
+    @app.get("/style/templates/{name}/variants/jobs/{job_id}")
+    async def style_template_variant_job_get(
+            name: str, job_id: str,
+            user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        job = _STYLE_JOBS.get(job_id)
+        if job is None or job.get("user_id") != user_id:
+            raise HTTPException(404, "换件任务不存在")
+        out = {k: v for k, v in job.items() if k != "user_id"}
+        out["elapsed"] = round(
+            time.time() - float(job.get("created_at") or time.time()), 1)
+        return out
+
+    async def _prepare_variant_videos(
+            ids: list[str], user_id: str, tmp_dir: str,
+    ) -> tuple[list[Path], JSONResponse | None]:
+        """换件参考片 → 本地路径。与单件入口同一条素材权限链。"""
+        videos: list[Path] = []
+        if not ids:
+            return videos, None
+        rows, denied = await storage.materials.resolve(ids, user_id=user_id)
+        if denied or not rows:
+            return videos, _json({"ok": False, "error": "素材不存在或无权使用"},
+                                 status_code=403)
+        by_id = {r.get("id"): r for r in rows}
+        for i, mid in enumerate(m for m in ids if m in by_id):
+            sub = Path(tmp_dir) / f"m{i:02d}"
+            sub.mkdir(parents=True, exist_ok=True)
+            try:
+                videos.append(await storage.workspace.localize_material(
+                    by_id[mid], sub))
+            except Exception as exc:  # noqa: BLE001 - 取不到字节=素材不可用
+                return videos, _json(
+                    {"ok": False, "error": f"参考片取不下来：{exc}"},
+                    status_code=502)
+        return videos, None
+
+    @app.post("/style/templates/{name}/edits")
+    async def style_template_edits(
+            name: str, req: StyleVariantRequest,
+            user_id: str = Depends(auth.http_user_id)) -> JSONResponse:
+        """一句话改画面里的几样东西：拆成多个零件，逐个走替换件同一套闸。
+
+        与单件换件的区别只在入口：用户不必先学会「点哪个零件」。一句话里
+        同时说人物轮廓和背景，就同时换两件；某个零件没过闸不影响其它零件。
+        """
+        target = (req.target or "").strip()
+        if not target:
+            return _json({"ok": False, "error": "先说想改成什么样（一句话就行）"},
+                         status_code=400)
+        row = await storage.style_templates.get(name)
+        if row is None or not style_templates.visible(row, user_id):
+            raise HTTPException(404, "模板不存在")
+        if row.get("owner_user_id") is None:
+            raise HTTPException(403, "系统内置模板不能换件（请先另存为自己的模板）")
+        ids = [str(m).strip() for m in req.material_ids if str(m).strip()]
+        if len(ids) > style_authoring.MAX_REFERENCE_VIDEOS:
+            return _json(
+                {"ok": False,
+                 "error": f"一次最多 {style_authoring.MAX_REFERENCE_VIDEOS} 条参考片"},
+                status_code=400)
+        try:
+            llm = _runtime_llm()
+        except Exception:  # noqa: BLE001 - 与沉淀同口径：没有模型给可读原因
+            llm = None
+        if llm is None:
+            return _json({"ok": False, "error": "没有可用的模型配置"},
+                         status_code=409)
+        picked = [str(c).strip() for c in req.components if str(c).strip()]
+        if not picked and str(req.component or "").strip():
+            picked = [str(req.component).strip()]
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="style-edits-")
+        try:
+            videos, err = await _prepare_variant_videos(ids, user_id, tmp_ctx.name)
+            if err is not None:
+                return err
+            async with _deposit_lock:
+                result = await style_authoring.author_edits(
+                    storage, base_name=name, target=target, user_id=user_id,
+                    components=picked, llm=llm, identity_user=user_id,
+                    videos=videos, mode=req.mode, follow=req.follow)
+        except style_authoring.AuthoringError as exc:
+            return _json(
+                {"ok": False, "error": str(exc), "detail": exc.detail,
+                 "attempts": exc.attempts}, status_code=422)
+        finally:
+            tmp_ctx.cleanup()
+        for item in (result.get("edits") or []):
+            vname = str(item.get("name") or "")
+            await _save_style_preview(user_id, vname, list(item.get("stills") or []))
+            item["preview_url"] = await _style_preview_url(
+                {"owner_user_id": user_id, "name": vname})
+        await _sync_skill_catalog()
+        return _json(result)
+
+    async def _run_style_edits_job(job_id: str, name: str,
+                                   req: StyleVariantRequest,
+                                   user_id: str) -> None:
+        job = _STYLE_JOBS.get(job_id)
+        if job is None:
+            return
+        try:
+            resp = await style_template_edits(name, req, user_id)
+            body = json.loads(bytes(resp.body).decode("utf-8"))
+            job.update(status="done" if resp.status_code < 400 else "error",
+                       status_code=int(resp.status_code), result=body)
+        except HTTPException as exc:
+            job.update(status="error", status_code=int(exc.status_code),
+                       result={"ok": False, "error": str(exc.detail)})
+        except Exception as exc:  # noqa: BLE001 - 任务失败要落进回执
+            job.update(status="error", status_code=500,
+                       result={"ok": False,
+                               "error": f"换件任务失败：{str(exc)[:300]}"})
+        finally:
+            job["finished_at"] = time.time()
+
+    @app.post("/style/templates/{name}/edits/jobs")
+    async def style_template_edits_job(
+            name: str, req: StyleVariantRequest,
+            user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """提交「一句话改多个零件」任务，立刻返回 job_id；GET 同一路径轮询。"""
+        _prune_style_jobs()
+        job_id = uuid.uuid4().hex
+        _STYLE_JOBS[job_id] = {"id": job_id, "user_id": user_id,
+                               "status": "running", "created_at": time.time()}
+        task = asyncio.create_task(
+            _run_style_edits_job(job_id, name, req, user_id))
+        _STYLE_TASKS.add(task)
+        task.add_done_callback(_STYLE_TASKS.discard)
+        return {"ok": True, "job_id": job_id, "status": "running"}
+
+    @app.get("/style/templates/{name}/edits/jobs/{job_id}")
+    async def style_template_edits_job_get(
+            name: str, job_id: str,
+            user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        job = _STYLE_JOBS.get(job_id)
+        if job is None or job.get("user_id") != user_id:
+            raise HTTPException(404, "换件任务不存在")
+        out = {k: v for k, v in job.items() if k != "user_id"}
+        out["elapsed"] = round(
+            time.time() - float(job.get("created_at") or time.time()), 1)
+        return out
+
+    @app.get("/style/templates")
+    async def style_templates_list(
+            user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """模板库清单：系统内置 + 本人沉淀的，带预览图直链。"""
+        rows = await storage.style_templates.list(user_id)
+        items = []
+        for row in rows:
+            item = style_authoring.public_row(row)
+            item["preview_url"] = await _style_preview_url(row)
+            items.append(item)
+        return {"templates": items}
+
+    @app.get("/style/templates/{name}")
+    async def style_template_detail(
+            name: str, user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """模板详情。源码只回给本人；别人的模板按 404（不泄露存在性）。"""
+        row = await storage.style_templates.get(name)
+        if row is None or not style_templates.visible(row, user_id):
+            raise HTTPException(404, "模板不存在")
+        item = style_authoring.public_row(
+            row, include_source=row.get("owner_user_id") == user_id)
+        item["preview_url"] = await _style_preview_url(row)
+        return {"template": item}
+
+    @app.delete("/style/templates/{name}")
+    async def style_template_delete(
+            name: str, user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """删除本人沉淀的模板：渲染容器、模板行、风格包技能、预览图一起清。
+
+        系统内置模板随镜像发布，不能从库里删；别人的模板同样按 403。
+        """
+        row = await storage.style_templates.get(name)
+        # 别人的模板按 404（不泄露存在性）；可见且 owner 为 NULL 才是系统内置。
+        if row is None or not style_templates.visible(row, user_id):
+            raise HTTPException(404, "模板不存在")
+        if row.get("owner_user_id") is None:
+            raise HTTPException(403, "系统内置模板不能删除")
+        # 基模板删了，挂在上面的替换件就失去归属：一起清掉。否则清单里会留下
+        # 「给一个已不存在的模板换的件」，选中也绑不上。
+        for dep in await storage.style_templates.list(user_id):
+            variant_of = (dep.get("manifest") or {}).get("variant_of")
+            if not (isinstance(variant_of, Mapping)
+                    and str(variant_of.get("template") or "") == name):
+                continue
+            dep_name = str(dep.get("name") or "")
+            if not dep_name or dep_name == name:
+                continue
+            await style_authoring.drop_template(dep_name)
+            await storage.style_templates.drop(dep_name)
+            await storage.skills.drop(dep_name)
+            try:
+                await storage.objects.delete(_style_preview_key(user_id, dep_name))
+            except Exception:  # noqa: BLE001 - 同上，删对象失败不阻断删行
+                pass
+        await style_authoring.drop_template(name)
+        await storage.style_templates.drop(name)
+        await storage.skills.drop(name)
+        # 删的是替换件就把基模板里的登记一起摘掉：留着一条指向已删模块的记录，
+        # 用户下次在清单里还会看到「可换成 XX」，选中却绑不上、只能回落默认。
+        variant_of = (row.get("manifest") or {}).get("variant_of")
+        if isinstance(variant_of, Mapping) and str(variant_of.get("template") or ""):
+            base = await storage.style_templates.get(
+                str(variant_of["template"]))
+            if base is not None:
+                manifest = dict(base.get("manifest") or {})
+                kept = [v for v in (manifest.get("variants") or [])
+                        if not (isinstance(v, Mapping) and v.get("name") == name)]
+                if len(kept) != len(manifest.get("variants") or []):
+                    manifest["variants"] = kept
+                    await storage.style_templates.set_manifest(
+                        str(variant_of["template"]), manifest)
+        try:
+            await storage.objects.delete(_style_preview_key(user_id, name))
+        except Exception:  # noqa: BLE001 - 对象删不掉不阻断删行（与 /materials 同口径）
+            pass
+        await _sync_skill_catalog()
+        return {"deleted": name}
 
     # ---- MCP 动态注册：配置落库，热连/热断 ----
 
@@ -1275,6 +1969,7 @@ def create_app(
                 "attachments": req.attachments,
                 "resume": req.resume,
                 "mode": req.mode,
+                "style_skill": req.style_skill,
             },
         )
         return ChatQueuedResponse(run_id=run_id, status="queued")
@@ -1288,7 +1983,8 @@ def create_app(
             run_id = await _resumed_run_id(user_id, req.conversation_id) or run_id
         answer = await agent.handle(
             user_id, req.conversation_id, req.message, run_id=run_id,
-            attachments=req.attachments, resume=req.resume
+            attachments=req.attachments, resume=req.resume,
+            style_skill=req.style_skill,
         )
         # 挂起态如实回给非 WS 客户端：answer 仍然保留（旧客户端照旧能读），
         # 但把结构化提问一并给出，脚本/CLI 才拿得到选项。
@@ -1800,9 +2496,13 @@ def create_app(
     @app.get("/materials")
     async def list_materials(user_id: str = Depends(auth.http_user_id),
                              conversation_id: str | None = None) -> dict[str, Any]:
-        """列出当前用户的所有素材（素材库面板用）。可选按会话过滤。"""
+        """列出当前用户的画面素材（素材库面板用）。可选按会话过滤。
+
+        音频不在这里：音乐/音频统一在「音乐库」（`GET /bgm`），同一首歌不该在
+        两个面板里各出现一次。素材库只回答「有哪些视频/图片可以复用到成片里」。
+        """
         rows = await storage.materials.list_visible(
-            user_id, conversation_id or None, kinds=("video", "audio", "image"))
+            user_id, conversation_id or None, kinds=("video", "image"))
         items = []
         for r in rows:
             try:
@@ -1838,9 +2538,13 @@ def create_app(
     @app.get("/bgm")
     async def list_bgm(q: str | None = None,
                        user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """BGM 曲库列表（音乐库面板用）：只返回本人导入的歌曲。"""
-        rows = await storage.materials.list_visible(
-            user_id, None, origin="bgm", kinds=("audio",))
+        """音乐库列表：本人**所有音频**（曲库导入的 + 对话里上传的）。
+
+        不按 `origin` 过滤是刻意的：素材库已经不列音频，如果这里只列
+        `origin=bgm`，用户自己上传的 mp3 就会两个面板都看不见。`origin` 随条目
+        返回，前端据此标「曲库导入 / 本地上传」。
+        """
+        rows = await storage.materials.list_visible(user_id, None, kinds=("audio",))
         if q:
             ql = q.lower()
             rows = [r for r in rows if ql in (r["filename"] or "").lower()]
@@ -1853,18 +2557,22 @@ def create_app(
             items.append({
                 "material_id": r["id"], "filename": r["filename"],
                 "bytes": r["bytes"], "duration": r.get("duration_sec"), "url": url,
+                "origin": r.get("origin", "upload"),
             })
         return {"bgm": items, "total": len(items)}
 
     @app.delete("/bgm/{material_id}")
     async def delete_bgm(material_id: str,
                          user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
-        """删除本人导入的 BGM 曲库中的一首歌。"""
+        """删除音乐库里的一条音频（曲库导入的或本地上传的）。
+
+        只允许删音频：这个入口在音乐库面板上，不能拿它绕过素材库去删视频。
+        """
         rows = await storage.materials.db.select(
             storage.materials.table,
-            where={"id": material_id, "origin": "bgm", "owner_user_id": user_id})
+            where={"id": material_id, "kind": "audio", "owner_user_id": user_id})
         if not rows:
-            raise HTTPException(404, "曲库中没有这首歌或不属于你")
+            raise HTTPException(404, "音乐库里没有这条音频或不属于你")
         object_key = rows[0].get("object_key")
         if object_key:
             try:
@@ -2159,6 +2867,15 @@ def create_app(
         s_key_row = await storage.secrets.row(user_id, secrets.SEARCH_API_KEY_NAME)
         s_key = (s_key_row or {}).get("value", "")
         eff_provider, _, _, s_source = await secrets.resolve_search_config(user_id)
+        if not eff_provider:
+            # 没另配后端时，模型走 DeepSeek 就沿用模型密钥调官方 Search / Fetch
+            # （见 `tools/web.deepseek_auto_key`）——设置页要如实写「走 deepseek」，
+            # 不然它还说「走免 key 回落链」，与工具真走的那一路对不上。
+            from .identity import use_identity
+            from .tools.web import deepseek_auto_key
+            with use_identity(user_id, ""):
+                if await deepseek_auto_key():
+                    eff_provider, s_source = "deepseek", "沿用模型密钥（模型走 DeepSeek）"
         q_limit, q_window, q_source = await secrets.resolve_quota(
             user_id, default_limit=quota_limit, default_window=quota_window)
         q_status = await quota_status(storage.db, user_id, limit=q_limit, window=q_window)

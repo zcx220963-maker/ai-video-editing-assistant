@@ -21,7 +21,7 @@ P4 之前这个模块还负责「零素材排版逐帧截图」；那条链下�
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .. import mediaops
 from ..mediaops import MediaError
@@ -167,13 +167,80 @@ TEXTURE_FILTERS: dict[str, str] = {
 }
 
 
-def apply_texture(src: Path, out: Path, kind: str) -> str:
-    """一段视频 → 加质感的视频（代码链按**每一镜的切片**各调一次，拼接之前）。
+#: 整片美术方向 → **切片末段那趟统一调色**的滤镜串。参数从 `art` 里两条有明确
+#: 像素后果的栏派生，不另起一条管线：
+#:
+#: * ``texture``：paper 轻颗粒 + 暗角（纸）；grain 颗粒更重（颗粒底）。none 不加。
+#:   它治的是「二十镜每镜自己画一层纸纹，颗粒粗细与暗角浓淡各不相同」——镜头代码
+#:   可以画纸纹，但整片的**统一层**只该有一处。
+#: * ``light``：光源偏左＝整片偏暖（晨光/灯在左），偏右＝偏冷。只动 midtone 一点点
+#:   （±0.03），够把各镜的色温拉齐，不至于把色板改掉。
+#:
+#: 为什么不做 duotone/lut 那种整片重调：那会把镜头代码画好的色板盖掉，而色板是
+#: 用户钉的那一档（`palette`）。这一层只做「统一」，不做「改写」。
+ART_GRADE_TEXTURE: dict[str, str] = {
+    "paper": "noise=alls=2:allf=t,vignette=PI/6",
+    "grain": "noise=alls=4:allf=t,vignette=PI/5.5",
+}
+_WARM = "colorbalance=rm=.03:gm=.01:bm=-.03"
+_COOL = "colorbalance=rm=-.02:gm=.01:bm=.03"
+ART_GRADE_LIGHT: dict[str, str] = {
+    "top-left": _WARM, "left": _WARM, "bottom-left": _WARM,
+    "top-right": _COOL, "right": _COOL, "bottom-right": _COOL,
+}
+
+
+def art_grade(art: Any) -> str:
+    """`art` → 一条 ``[0:v]…[v]`` 的调色链；没写或全是不生效的档 → ``""``。
+
+    没写 `art` 的片子必须拿到空串：那样 `apply_texture` 的字节与从前一致，
+    老片子的切片一个字节都不变。
+    """
+    a = art if isinstance(art, Mapping) else {}
+    steps: list[str] = []
+    texture = str(a.get("texture") or "").strip().lower()
+    if texture in ART_GRADE_TEXTURE:
+        steps.append(ART_GRADE_TEXTURE[texture])
+    tone = str(a.get("light") or "").strip().lower()
+    if tone in ART_GRADE_LIGHT:
+        steps.append(ART_GRADE_LIGHT[tone])
+    return f"[0:v]{','.join(steps)}[v]" if steps else ""
+
+
+def _compose_chains(*chains: str) -> str:
+    """把几条各自 ``[0:v]…[v]`` 的链首尾相接成**一趟**编码（不叠第二次 x264）。
+
+    每条链只许有一个输入 pad 与一个输出 pad（`TEXTURE_FILTERS` / `art_grade`
+    都是这个口径，见上面那段注释）：前一条的 `[v]` 改名成中间 pad，后一条的
+    `[0:v]` 换成同一个名字。形状不对时**当场抛**——静默少接一条就是「账上加了、
+    画上没加」，那正是这条链最贵的一类错。
+    """
+    parts = [c.strip() for c in chains if c and c.strip()]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    out: list[str] = []
+    for i, chain in enumerate(parts):
+        if not chain.startswith("[0:v]") or not chain.endswith("[v]"):
+            raise MediaError(f"滤镜链形状不对（应以 [0:v] 开头、[v] 结尾）：{chain[:80]}")
+        body = chain[len("[0:v]"):-len("[v]")]
+        src_pad = "[0:v]" if i == 0 else f"[g{i - 1}]"
+        dst_pad = "[v]" if i == len(parts) - 1 else f"[g{i}]"
+        out.append(src_pad + body + dst_pad)
+    return ";".join(out)
+
+
+def apply_texture(src: Path, out: Path, kind: str, art: Any = None) -> str:
+    """一段视频 → 加质感/统一调色的视频（代码链按**每一镜的切片**各调一次，拼接之前）。
     → 实际消费的滤镜串（空串 = 这趟没做，原样拷贝）。
 
+    ``art`` 是整片美术方向（可省）。它和质感档**合成同一趟 ffmpeg**：
+    先过质感档、再过统一调色——两条各自一次 x264 的话，同一镜会多一代压缩。
     返回串而不是布尔：记账要能回答「画面没变是档选错了，还是滤镜根本没跑」。
     """
-    chain = TEXTURE_FILTERS.get(str(kind or "").strip().lower())
+    chain = _compose_chains(TEXTURE_FILTERS.get(str(kind or "").strip().lower(), ""),
+                            art_grade(art))
     if not chain:
         mediaops.ffmpeg("-i", str(src), "-c", "copy", str(out), timeout=300)
         return ""

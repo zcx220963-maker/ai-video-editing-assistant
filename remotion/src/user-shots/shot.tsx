@@ -14,11 +14,13 @@
  *      或者你在这一镜代码里 `const palette = palettes["…"]` 自己绑的那一套）。
  *      缺了它这一镜就落回 `TOKENS` 的米白——一整片里就它一个色，看着像贴错了。
  *      **不要写死颜色**：写死之后用户在卡上换色板，你这一镜不动；
- *   4. 字幕交给 `<CaptionLayer/>`（不带 props）：整句、高亮词、逐词时间轴、
- *      字幕样式与高亮样式、字号与位置**全在它里面**，取的就是注入的那一份。
- *      要按自己的构图摆，就把它放进一个 `position: relative` 的盒子里；
- *      要连字的形态都自己定，才用 `<CaptionText/>` 自己排
- *      （见技能正文「字自己排」一节）；
+ *   4. **字幕是画面的一部分**：用 `<CaptionText/>` 把这一镜的整句**排进构图**——
+ *      套一个绝对定位的盒子，位置挑画面里最空的一带（下面这个例子摆在右下，
+ *      与齿轮同一条右缘）；整句、高亮词、逐词时间轴、高亮样式它都自己从注入里取，
+ *      你给的是**这与画面其余部分的对齐关系**。字色用整片那一档的 `ink`
+ *      （`film.ink`），字号由 `fitWidth`（盒子的设备像素宽）求。
+ *      只在整屏都是画面、确实找不到能排字的干净区域时，才退回整条 `<CaptionLayer/>`
+ *      （见技能正文「字自己排：字幕是画面的一部分」一节）；
  *   5. **画面要有那件东西**：下面这三件来自 `@dg/lib/draw/*`（简笔画零件库），
  *      它们画的是**能被认出的东西**。这一镜该画什么由**文案**决定——
  *      照「每一镜都要画出文案点到的那件东西」那一节：外轮廓 → 标志物 → 3~6 个部件。
@@ -33,7 +35,7 @@
 import React from 'react';
 import { AbsoluteFill, getInputProps, useVideoConfig } from 'remotion';
 import { E, lerp, seg, useT } from '@dg/motion';
-import { CaptionLayer, resolveFilmStyle } from '@dg/film';
+import { CaptionText, resolveFilmStyle } from '@dg/film';
 import { TOKENS } from '@dg/tokens';
 import { Figure } from '@dg/lib/draw/Figure';
 import { Gear } from '@dg/lib/draw/Gear';
@@ -53,6 +55,8 @@ const Shot: React.FC<ShotProps> = () => {
   const film = resolveFilmStyle(getInputProps());
   const bg = film.bg || TOKENS.bg;
   const accent = film.accent || TOKENS.accent;
+  // 字色用整片那一档的墨色：牛皮纸底上是深棕墨，深夜底上是浅墨——换色板时字跟着走
+  const ink = film.ink || TOKENS.ink;
   // 零件不读帧：要它们动，就把帧算成一个数传进去
   const spin = lerp(t, 0, 160);
   const grow = seg(t, 0.1, 0.55, E.standard);
@@ -72,12 +76,26 @@ const Shot: React.FC<ShotProps> = () => {
                upto={grow} ink={{ accent }} />
       </svg>
 
-      {/* ---- 字幕：交给零件包里那一件。整句、高亮词、逐词时间轴、样式与位置
-          全在 `<CaptionLayer/>` 里（不带 props 就取注入的那一份，与用户为整片挑的
-          字幕样式同一处）。**不要再手摆一条自己的字幕**：那样整片二十镜会有二十个
-          字号与位置，而这正是用户会一眼看出来的那种不一致。
-          它按最近的定位祖先摆——要挪到自己的构图里就套一个 `position: relative`。 */}
-      <CaptionLayer />
+      {/* ---- 字幕：这一镜的整句**排进构图**。`<CaptionText/>` 只画字：整句、高亮词、
+          逐字时间轴、高亮样式都取注入的那一份（与整片一致）；位置/宽度/颜色由外面这个
+          盒子给——下面这处是「齿轮正下方、与它同一条右缘」，因为这一镜右下是空的。
+          换一镜就照那一镜的构图重挑一处，**不要每镜都往底部丢一条**。
+          `fitWidth` 是设备像素：盒子多宽就给多宽，字号按它求。 */}
+      <div
+        style={{
+          position: 'absolute',
+          left: width * 0.55,
+          top: height * 0.56,
+          width: width * 0.38,
+          color: ink,
+          fontFamily: TOKENS.fontStack,
+          lineHeight: 1.38,
+          fontWeight: 600,
+          textAlign: 'left',
+        }}
+      >
+        <CaptionText fitWidth={width * 0.38} />
+      </div>
 
       {/* 上面那三件的颜色都跟着整片那一档走；要强调其中一件才显式传色： */}
       {/* <Gear x={…} y={…} r={…} ink={{ accent }} /> */}

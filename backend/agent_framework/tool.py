@@ -159,6 +159,21 @@ class Tool(ABC):
 
     owner_user_id: str | None = None
 
+    # ---- 缺必填参数时回给模型的话 ----
+
+    def missing_params_error(self, missing: list[str],
+                             params: dict[str, Any]) -> str:
+        """缺必填项时的报错（``prepare_call`` 用）。
+
+        默认一句通用话；**会写文件、参数又可能很长的工具**要覆盖它：
+        真机 2026-10-19 run 里，写手把一整镜 TSX 放进 `content` 却反复漏掉
+        `path`，模型连着 6 轮只看到 ``missing required params ['path']``，
+        既不知道要补什么形状，也看不出「再交一次一样的还是不会写」，
+        最后被无进展守卫停下，用户看到的是「卡死了」。报错本身就是可执行的
+        反馈：点名缺哪个键、给一个正确形状、并说明长内容被截断时怎么缩小。
+        """
+        return f"Error: missing required params {missing}"
+
     # ---- schema 导出 ----
 
     def to_schema(self) -> dict[str, Any]:
@@ -287,7 +302,7 @@ class ToolRegistry:
                         f"（原文 {len(str(params['_raw']))} 字符，四种保守修复都没救回来）。"
                         "不是你没填必填项——别换键名重试。请缩小单次提交的体积"
                         "（只交一个方案、去掉可选开关）后再交一次。")
-            return tool, params, f"Error: missing required params {missing}"
+            return tool, params, tool.missing_params_error(missing, params)
 
         casted: dict[str, Any] = {}
         for key, value in params.items():

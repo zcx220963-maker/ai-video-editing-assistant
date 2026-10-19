@@ -13,7 +13,11 @@ port = 8001
 path = "/mcp"
 json_response = true
 stateless_http = false
-timeout = 600
+# 单次工具调用超时。600 s 够跑完剪辑节点，但**装不下** `plan_motion`：它是逐镜写手
+# + 草稿真渲，32 镜实测要十几到二十几分钟（2026-10-18 run 8c5e161ddb20 在 600 s 处
+# 被掐断，模型重发三次，同一份分镜写了三遍）。MCP 口在这里放宽，Agent 侧另有
+# `_TOOL_CALL_TIMEOUTS` 只给 plan_motion 开 2700 s，其余工具仍是 650 s。
+timeout = 2700
 
 # 暴露给 Agent 的剪辑节点白名单（这里用工具名，与 Node.name 对齐；对应流程图节点全集）。
 available_nodes = [

@@ -98,10 +98,56 @@ class WriteTool(FileToolBase):
             "required": ["path", "content"],
         }
 
+    def missing_params_error(self, missing: list[str],
+                             params: dict[str, Any]) -> str:
+        """缺 path/content 时给模型一条能照着改的报错。
+
+        真机 2026-10-19：写手把一整镜 TSX 放进 `content`、连续 6 轮漏 `path`，
+        每轮只收到 ``missing required params ['path']``；它没有改形状，只是把同一段
+        内容又交一遍，最后被无进展守卫停下。这里把三件事说清楚：缺哪个键、正确
+        形状是什么、长内容像是被输出上限截断时该怎么缩小。
+        """
+        content = params.get("content")
+        size = len(content) if isinstance(content, str) else 0
+        if "path" in missing:
+            got = (f"这次只交来了 `content`（{size} 字符），没有 `path`。"
+                   if size else "`path` 和 `content` 都没交。")
+            if size >= 6000:
+                how = ("参数很可能是**输出上限把后面的 `path` 截掉了**："
+                       "把这一镜的 content 缩短（只留真正要写的部分）再交，"
+                       "或先写一个骨架文件，再用 edit_file 分段补。")
+            else:
+                how = ("新建或整体覆盖文件时，path 与 content 必须同时给；"
+                       "改一个**已经存在**的文件用 edit_file"
+                       "（path + old_string + new_string），不要重交整份。")
+            return ("Error: write_file 缺少必填参数 `path`。" + got
+                    + "正确形状：write_file(path=\"shots/s01.tsx\", content=\"…\")。"
+                    + how
+                    + "只交 content 不会写入任何文件；重复交同一份不会带来任何进展。")
+        if "content" in missing:
+            return ("Error: write_file 缺少必填参数 `content`。"
+                    "正确形状：write_file(path=\"shots/s01.tsx\", content=\"…\")；"
+                    "只给 path 会把文件写成空文件，所以这次没有执行。")
+        return super().missing_params_error(missing, params)
+
     async def execute(self, path: str, content: str) -> str:
         target = self._resolve(path, self.root())
         target.parent.mkdir(parents=True, exist_ok=True)
         existed = target.exists()
+        if existed and target.is_file():
+            try:
+                same = target.read_text(encoding="utf-8") == content
+            except (OSError, UnicodeDecodeError):
+                same = False
+            if same:
+                # 内容与磁盘一字不差 = 这一步没有任何推进。真机 2026-10-19 run
+                # `3dd70754ba89`：模型预览完把三份完全相同的代码重写了两遍，每轮
+                # 都回「已覆盖」，直到无进展守卫停下。写入本身是幂等的，但回执不能
+                # 只说「已覆盖」——要点明「没变化」，并给出下一步不是再写一遍。
+                return (f"未写入：{path} 与磁盘内容一字不差，这次没有任何变化。"
+                        "内容已经是最新的，不必再写一遍；要改内容请先 read_file，"
+                        "再用 edit_file 只改那一段。若是流程里的下一步该交分镜/出片"
+                        "（例如 motion 的 plan_motion），现在就去调它，不要重复写文件。")
         target.write_text(content, encoding="utf-8")
         action = "覆盖" if existed else "创建"
         return f"已{action}文件 {path}（{len(content)} 字符）"
@@ -192,16 +238,46 @@ class EditTool(FileToolBase):
         if not target.is_file():
             return f"Error: 文件不存在 {path}"
         text = target.read_text(encoding="utf-8")
+        if old_string == new_string:
+            # 真机 2026-10-19 run `e2ec9a6969ec`：模型连续 6 次交来 old == new 的
+            # 「编辑」（只想删一个行尾换行，实际 splitlines 后完全一样），每次都回
+            # 「已替换 1 处」——它以为改成功了，重试到被重复闸拦下，又退回重写整份
+            # 文件，整条 run 直到无进展守卫才停。old == new 永远不产生变化，必须
+            # 当场说破，不能报成功。
+            return (f"未修改：{path} 这次 edit_file 的 `old_string` 与 `new_string` "
+                    "**完全相同**，即使匹配成功文件也不会变。这次没有写盘。"
+                    "要改就写出不同的 `new_string`（要删/改哪一行就把它写进去）；"
+                    "如果这一镜已经可以了，就不要继续编辑草稿，去走流程的下一步"
+                    "（motion 片子是 `plan_motion` → `render_motion_code`）。")
         count = text.count(old_string)
         if count == 0:
             return f"Error: 未找到要替换的文本片段 {path}"
         if count > 1 and not replace_all:
             return f"Error: old_string 匹配 {count} 次，不唯一；请扩大上下文或设置 replace_all"
 
+        # 只增不减、且「新增的那一段」在旧内容里本来就有一份：这是把同一块再叠一遍，
+        # 不是推进。真机 2026-10-19 run 02cbcfb2440e：模型每轮把同一段约 380 字的光带
+        # `<path>` 再追加一份，old_string 恰好等于前面 N 份（唯一匹配），于是每轮都
+        # 「替换成功」，把 7KB 的镜头文件叠到 20KB 还在继续。
+        # 判据刻意定窄：新增内容 ≥120 字、且逐字出现在 old_string 里才拦；再加一个
+        # `/>`、补一行注释这类小重复不拦，避免误伤正常补码。
+        if not replace_all and new_string.startswith(old_string):
+            delta = new_string[len(old_string):].strip()
+            if len(delta) >= 120 and delta in old_string:
+                return (
+                    "Error: 这次替换只是把文件里已有的一段又原样加了一遍"
+                    f"（新增 {len(delta)} 字，旧内容里已有同样一段）。"
+                    "先 read_file 看清当前内容，把重复段落改成只保留一份。")
+
         if replace_all:
             updated, n = text.replace(old_string, new_string), count
         else:
             updated, n = text.replace(old_string, new_string, 1), 1
+        if updated == text:
+            # 兜底：old != new，但替换后的整份文件与原来相同（例如只动了行尾空白，
+            # 或 replace_all 的匹配彼此抵消）。同样不能回「已替换」。
+            return (f"未修改：{path} 替换前后内容完全一致，这次没有任何变化。"
+                    "不要重复同一份编辑；要么改出实际不同的内容，要么去走流程的下一步。")
         target.write_text(updated, encoding="utf-8")
         return f"已替换 {n} 处（{path}）"
 

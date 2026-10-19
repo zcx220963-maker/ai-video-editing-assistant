@@ -19,7 +19,7 @@ import re
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -30,6 +30,7 @@ from agent_framework.orchestration import (
     topological_order,
 )
 from agent_framework.storage import Storage, build_storage, to_ref
+from agent_framework import style_templates as style_tpl
 
 from .motion import caption_preview as cpreview
 from .motion import code_spec as cspec
@@ -159,6 +160,16 @@ class StorylineServer:
             if hung or stale:
                 print(f"[storyline] 启动对账：悬挂渲染任务置 failed {hung} 条，"
                       f"过期工作区文件回收 {stale} 个")
+            # 模板库：种子只补缺；已发布模板推给渲染容器（失败只打印，用到时补推）。
+            try:
+                added = await style_tpl.seed_system_templates(self.storage)
+                pushed = await style_tpl.sync_validated(self.storage)
+                if added or pushed.get("pushed") or pushed.get("failed"):
+                    print(f"[storyline] 模板库：新增种子 {added} 条，推送 "
+                          f"{pushed.get('pushed')} 条"
+                          + (f"，失败 {pushed['failed']}" if pushed.get("failed") else ""))
+            except Exception as exc:  # noqa: BLE001 - 模板库同步不该拦服务启动
+                print(f"[storyline] 模板库同步失败（沿用库里已有内容）：{exc}")
             self.renders.start_watchdog()
             stall = self.settings.caps.render_stall_sec
             print("[storyline] 渲染停滞看门狗："
@@ -217,6 +228,9 @@ class StorylineServer:
             # 身份由主 Agent 的 MCP 包装层注入（模型自报的值会被它覆写）
             uid = str(args.pop("user_id", "") or "")
             cid = str(args.pop("conversation_id", "") or "")
+            # 风格包只在声明了它的节点（今天只有 plan_motion）上出现；其余节点
+            # args 里根本没有这个键，pop 的缺省空串不会改变任何既有行为。
+            style_skill = str(args.pop("style_skill", "") or "")
             if sid == DEFAULT_SESSION and uid:
                 # 会话作用域取注入身份，不能跟 user_request 走：模型逐轮改写请求文本，
                 # 作用域随之漂移会让后续节点看不到上游产物、补齐时重跑根节点而报缺参。
@@ -237,6 +251,7 @@ class StorylineServer:
             state.user_request = str(args.get("user_request") or "")
             state.user_id = uid
             state.conversation_id = cid
+            state.style_skill = style_skill
             state.lang = str(args.pop("lang", "zh") or "zh")
             state.mode = str(args.pop("mode", "auto") or "auto")
             if node.name in LONG_RUNNING_NODES:
@@ -301,7 +316,14 @@ class StorylineServer:
             props.setdefault(cname, {"type": "string"})
         for pname, spec in props.items():
             jtype = spec.get("type") if isinstance(spec, dict) else None
-            base = _JSON_TYPE_MAP.get(jtype if isinstance(jtype, str) else "", Any)
+            # type 可以是联合（如 ["string", "number"]）：逐项映射后取 Union，
+            # 否则 FastMCP 会按单一 string 校验，模型传 0.4 这类数字直接被 pydantic 拒掉。
+            if isinstance(jtype, list):
+                members = tuple(dict.fromkeys(
+                    _JSON_TYPE_MAP.get(str(t), Any) for t in jtype))
+                base = Union[members] if members else Any
+            else:
+                base = _JSON_TYPE_MAP.get(jtype if isinstance(jtype, str) else "", Any)
             anno = Optional[base] if base is not Any else Any
             params.append(inspect.Parameter(pname, inspect.Parameter.KEYWORD_ONLY,
                                             default=None, annotation=anno))

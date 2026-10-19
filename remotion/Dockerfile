@@ -38,6 +38,10 @@ RUN npm ci --no-audit --no-fund
 
 COPY . .
 
+# 用户沉淀模板的落点。compose 会在这里挂命名卷；镜像里先建好，卷初始化时才继承
+# 目录属主，不会因为「挂载点不存在」把整个服务起成只读或报错。
+RUN mkdir -p src/lib/style/generated
+
 # 层末硬验：三个口的那份文件解析得动（注释里只要出现 `*/` 就会提前关掉块注释，
 # 这类错误镜像能烤成功、运行时才炸，所以必须在构建期拦）；闸① 真能加载
 # （ESLint 配置与自定义规则都在这一层）；母版文件真在。
@@ -64,7 +68,8 @@ RUN node -e "const{execSync}=require('child_process');const fs=require('fs');con
     && node --input-type=module -e "const m = await import('./lint-rules.mjs'); const bad = []; for (const p of m.ALLOWED_IMPORTS) { if (p.startsWith('@dg/')) continue; try { import.meta.resolve(p); } catch (e) { bad.push(p + '（' + (e.code || e.message) + '）'); } } if (bad.length) throw new Error('import 白名单里的包镜像里没装：' + bad.join('、') + '——要么装进 package.json，要么从白名单删掉'); console.log('import 白名单', m.ALLOWED_IMPORTS.size, '项全部可解析')" \
     && test -f src/FilmLayout.tsx && test -f src/index.ts \
     && test -d public/fonts \
-    && node tests/gate1-lint.mjs
+    && node tests/gate1-lint.mjs \
+    && node tests/draw-parts.mjs
 
 # （原来这里还在构建期跑闸⑬ 的三张红样——1×1 / 全白 / manifest 有记录但文件缺。
 #  供图通道撤掉后闸⑬ 本身没了，这一步随之删掉。）

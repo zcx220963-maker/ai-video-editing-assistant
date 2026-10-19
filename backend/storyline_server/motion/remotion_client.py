@@ -152,11 +152,16 @@ def fetch_artifact(artifact: str, dest: Path, *, base: str | None = None,
 
 def render_stills(*, code: str, input_props: dict[str, Any], frames: list[int],
                   scale: float = 0.4, base: str | None = None,
-                  timeout: int = 120) -> list[dict[str, Any]]:
+                  timeout: int = 120, with_layout: bool = False) -> Any:
     """预览静帧：渲这一镜的几帧小 JPEG → ``[{frame, jpeg_b64}]``。
 
     成本约是整镜渲染的百分之一（打包 1~3 秒 + 每帧几百毫秒），用在渲染前的计划确认卡上
     给人看——这是「抽几帧看」的主流验证方式，替代「整镜烧完再由机器判」。
+
+    ``with_layout=True`` 时改回 ``{"stills": […], "layout": {…} | None}``：服务端这一趟
+    本来就带回一行版面读数（字压字、字压图、出画——见 `server.mjs` 的 `renderStills`），
+    原先这里只取图、把读数丢了，于是「烧像素之前就能改」的那一次机会白白放过。
+    缺省仍回列表，别的调用方不受影响。
     """
     payload = {"code": code, "input_props": input_props, "frames": list(frames),
                "scale": scale}
@@ -164,7 +169,11 @@ def render_stills(*, code: str, input_props: dict[str, Any], frames: list[int],
                          timeout=timeout)
     if status != 200 or not j.get("ok"):
         raise RemotionError(f"预览静帧失败：{j.get('error') or j}", status=status)
-    return list(j.get("stills") or [])
+    stills = list(j.get("stills") or [])
+    if with_layout:
+        layout = j.get("layout")
+        return {"stills": stills, "layout": layout if isinstance(layout, dict) else None}
+    return stills
 
 
 def render_stills_multi(*, code: str, variants: list[dict[str, Any]],
@@ -210,6 +219,9 @@ def endpoints(*, base: str | None = None, health_timeout: int = 10,
                                                        timeout=fetch_timeout),
         "stills": lambda code, input_props, frames, scale=0.4: render_stills(
             code=code, input_props=input_props, frames=frames, scale=scale, base=base),
+        "stills_layout": lambda code, input_props, frames, scale=0.4: render_stills(
+            code=code, input_props=input_props, frames=frames, scale=scale, base=base,
+            with_layout=True),
         "stills_multi": lambda code, variants, scale=0.4: render_stills_multi(
             code=code, variants=variants, scale=scale, base=base),
     }

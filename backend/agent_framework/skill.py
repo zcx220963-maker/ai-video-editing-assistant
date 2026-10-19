@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import mimetypes
 import os
@@ -64,6 +65,13 @@ class Skill:
     unavailable_reason: str = ""
     display: str = ""             # frontmatter display：面向用户的中文名
     declared_sections: list[str] = field(default_factory=list)  # frontmatter sections：
+    # `kind` 把「流程技能 / 能力技能 / 风格包」分开：流程技能写死分镜与闸，风格包只是
+    # 视觉契约（manifest + 正文），不能互相顶替。缺省 workflow 让既有技能一个字段都不用改。
+    kind: str = "workflow"
+    # 风格包的机器可读契约：模板名、色板、构图、贯穿道具、字幕位。允许 API 写 dict、
+    # 磁盘 frontmatter 写一行 JSON 字符串——两种都在 `_to_skill` 归一到 dict。
+    style_manifest: dict[str, Any] = field(default_factory=dict)
+    owner_user_id: str | None = None   # None = 系统内置；非空 = 该用户私有
 
     # ---- 分段键（T42，§5.7 第②条）----
 
@@ -143,6 +151,23 @@ def _parse_sections(raw: Any) -> list[str]:
     """
     raw = str(raw or "").strip().strip("[]")
     return [tok.strip().strip("\"'") for tok in raw.split(",") if tok.strip()]
+
+
+def _parse_manifest(raw: Any) -> dict[str, Any]:
+    """风格包 manifest：PG 里可能是 jsonb 对象，磁盘 frontmatter 里是一行 JSON。
+
+    解析失败返回空 dict 而不是抛：风格包损坏只该退化成「没有风格包」，不该让整个
+    技能列表都读不出来（技能清单是启动路径的一部分）。
+    """
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            got = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return dict(got) if isinstance(got, Mapping) else {}
+    return {}
 
 
 # --------------------------------------------------------------------------
@@ -245,7 +270,7 @@ def section_catalog(body: str) -> list[tuple[str, str, int]]:
 
 
 def section_directory_line(body: str, *, planned: Iterable[str] = (),
-                           included: bool = True) -> str:
+                           included: bool | None = True) -> str:
     """一行式的分段目录（含「本轮计划用得上哪几块」），没标记就回空串。
 
     ``planned`` 是 ``plan.skills.sections_for_plan`` 的读法（本轮计划命中的那几块）。
@@ -253,8 +278,9 @@ def section_directory_line(body: str, *, planned: Iterable[str] = (),
     服务端知道、模型不知道，所以必须说出来；但**要不要取、取哪几块由模型自己定**
     （§2.2：技能的视角还给模型）。取法就写在同一行里。
 
-    ``included``：这一行跟着的那份正文里**有没有**这几块。两条路两种真话——
-    ``preload_skills`` 给的是默认集（不含），整份加载给的是全文（含），
+    ``included``：这一行跟着的那份正文里**有没有**这几块。三种真话——
+    ``True`` 整份加载给的是全文；``False`` = ``preload_skills`` 给的是默认集
+    （不含）；``None`` = 正文超过整份上限、这次只给目录，正文根本没随附。
     说反了模型会拿"上面那份里就有"去上面找。
     """
     rows = section_catalog(body)
@@ -264,11 +290,12 @@ def section_directory_line(body: str, *, planned: Iterable[str] = (),
     parts = [f"{name}（{title or '—'}，{size} B）" + ("**本轮计划用得上**" if name in want
                                                    else "")
              for name, title, size in rows]
-    where = ("这一份正文里也有它们" if included
-             else "**上面这份正文里没有它们**，要就照下面取")
+    where = ("这一份正文里也有它们" if included is True
+             else "**上面这份正文里没有它们**，要就照下面取" if included is False
+             else "**这次只给了目录，正文没有随附**，要就照下面取")
     return (f"\n\n（这份技能按小节分了几块：{'；'.join(parts)}。{where}——"
             f'要哪一块单独取：load_skill(name=..., section=键名)；'
-            f"为其中一块翻整份（40 KB 上下、会被压缩闸从中间切）不划算。）")
+            f"为其中一块翻整份（几十 KB、一次就把上下文预算吃掉大半）不划算。）")
 
 
 async def _one_chunk(data: bytes) -> AsyncIterator[bytes]:
@@ -308,6 +335,9 @@ class SkillLoader:
             # 分了哪几块，事实保证块真的存在——对账（声明 ⊆ 事实、事实 ⊆ 声明）由
             # `tests/test_skill.py` 判红，不许只写一头。
             declared_sections=_parse_sections(fm.get("sections", "")),
+            kind=str(fm.get("kind") or "workflow").strip() or "workflow",
+            style_manifest=_parse_manifest(fm.get("style_manifest")),
+            owner_user_id=row.get("owner_user_id"),
         )
 
     async def discover(self, user_id: str | None = None) -> list[Skill]:
@@ -389,11 +419,14 @@ class SkillLoader:
             meta, body = _parse_frontmatter(text)
             name = meta.get("name") or sub.name
             previous = await self._skills.get(name)
+            excluded = _excluded_prefixes(meta)
             files: list[dict[str, Any]] = []
             for p in sorted(sub.rglob("*")):
                 if not p.is_file() or p == md:
                     continue
                 rel = p.relative_to(sub).as_posix()
+                if excluded and rel.startswith(excluded):
+                    continue
                 key = self.object_key(name, rel)
                 data = p.read_bytes()
                 await self._objects.put(key, _one_chunk(data),
@@ -490,6 +523,12 @@ class SkillManifestContextSource:
 
     async def render(self, query: str, *, user_id: str | None = None) -> str | None:  # noqa: ARG002 (query 预留给未来匹配)
         skills = await self._loader.discover(user_id)
+        # 风格包不进清单。它们不是模型该自己发现、按需拉取的过程技能，而是用户在前端
+        # 选中的视觉数据，由 plan_motion 按名注入（`style_skill`）。放进常驻清单的代价
+        # 是**每沉淀一套风格就永久多占一份预算**：真机 2026-10-19 沉完「人影风格」后
+        # `<skills>` 从 3,156 B 涨到 3,878 B，直接顶穿闸㉓，用户连一句话都发不出去。
+        # 用户沉淀得越多、堵得越死，这条清单迟早会被用户的正常使用撑爆。
+        skills = [s for s in skills if s.kind != "style"]
         if not skills:
             return None
         manifest = "<skills>\n" + "\n".join(s.manifest_lines() for s in skills) + "\n</skills>"
@@ -505,7 +544,7 @@ class SkillManifestContextSource:
 
 
 #: 正文超过这个体量就在末尾附一句「共几行、怎么续读」。取值在闸的截断线
-#: （`compress.DEFAULT_RESULT_MAX_BYTES`，24 KB）**之下**：等回执说「中间被省掉」
+#: （`compress.DEFAULT_RESULT_MAX_BYTES`，60 KB）**之下**：等回执说「中间被省掉」
 #: 才告诉它怎么取，模型已经先撞上那面墙、已经开始了那串找不回来的尝试。
 _PAGING_NOTE_BYTES = 8_000
 
@@ -516,6 +555,74 @@ _OUTLINE_MAX_ROWS = 48
 #: 「无附件 xxx」那条错误里最多列几个在案附件。上百个全列是十几 KB 的一团路径，
 #: 而模型此刻只想知道「我写的名字错在哪」——完整清单在整份加载时已经给过。
 _MISSING_LIST_MAX = 12
+
+#: 小于这个行数的窗口按「小窗口」处理：**替模型放大到 `_PAGE_STEP_LINES` 行**。
+#: 真机 2026-10-18 run `31af0aeaeda8`：模型写 ``limit=1``，页脚就回它「接着读
+#: offset+1」，于是 397 行的 `pipeline.md` 被一行一行翻了 200 轮。工具是唯一知道
+#: 这一份多大的地方——小窗口在这里聚合，页脚再如实写明「已按 100 行给你」。
+_PAGE_MIN_LINES = 60
+
+#: 小窗口被放大到的页宽（行）。100 行约 4~6 KB，远在单条结果 60 KB 的闸之下。
+_PAGE_STEP_LINES = 100
+
+#: 正文（SKILL.md）超过这个字节数时，**不带参数的整份加载只给索引**：附件清单 +
+#: 带行号的章节目录 + 分段目录，正文本身不附。真机 run `9ff287ee91ab`：1422 行、
+#: 60 KB 的正文一次回给模型，占了半份上下文预算；模型随后按 offset 顺读了 32 个
+#: 窗口才撞上窗口上限，全程没交计划。分段键和行号本来就在标题里摆着——把目录
+#: 先给它，正文按节取，比让它自己翻便宜得多。
+#:
+#: 附件不走这条阈值：附件没有 section 标记，offset/limit 就是它唯一的导航。
+_WHOLE_BODY_MAX_BYTES = 24_000
+
+#: 大正文整份加载只回索引时，回执里必有这一句。`agent.py` 的正文窗口闸据此判断
+#: 「这一枪到底把正文发出去没有」——只有真发出去的页才算「本 run 已经给过」。
+#: 真机 run `a1f66c02f3c9` 死在把「只给了目录」记成「1 行起整份已给过」上：之后
+#: 每次按行取正文都被判成重复，模型连打 6 枪同一调用，整条 run 按原地打转停下。
+INDEX_ONLY_NOTE = "这次只给了上面的目录，正文没有随附"
+
+#: 小附件（≤40 KB）的 offset 写到末尾之外时，不把一句「越界」当结果：整份给它，
+#: 同时在回执里如实说明越界。真机 2026-10-17 run 639a8d0c0c8f 的三份 demo 就是这样：
+#: 模型要第 2 行、文件只有 1 行，只回一句错误等于把唯一的内容挡在外面。
+#: **只兜「越界」这一种错**；窗口合法时照模型给的行号真分页。
+_WHOLE_ATTACHMENT_BYTES = 40_000
+
+def _excluded_prefixes(meta: Mapping[str, Any]) -> tuple[str, ...]:
+    """frontmatter 的 ``exclude: demos/, shots/`` → 导入时跳过的相对路径前缀。
+
+    2026-10-18 用户决定：图形科普片**不要 demo**，镜头代码全部由模型自己写。demo 与卡库
+    文件留在磁盘上（不删，想对比或恢复只要删掉这一行 frontmatter），但不再登记成附件——
+    附件清单里没有它们，模型就既看不到也读不到，不会再一份份去翻（真机一条 run 读了 53 份
+    demo、还编出两个不存在的名字卡死在上面）。
+    """
+    raw = meta.get("exclude") if isinstance(meta, Mapping) else None
+    items = raw if isinstance(raw, (list, tuple)) else str(raw or "").split(",")
+    return tuple(p.strip().lstrip("/") for p in items if str(p).strip())
+
+
+def _nearest_attachments(names: list[str], rel: str, limit: int = _MISSING_LIST_MAX) -> list[str]:
+    """一个读不到的附件名 → 离它最近、真实存在的那几份（同目录 > 同类别的卡目录）。
+
+    `demos/<类别>/<卡名>/<文件>` 是卡库的固定形状：同目录有别的文件，多半是拼错了文件名；
+    同目录一份都没有，多半是卡名也是编的，那就给同类别下有哪些卡。都对不上返回空，
+    调用方退回老的「在案附件前几个」。
+    """
+    want = rel.strip().lstrip("/")
+    if not want.startswith("demos/") and "/" in want:
+        want = f"demos/{want}"
+    parts = want.split("/")
+    if len(parts) >= 3:
+        folder = "/".join(parts[:-1]) + "/"
+        same_dir = [n for n in names if n.startswith(folder)]
+        if same_dir:
+            return same_dir[:limit]
+    if len(parts) >= 2:
+        category = "/".join(parts[:2]) + "/"
+        cards = sorted({"/".join(n.split("/")[:3]) + "/" for n in names
+                        if n.startswith(category) and n.count("/") >= 3})
+        if cards:
+            return cards[:limit]
+    return []
+
 
 #: 一个目录下附件数达到这么多，清单里就折叠成「目录 / 件数 / 索引在哪」一行。
 _BULK_MIN = 8
@@ -574,11 +681,20 @@ class LoadSkillTool(Tool):
             "的块也在里面，末尾附分段目录与附件清单）；只想要其中一块就传 section"
             "（分段键，比读整份省得多）；"
             "传 path（如 references/x.md、scripts/y.py）返回该附件内容；"
-            "正文与附件都可以用 offset（1 起始的行号）与 limit（行数）按行分页续读，"
-            "回执末尾会写明共有多少行。长正文在**整份给出时**还附一份带行号的章节目录，"
+            "正文与附件都可以用 offset（1 起始的行号）与 limit（行数）分页续读——"
+            f"**一次取一大段**（limit≈{_PAGE_STEP_LINES} 行；更小的窗口会按 {_PAGE_STEP_LINES} 行返回），"
+            "**别一行一行取**。**整份就不带 offset/limit**，那是最省事的一条路；"
+            f"正文超过 {_WHOLE_BODY_MAX_BYTES} 字节时整份加载只给目录"
+            "（附件清单 + 章节目录 + 分段键），正文按 section 或 offset/limit 取。"
+            "回执末尾会写明共有多少行。"
+            "长正文在**整份给出时**还附一份带行号的章节目录，"
             "要哪一节直接按那个行号取那一节——**别从头顺读**。"
             "附件来自对象存储，只认技能登记过的相对路径，不接受任意文件路径"
             "——技能文件不在会话工作区里，用 read_file / grep 找不到它们。"
+            "**读材料是为了开工，不是为了读全**：同一段本 run 已经给过、回执还在"
+            "上下文里时，再取只会回一句指针；整条 run 的 load_skill 次数有软线提醒"
+            "与硬线上限——读到能开工就停，用读到的内容去动作（该出计划就出计划，"
+            "该写码就写码）；还缺哪一块就用 section= 单取那一块。"
         )
 
     @property
@@ -627,10 +743,24 @@ class LoadSkillTool(Tool):
         if err:
             return err
         if body is None:
+            size = len(skill.body.encode("utf-8"))
+            if size <= _WHOLE_BODY_MAX_BYTES:
+                return (f"{head}{self._outline(skill.body)}"
+                        f"{section_directory_line(skill.body, included=True)}"
+                        f"\n{SKILL_INDEX_END}"
+                        f"\n{skill.body}{self._paging_note(name, skill.body)}")
+            # 大正文：只给索引。分段目录必须排在 SKILL_INDEX_END **之前**——折叠闸
+            # 只保留分隔行以上的部分，排在正文后面就会被折掉，模型下次只剩行号、
+            # 不知道键名，又会开始顺读（见 `_WHOLE_BODY_MAX_BYTES` 的注释）。
+            total = len(skill.body.splitlines())
             return (f"{head}{self._outline(skill.body)}"
-                    f"\n{SKILL_INDEX_END}"
-                    f"\n{skill.body}{self._paging_note(name, skill.body)}"
-                    f"{section_directory_line(skill.body, included=True)}")
+                    f"{section_directory_line(skill.body, included=None)}"
+                    f"\n{SKILL_INDEX_END}\n"
+                    f"（这份正文共 {total} 行、{size} 字节，超过一次整份给的上限 "
+                    f"{_WHOLE_BODY_MAX_BYTES} 字节——**{INDEX_ONLY_NOTE}**。"
+                    f"要哪一节就按分段目录 load_skill(name, section=键名)；"
+                    f"正文没有分段就 load_skill(name, offset=行号, "
+                    f"limit≈{_PAGE_STEP_LINES})，一次取一大段。不要从头顺读。）")
         # 分页那头**不重复整份附件清单**（几百字节到 1 KB 的目录，跟着每一页发一遍
         # 就是按页数翻倍）与**整份章节目录**（它在第一次加载时给过）。名字与位置留着
         # ——模型得能对上「这是刚才那份技能的正文切片」。
@@ -674,6 +804,12 @@ class LoadSkillTool(Tool):
         页脚三件事：**这一页在哪一节**、**接着读的 offset 是几**、**到底了没有**。
         真机实测（14 镜「薄肌理论」那条 run）：这三件都没有时，模型读了 674 行里的
         11 页、又回头重取其中 9 页——它没有一个能确认「哪几行已经看过了」的办法。
+
+        **小窗口聚合成大段**（真机 2026-10-18 run `31af0aeaeda8`）：模型写
+        ``limit=1`` 时，页脚「接着读用 offset=166」就是在教它一行一行往下磨——
+        397 行翻了 200 轮。分页是「少给一点」，不是「一次只给一行」；小于
+        `_PAGE_MIN_LINES` 的窗口按 `_PAGE_STEP_LINES` 行给，并在页脚**如实写明**
+        （不是静默改行为），下一枪的 offset 才会真的往前走。
         """
         if not offset and not limit:
             return None, ""
@@ -681,11 +817,22 @@ class LoadSkillTool(Tool):
         start = max(1, int(offset or 1))
         if start > len(lines):
             return None, f"Error: offset {start} 超出末尾（全文共 {len(lines)} 行）"
+        requested = int(limit) if limit else 0
+        enlarged = 0 < requested < _PAGE_MIN_LINES
+        if enlarged:
+            limit = _PAGE_STEP_LINES
         end = len(lines) if not limit else min(len(lines), start + max(1, int(limit)) - 1)
         chunk = "\n".join(lines[start - 1:end])
         where = LoadSkillTool._heading_at(lines, start)
         where = f"——从「{where}」这一节开始" if where else ""
-        rest = ("**到底了**" if end >= len(lines) else f"接着读用 offset={end + 1}")
+        if end >= len(lines):
+            rest = "**到底了**"
+        elif enlarged:
+            rest = (f"你要的窗口太小（limit={requested}），已按 {_PAGE_STEP_LINES} 行给你；"
+                    f"接着读用 offset={end + 1}（一次取一大段；"
+                    f"整份就不带 offset/limit）")
+        else:
+            rest = f"接着读用 offset={end + 1}"
         return f"{chunk}\n\n（第 {start}–{end} 行，共 {len(lines)} 行{where}；{rest}）", ""
 
     @staticmethod
@@ -769,14 +916,16 @@ class LoadSkillTool(Tool):
     def _paging_note(name: str, text: str) -> str:
         """整份给出时，太长的正文附一句「共几行、怎么续读」。
 
-        阈值取在闸的截断线（24 KB）**之下**：等回执说「中间被省掉」才告诉它怎么取，
+        阈值取在闸的截断线（60 KB）**之下**：等回执说「中间被省掉」才告诉它怎么取，
         模型已经先撞上那面墙了。行数写出来，它才知道该从第几行接着要。
         """
         if len(text.encode("utf-8")) <= _PAGING_NOTE_BYTES:
             return ""
         total = len(text.splitlines())
         return (f"\n\n（这份正文共 {total} 行；太长读不完时用 "
-                f'load_skill(name="{name}", offset=行号, limit=行数) 按行续读，'
+                f'load_skill(name="{name}", offset=行号, limit=行数) '
+                f"一次取一大段（≈{_PAGE_STEP_LINES} 行）——**别一行一行取**；"
+                f"最省事的是整份一次取回：整份就不带 offset/limit。"
                 f"不要追问原文里没有的东西。）")
 
     async def _read_file(self, skill: Skill, rel: str,
@@ -800,6 +949,16 @@ class LoadSkillTool(Tool):
             # 的一团路径（还多半会被闸从中间切掉），而模型此刻只想知道「我写的那个名字
             # 错在哪」。完整清单本来就在整份加载的那一段里给过。
             names = [f["relpath"] for f in skill.files]
+            near = _nearest_attachments(names, rel)
+            if near:
+                # 2026-10-18 真机 run edd4ddb5808d：模型自己编了两个 demo 名
+                # （`type-rhythm-sync/WordSwapOnBeat.tsx` 等，卡库里从来没有），而这里原先
+                # 列的是全清单按字母排的前 12 个（全是 `camera/` 下的）——跟它要的那个目录
+                # 毫不相干，它找不到台阶下，同一个名字重发了 80 次。所以列**离它最近的**：
+                # 同目录里真有的那几份；同目录没有就列同类别下的卡目录。
+                return (f"Error: 技能 {skill.name} 里**没有** {rel} 这一份——不是没给你，是卡库里"
+                        f"本来就没有这个文件，再读多少次都一样，别再读它。离它最近、真实存在的是："
+                        f"{'、'.join(near)}。换成其中一份，或者这一镜不照 demo、直接写代码。")
             head = "、".join(names[:_MISSING_LIST_MAX]) or "（该技能无附件）"
             more = f"…（共 {len(names)} 个）" if len(names) > _MISSING_LIST_MAX else ""
             return (f"Error: 技能 {skill.name} 无附件 {rel}；在案的附件有 {head}{more}。"
@@ -814,14 +973,25 @@ class LoadSkillTool(Tool):
             url = await self._loader.attachment_url(skill, rel)
             return (f"[skill:{skill.name} file={rel}] 非文本附件（{len(data)} 字节），"
                     f"可直接访问的临时链接：{url}")
-        body, err = self._page(text, offset, limit)
-        if err:
-            return err
-        if body is not None:
-            return f"[skill:{skill.name} file={rel}]\n{body}"
-        # 附件这一路**不加**页脚：取附件是「把这份字节原样交给模型」，正文一字不改是
-        # 它唯一的契约（`test_code_forage` ⑥ 拿最大那份 demo 逐字节验的就是这条）。
-        # 缺的那半句由闸那边的回执补上——它已经知道这是 load_skill 的结果。
+        if offset or limit:
+            # 带窗口就**真按窗口给**，不分大小。2026-10-17 曾把小附件一律整份回
+            # （run 639a8d0c0c8f：折叠后按窗口重扫，同一份内容几十个别名）；代价是
+            # 模型的取页参数被静默忽略：run `9ff287ee91ab` 对 7~24 KB 的附件连换
+            # offset、每次仍从第 1 行开始，同参同结果闸一响就再也拿不到内容，
+            # 最后连打 6 轮同样的调用把 run 拖停。现在小窗口仍由 `_page` 聚合到
+            # 100 行（不会一行一行磨），但起始行照模型说的走，每次都是新内容。
+            body, err = self._page(text, offset, limit)
+            if err:
+                if len(data) <= _WHOLE_ATTACHMENT_BYTES:
+                    return (f"[skill:{skill.name} file={rel}]\n{text}\n\n"
+                            f"（{err.removeprefix('Error: ')}；这份附件共 "
+                            f"{len(text.splitlines())} 行、{len(data)} 字节，"
+                            f"已整份给你——分页只留给更大的文件；别一行一行取。）")
+                return err
+            if body is not None:
+                return f"[skill:{skill.name} file={rel}]\n{body}"
+        # 不带参数才是「整份字节原样交给模型」：正文一字不改是这一路的契约
+        # （`test_code_forage` ⑥ 拿最大那份 demo 逐字节验的就是这条）。
         return f"[skill:{skill.name} file={rel}]\n{text}"
 
 

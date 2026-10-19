@@ -39,6 +39,8 @@ frontend/dist/
 remotion/node_modules/
 # 渲染服务按 cache_key 自己堆的切片目录（本机预检也写这里），入库等于把缓存当源码
 remotion/out/
+# 用户沉淀的模板：PG 是唯一真相，容器里的生成目录只是发布缓存（且挂的是命名卷）
+remotion/src/lib/style/generated/
 
 # ---- 离线依赖包（体积大，且 requirements*.txt 才是权威）----
 *.whl
@@ -116,6 +118,7 @@ openchatcut-src/
 # remotion 测试：镜像构建期只跑下面放回来的四件（见 remotion/Dockerfile），其余是探针与本地夹具
 /remotion/tests/*
 !/remotion/tests/gate1-lint.mjs
+!/remotion/tests/draw-parts.mjs
 !/remotion/tests/gate13-assets.mjs
 !/remotion/tests/fixtures-gate13.mjs
 !/remotion/tests/shipped-namespace.mjs

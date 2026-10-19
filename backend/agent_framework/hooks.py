@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .connection_manager import OUTBOUND_TOPIC
+from .cost import cost_yuan
 from .media_replay import record_rendered_media
 from .messages import Message
 from .mq import MessageQueue
@@ -451,14 +452,19 @@ class UsageHook(AgentHook):
         sid = context.session.session_id
         user_id = context.session.user_id
         run_id = context.extras.get("run_id") or ""
+        # 这一次实际用的模型（按用户现解析，客户端写进 usage）优先；构造时给的只是缺省。
+        model = str(usage.get("model") or self._model or "")
         await self._db.insert("token_usage", {
             "user_id": user_id,
             "session_id": sid,
             "run_id": run_id,
-            "model": self._model,
+            "model": model,
             "prompt_tokens": usage.get("prompt_tokens", 0),
             "completion_tokens": usage.get("completion_tokens", 0),
             "total_tokens": usage.get("total_tokens", 0),
+            "cache_hit_tokens": usage.get("cache_hit_tokens"),
+            "cache_miss_tokens": usage.get("cache_miss_tokens"),
+            "cost_yuan": round(cost_yuan(usage, model=model), 6),
         })
 
 

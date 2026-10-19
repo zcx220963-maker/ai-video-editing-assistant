@@ -109,6 +109,17 @@ export const ALLOWED_IMPORTS = new Set([
   // 到渲染时才炸一句「paper is not a function」。所以这里只列**先验过的**两件。
   '@remotion/effects/paper',
   '@remotion/effects/halftone',
+  // 第二张表（中性色效果）：源图三块中性色，判据是「没崩 / 色度不跑 / 与不挂效果有差」
+  // ——见 `tests/effects-probe.mjs` 的 `EFFECT_TABLE`。按设计改色相的四件
+  // （duotone / lut / light-leak / chromatic-aberration）不在其中：它们要另一份
+  // 「声明调色板 vs 画面颜色」的判据，中性色判据对它们没有意义。
+  '@remotion/effects/glow',
+  '@remotion/effects/vignette',
+  '@remotion/effects/noise',
+  '@remotion/effects/speckle',
+  '@remotion/effects/roughen-edges',
+  '@remotion/effects/shadows-highlights',
+  '@remotion/effects/blur',
   // 画法通道：真三维与手绘斜纹。这两个家族在 package.json + lockfile 里躺着，
   // 且 2026-10-11 那批六支真渲夹具（roughjs / three / KaTeX × 两画幅）就是它们渲出来的
   'three',
@@ -144,6 +155,18 @@ export const ALLOWED_IMPORTS = new Set([
   '@dg/lib/helpers/rand',
   '@dg/lib/helpers/shake',
   '@dg/lib/helpers/camera',
+  // 手绘笔刷与场景底板（2026-10-18）。这两个**是带 index 的目录**，所以列目录名就能
+  // 解析（与上面 `@dg/lib/draw` 那批不同：那个目录没有 index 文件，只能逐件列）。
+  // 它们是可选参考件，不是闸⑦ 的入场券——镜头代码裸写 SVG/Canvas 同样算画。
+  '@dg/lib/brush',
+  '@dg/lib/scene',
+  // 同一个主角的走路件（2026-10-19）。它把步态、身高与朝向写成一份确定性实现，
+  // 二十几镜各自写码时才不会切一镜换一个身材。与上面两件同属 `vector` 通道。
+  '@dg/lib/walk',
+  // 风格模板（2026-10-19）：系统注册的 `silhouette-history`。用户不能上传 TSX，
+  // 这张白名单就是全部可用模板；新增模板时与 `backend/.../code_spec.py` 的
+  // `_ALLOWED_IMPORTS` 同步。
+  '@dg/lib/style/silhouette-history',
   // 简笔画零件库（2026-10-17）。**逐件列，与 `@dg/lib/*` 同一口径**：每件是一个
   // 文件级的入口，模型 import 一件就拿到一支能被认出的东西的轮廓（人、机器、厂房、
   // 齿轮、图表…）。它们底下走的是 roughjs 的手绘线，所以这些件的 import 在
@@ -166,6 +189,14 @@ export const ALLOWED_IMPORTS = new Set([
 ]);
 
 const isRelative = (src) => typeof src === 'string' && (src.startsWith('.') || src.startsWith('/'));
+
+/** 用户沉淀的模板落在 `src/lib/style/generated/<name>.tsx`，镜头按这个名字 import。
+ *  名字必须与渲染容器 `POST /templates` 的校验同一口径（小写字母开头，字母数字与 `-`），
+ *  否则一条带路径分隔符的 import 会把 bundler 带到生成目录之外。 */
+export const USER_TEMPLATE_RE = /^@dg\/lib\/style\/generated\/[a-z][a-z0-9-]{1,40}$/;
+
+const isAllowedImport = (src) =>
+  ALLOWED_IMPORTS.has(src) || USER_TEMPLATE_RE.test(String(src || ''));
 
 /** 字段通道三条规则的共用静态分析。
  *
@@ -422,7 +453,7 @@ export const dgPlugin = {
         return {
           ImportDeclaration(node) {
             const src = node.source.value;
-            if (isRelative(src) || ALLOWED_IMPORTS.has(src)) return;
+            if (isRelative(src) || isAllowedImport(src)) return;
             context.report({
               node,
               messageId: 'denied',
@@ -434,7 +465,7 @@ export const dgPlugin = {
             if (node.callee.name !== 'require' || !node.arguments.length) return;
             const arg = node.arguments[0];
             const src = arg.type === 'Literal' ? arg.value : undefined;
-            if (src === undefined || isRelative(src) || ALLOWED_IMPORTS.has(src)) return;
+            if (src === undefined || isRelative(src) || isAllowedImport(src)) return;
             context.report({
               node,
               messageId: 'denied',
@@ -559,10 +590,11 @@ export const dgPlugin = {
         schema: [],
         messages: {
           rawBg:
-            '禁止用 <div> 带 background/backgroundColor 画纯色块——用 DesignStage 做画布底色，' +
-            '用主题色板（palettes.json）的颜色。渐变（linear-gradient/radial-gradient）可以。',
+            '禁止用 <div> 带 background/backgroundColor 画纯色块——纯色填充走 SVG ' +
+            '<rect>/<circle>/<path> 的 fill（颜色取主题色板 palettes.json），' +
+            '或用 AbsoluteFill 的渐变 backgroundImage。渐变（linear-gradient/radial-gradient）可以。',
           rawBgLiteral:
-            '禁止用 <div> 带 background="{{val}}" 画纯色块——用 DesignStage + 主题色板。',
+            '禁止用 <div> 带 background="{{val}}" 画纯色块——用 SVG <rect fill> + 主题色板。',
         },
       },
       create(context) {

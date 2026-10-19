@@ -305,6 +305,31 @@ CREATE TABLE IF NOT EXISTS skill_files (
   PRIMARY KEY (skill, relpath)
 );
 
+-- 风格模板：**可执行的那一层**（React 组件），与 skills(kind=style) 的「数值+正文」分开。
+--
+-- owner_user_id 为 NULL = 系统内置（随镜像/种子发布）；填了 = 用户沉淀的模板，仅本人可见。
+-- source 存 TSX 源码：系统内置模板可以留空（镜像里已经烤好），用户模板必须非空——
+-- 它要被推送到渲染容器、逐次校验，容器重建后从 PG 重新推送。
+-- module 是镜头代码 import 的那条说明符；用户模板固定落在 generated/<name>，
+-- 这样与随镜像发布的内置模板互不覆盖。
+CREATE TABLE IF NOT EXISTS style_templates (
+  name           text PRIMARY KEY,
+  owner_user_id  text REFERENCES users(id) ON DELETE CASCADE,
+  display        text NOT NULL DEFAULT '',
+  description    text NOT NULL DEFAULT '',
+  module         text NOT NULL DEFAULT '',
+  components     jsonb NOT NULL DEFAULT '[]',
+  source         text NOT NULL DEFAULT '',
+  manifest       jsonb NOT NULL DEFAULT '{}',
+  probe          text NOT NULL DEFAULT '',
+  status         text NOT NULL DEFAULT 'draft'
+                 CHECK (status IN ('draft', 'validated', 'rejected')),
+  validation     jsonb NOT NULL DEFAULT '{}',
+  version        integer NOT NULL DEFAULT 1,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
 -- 时间线编辑器持久化：用户手工保存的可编辑时间线 JSON
 CREATE TABLE IF NOT EXISTS timelines (
   id            text PRIMARY KEY,
@@ -339,6 +364,11 @@ CREATE TABLE IF NOT EXISTS token_usage (
   prompt_tokens     integer NOT NULL DEFAULT 0,
   completion_tokens integer NOT NULL DEFAULT 0,
   total_tokens      integer NOT NULL DEFAULT 0,
+  -- 缓存命中 / 未命中（供应商回了才有；NULL = 没回，计价时整段按未命中算）与这一次的花费（元）。
+  -- 命中与未命中差 50 倍价：只记 prompt 总数，就永远看不出钱烧在哪（2026-10-17）。
+  cache_hit_tokens  integer,
+  cache_miss_tokens integer,
+  cost_yuan         double precision,
   created_at        timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS tk_user_time_idx ON token_usage (user_id, created_at);

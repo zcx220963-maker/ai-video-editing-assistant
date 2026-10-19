@@ -50,6 +50,12 @@ KEEP_KEYS = frozenset({
     # /tools、产物行、计划卡都拿 name 装机器名：整值查表，
     # 用户文件名（带后缀、不是任何工具名）查不到，自然原样留着。
     "name", "names",
+    # 模板/组件标识符（`style_pack.template`、槽位的 `variant_of.template`）：
+    # 它们要拿去拼 import 与做绑定，不能被换成中文展示名——换了之后前端把
+    # 「我的风格」当成模板名传回来，换件就绑不上了。
+    "template", "base_template", "component",
+    # 删除回执里的 `deleted` 是刚删掉的机器名，前端要拿它比对清单。
+    "deleted",
 })
 
 # 值是用户内容或标识符的键：整条不替。

@@ -86,6 +86,9 @@ class SessionConsumer:
         message = payload["message"]
         run_id = payload.get("run_id")
         attachments = payload.get("attachments") or []
+        # 用户在前端选的风格包；空串 = 不注入。只在**新开**的轮次里用，
+        # resume/approve 从 checkpoint scope 取（那里记的是当初选的那个包）。
+        style_skill = str(payload.get("style_skill") or "")
         # 「继续」是入口处的意图：帧里显式写了 resume 才续跑在途 run，否则新消息开新 run。
         resume = bool(payload.get("resume"))
         action = payload.get("action") or {}
@@ -129,13 +132,15 @@ class SessionConsumer:
                 # （user_id 是 "cron"，浏览器过不了归属校验，没人能来点）。
                 answer = await self.agent.handle(
                     user_id, conversation_id, message, run_id=run_id, stream=True,
-                    attachments=attachments, resume=resume, interactive=False
+                    attachments=attachments, resume=resume, interactive=False,
+                    style_skill=style_skill
                 )
             elif action.get("op") == "plan":
                 answer = await self.agent.plan(
                     user_id, conversation_id, message, run_id=run_id, stream=True,
                     attachments=attachments, feedback=str(action.get("feedback") or ""),
-                    revise_of=str(action.get("revise_of") or ""))
+                    revise_of=str(action.get("revise_of") or ""),
+                    style_skill=style_skill)
             else:
                 # 默认入口由 default_entry 决定（帧里的 mode 可逐条覆盖）：
                 # auto 直接进执行轮、渲染前统一弹确认卡；plan 先出计划卡再执行。
@@ -144,7 +149,8 @@ class SessionConsumer:
                 if resume:
                     answer = await self.agent.handle(
                         user_id, conversation_id, message, run_id=run_id, stream=True,
-                        attachments=attachments, resume=True)
+                        attachments=attachments, resume=True,
+                        style_skill=style_skill)
                 else:
                     # 同会话有被打断的执行轮时自动续跑，而不是开新规划轮。
                     # 执行轮的 checkpoint 里带着完整的执行上下文（已加载的素材、ASR 结果等），
@@ -208,11 +214,13 @@ class SessionConsumer:
                         if mode == ENTRY_PLAN:
                             answer = await self.agent.plan(
                                 user_id, conversation_id, message, run_id=run_id,
-                                stream=True, attachments=attachments)
+                                stream=True, attachments=attachments,
+                                style_skill=style_skill)
                         else:
                             answer = await self.agent.handle(
                                 user_id, conversation_id, message, run_id=run_id,
-                                stream=True, attachments=attachments)
+                                stream=True, attachments=attachments,
+                                style_skill=style_skill)
         except Exception as e:  # noqa: BLE001  失败也要回执，前端不能干等
             await self.mq.publish(
                 OUTBOUND_TOPIC,

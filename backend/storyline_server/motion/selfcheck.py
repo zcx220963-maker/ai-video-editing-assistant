@@ -196,20 +196,24 @@ def _preview_frames(total: int, at: Sequence[float] | None = None) -> list[int]:
 
 
 async def _complete_with_identity(messages: list[dict[str, Any]], *, llm: Any,
-                                  user_id: str, conversation_id: str) -> Any:
+                                  user_id: str, conversation_id: str,
+                                  **kwargs: Any) -> Any:
     """调一次模型，把**调用方注入的身份**绑在这一次调用上。
 
     为什么要显式绑：本模块跑在剪辑服务端——**另一个进程**，Agent 那条身份 contextvar
     不过 HTTP。不绑，`secrets.resolve_api_key` 的 `current_user_id()` 就是空串，
     查不到这位用户的页面配置，键永远解析不出来（真机表现是「未配置模型密钥」，
     而键其实配着）。节点的做法是同一个道理：`server.py` 从注入的 `user_id` 显式取。
+
+    ``**kwargs`` 原样交给 ``complete``（``max_tokens`` / ``timeout``，见
+    ``shot_writer`` 的写代码调用）。缺省不传时行为与从前完全一致。
     """
     from agent_framework.identity import use_identity
     client = llm or _default_llm()
     if not user_id:
-        return await client.complete(messages)
+        return await client.complete(messages, **kwargs)
     with use_identity(user_id, conversation_id):
-        return await client.complete(messages)
+        return await client.complete(messages, **kwargs)
 
 
 async def preview_shot(*, code: str, shot: Mapping[str, Any] | None = None,
@@ -288,4 +292,118 @@ async def preview_shot(*, code: str, shot: Mapping[str, Any] | None = None,
         # 空回复**不许**读成「画面没问题」：那是模型没说话，不是它看过之后说没事。
         return {"ok": False, "frames": picked, "review": "",
                 "note": "模型这一趟没吐任何东西——记「未判」，不是「没问题」。"}
-    return {"ok": True, "frames": picked, "review": text, "note": ""}
+    return {"ok": True, "frames": picked, "review": text, "note": "",
+            # 真机 2026-10-19 run `3dd70754ba89`：三镜预览都成功之后，模型把三份
+            # 一字不差的代码又重写了两遍，6 轮零变化后被无进展守卫停下——它以为
+            # `shots/*.tsx` 写完就算交付。预览只是自查；成片只读 `plan_motion` 里的
+            # brief/code，不读工作区里的草稿文件。这句话每次预览都带回去。
+            "next": "预览只是自查，不是交付。这一镜满意后把它交进 `plan_motion`"
+                    "（交 `brief`；想自己写就带 `code`），全部镜齐了再调 "
+                    "`render_motion_code`。写进工作区的 `shots/*.tsx` 只是草稿，"
+                    "出片不会读它。"}
+
+
+# ---------------------------------------------------------------------------
+# 风格对照（2026-10-18）：出片前，用带图模型逐镜看一眼「这一镜像不像用户要的那种风格」
+# ---------------------------------------------------------------------------
+#
+# 为什么要有它：风格由用户的话决定（`spec["style"]` 那一句，模型自己从用户要求里写出来），
+# 但每一镜做成什么样仍是模型自己挑的卡、自己写的代码——真机 run（「高级偏杂志风」）里
+# s05 是像样的杂志版式（眉题 + 衬线斜体大标题 + 细栏线），s02 却是一张 PPT 式对比表格、
+# s01 是霓虹灯大字。机器量不出「杂志感」，所以这里不设判据、不拦：拿预览静帧去问一个
+# 看得见图的模型，不像的镜带着改法写进回执，模型出片前可以用 shots_patch 只改那几镜。
+#
+# 花钱：每镜一张小图 + 几百字，一条 20 镜的片子约 0.05~0.2 元。花费随回执带回
+# （`cost_yuan`），主循环把它记进这条 run 的预算（见 `agent._charge_nodes`）。
+
+_STYLE_SYSTEM = """你是这条视频的**美术指导**。你会看到一镜画面的静帧，以及这条片子要的整体风格（一句话）。
+你只判断一件事：这一镜的**版式与视觉语言**符不符合那一句风格。
+
+判读纪律：
+· 画面最底下那一两行大字是字幕，由系统统一排，**不算**这一镜的版式，别拿它扣分。
+· 只看版式、字体层级、配色、线条、留白、构图这些，不评文案写得好不好。
+· 像 PPT 的就是不符合：卡片墙、表格框、项目符号、一堆圆角色块、所有东西居中堆着。
+· 与风格冲突的语汇也是不符合：比如要「杂志风」却用霓虹灯管字、科幻发光、游戏 UI。
+· 拿不准就判符合。你是在帮它找**明显**不对的镜，不是挑刺。
+
+只回一行 JSON，不要别的字：
+{"fits": true 或 false, "why": "≤40 字，说你看到了什么", "fix": "≤60 字，不符合时怎么改；符合时留空"}"""
+
+#: 同时看几镜（受供应商并发与渲染无关，纯网络请求）。
+STYLE_REVIEW_PARALLEL = 4
+
+
+def _parse_verdict(text: str) -> dict[str, Any] | None:
+    import json
+    import re
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if not m:
+        return None
+    try:
+        got = json.loads(m.group(0))
+    except ValueError:
+        return None
+    if not isinstance(got, Mapping) or not isinstance(got.get("fits"), bool):
+        return None
+    return dict(got)
+
+
+async def style_review(*, style: str, shots: Sequence[Mapping[str, Any]],
+                       stills: Mapping[str, Any], user_id: str = "",
+                       conversation_id: str = "", llm: Any = None) -> dict[str, Any]:
+    """逐镜看预览静帧对照整片风格 → ``{misfits, unjudged, checked, cost_yuan}``。
+
+    ``stills`` 是 ``{镜号: 图片文件路径}``（`code_render.preview_stills` 的产物）。
+    任何一镜看不成（没图、调用炸了、回话不是那一行 JSON）都记 ``unjudged``——
+    **未判不是符合**，回执里如实写。整个函数不抛：这是一份增益，不是闸。
+    """
+    import asyncio
+    import base64
+    from pathlib import Path
+
+    from agent_framework.cost import cost_yuan
+
+    out: dict[str, Any] = {"misfits": [], "unjudged": [], "checked": 0, "cost_yuan": 0.0}
+    if not str(style or "").strip():
+        return out
+    gate = asyncio.Semaphore(STYLE_REVIEW_PARALLEL)
+    texts = {str(s.get("id")): str(s.get("text") or "") for s in shots if isinstance(s, Mapping)}
+
+    async def one(sid: str, path: Any) -> None:
+        try:
+            b64 = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        except OSError:
+            out["unjudged"].append(sid)
+            return
+        ask = (f"整片要的风格：「{style}」\n这一镜的文案：「{texts.get(sid, '')}」\n"
+               "下面是这一镜的一张静帧。它的版式符不符合那一句风格？")
+        messages = [{"role": "system", "content": _STYLE_SYSTEM},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": ask},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]
+        async with gate:
+            try:
+                resp = await _complete_with_identity(messages, llm=llm, user_id=user_id,
+                                                     conversation_id=conversation_id)
+            except Exception:  # noqa: BLE001 —— 一镜看不成不带塌整份
+                out["unjudged"].append(sid)
+                return
+        usage = getattr(resp, "usage", None)
+        if usage:
+            out["cost_yuan"] += cost_yuan(usage, model=str(usage.get("model") or ""))
+        verdict = _parse_verdict(str(getattr(resp, "content", "") or ""))
+        if verdict is None:
+            out["unjudged"].append(sid)
+            return
+        out["checked"] += 1
+        if not verdict["fits"]:
+            why = str(verdict.get("why") or "").strip()[:60]
+            fix = str(verdict.get("fix") or "").strip()[:90]
+            out["misfits"].append(f"{sid}：{why}" + (f"——改法：{fix}" if fix else ""))
+
+    await asyncio.gather(*(one(str(sid), p) for sid, p in sorted(stills.items())))
+    out["misfits"].sort()
+    out["unjudged"].sort()
+    out["cost_yuan"] = round(out["cost_yuan"], 4)
+    return out

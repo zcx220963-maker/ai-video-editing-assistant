@@ -1,0 +1,38 @@
+[
+  {
+    "name": "silhouette-history",
+    "display": "剪影年轮",
+    "description": "侧向行走的剪影穿过一层层时代背景，一块发光矩形贯穿全片；同一构图、同一光位、同一条字幕。",
+    "module": "@dg/lib/style/silhouette-history",
+    "components": [
+      {"name": "SilhouetteStage", "role": "舞台：天空/地面/颗粒/暗角/运镜"},
+      {"name": "GlowRect", "role": "贯穿全片的发光矩形，kind 换时代"},
+      {"name": "SilhouetteWalk", "role": "同一主角的行走剪影，停一下再走"},
+      {"name": "EraInscription", "role": "右上角「年代 · 地点」小字"},
+      {"name": "StyleCaption", "role": "底部居中的那一条贴画面字幕"}
+    ],
+    "manifest": {
+      "responsible": "人物剪影、贯穿光块、年代铭文、贴画面字幕",
+      "defaults": {
+        "template": "silhouette-history",
+        "palette": {
+          "sky": ["#0b1020", "#3a2a3f", "#e8a06a"],
+          "ground": "#07070a",
+          "ink": "#050507",
+          "accent": "#ff7a2f",
+          "paper": "#f2e6d0"
+        },
+        "composition": {
+          "figure_x": 0.32, "figure_h": 0.46, "ground_y": 0.82,
+          "horizon": 0.62, "camera": "slow push-in 1.02x to 1.06x, no cuts"
+        },
+        "repeat_composition": true,
+        "recurring_pose": "walk left to right, pause beside the glow, lean 8 degrees, continue",
+        "recurring_prop": "a glowing rectangle at 0.70W / 0.34H, same size and position every shot",
+        "caption": {"look": "overlay", "position": "bottom-center", "width": 0.62},
+        "inscription": {"position": "top-right", "style": "small serif, 0.022H"},
+        "motion": {"camera": "1.02 to 1.06 slow push, no cuts", "grain": 0.12, "vignette": 0.35}
+      }
+    }
+  }
+]

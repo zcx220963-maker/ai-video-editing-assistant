@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { lintShotCode } from './lint.mjs';
+import { lintShotCode, lintTemplateCode } from './lint.mjs';
 import { motionDensity } from './motionsample.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -37,6 +37,13 @@ const OUT = path.join(ROOT, 'out');
 const PUBLIC = path.join(ROOT, 'public');
 const recursiveDir = { recursive: true };
 const SHOT_FILE = path.join(ROOT, 'src', 'user-shots', 'shot.tsx');
+// 用户沉淀的模板：单独一个目录，**只由 /templates 口写入**，随镜像发布的内置模板
+// 不在这里。目录挂命名卷——容器重建后文件还在；真丢了也会被 `sync_validated()`
+// 从 PG 重推，所以这里不是真相，只是缓存。
+const GENERATED_DIR = path.join(ROOT, 'src', 'lib', 'style', 'generated');
+const TEMPLATE_NAME_RE = /^[a-z][a-z0-9-]{1,40}$/;
+// 一份模板单文件，正常 5~30KB；200KB 足够画复杂场景，又不至于让写盘/推送变成 DOS。
+const TEMPLATE_MAX_BYTES = 200 * 1024;
 const PORT = Number(process.env.PORT || 8010);
 // 无 GPU 的容器里实测：angle/egl/swiftshader 三档都拿不到 WebGL 上下文（three.js 镜
 // 直接 500），只有 swangle 画得出带光影的几何体。改这一档等于决定 3D 通道在不在。
@@ -257,7 +264,10 @@ async function renderStills(payload) {
       for (const frame of all) {
         const { buffer } = await renderStill({
           serveUrl, composition, inputProps: job.props, frame, puppeteerInstance: browser,
-          imageFormat: 'jpeg', jpegQuality: 80, scale,
+          // 90 而不是 80：这些静帧既是确认卡上给人看的图，也是带图判官的输入。
+          // 80 在 0.4 倍那档上还看不出来，scale 提到 1 之后细线插画与描边的边缘
+          // 会开始糊——那正是「画面质量低」的第一眼来源。每张多几十 KB，可以接受。
+          imageFormat: 'jpeg', jpegQuality: 90, scale,
           browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
           onBrowserLog,
         });
@@ -684,6 +694,53 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, node: process.version, remotion: remotionVersion,
                               chromium: await chromiumVersion(), gl: GL,
                               ...(await versions()) });
+    }
+    // ---- 用户沉淀的模板：写入 / 列举 / 删除 / 单独 lint ----
+    // 这一组口只做「文件落地 + 语法/白名单闸」，**不判模板画得好不好**——那是产品侧
+    // 的预览与探针的事。镜头代码能不能 import 到它，由 lint 的 generated 前缀放行，
+    // 名字不合法在写盘前就 400。
+    if (req.method === 'GET' && url.pathname === '/templates') {
+      await fs.mkdir(GENERATED_DIR, recursiveDir);
+      const names = (await fs.readdir(GENERATED_DIR)).filter((n) => n.endsWith('.tsx'));
+      const templates = {};
+      for (const file of names) {
+        const source = await fs.readFile(path.join(GENERATED_DIR, file), 'utf8');
+        templates[file.replace(/\.tsx$/, '')] =
+          createHash('sha256').update(source).digest('hex').slice(0, 16);
+      }
+      return send(res, 200, { ok: true, templates });
+    }
+    if (req.method === 'POST' && url.pathname === '/templates') {
+      const body = await readBody(req);
+      const name = String(body.name ?? '');
+      const source = String(body.source ?? '');
+      if (!TEMPLATE_NAME_RE.test(name)) {
+        return send(res, 400, { ok: false, error: `模板名不合法：${name.slice(0, 40)}（小写字母开头，字母数字与 -，2~41 位）` });
+      }
+      if (!source.trim()) return send(res, 400, { ok: false, error: '模板源码为空' });
+      if (Buffer.byteLength(source, 'utf8') > TEMPLATE_MAX_BYTES) {
+        return send(res, 400, { ok: false, error: `模板源码超过 ${TEMPLATE_MAX_BYTES} 字节` });
+      }
+      const lint = await lintTemplateCode(source);
+      if (!lint.ok) return send(res, 400, { ok: false, error: '模板 lint 未通过', errors: lint.errors });
+      await fs.mkdir(GENERATED_DIR, recursiveDir);
+      const target = path.join(GENERATED_DIR, `${name}.tsx`);
+      const tmp = `${target}.tmp-${process.pid}`;
+      await fs.writeFile(tmp, source, 'utf8');
+      await fs.rename(tmp, target);        // 原子替换：镜头不会读到半份模板
+      const hash = createHash('sha256').update(source).digest('hex').slice(0, 16);
+      console.log(`[template] ${name} ${Buffer.byteLength(source, 'utf8')}B ${hash}`);
+      return send(res, 200, { ok: true, name, hash });
+    }
+    if (req.method === 'DELETE' && url.pathname.startsWith('/templates/')) {
+      const name = decodeURIComponent(url.pathname.slice('/templates/'.length));
+      if (!TEMPLATE_NAME_RE.test(name)) return send(res, 400, { ok: false, error: '模板名不合法' });
+      await fs.rm(path.join(GENERATED_DIR, `${name}.tsx`), { force: true });
+      return send(res, 200, { ok: true, name });
+    }
+    if (req.method === 'POST' && url.pathname === '/lint-template') {
+      const body = await readBody(req);
+      return send(res, 200, await lintTemplateCode(String(body.code ?? '')));
     }
     if (req.method === 'POST' && url.pathname === '/lint') {
       const body = await readBody(req);

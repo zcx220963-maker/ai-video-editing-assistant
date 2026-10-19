@@ -36,7 +36,7 @@ OUTPUT_FIELD_NAMES = frozenset({
     "motion_spec", "estimated_sec", "target_warnings", "target_duration_sec",
     "plan_table", "char_count", "frames_total",
     "motion_ledger", "field_checks", "planned_frames", "changed_shots",
-    # 出处闸与链身份：source_gate 是分镜卡上每一镜的凭据状态（verified /
+    # 出处对账与链身份：source_gate 是分镜卡上每一镜的凭据状态（verified /
     # declared_unverified / no_source / ledger_absent），chain 标这一版画面出自哪条流水线
     # （局部改拿它判旧产物），code_chars 是每一镜的代码字节数。三者都是产物里的键、不是入参，
     # 技能正文要教模型「如实报每镜的凭据是哪一种」，不收就是假告警。
@@ -56,6 +56,10 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 这些值只出现在回执与分镜账里，schema 扫不出来，不收就是假告警。
     "style_channels", "style_text_only", "style_warnings",
     "fill_spans", "fill_warnings",
+    # 数据时效（2026-10-18）的产物键：freshness_warnings 是分镜卡上「哪几镜的数字标的是
+    # 两年前的年份（或没填出处）」那栏人话提醒。它只活在 plan_motion 回执里，schema 扫不出来；
+    # 技能正文要教模型「先照这一栏换最新一期再交版」，不收就是假告警。
+    "freshness_warnings",
     # 闸⑧（版面回读，记账不拦截）的产物键：layout_warnings 是逐镜带镜号的人话告警
     # （叠字/被画面带切/引线悬空），layout_unscanned 点名的不是「干净」而是「这一镜没扫」。
     # 技能正文教模型「有告警就照条目点名、有没扫的镜就如实说没验过」，这两个键只活在回执里，
