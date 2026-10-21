@@ -178,6 +178,9 @@ class NodeState:
     # 本轮用户选的风格包名（kind=style）。服务端入口从 MCP 入参写进来，
     # plan_motion 读它去 PG 取 manifest；其他节点只透传，不解释。
     style_skill: str = ""
+    # 本轮用户选了「直接出片」：出片前不等确认、也不预渲静帧。与 style_skill 同路
+    # 从 MCP 入参写进来，只有 plan_motion 声明它并消费。
+    go_straight: bool = False
     store: Store = field(default_factory=Store)
     summary: NodeSummary = field(default_factory=NodeSummary)
     # 任一节点从客户端见过的参数在此留痕：拦截器补齐的依赖以默认入参执行，

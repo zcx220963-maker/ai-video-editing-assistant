@@ -96,6 +96,32 @@ MAX_TEXT_CHARS = 60          # 竖屏字幕带两行的容量
 MAX_TEXT_CHARS_WIDE = 110    # 横屏那条居中横排字幕：一行更宽，两行装得下更多
 MAX_HIGHLIGHTS_PER_SHOT = 4
 
+#: 英文字幕（2026-10-21，中英双字幕的第二行）：一行 0.54 倍字号，横向按字距更宽。
+#: 上限按中文那一栏的 1.6 倍取——同一句话的英文大致就是这个量级，再长就该拆镜了。
+MAX_TEXT_EN_CHARS = 180
+
+#: 字幕里不画的装饰括号（2026-10-21）。用户原话：「不需要 ⌈⌋ 这种符号」。
+#: 这类符号在母版里既不参与排版也不表示语气，只是模型偶尔拿来「点睛」；画出来就是
+#: 字面上的一对怪符号，还会把逐词高亮的子串对齐搞乱。**在这里剥掉、不进任何一帧**。
+#: `《》` 不在此列——书名号是正经标点（片尾那句引书名要用）。
+_DECO_BRACKETS = str.maketrans({c: None for c in "「」『』⌈⌉⌊⌋〈〉"})
+
+
+def strip_caption_periods(s: str) -> str:
+    """字幕不画句号（2026-10-21 用户点名：句尾不要句号，用两个空格替代）。
+
+    句中的「。」换成两个空格（一句话接一句话，不画那个圈），句尾那个直接去掉。
+    ASCII 句点**只去句尾**——`44.7%`、`3.6 倍`、`NHTSA` 里的点一个都不动；写成
+    `r"."` 全删会把数字一起改坏，而数字是这条链上唯一不能改口径的东西。
+    英文那一行同理：结尾的 `.` 去掉，词中间的保留。
+    """
+    if not s:
+        return s
+    out = s.replace("。", "  ").replace("．", "  ")
+    out = re.sub(r"[ \t]{3,}", "  ", out).strip()
+    out = out.rstrip(".").rstrip()
+    return out
+
 # R1: card / derived_from 契约栏——模型必须声明选了哪张卡、代码来自哪些 demo
 _SKILL_DIR = Path(__file__).resolve().parents[2] / "examples/skills/motion_explainer"
 
@@ -261,20 +287,29 @@ PROTAGONIST_STRIDE_RANGE = (0.5, 1.8)
 
 
 #: 五个枚举栏的「名字 → 取值表」：归一与报错共用一张表，免得两处各列一遍。
-#: 认得出的近义写法 → 契约里的那一档。**只收无歧义的近义**，认不出的照旧报错。
+#: 认得出的近义写法 → 契约里的那一档。**只收无歧义的近义**，认不出的丢掉那一栏。
 #: 真机 run 7dcaa7246e92（2026-10-19，13 镜娱乐史）：整份分镜只因两条一词之差被打回——
 #: 把顶层的 `texture="film"` 写进了 `art.texture`，又自造了 `type="sans-caption"`。
 #: 这不是「用户要的画风没画出来」，是同一档的另一种叫法；为一词之差打回 13 镜重交，
-#: 代价是一整轮写码（§「堵死比白烧更坏」）。认不出、真会画错的值仍在 `norm_art` 报错，
-#: 不在这里悄悄吞掉。
+#: 代价是一整轮写码（§「堵死比白烧更坏」）。
+#: 2026-10-20 第 001 期真机又撞一次：`brush="flat"`（把「扁平矢量」当笔触写）、
+#: `motion="standard"`。同一份 30 多镜的计划被打回、模型重写一遍，白等两分钟。
+#: 所以现在**认不出也只丢那一栏、不报错**：`art` 是画法增益，没有它写手照样按
+#: `art.look` 画；而为一栏打回整份计划，代价远大于少一句笔触提示。丢掉是安全的
+#: （不会出现「提示词写着石墨、画面是别的」那种静默错画），代价只是那一栏没生效。
 ART_ALIASES: dict[str, dict[str, str]] = {
     "texture": {"film": "grain", "vhs": "grain", "old-film": "grain",
                 "photo": "none", "clean": "none", "flat": "none"},
     "type": {"sans-caption": "sans-editorial", "sans": "sans-editorial",
              "sans-serif": "sans-editorial", "serif-caption": "serif-editorial",
              "serif": "serif-editorial"},
-    "brush": {"pen": "ink", "pencil": "graphite", "graphite-pencil": "graphite"},
-    "motion": {"ease": "linear", "easing": "linear", "bounce": "spring"},
+    "brush": {"pen": "ink", "pencil": "graphite", "graphite-pencil": "graphite",
+              "flat": "ink", "flat-vector": "ink", "vector": "ink",
+              "line": "ink", "outline": "ink"},
+    "motion": {"ease": "linear", "easing": "linear", "bounce": "spring",
+               "elastic": "spring", "standard": "linear", "default": "linear",
+               "smooth": "linear", "ease-in": "linear", "ease-out": "linear",
+               "ease-in-out": "linear"},
 }
 
 ART_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -296,8 +331,9 @@ ART_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 #: 取值就是 ffmpeg `xfade` 的 `transition=` 名（`mediaops._XFADE` 那张表的键），
 #: 不另起一套别名：多一层映射就多一处「界面写 fade、命令行写别的」的机会。
 #: `none` 是默认——不选转场的片子逐字节不变，回归就永远有那一侧可以比。
-TRANSITION_STYLES = ("none", "fade", "dissolve", "wipeleft", "wiperight",
-                     "slideup", "circleopen")
+TRANSITION_STYLES = ("none", "fade", "fadeblack", "dissolve", "wipeleft",
+                     "wiperight", "slideup", "circleopen", "circleclose",
+                     "zoomin", "hblur", "radial", "smoothleft")
 
 #: 转场时长（秒）。**做成枚举而不是自由数字**：计划卡的开关模型是「枚举 / 布尔 /
 #: 带界数值」三选一，而每一项都要能反查到取值来源、都要有一句中文标签
@@ -921,13 +957,25 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
     if n > MAX_CODE_BYTES:
         _err(errors, f"{sid}：代码 {n} 字节 > {MAX_CODE_BYTES}，一镜一次浏览器，这个体积不接")
 
-    text = str(raw.get("text") or "").strip()
+    # 装饰括号（2026-10-21）：见 `_DECO_BRACKETS`。先剥再量字数、再判高亮子串——
+    # 反过来的话，剥掉一个括号会让已经算过的高亮词落空。
+    text = strip_caption_periods(
+        str(raw.get("text") or "").translate(_DECO_BRACKETS).strip())
     if not text:
         _err(errors, f"{sid}：text 为空——每一镜必须有一句要说的话")
     if len(text) > max_chars:
         _err(errors, f"{sid}：文案 {len(text)} 字 > {max_chars}，这一档画幅的字幕条放不下，请拆镜")
+    # 英文字幕：与 `text` 同一句话的英文，画在中文下面一行（字号 0.54 倍）。
+    # **可省**——省了就只排中文那一行，老片子一个字节都不变。写长了只报不改句：
+    # 这一栏是排版容量，不是画面内容，截断会留下半句话。
+    text_en = strip_caption_periods(
+        str(raw.get("text_en") or "").translate(_DECO_BRACKETS).strip())
+    if len(text_en) > MAX_TEXT_EN_CHARS:
+        _err(errors, f"{sid}：英文字幕 {len(text_en)} 字 > {MAX_TEXT_EN_CHARS}，"
+                     "两行字幕放不下，请拆镜或压短这句英文")
 
-    highlights = [str(h) for h in (raw.get("highlight") or []) if str(h).strip()]
+    highlights = [str(h).translate(_DECO_BRACKETS) for h in (raw.get("highlight") or [])
+                  if str(h).strip()]
     if len(highlights) > MAX_HIGHLIGHTS_PER_SHOT:
         # 2026-10-19：多出来的高亮词就地截掉、不再打回——真机上 24 镜一份分镜，
         # 一个高亮词写多就让整份重交；多一个「亮起来」的词是排版偏好，不是渲不出的错。
@@ -1018,6 +1066,8 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
         "entities": entities,
         "code": code,
         "text": text,
+        # 英文字幕（2026-10-21）：只进第二行，不参与高亮。空串＝只排中文那一行。
+        "text_en": text_en,
         "highlight": highlights,
         "fields": _norm_fields(raw.get("fields"), sid, errors),
         "min_duration_sec": min_sec,
@@ -1089,9 +1139,11 @@ def expand_code_refs(raw: Mapping[str, Any]) -> dict[str, Any]:
 def norm_art(value: Any) -> tuple[dict[str, Any], list[str]]:
     """整片美术方向 → (归一的 `art`, 错误清单)。缺省 `{}`（＝没写，老片子字节不变）。
 
-    规则与 `texture`/`palette` 那两支同一条：认不出的枚举值**报错并丢掉这一栏**，
-    不留着让下游「认不出就不生效」——「提示词里写着石墨笔触、画面上是别的东西」
-    是这一层最难查的一类静默。`look` 与 `palette_note` 是两句自由文本，截断不报错。
+    认不出的枚举值**只丢掉这一栏、不报错**（2026-10-20 改；理由见 `ART_ALIASES` 上面
+    那段注释）：`art` 是画法增益，一栏没生效最多是少一句提示，而报错会把整份三十多镜的
+    计划打回重写。丢掉而不是留着，仍然守住原来那条底线——不会出现「提示词里写着石墨
+    笔触、画面上是别的东西」这种静默错画。只有 `art` 本身不是对象时才报错。
+    `look` 与 `palette_note` 是两句自由文本，截断不报错。
 
     归一必须**幂等**：校验会把一份过过校验的 spec 再校验一遍（补丁链，见
     `transition_sec` 那段注释），所以本函数写下的值必须自己再认一遍。
@@ -1112,7 +1164,7 @@ def norm_art(value: Any) -> tuple[dict[str, Any], list[str]]:
         # 模型只会把同一件事重写一遍。归一后的值仍要在枚举里，递归一次也幂等。
         name = ART_ALIASES.get(key, {}).get(name, name)
         if name not in allowed:
-            errs.append(f"art.{key}={raw!r} 不在可选值里（可用：{', '.join(allowed)}）")
+            # 认不出就丢掉这一栏（见 docstring）：一栏没生效是小事，打回整份计划是大事。
             continue
         out[key] = name
     look = str(value.get("look") or "").strip()
@@ -1157,6 +1209,10 @@ def norm_protagonist(value: Any) -> tuple[dict[str, Any], list[str]]:
     }
     if render in aliases:
         out["render"] = aliases[render]
+    # 2026-10-20 起不再有「用哪个共享组件画主体」这一栏：主体怎么画由写手按 brief
+    # 自己决定（用户的原话是「llm 自己明明有能力的，为什么非要限制模板」）。
+    # 连贯性靠下一组量化数（身高/基准线/朝向/步频）守，不靠锁死一个组件。
+    # 旧 spec 里残留的 `component` 在这里被丢掉，不影响分镜成立。
     wardrobe = str(value.get("wardrobe") or "").strip()
     if wardrobe:
         out["wardrobe"] = wardrobe[:PROTAGONIST_WARDROBE_MAX_CHARS]
@@ -1313,19 +1369,24 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
             pct = int(rate[:-1])
             if not -50 <= pct <= 50:
                 _err(errors, f"rate={rate} 超出 ±50%")
+            elif pct < 0:
+                # 正常语速是下限（2026-10-20 用户要求）。历史分镜里写过的 -4%/-8%
+                # 在这里静默归到 +0%，而不是打回重写：降速只会让整片更闷，归零
+                # 不会破坏画面与文案；要「慢」是靠 `min_duration_sec` 留白。
+                rate = "+0%"
 
-    # 字幕两维（2026-10-16 起）：整片一档 + 逐镜可覆盖。缺省是「贴画面 + 关键词换色」
-    # ——用户否掉了纸条，缺省就得是那个「不像 PPT」的组合。
-    caption_style = str(raw.get("caption_style") or "on_picture").strip().lower()
+    # 字幕两维（2026-10-16 起）：整片一档 + 逐镜可覆盖。缺省是「白字黑边 + 关键词
+    # 换色」——用户 2026-10-20 的原话是「我要黑边白色字」，贴在画面上、不要纸条底。
+    caption_style = str(raw.get("caption_style") or "outlined").strip().lower()
     if caption_style not in CAPTION_STYLES:
         _err(errors, f"caption_style={caption_style!r} 不支持"
                      f"（可用：{', '.join(CAPTION_STYLES)}）")
-        caption_style = "on_picture"
-    highlight_style = str(raw.get("highlight_style") or "color").strip().lower()
+        caption_style = "outlined"
+    highlight_style = str(raw.get("highlight_style") or "plain").strip().lower()
     if highlight_style not in HIGHLIGHT_STYLES:
         _err(errors, f"highlight_style={highlight_style!r} 不支持"
                      f"（可用：{', '.join(HIGHLIGHT_STYLES)}）")
-        highlight_style = "color"
+        highlight_style = "plain"
     # 高亮词的自定义色（2026-10-16）。空串＝没钉，跟色板走（`captionLook()` 的 accent）。
     # 非空就必须是一条真颜色：它最终落在 CSS 的 `color` 上，一个认不出的值**不报错、
     # 只是静默变回缺省色**——「面板上明明设了红，渲出来还是色板那个色」是最难查的一类，
@@ -1511,6 +1572,30 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     prop = str(raw.get("recurring_prop") or "").strip()
     if prop:
         spec["recurring_prop"] = prop[:RECURRING_PROP_MAX_CHARS]
+    # 片壳（2026-10-20）。与 `style` 同一个坑：上面那份字面量只抄认识的键，不在这里
+    # 抄一遍，注入到 `shot_input_props` 的那一栏就永远是空的——写进 spec 也到不了渲染。
+    # 名单只认 `SHELLS`：一个没注册的名字如果活着穿过校验，entry 会拿不到壳，
+    # 镜头代码又按「有壳」写，结果是没有外框的整帧——比缺省不选壳更坏。
+    shell = str(raw.get("shell") or "").strip().lower()
+    if shell:
+        if shell not in SHELLS:
+            _err(errors, f"shell={shell!r} 不认识（可用：{', '.join(SHELLS)}）")
+        else:
+            spec["shell"] = shell
+            label = str(raw.get("shell_label") or "").strip()
+            if label:
+                spec["shell_label"] = label[:SHELL_LABEL_MAX_CHARS]
+    # 参考片素材（2026-10-20）：用户传了参考片/参考图时，写手要**看着**参考帧画，
+    # 而不是只读一句「剪影」。它不是卡面旋钮，也不进风格包——素材 id 属用户，
+    # 系统风格包不能写死别人的 id。只收 `mat-` 前缀，最多 4 条（每条抽 3 帧）。
+    refs = raw.get("reference_materials")
+    if isinstance(refs, str):
+        refs = [refs]
+    if isinstance(refs, (list, tuple)):
+        clean_refs = [str(x).strip() for x in refs
+                      if str(x).strip().startswith("mat-")][:4]
+        if clean_refs:
+            spec["reference_materials"] = clean_refs
     # 风格包（2026-10-19）：由 `plan_motion._attach_style_pack` 从 PG 注入，**不是用户
     # 自由值**——所以不进 `FILM_KNOBS`/`knob_props`（自由值进卡面会被计划校验打回），
     # 但必须在这里抄一遍，否则写手、导演、评审三处都收不到（与 `style` 同一个坑）。
@@ -1704,7 +1789,67 @@ def film_style_of(shot: Mapping[str, Any], *,
             color = str(pal.get(slot) or "").strip().lower()
             if re.fullmatch(r"#[0-9a-f]{6}", color):
                 out[key] = color
+    # 字幕的字号系数与中英次序（2026-10-21）：这是**风格包的决定**，母版不再写死。
+    # manifest 的 `caption` 块可以写 `{"size": 0.44, "order": "en-zh"}`，也可以只写其中
+    # 一个键。同样只带声明了的键——它要进缓存键、逐镜过 HTTP，补全会让没声明过的片子
+    # 整片白烧一次（与上面 `bleed`/`bg` 同一个教训）。
+    cap_cfg = _manifest_caption(film)
+    if cap_cfg:
+        size = cap_cfg.get("size")
+        if isinstance(size, bool):
+            size = None
+        try:
+            size = float(size) if size is not None else None
+        except (TypeError, ValueError):
+            size = None
+        if size is not None and math.isfinite(size) \
+                and CAPTION_SIZE_MIN <= size <= CAPTION_SIZE_MAX:
+            out["captionSize"] = round(size, 3)
+        order = str(cap_cfg.get("order") or "").strip().lower()
+        if order in CAPTION_ORDERS:
+            out["captionOrder"] = order
+        # 字块离画面底多远、字号硬上限（2026-10-21）：与 size/order 同一规矩——只在
+        # manifest 声明了才带，缺席时母版落几何表/0.036H，没声明过的片子像素不变。
+        for key, lo, hi in (("bottom", CAPTION_BOTTOM_MIN, CAPTION_BOTTOM_MAX),
+                            ("cap", CAPTION_CAP_MIN, CAPTION_CAP_MAX)):
+            raw_num = cap_cfg.get(key)
+            if isinstance(raw_num, bool) or raw_num is None:
+                continue
+            try:
+                num = float(raw_num)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(num) and lo <= num <= hi:
+                out["captionBottom" if key == "bottom" else "captionCap"] = round(num, 4)
     return out
+
+
+def _manifest_caption(film: Mapping[str, Any] | None) -> dict[str, Any]:
+    """风格包 manifest 里的 `caption` 块（认不出返回空 dict，不抛）。
+
+    允许两种写法：dict（API 写入）与一行 JSON 字符串（磁盘 SKILL.md 的 frontmatter
+    只能一行一值）——与 `skill._to_skill` 解 `style_manifest` 同一口径。
+    """
+    if not isinstance(film, Mapping):
+        return {}
+    pack = film.get("style_pack")
+    if not isinstance(pack, Mapping):
+        return {}
+    manifest = pack.get("manifest")
+    if isinstance(manifest, str):
+        try:
+            manifest = json.loads(manifest)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(manifest, Mapping):
+        return {}
+    cap = manifest.get("caption")
+    if isinstance(cap, str):
+        try:
+            cap = json.loads(cap)
+        except (TypeError, ValueError):
+            return {}
+    return dict(cap) if isinstance(cap, Mapping) else {}
 
 
 def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
@@ -1740,6 +1885,18 @@ def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
     style = film_style_of(shot, film=film)
     if style:
         payload["film_style"] = style
+    # 英文字幕（2026-10-21）画进切片里的第二行，改一个词就换像素，所以必须进键。
+    # 与上面 `film_style` 同一条纪律——**只在真有这一行时才加**：无条件把 `""`/`None`
+    # 塞进去，会让所有既有镜的键整体漂移、整片白烧一次，而它们一个字节都没变。
+    text_en = str(shot.get("text_en") or "").strip()
+    if text_en:
+        payload["text_en"] = text_en
+    # 片壳（2026-10-20）：壳名与那行小字都画进切片（外框由 entry 套在每一镜外面），
+    # 换壳/换期号＝换像素，必须进键。与上面 `film_style` 同一条纪律——**只在真选了
+    # 壳时才加**：无条件把 `None` 放进键，所有老片子的键会整体漂移、整片白烧一次。
+    shell = str(film.get("shell") or "").strip()
+    if shell:
+        payload["shell"] = [shell, str(film.get("shell_label") or "").strip()]
     # 层E2（R19）：这一镜**覆盖**了字幕两维时也要进键。整片那两档本来就在 `FILM_KNOBS`
     # 里，所以只有「申报过覆盖」才加——不加的话「同一段代码、整片 paper 而这一镜
     # on_picture」会共用一份切片，纸条本该消失的那一镜会拿到带纸条的旧切片，
@@ -1824,7 +1981,11 @@ PICTORIAL_CHANNELS: dict[str, tuple[str, ...]] = {
     # 只是把「锅炉 + 烟囱 + 飞轮」这类拆法预先写好。不记在这里，`<Machine/>` 画出来的
     # 东西在闸⑦ 眼里是「只有文字与色块」——判据认的是 import 名，不是产物的形状。
     "rough": ("roughjs", *_DRAW_PARTS),
-    "three": ("three", "@react-three/fiber", "@remotion/three"),
+    # 三维模板也算三维通道（2026-10-21）：镜头代码只 import `StudioStage` 时，
+    # 它自己不写 `three` 三包，但画面确实是逐帧渲出来的三维场景。不从这里认，
+    # 每一镜都会被闸⑦ 判成「只画了文字与色块」。
+    "three": ("three", "@react-three/fiber", "@remotion/three",
+              "@dg/lib/style/cinema-studio"),
     "katex": ("katex",),
 }
 
@@ -1846,7 +2007,8 @@ _VECTOR_MARKUP_RE = re.compile(
 #: `<path>/<rect>/<filter>`，只是渲染发生在组件内部。
 _VECTOR_COMPONENT_PKGS: tuple[str, ...] = ("@dg/lib/brush", "@dg/lib/scene",
                                            "@dg/lib/walk",
-                                           "@dg/lib/style/silhouette-history")
+                                           "@dg/lib/style/silhouette-history",
+                                           "@dg/lib/style/cinema-studio")
 
 #: 第五条通道（2026-10-18）：`<canvas>` 上手写绘制。判据是**真拿了 2D 上下文**——
 #: 光写一个 `<canvas>` 空标签不算（空白画布与色块一样，画面里没东西）。技能正文允许
@@ -4481,6 +4643,82 @@ def autofix_ink_contrast(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[s
     return {**raw, "shots": out}, notes
 
 
+#: 用户原话里点名了别的字幕形态时，系统不再把整片拉回白字黑边。
+#: 这些是**用户自己说的话**，优先级高于缺省；模型写的 `on_picture` 不在此列。
+_CAPTION_REQUESTS = ("无底", "贴画面", "不要描边", "不要黑边", "没有描边", "纸条",
+                     "纸带", "大字", "横幅", "不要字幕", "不上字幕", "on_picture")
+
+#: 用户明确要「词被点出来」时才保留关键词换色。白字黑边是**读得出来**的一档，
+#: 它的字色本来就统一；混进几枚强调色的词，整条字幕就不像同一套排版了。
+_HIGHLIGHT_REQUESTS = ("关键词", "高亮", "换色", "重点词", "变色", "强调词")
+
+
+def autofix_caption_default(raw: Mapping[str, Any],
+                            user_request: str = "") -> tuple[dict[str, Any], list[str]]:
+    """字幕缺省收敛到「白字黑边」（2026-10-20 用户点名：默认黑边白字）。
+
+    为什么由系统统一、而不是再在技能正文里写一句：真机片《从篝火到屏幕》
+    （40 镜）里模型把整片写成 `on_picture`，同时 `highlight_style: color` 让
+    没被点名的字用深棕色——深底 + 深字，成片里大半句读不出来；而且有几镜自排、
+    有几镜交给 `<CaptionLayer/>`，同一部片像三个人的字幕。这一栏是**整片级**的
+    缺省，不是创作选择：用户没点名别的样子时，统一成白字黑边（描边把字从任何
+    底色上摘出来），逐镜的 `on_picture` 覆盖也一并去掉，让它继承整片。
+
+    用户原话里明确说了「无底 / 贴画面 / 不要黑边 / 纸条 / 大字 / 横幅 / 不要字幕」
+    时**一个字节都不动**——那是用户的选择，不是模型跑偏。其他逐镜值（`paper`、
+    `top_banner` 等）也保留：那些是有理由的版式决定，不是同一种「读不出来」。
+    """
+    req = str(user_request or "")
+    if any(k in req for k in _CAPTION_REQUESTS):
+        return dict(raw), []
+    notes: list[str] = []
+    out = dict(raw)
+    top = str(out.get("caption_style") or "").strip().lower()
+    if top == "on_picture":
+        out["caption_style"] = "outlined"
+        notes.append("整片字幕：on_picture（无描边）→ outlined（白字黑边），"
+                     "深底上才读得出来；要换回无底请在对话里点名")
+    elif not top:
+        out["caption_style"] = "outlined"
+    # 白字黑边这一档的字色本来就是统一的：模型常把整片写成 `highlight_style: color`
+    # （技能正文里的示例就是 `emphasis="color"`），成片里几枚词突然变成强调色，
+    # 用户看到的就是「字幕不统一」（2026-10-20 真机）。用户没点名要关键词时，
+    # 把这一档收回 plain；点名了（「关键词换色 / 高亮」）就一个字节都不动。
+    hl = str(out.get("highlight_style") or "").strip().lower()
+    if (str(out.get("caption_style") or "").strip().lower() == "outlined"
+            and hl != "plain"
+            and not any(k in req for k in _HIGHLIGHT_REQUESTS)):
+        # 2026-10-21：用户看过成片后点名「不要这种带关键字的」——白字黑边这一档
+        # **整条字同一个白色**。不只是换色那一档：逐词点亮（karaoke）会让没念到的字
+        # 淡下去、底色块与撕纸笔触会在字后面加东西，三种在深底上都比纯白难读，
+        # 也都破坏了「一条字幕一个样」。所以这一档下**所有**强化方式都收回 plain；
+        # 用户明确点名了（「关键词换色 / 高亮 / 逐词点亮」）就一个字节都不动。
+        out["highlight_style"] = "plain"
+        notes.append("整片字幕：白字黑边下取消关键词强调（highlight_style → plain），"
+                     "整条字同色；要给关键词上色请在对话里点名")
+    shots = out.get("shots")
+    if isinstance(shots, list):
+        fixed: list[Any] = []
+        changed: list[str] = []
+        for i, shot in enumerate(shots):
+            if not isinstance(shot, Mapping):
+                fixed.append(shot)
+                continue
+            style = str(shot.get("caption_style") or "").strip().lower()
+            if style != "on_picture":
+                fixed.append(shot)
+                continue
+            row = dict(shot)
+            row.pop("caption_style", None)       # 去掉覆盖 → 继承整片的「白字黑边」
+            fixed.append(row)
+            changed.append(str(shot.get("id") or f"s{i + 1:02d}"))
+        if changed:
+            out["shots"] = fixed
+            notes.append("逐镜字幕覆盖 on_picture 已去掉、跟随整片白字黑边："
+                         + "、".join(changed))
+    return out, notes
+
+
 #: 画面最底下留给字幕的那一条（设备像素），与 `remotion/src/tokens.ts` 的
 #: `FILM_GEOMETRY[*].bottomSafe` 同值。这里只用来**说给模型听**（回执里那句「别在这里放东西」），
 #: 不参与任何判据——判「压没压」的是渲染侧探针量出来的真实盒子，不是这个数。
@@ -4572,7 +4810,7 @@ def _strip_zone_captions(code: str, zone_px: int) -> tuple[str, list[str]]:
 
 def _shot_caption_style(shot: Mapping[str, Any], spec: Mapping[str, Any]) -> str:
     """这一镜**生效**的字幕样式：镜级覆盖 > 整片 > 缺省（与 `shot_input_props` 同一条回落）。"""
-    return str(shot.get("caption_style") or spec.get("caption_style") or "on_picture")
+    return str(shot.get("caption_style") or spec.get("caption_style") or "outlined")
 
 
 def autofix_caption_layer(spec: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -4594,6 +4832,10 @@ def autofix_caption_layer(spec: Mapping[str, Any]) -> tuple[dict[str, Any], list
     """
     shots = spec.get("shots")
     if not isinstance(shots, list):
+        return dict(spec), []
+    if str(spec.get("shell") or "").strip():
+        # 片壳模式：底部字幕归片壳，镜头代码里不许出现字幕件（渲染入口有片壳合约）。
+        # 这里再补 `<CaptionLayer/>` 会与壳的字幕叠成两条，也会让这一镜在出片时被拒。
         return dict(spec), []
     zone = CAPTION_ZONE_PX.get(str(spec.get("aspect") or "landscape"), 300)
     # 模板自己的主字幕组件也算「这一镜已经有字幕」：看不见它就会再补一条
@@ -4687,6 +4929,144 @@ def _strip_bare_caption_text(code: str) -> tuple[str, int]:
         return ""
 
     return _CAPTION_TEXT_ELEMENT_RE.sub(repl, code), gone
+
+
+#: 整屏 `<feTurbulence>` 颗粒：一个 `<filter>` 里只有噪声、被一块铺满画幅的 `<rect>`
+#: 引用。2026-10-20 实测（1080p、软件 GL、同一镜 4 帧）：带整屏噪声 39.2 秒，换成
+#: 静态贴图 8.3 秒——噪声在**每一帧**都重算一遍，而它的输出一帧都没变过。
+_TURB_FILTER_RE = re.compile(
+    r'<filter\b[^>]*\bid="(?P<fid>[^"{}]+)"[^>]*>(?P<body>.*?)</filter>', re.S)
+_RECT_EL_RE = re.compile(r"<rect\b[^>]*/>", re.S)
+_IMPORT_LINE_RE = re.compile(r'^\s*import\s+[^;\n]+;\s*$', re.M)
+
+
+#: 「铺满画幅」的宽／高只认这几种写法：`{width}`、`{W}`、`"100%"`。
+#: 带算术的（`width * 0.2`、`width - 8`）一律不算——差一点也是差，宁可不换。
+_FULL_W_RE = re.compile(
+    r'\bwidth\s*=\s*(?:\{\s*(?:width|W|vw)\s*\}|\{\s*"100%"\s*\}|"100%")')
+
+
+def _grain_rect_is_fullscreen(el: str) -> bool:
+    """这块 rect 是不是铺满画幅（宽高就是画面宽高，而不是写死的数或算出来的比例）。"""
+    return bool(_FULL_W_RE.search(el)
+                and re.search(r'\bheight\s*=\s*(?:\{\s*(?:height|H|vh)\s*\}'
+                              r'|"100%")', el))
+
+
+def _grain_props(source: str, rect: str) -> str:
+    """从原 rect / 噪声元素上抄下能保持画面的几个值（透明度、种子）。"""
+    props: list[str] = []
+    op = re.search(r'\bopacity=\{([^}]+)\}', rect) or re.search(
+        r'\bopacity="([^"]+)"', rect)
+    props.append(f"opacity={{{op.group(1).strip() if op else '0.5'}}}")
+    seed = re.search(r'\bseed="(\d+)"', source)
+    if seed:
+        props.append(f"seed={{{seed.group(1)}}}")
+    # 原来的整屏噪声没有混合模式（normal）；`Grain` 缺省是 overlay，照抄会变亮。
+    props.append('blend="normal"')
+    return " ".join(props)
+
+
+def _grain_fix_code(code: str) -> tuple[str, int]:
+    """把「整屏 feTurbulence 滤镜」换成一个静态贴图层 `<Grain/>` → (新代码, 换了几处)。
+
+    只认很窄的一种形状：`<filter id=…>` 里**只有**噪声、且被一块铺满画幅的 `<rect>`
+    引用，且这个 filter 没有被别处用到。动态噪声（参数里有 `{…}`）不动——那是模型
+    刻意在动的纹理。名字已经被占（代码里自己定义了 `Grain`）也不动。
+    """
+    if "feTurbulence" not in code:
+        return code, 0
+    # 代码里自己定义了一个 `Grain`（或从别处引来同名），再加 import 就是重复声明。
+    if re.search(r"\b(?:const|let|var|function|class)\s+Grain\b", code):
+        return code, 0
+    imported = bool(re.search(r'import\s+[^;]*\bGrain\b[^;]*;', code))
+    done = 0
+    guard = 0
+    while guard < 4:
+        guard += 1
+        changed = False
+        for fm in list(_TURB_FILTER_RE.finditer(code)):
+            fid = fm.group("fid")
+            body = fm.group("body")
+            if "feTurbulence" not in body or "{" in body:
+                continue
+            rects = [m for m in _RECT_EL_RE.finditer(code)
+                     if f'filter="url(#{fid})"' in m.group(0)
+                     and _grain_rect_is_fullscreen(m.group(0))]
+            uses = len(re.findall(
+                rf'filter="url\(#{re.escape(fid)}\)"', code))
+            if not rects or uses != len(rects):
+                continue
+            rect = rects[0].group(0)
+            props = _grain_props(body, rect)
+            at = code.find(rect)
+            close = code.find("</svg>", at)
+            if close < 0:
+                continue
+            # 先在 `</svg>` 后面放一个占位符，再删原件：用下标算位移，删两段就会错。
+            close += len("</svg>")
+            marker = "\u0000DG_GRAIN\u0000"
+            code = code[:close] + marker + code[close:]
+            code = code.replace(rect, "", 1)
+            code = code.replace(fm.group(0), "", 1)
+            # `<Grain/>` 是 AbsoluteFill，不能放进 svg 里——插在它所在的那个 svg 之后。
+            code = code.replace(marker, f"\n      <Grain {props} />", 1)
+            done += 1
+            changed = True
+            break
+        if not changed:
+            break
+    if not done:
+        return code, 0
+    # 补 import：已经引了 Grain 就不动；引了 brush 但没引 Grain 就把名字加进去。
+    if not imported:
+        brush_import = re.search(
+            r'import\s+\{([^}]*)\}\s+from\s+"@dg/lib/brush";', code)
+        if brush_import:
+            names = [n.strip() for n in brush_import.group(1).split(",") if n.strip()]
+            names.append("Grain")
+            code = code.replace(
+                brush_import.group(0),
+                'import { ' + ", ".join(names) + ' } from "@dg/lib/brush";', 1)
+        else:
+            imports = list(_IMPORT_LINE_RE.finditer(code))
+            at = imports[-1].end() if imports else 0
+            code = code[:at] + '\nimport { Grain } from "@dg/lib/brush";' + code[at:]
+    return code, done
+
+
+def autofix_film_grain(spec: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """整屏 `<feTurbulence>` 颗粒 → 静态贴图 `<Grain/>`（只换画法、不减质感）。
+
+    2026-10-20 真机：36 镜每一镜都手写了一块铺满画幅、挂着噪声滤镜的 `<rect>`。
+    噪声是静态的（固定 seed），但 Chromium 在逐帧渲染里**每帧重算一次**，1080p 下
+    一帧要多花好几秒——实测同一镜 4 帧 39.2s vs 8.3s。整条片 36 镜就是四十多分钟
+    里的一大半。`<Grain/>`（`@dg/lib/brush`）用的是一张固定 seed 的噪声贴图，
+    浏览器只栅格化一次。
+
+    与别的 autofix 一样：不改判据、不打回；认不出的形状原样留着。
+    """
+    shots = spec.get("shots")
+    if not isinstance(shots, list):
+        return dict(spec), []
+    fixed: list[str] = []
+    out: list[Any] = []
+    for i, shot in enumerate(shots):
+        if not isinstance(shot, Mapping) or not shot.get("code"):
+            out.append(shot)
+            continue
+        code, n = _grain_fix_code(str(shot["code"]))
+        if n:
+            fixed.append(str(shot.get("id") or f"s{i + 1:02d}"))
+            out.append({**shot, "code": code})
+        else:
+            out.append(shot)
+    notes: list[str] = []
+    if fixed:
+        notes.append(
+            f"颗粒：{'、'.join(fixed)} 的整屏噪声滤镜换成了 <Grain/>"
+            "（同一张图每帧重算一遍噪声很慢；换成的贴图只栅格化一次，画面上仍是同样的颗粒）")
+    return {**dict(spec), "shots": out}, notes
 
 
 def autofix_duplicate_caption(spec: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -4959,6 +5339,22 @@ RECURRING_PROP_MAX_CHARS = 60
 STYLE_PACK_NAME_MAX_CHARS = 64
 STYLE_PACK_DISPLAY_MAX_CHARS = 80
 STYLE_PACK_BODY_MAX_CHARS = 12000
+#: 字幕字号系数（manifest 的 `caption.size`，乘在母版算出的字号上）的放行区间。
+#: 与 `FilmLayout.tsx` 的 `resolveFilmStyle` 同一条边界：两端都是**兜底**，不是设计建议。
+#: 低于 0.2 在 1080p 上落到读不出的十几像素，高于 1.5 会顶穿母版那条 0.036H 的硬上限。
+CAPTION_SIZE_MIN = 0.2
+CAPTION_SIZE_MAX = 1.5
+#: 中英两行的次序（manifest 的 `caption.order`）。缺省 `en-zh`＝英文在上。
+CAPTION_ORDERS = ("en-zh", "zh-en")
+#: 满幅字幕**字块底边到画面底**的距离（manifest 的 `caption.bottom`，占画面高的比例）。
+#: 与 `FilmLayout.tsx` 的 `resolveFilmStyle` 同一条边界。缺省见 `FILM_GEOMETRY` 的
+#: `bleedCaptionBottom`（横屏 48px ≈ 一行字）；写 0.045 就是「离底一行字」。
+CAPTION_BOTTOM_MIN = 0.005
+CAPTION_BOTTOM_MAX = 0.3
+#: 字幕字号硬上限（manifest 的 `caption.cap`，占画面高的比例）。母版缺省 0.036
+#: （中英两行时）与 0.04（只有中文）；这是「字是画面的一部分、但不吃掉画面」那条线。
+CAPTION_CAP_MIN = 0.02
+CAPTION_CAP_MAX = 0.08
 #: 模板模块说明符：内置模板走 `@dg/lib/style/<name>`，用户沉淀的走
 #: `@dg/lib/style/generated/<name>`。**只放行这两条前缀**——写手会把它原样写进
 #: `import`，一个自由值就是一条打包期才炸的路径。
@@ -4974,6 +5370,18 @@ STYLE_SLOTS_MAX = 24
 STYLE_SLOT_CONTRACT_MAX = 32
 STYLE_SLOT_VARIANTS_MAX = 12
 STYLE_OVERRIDES_MAX = 16
+
+#: 片壳（`spec["shell"]`）：整片不变的那一层外框，**由 Remotion 镜像在 entry 层套住
+#: 每一镜**，镜头代码只往画面带里填主体。纸底、顶部色条、左上圆钟、期号小字、底部字幕
+#: 全归它——于是「五十镜各画五十种外框」在结构上不可能发生，也就不需要出图后再评审。
+#:
+#: 名单与 `remotion/src/lib/shells.ts` 的 `SHELLS` 逐字相同（两处一起改；那边的启动一致性
+#: 检查与这里对不上时，选了壳的片子会拿不到壳——这正是 `tests` 要盯的那条）。
+#: 它**不进 FILM_KNOBS**：只在真选了壳时才进缓存键（见 `shot_cache_key`），否则所有老片
+#: 子的键会漂移一次、整片白烧。
+SHELLS: tuple[str, ...] = ("paper-flat",)
+#: 片壳上那行整片不变的小字（如「第 001 期 · 主题」）。自由文本，超长截断不报错。
+SHELL_LABEL_MAX_CHARS = 48
 #: 每镜画面描述（`shots[].brief`，交给逐镜写代码的那次调用）的长度上限（字符）。
 SHOT_BRIEF_MAX_CHARS = 400
 
@@ -5011,8 +5419,12 @@ COLOR_KNOBS: tuple[str, ...] = ("highlight_color",)
 _VOICE_RE = re.compile(r"^[a-z]{2}(-[A-Za-z]{2,})?-[A-Za-z]+Neural$")
 _RATE_RE = re.compile(r"^[+-]\d{1,3}%$")
 
-#: 语速档位（前端下拉直接给这几个，比让用户填百分号友好）
-RATE_CHOICES = ("-20%", "-10%", "+0%", "+10%", "+20%", "+30%")
+#: 语速档位（前端下拉直接给这几个，比让用户填百分号友好）。
+#:
+#: 2026-10-20 用户明确要求「人声朗读正常语速，不要降速」：负档位从可选清单里拿掉，
+#: 正常语速（+0%）就是下限。要更慢的听感用更长的文案或 `min_duration_sec` 留白，
+#: 不靠 TTS 降速——降速在真机 run 里被模型用来凑目标时长（实测出现过 -8%）。
+RATE_CHOICES = ("+0%", "+10%", "+20%", "+30%")
 
 #: 开关取值的中文标签。**每个取值都要有一句**：卡面上的 radio 文字优先用模型写的
 #: ``display``，模型没写就回落到这里（见 ``plan/validate.py::_check_params``）——
@@ -5068,11 +5480,17 @@ KNOB_VALUE_LABELS: dict[str, dict[str, str]] = {
     # R7-T22：转场与进出场。措辞要说清「观众看到的是什么」，而不是抄 ffmpeg 的档名
     # （wipeleft 这三个字母对人没有意义）。四条都在确认卡与计划卡两张卡上出现。
     "transition": {"none": "硬切（镜镜直接接）", "fade": "淡叠·前一镜淡出后一镜淡入",
+                   "fadeblack": "黑场·先暗到黑再从黑里亮起来",
                    "dissolve": "溶解·两边互相化开",
                    "wipeleft": "左擦·新画面从右往左推过来",
                    "wiperight": "右擦·新画面从左往右推过去",
                    "slideup": "上滑·新画面自下而上顶入",
-                   "circleopen": "圆开·从中心扩开"},
+                   "circleopen": "圆开·从中心扩开",
+                   "circleclose": "圆收·旧画面向中心收拢",
+                   "zoomin": "推进·画面放大着换过去",
+                   "hblur": "横向拖影·画面被速度拉开",
+                   "radial": "涟漪·圆形波纹从一点荡开",
+                   "smoothleft": "柔推·缓动横移换过去"},
     "transition_sec": {"0.2": "0.2 秒·一闪而过", "0.4": "0.4 秒·轻叠（默认）",
                        "0.6": "0.6 秒·看得出", "0.9": "0.9 秒·很缓"},
     # 同一个取值在两张表里是**互为反向**的一件事：入场是「进来」，出场是「出去」。
@@ -5138,11 +5556,14 @@ def knob_props() -> dict[str, Any]:
         },
         "rate": {
             "type": "string", "enum": list(RATE_CHOICES), "default": "+0%",
-            "description": "语速档位，越快整片越短；与目标时长对账先看它",
+            "description": "语速档位。**缺省 +0% 就是正常朗读速度，也是下限**；"
+                           "不支持放慢。时长不够先加文案、加画面驻留或加镜，"
+                           "不要靠降速凑时长",
         },
         "caption_style": {
-            "type": "string", "enum": list(CAPTION_STYLES), "default": "on_picture",
-            "description": "字幕长什么样、站在哪（整片默认，每镜可覆盖）；none=不上字幕",
+            "type": "string", "enum": list(CAPTION_STYLES), "default": "outlined",
+            "description": "字幕长什么样、站在哪（整片默认，每镜可覆盖）；"
+                           "缺省 outlined＝白字黑边；none=不上字幕",
         },
         "highlight_style": {
             "type": "string", "enum": list(HIGHLIGHT_STYLES), "default": "color",
@@ -5375,6 +5796,9 @@ IMPORT_WHITELIST: tuple[str, ...] = (
     # 风格模板（2026-10-19）：系统注册的 `silhouette-history`。用户不能上传 TSX，
     # 所以这笔名单就是全部模板；新增模板时这里与 `remotion/lint-rules.mjs` 同步。
     "@dg/lib/style/silhouette-history",
+    # 三维写实模板（2026-10-21）「暗房微距」。舞台/材质/灯光/相机/调色在模板里，
+    # 镜头代码只摆这一镜的实物；名单与 `remotion/lint-rules.mjs` 同步。
+    "@dg/lib/style/cinema-studio",
     "@dg/themes/palettes.json",
 )
 
@@ -5508,9 +5932,8 @@ def spec_schema() -> dict[str, Any]:
                                "**用户给了这类参考片，或选题本身就是一条贯穿线索时写；"
                                "没有贯穿主体就别写**——这一栏一写，每一镜的写手都会把它"
                                "放进去，包括文案没提到它的镜。"
-                               "**画法不限**：主体怎么动（走/跑/爬/飞/游/滚/生长……）由 "
-                               "brief 与文案决定，写手在镜头代码里自己画（SVG/Canvas）；"
-                               "`@dg/lib/walk` 的 `<WalkingFigure>` 只是走路的人的可选捷径。"
+                               "**画法**：怎么动、画成什么样都由写手按 brief 决定；"
+                               "这一栏只给连续性——height/foot_y/facing/stride_sec。"
                                "要写实/有体积就选 `render: lit`，不要默认剪影。"
                                "数值越界会被夹回范围，不影响分镜成立",
                 "properties": {
@@ -5566,6 +5989,22 @@ def spec_schema() -> dict[str, Any]:
                           "description": "有配乐时把镜头切点卡到拍上（只往后补、最多约半拍）"},
             "title": {"type": "string", "maxLength": 80,
                       "description": "片子标题（出现在界面与素材库，不进画面）"},
+            # 片壳（2026-10-20）：当用户要求「纸底/顶部色条/左上圆钟/期号这类整片不变的
+            # 外框」，或风格本身就是一档固定的版式时写它。选了以后**外框与底部字幕由片壳
+            # 统一画**，镜头代码只画主体——于是没有「这一镜字幕压住主体」「钟换了位置」
+            # 这类需要出图后再评审的问题。不选＝维持原样，镜头代码自己画整帧。
+            "shell": {
+                "type": "string", "enum": list(SHELLS),
+                "description": "整片统一外框（缺省不套）。`paper-flat`：暖纸底 + 顶部"
+                               "彩色细条 + 左上角固定圆钟 + 右上角期号小字 + 底部字幕，"
+                               "全片同一位置。**选了它，镜头代码只画这一镜的主体与场景，"
+                               "不再画底色/色条/钟/字幕，也不要再套母版**；"
+                               "画布尺寸用 `useBody()`。用户没要求整片固定外框就不要写"},
+            "shell_label": {
+                "type": "string", "maxLength": SHELL_LABEL_MAX_CHARS,
+                "description": "片壳右上角那行整片不变的小字（如「第 001 期 · 主题」）。"
+                               "只在写了 `shell` 时有效；用户没给期号/主题就不写"},
+
             # 风格**由用户的话决定**，不是枚举（2026-10-17）：这里只给一个地方把「你从
             # 用户那句话里读出来的风格」写成一句话——它上计划卡给人看（理解歪了一眼就看得
             # 出来），也是你写每一镜代码时的同一份依据，整片因此是一种语言而不是十四种。
@@ -5582,6 +6021,13 @@ def spec_schema() -> dict[str, Any]:
                 "description": "把 `style` 那句拆成 3~5 个**可执行做法**（如网格 8px、色数 ≤6、"
                                "边缘硬切、扫描线间隔、光源方向、材质）。系统的美术导演会在"
                                "逐镜写码前自动补；你写了就以你的为准。不进计划卡旋钮。"},
+            "reference_materials": {
+                "type": "array", "items": {"type": "string", "maxLength": 64},
+                "maxItems": 4,
+                "description": "参考片素材 id（mat-…），可空。用户给了参考片/参考图时，"
+                               "把附件里的 material_id 原样写进来；系统会抽参考帧随每一镜"
+                               "发给写手，让它照着参考的画法画。不是计划卡旋钮。",
+            },
             "recurring_prop": {
                 "type": "string", "maxLength": RECURRING_PROP_MAX_CHARS,
                 "description": "整片贯穿装置：**一件**在画面世界里反复出现的具体道具，"
@@ -5692,6 +6138,11 @@ def spec_schema() -> dict[str, Any]:
                                                 f"容量按画幅：竖屏 ≤{MAX_TEXT_CHARS} 字、"
                                                 f"横屏 ≤{MAX_TEXT_CHARS_WIDE} 字"
                                                 "（超了拆镜，不裁句子）"},
+                        "text_en": {"type": "string", "maxLength": MAX_TEXT_EN_CHARS,
+                                    "description": "同一句话的英文，画在中文下面一行（中英双字幕）。"
+                                                   "与 text 逐句对应、语气一致，不逐字硬译；"
+                                                   "只写这句话本身，不加引号、方括号或 ⌈⌉ 这类装饰符号。"
+                                                   "可省：省了就只排中文那一行"},
                         # 真机 run 7dcaa7246e92（2026-10-19，13 镜娱乐史）：模型只写了
                         # 14~17 字/镜的旁白，目标 170s 估出来 45~74s，被时长闸打回；它
                         # 看不到这一栏（schema 里没列），只能按报错去灌水加镜——13 个时代
@@ -6066,7 +6517,9 @@ def duration_block(spec: dict[str, Any], target: float | None, *,
     """估算整体偏离目标到不值得开烧时 → 一句带具体改法的拒因；否则 None。
 
     改法按有无旁白分开给：无旁白说「加镜 / 加长驻留」（没有语速可调），有旁白说
-    「加镜加文案 / 放慢语速」。镜数建议按**每镜平均时长**折算，而不是按字数。
+    「加文案 / 加画面驻留 / 加镜」。**不把「放慢语速」当凑时长的办法**：正常语速是
+    用户要的听感，降速只用于用户明确要求放慢的片子。镜数建议按**每镜平均时长**
+    折算，而不是按字数。
     """
     if not target or target <= 0:
         return None
@@ -6084,9 +6537,10 @@ def duration_block(spec: dict[str, Any], target: float | None, *,
         # 把画面留长（旁白说完人还在走、背景还在滚），或把文案写长；灌水加镜会把
         # 一条 13 个时代的片子拆成几十镜。真机 run 7dcaa7246e92 的报错只给了
         # 「加镜/放慢语速」，模型于是准备把 13 镜加到 37 镜。
+        # 语速不再作为凑时长的手段：用户要的是正常朗读速度（2026-10-20）。
         fix = ("先给每镜写 `min_duration_sec` 把画面留长（旁白说完继续走）、"
-               "把每镜文案写长，或放慢语速；仍不够再加镜"
-               f"（约 {max(n + 1, round(target / per))} 镜）")
+               "把每镜文案写长；仍不够再加镜"
+               f"（约 {max(n + 1, round(target / per))} 镜）。不要靠放慢语速凑时长")
     else:
         need = max(n + 1, round(target / min(MAX_DWELL_SEC, max(per, 12.0))))
         fix = (f"加到约 {need} 镜（每镜最多驻留 {MAX_DWELL_SEC:.0f}s 也只够 "
@@ -6102,7 +6556,7 @@ def check_target(spec: dict[str, Any], target_sec: float | None) -> list[str]:
     low, high = estimate_sec(spec)
     if high < target_sec * 0.75:
         return [f"按当前文案估算只有 {low:.0f}~{high:.0f} 秒，比目标 {target_sec:.0f} 秒短不少："
-                f"加镜或放慢语速"]
+                f"加镜、把文案写长或给每镜留更长的画面；不要靠放慢语速凑时长"]
     if low > target_sec * 1.35:
         return [f"按当前文案估算 {low:.0f}~{high:.0f} 秒，比目标 {target_sec:.0f} 秒长不少："
                 f"删镜或缩短每镜文案（当前 {len(spec.get('shots') or [])} 镜）"]

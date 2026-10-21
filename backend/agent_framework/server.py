@@ -57,7 +57,8 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from . import model_probe, secrets, style_authoring, style_templates, uploads
+from . import (model_probe, motion_preview, secrets, style_authoring,
+               style_pack_gen, style_templates, uploads)
 from .agent import Agent
 from .auth import Authenticator
 from .catalog import get_catalog
@@ -136,6 +137,14 @@ class ChatRequest(BaseModel):
     # 它只随这一轮走：注入 Identity 后由 MCPTool 传给声明了该参数的工具，
     # 不写进对话历史，也不让模型自己填。
     style_skill: str = ""
+    # 这一位是用户在下拉里**现点**的，不是从上一条消息继承来的旧值。服务端据此把
+    # 它记成会话表里的明确决定；不带它时，同一会话里先前在对话里换过的风格说了算。
+    style_explicit: bool = False
+    # 用户在入口上勾了「直接出片」：不预渲静帧、出片前不等确认，一口气跑到成片。
+    # 与 style_skill 同一条纪律——只随这一轮走，经 Identity 注入给声明了该参数的
+    # 节点，不写进对话历史，模型也看不到它是怎么来的。紧一轮有效：下次不带就回到
+    # 默认的「先预览、再确认」。
+    go_straight: bool = False
 
 
 class RunForkRequest(BaseModel):
@@ -700,6 +709,38 @@ class StyleVariantOptionsRequest(BaseModel):
     """
 
     component: str = ""
+
+
+class StylePackPreviewRequest(BaseModel):
+    """POST /style/packs/{name}/preview：还没保存的那一版 manifest 直接出三帧。
+
+    必须放在模块级：``server.py`` 有 ``from __future__ import annotations``，
+    注解是字符串，类若埋在 ``create_app`` 闭包里，FastAPI 生成 openapi 时
+    解析不到这个 ForwardRef，整个 ``/openapi.json`` 会 500（不是这一只 404，
+    是所有接口的文档一起挂掉，很难看出是谁干的）。
+    """
+
+    #: 空＝按库里现存的 manifest 渲。
+    manifest: dict[str, Any] = {}
+    at: list[float] = []
+
+
+class StylePackDraftRequest(BaseModel):
+    """POST /style/packs/generate：一句话描述 → 一份可用的风格包，直接落成我的风格。"""
+
+    description: str = ""
+
+
+class StylePackReviseRequest(BaseModel):
+    """POST /style/packs/{name}/revise：一句话改这一版（还没保存的草稿也能改）。
+
+    ``manifest``/``body`` 为空＝按库里现存的改；前端把当前草稿传上来，改完回填，
+    保存仍走原来的保存按钮——这一只不落库。
+    """
+
+    instruction: str = ""
+    manifest: dict[str, Any] | None = None
+    body: str | None = None
 
 
 class AuthCredentials(BaseModel):
@@ -1803,6 +1844,191 @@ def create_app(
         await _sync_skill_catalog()
         return {"deleted": name}
 
+    # ---- 风格工作室：一句话生成一份风格包 ----
+    #
+    # 此前「新建风格」要求用户自己写一段 manifest JSON——那是配置，不是需求。这一只
+    # 把「我想要水墨长卷、冷灰、留白多、缓推」变成一份可用的风格包（名字 + 正文 +
+    # manifest），直接落成**本人**的技能行；不挂模板也能用（写手照不变量自己画），
+    # 有合适的模板就由模型从模板库里挑一个挂上。
+    #
+    # 只产数据、不产代码：模板是可执行层，仍由沉淀/换件那条链负责。生成失败只回一句
+    # 人话，不落半份风格包（「堵死比白烧更坏」：这里失败不拦用户，改句话再来）。
+    @app.post("/style/packs/generate")
+    async def style_pack_generate(req: StylePackDraftRequest,
+                                  user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        if skill_loader is None:
+            raise HTTPException(409, "技能库未启用（--no-skills）")
+        desc = str(req.description or "").strip()
+        if len(desc) < 4:
+            raise HTTPException(400, "先用一句话说清想要的视觉（至少四个字）")
+        if len(desc) > style_pack_gen.MAX_DESCRIPTION_CHARS:
+            raise HTTPException(400, "描述太长了，控制在一千字以内说重点")
+        try:
+            llm = _runtime_llm()
+        except Exception:  # noqa: BLE001 - 与换件面板同口径：没有模型给可读原因
+            llm = None
+        if llm is None:
+            raise HTTPException(409, "没有可用的模型配置（先在设置里配好模型密钥）")
+        rows = await storage.style_templates.list(user_id)
+        templates = [{"name": r.get("name"), "display": r.get("display"),
+                      "description": r.get("description")}
+                     for r in rows
+                     if str(r.get("status") or "") == "validated"
+                     and style_templates.visible(r, user_id)]
+        try:
+            draft = await style_pack_gen.generate(
+                llm, description=desc, templates=templates,
+                identity_user=user_id)
+        except style_pack_gen.DraftError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        # 名字随机、显示名由模型给：中文显示名不能进 URL（技能名只允许字母数字与 _ -）。
+        for _ in range(5):
+            name = f"style_{uuid.uuid4().hex[:8]}"
+            if await storage.skills.get(name) is None:
+                break
+        else:
+            raise HTTPException(503, "生成的名字连撞了几次，再点一次试试")
+        fm: dict[str, Any] = {
+            "name": name, "display": draft["display"],
+            "description": draft["description"], "always": "false",
+            "requires": "", "kind": "style", "sections": "", "exclude": [],
+            "style_manifest": draft["manifest"],
+        }
+        await storage.skills.upsert(name, draft["body"],
+                                    description=draft["description"],
+                                    frontmatter=fm, files=[],
+                                    owner_user_id=user_id)
+        await _sync_skill_catalog()
+        return {"name": name, "display": draft["display"],
+                "description": draft["description"],
+                "style_manifest": draft["manifest"],
+                "template": str(draft["manifest"].get("template") or "")}
+
+    # ---- 风格工作室：一句话改这一版 ----
+    #
+    # 用户不该先学会 manifest 的键名。这一只把「字幕再往下一点」「底子再冷一点、
+    # 少一点金光」翻成对数据的具体修改，改完回给前端**草稿**（不落库，保存仍走
+    # 原来的保存按钮）。要换的是画面组件本身时，只回 `needs_template`，把人引到
+    # 模板那一层——模型不在这里写 TSX（那是可执行层，要过编译与探针）。
+    @app.post("/style/packs/{name}/revise")
+    async def style_pack_revise(name: str, req: StylePackReviseRequest,
+                                user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        if skill_loader is None:
+            raise HTTPException(409, "技能库未启用（--no-skills）")
+        row = await storage.skills.get(name)
+        if row is None:
+            raise HTTPException(404, f"风格包 {name!r} 不存在")
+        owner = row.get("owner_user_id")
+        if owner is not None and owner != user_id:
+            raise HTTPException(404, "风格包不存在")
+        fm = row.get("frontmatter") or {}
+        if str(fm.get("kind") or "workflow").lower() != "style":
+            raise HTTPException(400, "这一份不是风格包（kind 不是 style）")
+        instruction = str(req.instruction or "").strip()
+        if len(instruction) < 2:
+            raise HTTPException(400, "先说一句想改哪里")
+        manifest = req.manifest if isinstance(req.manifest, Mapping) else None
+        if manifest is None:
+            manifest = fm.get("style_manifest") or {}
+        if isinstance(manifest, str):
+            try:
+                manifest = json.loads(manifest)
+            except (TypeError, ValueError):
+                manifest = {}
+        if not isinstance(manifest, Mapping):
+            manifest = {}
+        base_body = str(req.body if req.body is not None else row.get("body") or "")
+        try:
+            llm = _runtime_llm()
+        except Exception:  # noqa: BLE001 - 与生成同口径
+            llm = None
+        if llm is None:
+            raise HTTPException(409, "没有可用的模型配置（先在设置里配好模型密钥）")
+        rows = await storage.style_templates.list(user_id)
+        templates = [{"name": r.get("name"), "display": r.get("display")}
+                     for r in rows
+                     if str(r.get("status") or "") == "validated"
+                     and style_templates.visible(r, user_id)]
+        try:
+            got = await style_pack_gen.revise(
+                llm, instruction=instruction, manifest=manifest, body=base_body,
+                templates=templates, identity_user=user_id)
+        except style_pack_gen.DraftError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return {"manifest": got["manifest"], "body": got["body"],
+                "note": got["note"], "needs_template": got["needs_template"]}
+
+    # ---- 风格工作室：改一版 manifest，先渲三帧看看 ----
+    #
+    # 为什么要有这一只：manifest 此前只能在技能弹窗里当一个 JSON 文本框改，改完要等
+    # 下一整片出片才知道「字幕离底多远、字多大、配色落在画面上是什么样」。这里把
+    # 「改的值」直接喂给同一套 props 组装（`motion_preview.render_preview`），渲的
+    # 是模板自己的 probe 样例——与成片同一条链、同一份 film_style，不另开一条预览路。
+    #
+    # 只渲三帧、不落盘、不动库：保存仍走 `PUT /skills/{name}`，这一只只负责「看」。
+    @app.post("/style/packs/{name}/preview")
+    async def style_pack_preview(name: str, req: StylePackPreviewRequest,
+                                 user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        if skill_loader is None:
+            raise HTTPException(409, "技能库未启用（--no-skills）")
+        row = await storage.skills.get(name)
+        if row is None:
+            raise HTTPException(404, f"风格包 {name!r} 不存在")
+        owner = row.get("owner_user_id")
+        if owner is not None and owner != user_id:
+            raise HTTPException(404, "风格包不存在")
+        fm = row.get("frontmatter") or {}
+        if str(fm.get("kind") or "workflow").lower() != "style":
+            raise HTTPException(400, "这一份不是风格包（kind 不是 style）")
+        manifest = req.manifest or (fm.get("style_manifest") or {})
+        if isinstance(manifest, str):
+            try:
+                manifest = json.loads(manifest)
+            except (TypeError, ValueError):
+                manifest = {}
+        if not isinstance(manifest, Mapping):
+            manifest = {}
+        tpl_name = str(manifest.get("template") or "").strip()
+        if not tpl_name:
+            raise HTTPException(400, "这份风格包没挂模板（manifest 的 template 为空），没有可渲的样例")
+        tpl = await storage.style_templates.get(tpl_name)
+        if tpl is None or not style_templates.visible(tpl, user_id):
+            raise HTTPException(400, f"模板「{tpl_name}」不在模板库里")
+        probe = str(tpl.get("probe") or "")
+        if not probe.strip():
+            raise HTTPException(400,
+                                "这套模板没有预览样例（probe 为空）；先在模板库里沉淀一份"
+                                "带预览的模板，或等出片时看预览静帧")
+        palette = manifest.get("palette") if isinstance(manifest.get("palette"), Mapping) else {}
+        bleed = manifest.get("bleed", True) is not False
+        bg = str(palette.get("page") or "#07080a").lower()
+        spec: dict[str, Any] = {
+            "aspect": "landscape", "fps": 30, "width": 1920, "height": 1080,
+            "bleed": bleed, "caption_style": "outlined", "highlight_style": "plain",
+            "palette": "none",
+            "style": str(manifest.get("display") or fm.get("display") or ""),
+            "style_pack": {"name": name, "display": str(fm.get("display") or ""),
+                           "manifest": dict(manifest), "body": ""},
+            "shots": [{
+                "id": "preview",
+                "code": probe,
+                "text": "十个人里，不到一个把血压控制住",
+                "text_en": "Fewer than one in ten keeps it under control.",
+                "highlight": [], "bleed": bleed, "bg": bg,
+            }],
+        }
+        at = [float(x) for x in (req.at or []) if isinstance(x, (int, float))][:5] or [0.2, 0.5, 0.8]
+        try:
+            got = await motion_preview.render_preview(
+                spec, shot_id="preview", at=at, scale=0.6)
+        except motion_preview.PreviewError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        stills = [{"frame": int(s.get("frame") or 0),
+                   "jpeg_b64": str(s.get("jpeg_b64") or "")}
+                  for s in (got.get("stills") or []) if s.get("jpeg_b64")]
+        return {"template": tpl_name, "stills": stills, "frames": got.get("frames") or [],
+                "film": got.get("film") or {}, "rejected": got.get("rejected") or []}
+
     # ---- MCP 动态注册：配置落库，热连/热断 ----
 
     @app.get("/mcp/servers")
@@ -1970,6 +2196,8 @@ def create_app(
                 "resume": req.resume,
                 "mode": req.mode,
                 "style_skill": req.style_skill,
+                "style_explicit": bool(req.style_explicit),
+                "go_straight": bool(req.go_straight),
             },
         )
         return ChatQueuedResponse(run_id=run_id, status="queued")
@@ -1981,10 +2209,17 @@ def create_app(
         run_id = uuid.uuid4().hex[:12]
         if req.resume:
             run_id = await _resumed_run_id(user_id, req.conversation_id) or run_id
+        if req.style_explicit:
+            # 同步入口没有经过 MQ，不在这里落一次的话，「下拉里现选的那套」会被
+            # 会话表里先前对话换过的风格压住（与消费者那条同一口径）。
+            from .style_override import set_style_override
+            set_style_override(session_key(user_id, req.conversation_id),
+                               req.style_skill)
         answer = await agent.handle(
             user_id, req.conversation_id, req.message, run_id=run_id,
             attachments=req.attachments, resume=req.resume,
             style_skill=req.style_skill,
+            go_straight=req.go_straight,
         )
         # 挂起态如实回给非 WS 客户端：answer 仍然保留（旧客户端照旧能读），
         # 但把结构化提问一并给出，脚本/CLI 才拿得到选项。
@@ -3455,6 +3690,66 @@ def create_app(
         """图形科普片的元素命中表（带空间框的那一份）。"""
         return await _hitmap_bundle(artifact_id, conv_id, user_id)
 
+    @app.get("/motion/shot-fields")
+    async def motion_shot_fields(artifact_id: str, conv_id: str = "",
+                                 user_id: str = Depends(auth.http_user_id)
+                                 ) -> dict[str, Any]:
+        """调参台要的逐镜旋钮清单：镜号、这一镜说的话、以及它交出来的字段。
+
+        字段的声明原样返回（名字/类型/当前值/范围），**不在服务端另编一套控件描述**：
+        出片时 ``fields.x`` 取的就是这一份，另立一张表就会出现「台上能调、画面上没这个值」。
+        读的是这一版成片自带的编辑包（与命中表同源），所以旋钮的当前值与屏幕上的像素
+        是同一版的。
+        """
+        bundle = await _hitmap_bundle(artifact_id, conv_id, user_id)
+        spec = bundle.get("spec") if isinstance(bundle.get("spec"), Mapping) else {}
+        if not spec.get("shots"):
+            raise HTTPException(
+                409, "这一版是旧产物，编辑包里没带分镜——重新出片后就能逐镜调参")
+        controls = bundle.get("controls") if isinstance(bundle.get("controls"), Mapping) else {}
+        return {"shots": motion_preview.shot_list(spec),
+                "film": motion_preview.film_controls(spec, controls)}
+
+    @app.post("/motion/shot-preview")
+    async def motion_shot_preview(request: Request,
+                                  user_id: str = Depends(auth.http_user_id)
+                                  ) -> dict[str, Any]:
+        """调参台的「看一眼」：改几个字段值，只渲这一镜的三帧，**不落盘**。
+
+        body：``{artifact_id, conv_id?, shot, fields?: {name: value}, at?: [0.2,0.5,0.8],
+        scale?}``。花的是补丁口的百分之一（不打包整片、不烧视频），所以可以边拖边看。
+        满意了再调 ``POST /motion/patch`` 把同一组值落成新版本——那一步才重烧像素，
+        且只重烧受影响的那几镜。
+        """
+        body = await request.json()
+        artifact_id = str(body.get("artifact_id") or "").strip()
+        if not artifact_id:
+            raise HTTPException(400, "缺少 artifact_id（要调哪一版成片）")
+        shot_id = str(body.get("shot") or "").strip()
+        if not shot_id:
+            raise HTTPException(400, "缺少 shot（要调哪一镜）")
+        bundle = await _hitmap_bundle(artifact_id, str(body.get("conv_id") or ""), user_id)
+        spec = bundle.get("spec") if isinstance(bundle.get("spec"), Mapping) else {}
+        if not spec.get("shots"):
+            raise HTTPException(
+                409, "这一版是旧产物，编辑包里没带分镜——重新出片后就能逐镜调参")
+        at = body.get("at")
+        at = [float(x) for x in at] if isinstance(at, list) and at else [0.2, 0.5, 0.8]
+        try:
+            scale = float(body.get("scale") or 0.6)
+        except (TypeError, ValueError):
+            scale = 0.6
+        fields = body.get("fields") if isinstance(body.get("fields"), Mapping) else {}
+        film = body.get("film") if isinstance(body.get("film"), Mapping) else {}
+        controls = bundle.get("controls") if isinstance(bundle.get("controls"), Mapping) else {}
+        try:
+            return await motion_preview.render_preview(
+                spec, shot_id=shot_id, overrides=fields, film=film,
+                controls=controls, at=at, scale=max(0.2, min(1.0, scale)))
+        except motion_preview.PreviewError as exc:
+            raise HTTPException(
+                400, {"error": str(exc), "rejected": exc.rejected}) from exc
+
     @app.get("/timeline/hitmap")
     async def timeline_hitmap(artifact_id: str, conv_id: str = "",
                               user_id: str = Depends(auth.http_user_id)
@@ -3675,7 +3970,9 @@ def create_app(
         """图形科普片的局部改：前端按命中表下补丁，只重烧受影响的那几镜。
 
         body：``base_artifact_id`` 必填，外加 edits / shot_sets / remove_shots / reorder /
-        bgm / bgm_volume / bgm_duck / texture / target_duration_sec / wait_sec
+        bgm / bgm_volume / bgm_duck / texture / film / target_duration_sec / wait_sec
+        （``film`` 是调参台那几栏整片观感：palette / caption_style / highlight_style /
+        texture；前三栏换一栏整片重烧，质感一镜都不重烧）
         （语义见节点 input_schema，这里原样透传）。返回体是工具回执：顶层的
         ``artifact_id`` 是**新版本**的号（轮询与播它都用这一个），``status`` 为
         queued/running 时前端改轮询 ``GET /render_status?artifact_id=…``；done 时那里的
@@ -3684,7 +3981,7 @@ def create_app(
         return await _patch_submit(
             "patch_motion_code", await request.json(), user_id,
             ("edits", "shot_sets", "remove_shots", "reorder", "bgm", "bgm_volume",
-             "bgm_duck", "texture", "target_duration_sec", "wait_sec"))
+             "bgm_duck", "texture", "film", "target_duration_sec", "wait_sec"))
 
     @app.post("/timeline/patch")
     async def timeline_patch(request: Request,

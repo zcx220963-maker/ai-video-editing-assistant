@@ -188,6 +188,92 @@ def _seams_of(transition: Any, n: int) -> list[dict[str, Any]]:
     return out
 
 
+def _stream_signature(path: str | Path) -> dict[str, Any] | None:
+    """这一段的**编码身份**：流拷贝拼接要求逐段完全一致的那几项。
+
+    只比 `probe()` 的宽高/fps 还不够：同样的尺寸可以是 h264 的 high 与 main、
+    yuv420p 与 yuv422p，AAC 的 44.1k 与 48k。任何一项不同，`-c copy` 拼出来的
+    文件要么解不开、要么音画各自漂移——而且失败形态常常是「能播但后面没声」，
+    抽帧看不出来。所以这里宁可多读一次 ffprobe，也不拿一个「看起来能播」的片子冒险。
+    """
+    try:
+        proc = run(["ffprobe", "-v", "error", "-print_format", "json",
+                    "-show_streams", str(path)], timeout=60)
+        streams = json.loads(proc.stdout).get("streams", [])
+    except (MediaError, ValueError):
+        return None
+    v = next((s for s in streams if s.get("codec_type") == "video"), None)
+    a = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if v is None or a is None:
+        return None
+    return {
+        "v_codec": v.get("codec_name"), "v_profile": v.get("profile"),
+        "v_pix_fmt": v.get("pix_fmt"), "v_width": v.get("width"),
+        "v_height": v.get("height"), "v_time_base": v.get("time_base"),
+        "a_codec": a.get("codec_name"), "a_rate": a.get("sample_rate"),
+        "a_channels": a.get("channels"), "a_layout": a.get("channel_layout"),
+    }
+
+
+def _can_stream_copy(clips: list[str | Path], fps: float | None) -> bool:
+    """逐段编码身份一致才允许流拷贝拼接（2026-10-20）。
+
+    为什么值得加这一趟：成片拼接从前一律重编码——300 秒 1080p 再压一遍是几十秒到
+    两分钟，而所有切片本来就出自同一套渲染参数。参数一致时 `-c copy` 是纯字节拼接，
+    画面一个像素都不动（也避免「拼接这一趟又压一次」的二次损失）。
+    不一致（某镜过了不同的质感滤镜、某镜没有音轨）就老老实实重编码。
+    """
+    if len(clips) < 2:
+        return False
+    ref = _stream_signature(clips[0])
+    if ref is None:
+        return False
+    for c in clips[1:]:
+        if _stream_signature(c) != ref:
+            return False
+    if fps:
+        info = probe(clips[0])
+        if abs(float(info.get("fps") or 0.0) - float(fps)) > 0.02:
+            return False
+    return True
+
+
+def _concat_copy(clips: list[str | Path], dst: Path, *, fps: float | None) -> Path:
+    """流拷贝拼接（concat demuxer），产物再核一遍时长/帧率/音轨。
+
+    任何一项对不上就抛 `MediaError`，调用方落回重编码那条老路——**宁可多花几十秒，
+    也不交一条「能播但后面没声」的成片**。
+    """
+    total = 0.0
+    for c in clips:
+        total += float(probe(c).get("duration") or 0.0)
+    list_path = dst.parent / f".{dst.stem}.concat.txt"
+    lines = []
+    for c in clips:
+        # concat demuxer 的单引号转义：路径里的 ' 写成 '\''
+        p = str(Path(c).resolve()).replace("'", "'\\''")
+        lines.append(f"file '{p}'")
+    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        ffmpeg("-f", "concat", "-safe", "0", "-i", str(list_path),
+               "-c", "copy", str(dst))
+    finally:
+        list_path.unlink(missing_ok=True)
+    if not dst.exists() or dst.stat().st_size == 0:
+        raise MediaError("流拷贝拼接的产物为空")
+    info = probe(dst)
+    if not info.get("has_audio"):
+        raise MediaError("流拷贝拼接的产物没有音轨")
+    duration = float(info.get("duration") or 0.0)
+    if abs(duration - total) > max(1.0, total * 0.01):
+        raise MediaError(
+            f"流拷贝拼接的时长对不上（{duration:.2f}s vs 各段合计 {total:.2f}s）")
+    if fps and abs(float(info.get("fps") or 0.0) - float(fps)) > 0.02:
+        raise MediaError(
+            f"流拷贝拼接的帧率对不上（{info.get('fps')} vs {fps}）")
+    return dst
+
+
 def concat(clips: list[str | Path], dst: str | Path, *,
            fps: float | None = None,
            transition: Any = None) -> Path:
@@ -213,6 +299,14 @@ def concat(clips: list[str | Path], dst: str | Path, *,
     seams = _seams_of(transition, len(clips))
     if len(clips) > 1 and any(s["duration"] > 0 for s in seams):
         return _concat_xfade(clips, dst, fps=fps, seams=seams)
+    # 没有转场时优先流拷贝（2026-10-20）：逐段编码参数一致就没有重编码的理由，
+    # 拼接这一步从「整片再压一遍」变成「按顺序接字节」。不一致或产物核不过就落回
+    # 下面的重编码——判据与兜底都在 `_can_stream_copy` / `_concat_copy` 里。
+    if _can_stream_copy(clips, fps):
+        try:
+            return _concat_copy(clips, dst, fps=fps)
+        except MediaError:
+            pass
     args: list[str] = []
     for c in clips:
         args += ["-i", str(c)]
@@ -365,7 +459,9 @@ def tone_wav(dst: str | Path, duration: float = 5.0, freq: int = 220) -> Path:
 _XFADE = {
     "fade": "fade", "fadeblack": "fadeblack", "dissolve": "dissolve",
     "wipeleft": "wipeleft", "wiperight": "wiperight", "slideup": "slideup",
-    "circleopen": "circleopen", "radial": "radial", "smoothleft": "smoothleft",
+    "circleopen": "circleopen", "circleclose": "circleclose",
+    "zoomin": "zoomin", "hblur": "hblur",
+    "radial": "radial", "smoothleft": "smoothleft",
     "hardcut": "fade",  # 硬切以 0 时长近似：给一个极短淡入避免滤镜报错
 }
 

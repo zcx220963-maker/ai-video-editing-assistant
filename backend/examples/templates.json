@@ -5,34 +5,164 @@
     "description": "侧向行走的剪影穿过一层层时代背景，一块发光矩形贯穿全片；同一构图、同一光位、同一条字幕。",
     "module": "@dg/lib/style/silhouette-history",
     "components": [
-      {"name": "SilhouetteStage", "role": "舞台：天空/地面/颗粒/暗角/运镜"},
-      {"name": "GlowRect", "role": "贯穿全片的发光矩形，kind 换时代"},
-      {"name": "SilhouetteWalk", "role": "同一主角的行走剪影，停一下再走"},
-      {"name": "EraInscription", "role": "右上角「年代 · 地点」小字"},
-      {"name": "StyleCaption", "role": "底部居中的那一条贴画面字幕"}
+      {
+        "name": "SilhouetteStage",
+        "role": "舞台：天空/地面/颗粒/暗角/运镜"
+      },
+      {
+        "name": "GlowRect",
+        "role": "贯穿全片的发光矩形，kind 换时代"
+      },
+      {
+        "name": "SilhouetteWalk",
+        "role": "同一主角的行走剪影，停一下再走"
+      },
+      {
+        "name": "EraInscription",
+        "role": "右上角「年代 · 地点」小字"
+      },
+      {
+        "name": "StyleCaption",
+        "role": "底部居中的那一条贴画面字幕"
+      }
     ],
     "manifest": {
       "responsible": "人物剪影、贯穿光块、年代铭文、贴画面字幕",
       "defaults": {
         "template": "silhouette-history",
         "palette": {
-          "sky": ["#0b1020", "#3a2a3f", "#e8a06a"],
+          "sky": [
+            "#0b1020",
+            "#3a2a3f",
+            "#e8a06a"
+          ],
           "ground": "#07070a",
           "ink": "#050507",
           "accent": "#ff7a2f",
           "paper": "#f2e6d0"
         },
         "composition": {
-          "figure_x": 0.32, "figure_h": 0.46, "ground_y": 0.82,
-          "horizon": 0.62, "camera": "slow push-in 1.02x to 1.06x, no cuts"
+          "figure_x": 0.32,
+          "figure_h": 0.46,
+          "ground_y": 0.82,
+          "horizon": 0.62,
+          "camera": "slow push-in 1.02x to 1.06x, no cuts"
         },
         "repeat_composition": true,
         "recurring_pose": "walk left to right, pause beside the glow, lean 8 degrees, continue",
         "recurring_prop": "a glowing rectangle at 0.70W / 0.34H, same size and position every shot",
-        "caption": {"look": "overlay", "position": "bottom-center", "width": 0.62},
-        "inscription": {"position": "top-right", "style": "small serif, 0.022H"},
-        "motion": {"camera": "1.02 to 1.06 slow push, no cuts", "grain": 0.12, "vignette": 0.35}
+        "caption": {
+          "look": "overlay",
+          "position": "bottom-center",
+          "width": 0.62
+        },
+        "inscription": {
+          "position": "top-right",
+          "style": "small serif, 0.022H"
+        },
+        "motion": {
+          "camera": "1.02 to 1.06 slow push, no cuts",
+          "grain": 0.12,
+          "vignette": 0.35
+        }
       }
-    }
+    },
+    "probe_file": "probes/silhouette-history.tsx"
+  },
+  {
+    "name": "cinema-studio",
+    "display": "暗房微距",
+    "description": "一件真实的实物放在深色台面上，被一束后上方的暖光打亮；同一张台面、同一个光位、同一条贴画面字幕，整片像夜里的微距静物摄影。",
+    "module": "@dg/lib/style/cinema-studio",
+    "components": [
+      {
+        "name": "StudioStage",
+        "role": "舞台：台面/墙/窗/灯/相机/雾/景深/颗粒/暗角"
+      },
+      {
+        "name": "ContactShadow",
+        "role": "实物落在台面上的接触阴影"
+      },
+      {
+        "name": "Scatter",
+        "role": "散落的颗粒（盐、糖、灰、碎屑），dome 堆成一撮"
+      },
+      {
+        "name": "Dust",
+        "role": "空气里缓慢飘的浮尘"
+      },
+      {
+        "name": "GlassMaterial",
+        "role": "玻璃、杯壁、窗、镜片"
+      },
+      {
+        "name": "MetalMaterial",
+        "role": "钢、黄铜、铝；tone 换金属"
+      },
+      {
+        "name": "CeramicMaterial",
+        "role": "瓷、药片、搪瓷、纸"
+      },
+      {
+        "name": "WoodMaterial",
+        "role": "木台、木勺、木盒"
+      },
+      {
+        "name": "GranularMaterial",
+        "role": "盐、糖、沙、灰这类堆积物"
+      },
+      {
+        "name": "Mark",
+        "role": "手绘标注：圈、下划线、箭头、括号，沿路径长出来"
+      },
+      {
+        "name": "LineDraw",
+        "role": "随帧生长的 SVG 线"
+      }
+    ],
+    "manifest": {
+      "responsible": "台面、灯光、相机、景深、材质与调色——一镜一件实物的舞台",
+      "defaults": {
+        "template": "cinema-studio",
+        "use_template": true,
+        "draw_mode": "template",
+        "palette_name": "darkroom",
+        "palette": {
+          "page": "#07080a",
+          "surface": "#14100d",
+          "field": "#1a1512",
+          "text": "#f4efe6",
+          "muted": "#a89c8c",
+          "accent": "#ffcf6b",
+          "border": "#2a241f",
+          "light": "#ffc994",
+          "rim": "#5f92ff"
+        },
+        "composition": {
+          "subject_width": [
+            0.35,
+            0.55
+          ],
+          "subject_height": [
+            0.35,
+            0.55
+          ],
+          "horizon": 0.55,
+          "camera": "slow push-in, one shot one move, no cuts"
+        },
+        "recurring_prop": "一张深色台面与一束从后上方来的暖光，全片同一光位",
+        "caption": {
+          "look": "overlay",
+          "position": "bottom-center",
+          "width": 0.62
+        },
+        "motion": {
+          "camera": "push / pan / orbit，缓慢，一镜一个动作",
+          "grain": 0.14,
+          "vignette": 0.55
+        }
+      }
+    },
+    "probe_file": "probes/cinema-studio.tsx"
   }
 ]

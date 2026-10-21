@@ -20,6 +20,9 @@ P4 之前这个模块还负责「零素材排版逐帧截图」；那条链下�
 
 from __future__ import annotations
 
+import math
+import os
+import re
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -147,8 +150,11 @@ class ShotCache:
 #: 取值清单的另一半在 ``code_spec.TEXTURES``，两边各写一遍就会出现「界面上有这档、
 #: 渲出来是原片」，由 ``tests/test_code_spec.py`` 按表逐项查。
 TEXTURE_FILTERS: dict[str, str] = {
-    # 老胶片：细颗粒 + 暗角 + 一点暖偏，纸片版式压色偏所以走 colorbalance 而不是 eq
-    "film": ("[0:v]noise=alls=7:allf=t+u,vignette=PI/5,"
+    # 老胶片：细颗粒 + 暗角 + 一点暖偏，纸片版式压色偏所以走 colorbalance 而不是 eq。
+    # 2026-10-20 暗角从 PI/5 收到 PI/7、颗粒从 7 收到 5：真机片（40 镜）量出来
+    # 平均亮度只有 15~26/255，再叠一层重暗角就是「根本看不清」。胶片感来自颗粒与
+    # 暖偏，不靠把四周压死。
+    "film": ("[0:v]noise=alls=5:allf=t+u,vignette=PI/7,"
              "colorbalance=rm=.05:gm=.01:bm=-.05,"
              "unsharp=3:3:.6:3:3:.2[v]"),
     # 老电视：横向扫描线 + 左右色偏 + 压一点饱和，颗粒比胶片细
@@ -167,6 +173,83 @@ TEXTURE_FILTERS: dict[str, str] = {
 }
 
 
+#: 可见度下限（0~255）。低于它的切片在质感之后补一段 gamma 提亮，让它看得清。
+#:
+#: 为什么系统兜这一手（2026-10-20）：真机片《从篝火到屏幕》40 镜的平均亮度量出来
+#: 是 15~26——不是「暗调」，是几乎全黑；用户原话「整体画面很暗，导致根本看不清」。
+#: 根子在分镜把底色写成了「深墨褐的纸」，写手又各加了一层重暗角；只在提示词里劝
+#: 一次，下一版仍可能再压暗。这一层是**地板、不是调色**：只提 gamma（黑还是黑），
+#: 阈值以上一个字节不动，所以亮底片、纸感片完全不受影响。要关掉或再抬高：
+#: `MOTION_LUMA_FLOOR=0` / `=110`。gamma 上限 2.3 是为了不把夜景拉成灰雾。
+#: 默认 90 而不是「读数正好 72」：量的是质感**之前**的切片，而 film 的暗角/颗粒
+#: 还会再压一截（真机实测 gamma 按 72 求得，过完质感只剩 58）。按 90 求，
+#: 过完质感落在 72~73——肉眼「看得清」的那一档。
+LUMA_FLOOR = max(0.0, float(os.environ.get("MOTION_LUMA_FLOOR", "90") or 90))
+_LUMA_RE = re.compile(r"lavfi\.signalstats\.YAVG=([0-9.]+)")
+
+
+def mean_luma(src: Path) -> float:
+    """片子**中段 1 秒**的平均亮度（0~255）。取中段是为了避开片头/片尾的淡入淡出。
+
+    量不出来（滤镜不可用、文件坏了）返回 0——调用方把 0 当成「不知道」，不补提亮。
+    """
+    try:
+        dur = float(mediaops.probe(src).get("duration") or 0.0)
+    except Exception:      # noqa: BLE001 - 量亮度是增益，不该让出片失败
+        return 0.0
+    at = max(0.0, dur * 0.45)
+    try:
+        proc = mediaops.run([
+            "ffmpeg", "-hide_banner", "-v", "error", "-ss", f"{at:.3f}",
+            "-i", str(src), "-t", "1",
+            "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+            "-f", "null", "-",
+        ], timeout=120)
+    except Exception:      # noqa: BLE001
+        return 0.0
+    vals = [float(v) for v in _LUMA_RE.findall(proc.stdout or "")]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def luma_lift_chain(avg: float, floor: float | None = None) -> tuple[str, str] | None:
+    """按平均亮度求一段提亮链；已经够亮返回 None（一个字节都不动）。
+
+    → (滤镜链, 一句人话)。链的形状与 `TEXTURE_FILTERS` 同口径（`[0:v]…[v]`），
+    好让 `_compose_chains` 直接接在质感/统一调色后面。
+    """
+    target = LUMA_FLOOR if floor is None else float(floor)
+    if target <= 0 or avg <= 6.0 or avg >= target:
+        return None
+    # 输出 = 255·(输入/255)^(1/gamma)，所以要拉到 target：
+    # 1/gamma = ln(target/255)/ln(avg/255) → gamma 取它的倒数。写反了就是
+    # gamma=0.57 被夹回 1.0，量出来「补了提亮」、画面上一个像素没变。
+    gamma = math.log(max(avg, 1.0) / 255.0) / math.log(target / 255.0)
+    gamma = min(2.3, max(1.0, gamma))
+    # brightness 只给一点点，处理 avg 极低（<8）时 gamma 封顶后仍差一截的情况；
+    # 黑位仍在 0~10 之间，不会把夜景洗成灰雾。正常暗调（avg 15~40）只靠 gamma。
+    bright = 0.05 if avg < 8.0 else 0.0
+    return (f"[0:v]eq=gamma={gamma:.3f}:brightness={bright:.2f}[v]",
+            f"gamma={gamma:.3f}, 亮度 {avg:.0f}→{target:.0f}")
+
+
+def lift_still(still: Path) -> tuple[str, str]:
+    """预览静帧补提亮（与成片同一把尺）。→ (说明, 实际链)。不改判据，只动像素。"""
+    avg = mean_luma(still)
+    got = luma_lift_chain(avg)
+    if not got:
+        return "", ""
+    chain, note = got
+    tmp = still.with_name(still.stem + ".lift.jpg")
+    try:
+        mediaops.ffmpeg("-i", str(still), "-vf", chain[len("[0:v]"):-len("[v]")],
+                        "-q:v", "3", str(tmp), timeout=120)
+        tmp.replace(still)
+    except Exception:      # noqa: BLE001 - 提亮失败就交原图，预览不该因此空掉
+        tmp.unlink(missing_ok=True)
+        return "", ""
+    return note, chain
+
+
 #: 整片美术方向 → **切片末段那趟统一调色**的滤镜串。参数从 `art` 里两条有明确
 #: 像素后果的栏派生，不另起一条管线：
 #:
@@ -179,8 +262,9 @@ TEXTURE_FILTERS: dict[str, str] = {
 #: 为什么不做 duotone/lut 那种整片重调：那会把镜头代码画好的色板盖掉，而色板是
 #: 用户钉的那一档（`palette`）。这一层只做「统一」，不做「改写」。
 ART_GRADE_TEXTURE: dict[str, str] = {
-    "paper": "noise=alls=2:allf=t,vignette=PI/6",
-    "grain": "noise=alls=4:allf=t,vignette=PI/5.5",
+    # 暗角同样收轻（2026-10-20）：这一层会和质感档叠在一起，两层重暗角就是近黑。
+    "paper": "noise=alls=2:allf=t,vignette=PI/8",
+    "grain": "noise=alls=4:allf=t,vignette=PI/7",
 }
 _WARM = "colorbalance=rm=.03:gm=.01:bm=-.03"
 _COOL = "colorbalance=rm=-.02:gm=.01:bm=.03"
@@ -231,16 +315,24 @@ def _compose_chains(*chains: str) -> str:
     return ";".join(out)
 
 
-def apply_texture(src: Path, out: Path, kind: str, art: Any = None) -> str:
+def apply_texture(src: Path, out: Path, kind: str, art: Any = None,
+                  avg_luma: float | None = None) -> str:
     """一段视频 → 加质感/统一调色的视频（代码链按**每一镜的切片**各调一次，拼接之前）。
     → 实际消费的滤镜串（空串 = 这趟没做，原样拷贝）。
+
+    ``avg_luma`` 是调用方已经量过的平均亮度（省一趟解码）；不给就现量。
 
     ``art`` 是整片美术方向（可省）。它和质感档**合成同一趟 ffmpeg**：
     先过质感档、再过统一调色——两条各自一次 x264 的话，同一镜会多一代压缩。
     返回串而不是布尔：记账要能回答「画面没变是档选错了，还是滤镜根本没跑」。
     """
+    # 可见度地板排在最后：先让质感和统一调色把画面压到它该有的样子，再判断
+    # 「这一镜还看不看得清」。量的是**这一镜自己的像素**，不是整片的平均——
+    # 夜景镜与数据镜本来就该有不同的亮度。
+    lift = luma_lift_chain(mean_luma(src) if avg_luma is None else float(avg_luma))
     chain = _compose_chains(TEXTURE_FILTERS.get(str(kind or "").strip().lower(), ""),
-                            art_grade(art))
+                            art_grade(art),
+                            lift[0] if lift else "")
     if not chain:
         mediaops.ffmpeg("-i", str(src), "-c", "copy", str(out), timeout=300)
         return ""

@@ -22,7 +22,7 @@ import {
 import { resolveFilmStyle } from '@dg/film';
 import { TOKENS } from '@dg/tokens';
 import { WalkingFigure } from '@dg/lib/walk';
-import type { WalkRender, WalkWardrobe } from '@dg/lib/walk';
+import type { WalkOutfit, WalkRender, WalkWardrobe } from '@dg/lib/walk';
 import { Grain, LightPool, Vignette } from '@dg/lib/brush';
 import { CaptionText } from '@dg/film';
 
@@ -293,8 +293,15 @@ export interface SilhouetteWalkProps {
   walking?: boolean;
   facing?: 1 | -1 | 'left' | 'right';
   strideSec?: number;
+  /**
+   * 步态相位（0~1）。**不传就接全片时钟**：`((filmStartSec + t) / strideSec) % 1`，
+   * 这样切镜时不会从「左脚在前」重新起步。只有想让这一镜单独起步时才显式传。
+   */
   phase?: number;
+  /** 旧写法：plain / cloak / cap / coat / hoodie。 */
   wardrobe?: WalkWardrobe;
+  /** 衣服与随身物（推荐）：同一副骨架，逐镜只换这一层。 */
+  outfit?: WalkOutfit;
   render?: WalkRender;
   /** 剪影色。缺省整片墨色。 */
   fill?: string;
@@ -313,11 +320,16 @@ export interface SilhouetteWalkProps {
 export const SilhouetteWalk: React.FC<SilhouetteWalkProps> = ({
   figureH = 0.46, groundY = 0.82, fromX = 0.10, toX = 0.86,
   pauseX = 0.36, pauseAt = 0.5, pauseLen = 0.18, lean = 8,
-  walking = true, facing = 'right', strideSec = 1.0, phase = 0,
-  wardrobe = 'plain', render = 'silhouette', fill, rim, shadow = true,
+  walking = true, facing = 'right', strideSec = 1.0, phase,
+  wardrobe = 'plain', outfit, render = 'silhouette', fill, rim, shadow = true,
 }) => {
   const frame = useCurrentFrame();
-  const { width, height, durationInFrames } = useVideoConfig();
+  const { width, height, durationInFrames, fps } = useVideoConfig();
+  // 缺省相位接**全片时钟**（2026-10-20）：写手常常不传 `phase`，而缺省 0 会让
+  // 每一镜都从「左脚在前」重新起步，切点处换脚——这正是「不是同一个人在一直走」
+  // 的一半来源。`filmStartSec` 由渲染侧按真实时间轴注入；显式传 `phase` 仍优先。
+  const { filmStartSec = 0 } = getInputProps() as { filmStartSec?: number };
+  const phaseNow = phase ?? ((filmStartSec + frame / fps) / strideSec) % 1;
   const last = Math.max(1, durationInFrames - 1);
   // `interpolate` 要求输入区间**严格递增**。比例换算出来的两个停顿点，在极短的镜、
   // 或 `pauseAt` 贴着两头时可能相等甚至反序（真机 30 帧的探针就撞上 [12,17,12,17]）：
@@ -365,9 +377,10 @@ export const SilhouetteWalk: React.FC<SilhouetteWalkProps> = ({
         height={height * figureH}
         facing={facing}
         strideSec={strideSec}
-        phase={phase}
+        phase={phaseNow}
         walking={walking && !stopped}
         wardrobe={wardrobe}
+        outfit={outfit}
         render={render}
         fill={fill}
         rim={rim}

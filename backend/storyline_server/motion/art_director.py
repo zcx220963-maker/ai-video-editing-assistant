@@ -94,16 +94,32 @@ def _parse(text: str) -> dict[str, Any] | None:
     return dict(got)
 
 
-def _ask(spec: Mapping[str, Any], todo: Sequence[Mapping[str, Any]]) -> str:
+def _ask(spec: Mapping[str, Any], todo: Sequence[Mapping[str, Any]],
+         user_request: str = "") -> str:
     style = str(spec.get("style") or "").strip() or "（没写，按选题自己定）"
     art = spec.get("art") if isinstance(spec.get("art"), Mapping) else {}
     art_bits = "；".join(f"{k}={v}" for k, v in art.items() if str(v or "").strip())
     prop = str(spec.get("recurring_prop") or "").strip()
     protagonist = spec.get("protagonist")
-    lines = [
+    lines = []
+    # 用户原话放最前面：导演改写 brief 时，最容易丢的就是「用户点名要/不要的东西」。
+    req = " ".join(str(user_request or "").split())
+    if req:
+        lines += ["=== 用户原话（最高事实）===",
+                  req[:4000] + ("…" if len(req) > 4000 else ""),
+                  "用户点名要的、点名不要的、说的年代与语气，都以此为准；"
+                  "改写 brief 时不许把它替换成默认画法。", ""]
+    lines += [
         f"整片风格：「{style}」",
         f"画幅：{spec.get('aspect') or 'landscape'}",
     ]
+    shell = str(spec.get("shell") or "").strip()
+    if shell:
+        # 片壳是整片契约：外框与底部字幕归壳，brief 只描述画面带里那一镜的主体。
+        lines.append(
+            f"整片片壳：{shell}——暖纸底、顶部色条、左上圆钟、右上期号与底部字幕由片壳"
+            "统一画，全片同一位置与字号。每一镜的 brief 只写画面带里的主体、场景与动作，"
+            "不要给字幕的位置或字号，也不要写底色、色条、钟或期号。")
     if art_bits:
         lines.append(f"整片美术方向：{art_bits}")
     if prop:
@@ -120,6 +136,14 @@ def _ask(spec: Mapping[str, Any], todo: Sequence[Mapping[str, Any]]) -> str:
             lines.append(
                 f"整片贯穿主体（**{subject}，每镜都要在**；画法 {render}）："
                 f"「{look}」" + extra)
+            if wardrobe:
+                # 2026-10-20：用户要「同一个人换衣服」，不是每镜重新发明一个人。
+                # brief 负责写清这一镜**穿什么、戴什么、手里拿什么**；骨架、身高、
+                # 步态仍由整片那一组连续性数字守住。
+                lines.append(
+                    "每一镜的 brief 都要写清这一镜的衣着、头饰与持物（照上面的演进线"
+                    "和用户原话，按时代换），但**不要另换一副身体**：身高、骨架、"
+                    "朝向与步态整片不变，换的只是外面这一层。")
     pack = spec.get("style_pack") if isinstance(spec.get("style_pack"), Mapping) else {}
     manifest = pack.get("manifest") if isinstance(pack.get("manifest"), Mapping) else {}
     if pack:
@@ -132,12 +156,15 @@ def _ask(spec: Mapping[str, Any], todo: Sequence[Mapping[str, Any]]) -> str:
                            ("recurring_prop", "贯穿道具"),
                            ("caption", "字幕"),
                            ("inscription", "铭文"),
-                           ("avoid", "不要出现")):
+                           ("avoid", "不要出现"),
+                           # 用户在前端写给导演这一层的话（2026-10-21）：属于这份风格
+                           # 的数据，不是后端的风格分支；空着整行不出现。
+                           ("art_note", "用户补充：写给分镜导演")):
             value = manifest.get(key)
             if isinstance(value, (dict, list)):
                 value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
             if str(value or "").strip():
-                lines.append(f"  {label}：{value}")
+                lines.append(f"  {label}：{str(value)[:1200]}")
         # 沉淀出来的三个角度（visual / motion / text）：导演排 brief 时就要把它们
         # 拆进每一镜，不能让写手到写代码时才发现「这一镜该穿什么、写什么字」。
         facets = manifest.get("facets")
@@ -153,14 +180,21 @@ def _ask(spec: Mapping[str, Any], todo: Sequence[Mapping[str, Any]]) -> str:
                                "但**不要把它写成每镜重新起步**——步态/位移由全片时钟连起来。")
             text = facets.get("text") if isinstance(facets.get("text"), Mapping) else {}
             items = [i for i in (text.get("items") or []) if isinstance(i, Mapping)]
+            if shell:
+                # 字幕归片壳，brief 不再给它的位置/字号；画面里的铭文与招牌字照旧。
+                items = [i for i in items
+                         if str(i.get("kind") or "caption").strip().lower()
+                         not in ("caption", "subtitle", "字幕")]
             if items:
                 lines.append("  文字纪律：每一镜 brief 要给这些文字的位置、字号与内容——"
                              + "；".join(
                                  f"{i.get('kind') or 'caption'}（位置 "
                                  f"{i.get('position') or '照风格不变量'}）"
                                  for i in items[:4])
-                             + "（铭文写年代与地点，字幕用本镜文案；用模板组件或"
-                               "自己画都行，但**字幕只有一条**）。")
+                             + ("（铭文写年代与地点；底部字幕由片壳统一画，brief 不用管）。"
+                                if shell else
+                                "（铭文写年代与地点，字幕用本镜文案；用模板组件或"
+                                "自己画都行，但**字幕只有一条**）。"))
             changed: list[str] = []
             for fname in ("visual", "motion", "text"):
                 facet = facets.get(fname)
@@ -228,17 +262,22 @@ def _ask(spec: Mapping[str, Any], todo: Sequence[Mapping[str, Any]]) -> str:
             lines.append(f"  已申报主体：{subject}")
         if entities:
             lines.append(f"  已申报实体：{'、'.join(entities)}")
-    if str(manifest.get("recurring_pose") or "").strip():
-        # 静帧看不出来「人有没有在走」：brief 只写「一个人站在画面里」时，写手就会
-        # 交一张站着的剪影。步态是整片契约的一部分，必须落到每一镜的动作描述里。
-        lines.append("每一镜的 brief 都要写清**主体怎么动**（从哪走到哪、在哪停、怎么转身），"
-                     "不能只写「主体在画面里」——成片里主体必须一直在动。")
+    # 有贯穿主体就写这一条，不必等风格包：2026-10-20 真机片没选风格包，导演把
+    # 「站着看戏」原样写进 brief，40 镜里好几镜主体站死，用户说「人在走动的怎么
+    # 不连贯」。步态是整片契约的一部分，必须落到每一镜的动作描述里。
+    _has_lead = (isinstance(protagonist, Mapping)
+                 and bool(str(protagonist.get("look") or "").strip()))
+    if str(manifest.get("recurring_pose") or "").strip() or _has_lead:
+        lines.append("每一镜的 brief 都要写清**主体怎么动**（从哪走到哪、边走边做什么、"
+                     "在哪停半步再走），不能只写「主体在画面里」或「站在某处看着」——"
+                     "成片里主体必须一直在动，停也只停半步。")
     lines.append("给每一镜圈实体、补画面落点；把整片风格拆成可执行做法。只回那一行 JSON。")
     return "\n".join(lines)
 
 
 async def concretize(spec: dict[str, Any], *, user_id: str = "",
-                     conversation_id: str = "", llm: Any = None) -> dict[str, Any]:
+                     conversation_id: str = "", llm: Any = None,
+                     user_request: str = "") -> dict[str, Any]:
     """补 `spec["style_grammar"]` 与无 code 镜的 `brief`（原地改）→ 一份账。
 
     返回 ``{enabled, changed, style_grammar, notes, cost_yuan, calls}``。
@@ -259,7 +298,7 @@ async def concretize(spec: dict[str, Any], *, user_id: str = "",
         return out
 
     messages = [{"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": _ask(spec, todo)}]
+                {"role": "user", "content": _ask(spec, todo, user_request)}]
     kwargs: dict[str, Any] = {
         "max_tokens": DIRECTOR_MAX_TOKENS, "timeout": DIRECTOR_TIMEOUT_SEC}
     if DIRECTOR_MODEL:

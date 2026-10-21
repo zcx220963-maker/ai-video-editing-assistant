@@ -38,6 +38,25 @@ from agent_framework.render_library import register_render
 
 from ..motion import code_patch as mcode
 from ..motion import code_render
+
+
+def _exc_digest(exc: BaseException) -> str:
+    """异常没有消息时，给出还能查下去的那一句话：类型名 + 最后一行堆栈。
+
+    有的失败天然没有话（`asyncio.CancelledError()`、`Exception()`、被 SIGKILL 的
+    子进程包装出来的空消息）。这类失败写进 `render_jobs.error` 就是空串，界面上
+    「出片失败」却没有任何线索——一小时四十分的活儿白跑，连从哪一步开始查都不知道。
+    """
+    import traceback
+    tail = ""
+    try:
+        frames = traceback.extract_tb(exc.__traceback__)
+        if frames:
+            last = frames[-1]
+            tail = f"（{Path(str(last.filename)).name}:{last.lineno} {last.name}）"
+    except Exception:  # noqa: BLE001 —— 取堆栈失败不能再抛，兜底的话已经够了
+        tail = ""
+    return f"{type(exc).__name__}{tail}"[:500]
 from ..motion import code_spec as cspec
 from ..motion import hitmap as mhit
 from ..motion import remotion_client as rc
@@ -119,6 +138,9 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         # 旧计划**里的代码不会重跑那一步。这里再修一次（幂等），免得用户点确认之后
         # 才在成片里看到两条叠在一起的字。
         raw, _dup_caption_notes = cspec.autofix_duplicate_caption(raw)
+        # 整屏 `<feTurbulence>` 颗粒的渲染口兜底：plan_motion 入库前已经换过，但旧
+        # checkpoint 里的代码不会重跑那一步。幂等，没这种写法就一个字节都不动。
+        raw, _grain_notes = cspec.autofix_film_grain(raw)
         spec, errors = cspec.validate_code_spec(
             cspec.overlay_knobs(cspec.with_default_qc(raw), inputs))
         # 手写 spec 可能只带 `brief`（2026-10-18：code 可省）：在烧像素之前补写，
@@ -128,7 +150,9 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             from ..motion import shot_writer
             wrote = await shot_writer.write_shot_code(
                 spec, user_id=state.user_id or "",
-                conversation_id=state.conversation_id or "")
+                conversation_id=state.conversation_id or "",
+                user_request=getattr(state, "user_request", "") or "",
+                storage=self.storage)
             if wrote["unwritten"]:
                 raise ValueError(
                     "出片前补写镜头代码时有几镜没写成（"
@@ -157,7 +181,10 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
                 sess=sess, artifact=artifact, jobs=jobs, attempt=attempt)
         except Exception as exc:
             lint_errs = getattr(exc, 'lint_errors', None) or []
-            detail = str(exc)[:500]
+            # 空的异常消息是真机出现过的状态：2026-10-20 那条 53 镜的活儿跑到
+            # assemble 93% 收口成 failed，`error` 字段是空的——一条跑了一小时四十分
+            # 的失败没有任何线索可查。异常本身没有话时，用类型名与最后一行堆栈兜住。
+            detail = str(exc)[:500] or _exc_digest(exc)
             if lint_errs:
                 detail += "：\n" + "\n".join(
                     f"  · {e.get('rule', '?')} L{e.get('line', '?')}: {e.get('msg', '')}"
@@ -1064,6 +1091,21 @@ class PatchCodeMotionVideoNode(MotionPatchBase, RenderCodeMotionVideoNode):
                            "**一镜都不重烧**（命中缓存的镜照样被加上新档）；"
                            "不传就沿用 base 那一版的档",
         },
+        "film": {
+            "type": "object",
+            "description": "整片观感那几栏：{palette?, caption_style?, highlight_style?, texture?}。"
+                           "前三栏是色板名与两档字幕形态，值必须取自计划卡同一份枚举"
+                           "（认不出的会把这一版退回，不静默落成「没选」）；"
+                           "它们进按镜缓存键，换一栏**整片重烧**。texture 与顶层 texture 同义，"
+                           "跑在切片之后，一镜都不重烧。只改个别镜的质感请走 edits 的 "
+                           "/shots/i/texture。",
+            "properties": {
+                "palette": {"type": "string"},
+                "caption_style": {"type": "string"},
+                "highlight_style": {"type": "string"},
+                "texture": {"type": "string", "enum": list(cspec.TEXTURES)},
+            },
+        },
         "target_duration_sec": {
             "type": "number",
             "description": "目标秒数。**缺省沿用 base 那一版当初的承诺值**（从它的渲染任务行读），"
@@ -1096,7 +1138,9 @@ class PatchCodeMotionVideoNode(MotionPatchBase, RenderCodeMotionVideoNode):
             from ..motion import shot_writer
             wrote = await shot_writer.write_shot_code(
                 spec, user_id=state.user_id or "",
-                conversation_id=state.conversation_id or "")
+                conversation_id=state.conversation_id or "",
+                user_request=getattr(state, "user_request", "") or "",
+                storage=self.storage)
             if wrote["unwritten"]:
                 raise ValueError(
                     "局部改：有几镜按新 brief 没写成（"

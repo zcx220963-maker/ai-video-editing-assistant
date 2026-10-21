@@ -170,6 +170,17 @@ const grainTile = (variant: number, tile: number, freq: number) => {
 // 胶片颗粒：铺满父级（absolute inset 0）的灰度噪点层，每 step 帧换一次纹理与偏移（确定性）。
 // 亮场 opacity 0.04–0.08、暗场 0.06–0.12；blend 默认 overlay（暗场可试 'soft-light' / 'screen'）。
 // 用途：大面积渐变防色带、给平面 UI 一点胶片质感。放在要覆盖的内容之后（上层）。
+//
+// 上限 0.14（2026-10-21）：这是「质感」这一层的**物理上限**，不是口味。写手交过
+// `opacity={0.5} blend="normal"` 的一镜——那样铺一层中灰在画面上，等于把整帧的
+// 对比度砍半：底色与主体一起被洗成雾，用户的原话是「一点高质量的感觉都没有，
+// 起码要清晰吧」。颗粒是压在画上的细砂，不是盖在上面的毛玻璃；越过这条线，
+// 删掉比调小更接近他要的画面。夹住而不是抛错：一镜因为质感参数被拦下来，
+// 代价是整条渲染趟停在那一镜（「堵死比白烧更坏」），而缩小后的颗粒仍是他要的那一档。
+const GRAIN_MAX = 0.14;
+//: 已经提醒过的越界值。Remotion 是逐帧渲染，组件每帧都会被调用一次——
+//: 不记一下的话，一镜两三百帧会把同一个 warn 打两三百遍，日志里淹掉真正要看的读数。
+const grainWarned = new Set<number>();
 export const Grain: React.FC<{
   opacity?: number; step?: number; scale?: number; freq?: number;
   blend?: React.CSSProperties['mixBlendMode']; style?: React.CSSProperties;
@@ -179,9 +190,16 @@ export const Grain: React.FC<{
   const tile = 256;
   const ox = Math.floor(hash(k * 3 + 1) * tile);
   const oy = Math.floor(hash(k * 7 + 2) * tile);
+  const used = Math.min(Math.max(opacity, 0), GRAIN_MAX);
+  if (opacity > GRAIN_MAX && !grainWarned.has(opacity)) {
+    grainWarned.add(opacity);
+    // 走 console.warn 而不是静默：日志里能看见是哪一镜写的，评审据此提醒写手；
+    // 画面本身照常出片，不被一个手感参数卡住。
+    console.warn(`[dg] <Grain opacity={${opacity}}> 超过质感上限 ${GRAIN_MAX}，按 ${GRAIN_MAX} 绘制`);
+  }
   return (
     <div style={{
-      position: 'absolute', inset: 0, pointerEvents: 'none', opacity, mixBlendMode: blend,
+      position: 'absolute', inset: 0, pointerEvents: 'none', opacity: used, mixBlendMode: blend,
       backgroundImage: grainTile(k % 6, tile, freq), backgroundSize: `${tile * scale}px ${tile * scale}px`,
       backgroundPosition: `${ox}px ${oy}px`, ...style,
     }} />

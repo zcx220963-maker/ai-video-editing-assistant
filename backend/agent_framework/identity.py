@@ -25,6 +25,17 @@ class Identity:
     # 与 artifact_id 一样属于「这次是谁在跑」而不是「工具是什么」：MCP 包装层在
     # 发请求前覆写，模型在 schema 里看不到来源，也就编不出一个不存在的包名。
     style_skill: str = ""
+    # 用户这一轮的原话。空串 = 不注入。
+    #
+    # 2026-10-20：节点 schema 里的 `user_request` 以前只能靠模型自己填，模型写的是
+    # 一句概括；真正画每一镜的写手看到的又是再往下加工一层的 brief，用户的原话在
+    # 两轮转述之后就没了。这里按 `user_id` 的同一条纪律由 run 入口写入、MCP 包装层
+    # 覆写：模型改不动，节点拿到的是用户本人说的那一句。
+    user_request: str = ""
+    # 这一轮用户选了「直接出片」：出片前不再弹确认卡、也不预渲静帧。
+    # 与 style_skill 同一条纪律：它属于「这次是谁在跑」，由 run 入口写、MCP 包装层覆写，
+    # 模型在 schema 里只看到一个布尔，编不出开关。
+    go_straight: bool = False
 
     @property
     def session_id(self) -> str:
@@ -120,7 +131,21 @@ def rebind_artifact_scope(artifact_id: str) -> None:
     cur = _current.get()
     if cur is not None and artifact_id and artifact_id != cur.artifact_id:
         _current.set(Identity(cur.user_id, cur.conversation_id, artifact_id,
-                              cur.style_skill))
+                              cur.style_skill, cur.user_request, cur.go_straight))
+
+
+def rebind_style_skill(style_skill: str) -> None:
+    """就地换掉本上下文链上的风格包（用户与会话不变）。
+
+    用户在对话里说「换成水墨风」时，工具在**这一轮**就把新包做好；之后同一轮里的
+    `plan_motion` / `render_motion_code` 必须立刻按新包走，不能等到下一条消息。
+    身份是 frozen dataclass，所以换的是 contextvar 里那个对象——外层 ``use_identity``
+    退出时仍会 reset 它自己设的值，不会外泄。
+    """
+    cur = _current.get()
+    if cur is not None and style_skill != cur.style_skill:
+        _current.set(Identity(cur.user_id, cur.conversation_id, cur.artifact_id,
+                              style_skill, cur.user_request, cur.go_straight))
 
 
 def current_identity_or(user_id: str = "default",
@@ -135,9 +160,11 @@ def current_identity_or(user_id: str = "default",
 
 @contextmanager
 def use_identity(user_id: str, conversation_id: str, artifact_id: str = "",
-                 style_skill: str = ""):
+                 style_skill: str = "", user_request: str = "",
+                 go_straight: bool = False):
     """在 with 块内把身份绑定到当前执行上下文（含其 await 出去的所有层）。"""
-    token = _current.set(Identity(user_id, conversation_id, artifact_id, style_skill))
+    token = _current.set(Identity(user_id, conversation_id, artifact_id, style_skill,
+                                  user_request, go_straight))
     try:
         yield _current.get()
     finally:
@@ -146,26 +173,32 @@ def use_identity(user_id: str, conversation_id: str, artifact_id: str = "",
 
 @contextmanager
 def use_identity_or_inherit(user_id: str, conversation_id: str, artifact_id: str = "",
-                            style_skill: str = ""):
+                            style_skill: str = "", user_request: str = "",
+                            go_straight: bool = False):
     """同上，但已在某次 run 之内时**继承**外层身份而不覆写。
 
     常驻子 Agent / spawn 出来的下游 Agent 有自己的会话键（各自的历史分片），
     但它们干的是同一位用户在同一会话里的活：素材 owner、收件箱与任务板作用域
     必须跟着外层，否则队友会查不到用户的素材、读不到发给它的消息。
 
-    例外是 ``artifact_id`` 与 ``style_skill``：外层没有它（空串）而本次显式给了
-    （分叉重跑带着新产物集，或本轮用户选了风格包），则以本次为准——只补空位，
-    不覆盖外层已有的值。
+    例外是 ``artifact_id``、``style_skill`` 与 ``user_request``：外层没有它（空串）
+    而本次显式给了（分叉重跑带着新产物集、本轮用户选了风格包、或 run 入口带着用户
+    原话），则以本次为准——只补空位，不覆盖外层已有的值。
     """
     cur = _current.get()
     if cur is not None:
         # 外层已有身份：只补空位，不覆盖非空值。风格包同一道理——子 Agent 继承
         # 本轮用户选的包，不能因为自己没拿到这个参数就把整轮风格清空。
         merged, token = cur, None
-        if (artifact_id and not cur.artifact_id) or (style_skill and not cur.style_skill):
+        if ((artifact_id and not cur.artifact_id)
+                or (style_skill and not cur.style_skill)
+                or (user_request and not cur.user_request)
+                or (go_straight and not cur.go_straight)):
             merged = Identity(cur.user_id, cur.conversation_id,
                               artifact_id or cur.artifact_id,
-                              style_skill or cur.style_skill)
+                              style_skill or cur.style_skill,
+                              user_request or cur.user_request,
+                              go_straight or cur.go_straight)
             # **补上的空位必须真的推进 contextvar**：工具读身份走 `current_identity()`，
             # 只 yield 一个合并值等于没给——分叉重跑带着新 artifact_id 进来，节点仍在
             # 旧产物集上写；同理子 Agent 拿不到本轮选的风格包。只在确实补了值时 set，
@@ -177,5 +210,6 @@ def use_identity_or_inherit(user_id: str, conversation_id: str, artifact_id: str
             if token is not None:
                 _current.reset(token)
         return
-    with use_identity(user_id, conversation_id, artifact_id, style_skill) as ident:
+    with use_identity(user_id, conversation_id, artifact_id, style_skill,
+                      user_request, go_straight) as ident:
         yield ident

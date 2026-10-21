@@ -143,12 +143,15 @@ def _ask(*, text: str, subject: str, art: Mapping[str, Any],
                      f"（模板 {manifest.get('template') or '无'}）")
         for key, label in (("composition", "构图"), ("recurring_pose", "贯穿姿势"),
                            ("recurring_prop", "贯穿道具"), ("caption", "字幕"),
-                           ("inscription", "铭文"), ("avoid", "不要出现")):
+                           ("inscription", "铭文"), ("avoid", "不要出现"),
+                           # 用户在前端写给评审这一层的话（2026-10-21）：属于这份
+                           # 风格的数据；空着整行不出现。
+                           ("review_note", "用户补充：写给评审")):
             value = manifest.get(key)
             if isinstance(value, (dict, list)):
                 value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
             if str(value or "").strip():
-                lines.append(f"  {label}：{value}")
+                lines.append(f"  {label}：{str(value)[:1200]}")
         # 不变量是沉淀分析从参考片量出来的，和写手看到的是同一份数据：
         # 评审只拿「什么不能换」去判，不拿模板代码的某一种外形去判。
         from .shot_writer import _style_invariant_lines
@@ -205,6 +208,7 @@ async def review_stills(*, shots: Sequence[Mapping[str, Any]],
                         stills: Mapping[str, Any], art: Mapping[str, Any] | None = None,
                         prop: str = "", style: str = "", grammar: str = "",
                         style_pack: Mapping[str, Any] | None = None,
+                        references: Sequence[bytes] = (),
                         user_id: str = "", conversation_id: str = "",
                         llm: Any = None) -> dict[str, Any]:
     """逐镜看预览静帧 → ``{checked, passed, failed, unjudged, scores, cost_yuan}``。
@@ -268,7 +272,15 @@ async def review_stills(*, shots: Sequence[Mapping[str, Any]],
                 "scores": verdict["scores"],
             })
 
-    await asyncio.gather(*(one(str(sid), p) for sid, p in sorted(stills.items())))
+    items = sorted(stills.items())
+    rate = _review_rate()
+    if rate <= 0:
+        items = []
+    elif rate < 1.0 and items:
+        # 隔 round(1/rate) 镜取一镜：0.34 → 每 3 镜看 1 镜。排序后取，确定性。
+        step = max(1, round(1.0 / rate))
+        items = items[::step]
+    await asyncio.gather(*(one(str(sid), p) for sid, p in items))
     for key in ("passed", "unjudged"):
         out[key].sort()
     out["failed"].sort(key=lambda x: x["shot"])
@@ -291,23 +303,50 @@ REWRITE_PARALLEL = max(1, int(os.environ.get("MOTION_REWRITE_PARALLEL", "4") or 
 
 
 def review_enabled(spec: Mapping[str, Any]) -> bool:
-    """这一趟开不开视觉评审：spec 那一栏优先，缺省跟随环境变量，再缺省开。"""
+    """这一趟开不开视觉评审：spec 那一栏优先，缺省跟随环境变量，**再缺省关**。
+
+    2026-10-20 从「缺省开」改成「缺省关」。原因不是评审没用，而是它一直在替一个
+    结构问题兜底：镜头代码自己画整帧，外框/字幕/主体各画各的，于是只能出图后再找
+    一台看图模型去挑「字幕压住主体」。片壳上线后外框由 entry 层独占，这类问题在
+    结构上不成立；其余的批评交给用户自己在成片上抽检——缺省路径上不该有一趟
+    「按镜计费、还要重写重渲」的模型调用。
+    要开就显式设 `MOTION_VISUAL_REVIEW=1`（配 `MOTION_VISUAL_REVIEW_RATE` 抽样）。
+    """
     raw = spec.get("visual_review") if isinstance(spec, Mapping) else None
     if isinstance(raw, bool):
         return raw
-    return os.environ.get("MOTION_VISUAL_REVIEW", "1") not in ("0", "false", "no")
+    return os.environ.get("MOTION_VISUAL_REVIEW", "0") not in ("0", "false", "no", "")
+
+
+def _review_rate() -> float:
+    """显式开启评审时看几成镜（0~1，缺省 1.0=全看）。
+
+    用户要的是「出片之后按 1/3 抽检」：把这一栏设成 0.34，就每三镜看一镜，
+    抽样按镜号排序隔几镜取一镜——确定性，同一份分镜每次抽到的是同一批。
+    """
+    try:
+        rate = float(os.environ.get("MOTION_VISUAL_REVIEW_RATE", "1") or 1)
+    except (TypeError, ValueError):
+        rate = 1.0
+    return min(1.0, max(0.0, rate))
 
 
 async def rewrite_failed(*, spec: dict[str, Any], failed: Sequence[Mapping[str, Any]],
                          user_id: str = "", conversation_id: str = "",
                          llm: Any = None, client: Mapping[str, Any] | None = None,
                          limit: int | None = None,
-                         stills: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                         stills: Mapping[str, Any] | None = None,
+                         user_request: str = "",
+                         prefix: str = "上一版静帧的问题") -> dict[str, Any]:
     """红镜逐镜重写（``shot_writer.rewrite_shot_code``），原地改 ``spec["shots"]``。
 
     → ``{rewritten: {镜号: {...}}, skipped: [镜号], cost_yuan, calls}``。
     ``skipped`` 是超出预算（``MAX_REWRITES``）或重写没写成的镜——回执要能回答
     「哪几镜没改、为什么」。
+
+    ``prefix`` 是交给写手那一句的抬头。视觉评审用的是「上一版静帧的问题」；预览阶段
+    发现代码编译不过时没有静帧可看，抬头换成「这一镜的代码编译不过」——不然写手会
+    去找一张不存在的图。
 
     ``stills`` 是 ``{镜号: 本地静帧路径}``：**把上一版那张图一并交给写手**。
     只给文字批评时，写手是在改自己想象中的画面；给了图，它才看得见「空心方框」「线框
@@ -330,14 +369,14 @@ async def rewrite_failed(*, spec: dict[str, Any], failed: Sequence[Mapping[str, 
 
     async def one(item: Mapping[str, Any]) -> None:
         sid = str(item.get("shot"))
-        critique = (f"上一版静帧的问题：{item.get('why') or '评审没给理由'}"
+        critique = (f"{prefix}：{item.get('why') or '评审没给理由'}"
                     f"\n改法：{item.get('fix') or '按五条里最低的那几条改'}")
         async with gate:
             try:
                 got = await shot_writer.rewrite_shot_code(
                     rows[sid], critique=critique, spec=spec, user_id=user_id,
                     conversation_id=conversation_id, llm=llm, client=client,
-                    still=(stills or {}).get(sid))
+                    still=(stills or {}).get(sid), user_request=user_request)
             except Exception as exc:  # noqa: BLE001 —— 一镜重写失败不带塌整份
                 out["skipped"].append(sid)
                 out["rewritten"][sid] = {

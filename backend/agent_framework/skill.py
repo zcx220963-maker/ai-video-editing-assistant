@@ -72,6 +72,14 @@ class Skill:
     # 磁盘 frontmatter 写一行 JSON 字符串——两种都在 `_to_skill` 归一到 dict。
     style_manifest: dict[str, Any] = field(default_factory=dict)
     owner_user_id: str | None = None   # None = 系统内置；非空 = 该用户私有
+    # 分段归属（frontmatter `readers:`，形如 `code-manual=writer, film-knobs=both`）：
+    # **这一段是给谁看的**。只影响分段目录上的一行标签，不删正文、不拦读取。
+    # 真机账（2026-10-21，run 006aa898d4fa）：规划轮 68 次迭代全在 load_skill，
+    # 单次 prompt 到 195K token、累计 8.77M——其中 23.5 KB 是「怎么写一镜代码」的
+    # 手册，而规划轮交的是 brief，代码由 `shot_writer._contract()` 从同一份正文里
+    # 按标题截取后逐镜喂给写手。目录写成什么样，模型就读多少；标了 writer 的块
+    # 就是告诉它这一块不用读，而不是不给它读。
+    readers: dict[str, str] = field(default_factory=dict)
 
     # ---- 分段键（T42，§5.7 第②条）----
 
@@ -139,6 +147,23 @@ def _parse_requires(raw: str) -> list[str]:
 
 def _is_true(value: Any) -> bool:
     return str(value).strip().lower() in ("true", "1", "yes")
+
+
+def _parse_readers(raw: Any) -> dict[str, str]:
+    """解析 frontmatter 的 ``readers:``：``code-manual=writer, film-knobs=both``。
+
+    与 ``_parse_sections`` 同一种「一行逗号分隔」，只是值是归属而不是布尔。
+    认得的归属只有三种：``writer``（逐镜写码侧）、``planner``（规划侧）、``both``；
+    写别的词**原样保留**、目录上按「不属于任何一侧」不打标签——归属是给人看的
+    说明，写错一个词不值得让整份技能加载失败。
+    """
+    out: dict[str, str] = {}
+    for tok in str(raw or "").replace(";", ",").split(","):
+        key, _, val = tok.partition("=")
+        key, val = key.strip().strip("\"'"), val.strip().strip("\"'").lower()
+        if key and val:
+            out[key] = val
+    return out
 
 
 def _parse_sections(raw: Any) -> list[str]:
@@ -270,7 +295,8 @@ def section_catalog(body: str) -> list[tuple[str, str, int]]:
 
 
 def section_directory_line(body: str, *, planned: Iterable[str] = (),
-                           included: bool | None = True) -> str:
+                           included: bool | None = True,
+                           readers: Mapping[str, str] | None = None) -> str:
     """一行式的分段目录（含「本轮计划用得上哪几块」），没标记就回空串。
 
     ``planned`` 是 ``plan.skills.sections_for_plan`` 的读法（本轮计划命中的那几块）。
@@ -282,20 +308,31 @@ def section_directory_line(body: str, *, planned: Iterable[str] = (),
     ``True`` 整份加载给的是全文；``False`` = ``preload_skills`` 给的是默认集
     （不含）；``None`` = 正文超过整份上限、这次只给目录，正文根本没随附。
     说反了模型会拿"上面那份里就有"去上面找。
+
+    ``readers``（frontmatter ``readers:``）给每块打一个归属标签；今天只标
+    ``writer``——「逐镜写码侧」。**这是说明，不是闸**：标了的块照样能取，只是
+    目录上先告诉它「这一块系统会直接喂给写手，规划阶段不用读」。真机上规划模型
+    看到 10 块无名目的条目就一块一块顺读，读到硬上限还在空转；把「谁需要」写在
+    目录里，比等它读完再提醒省得多。
     """
     rows = section_catalog(body)
     if not rows:
         return ""
     want = {str(s).strip() for s in (planned or ()) if str(s).strip()}
-    parts = [f"{name}（{title or '—'}，{size} B）" + ("**本轮计划用得上**" if name in want
-                                                   else "")
+    tag_of = {str(k): str(v).strip().lower() for k, v in (readers or {}).items()}
+    parts = [f"{name}（{title or '—'}，{size} B）"
+             + ("·写手侧" if tag_of.get(name) == "writer" else "")
+             + ("**本轮计划用得上**" if name in want else "")
              for name, title, size in rows]
     where = ("这一份正文里也有它们" if included is True
              else "**上面这份正文里没有它们**，要就照下面取" if included is False
              else "**这次只给了目录，正文没有随附**，要就照下面取")
+    note = ("标『写手侧』的那几块是**逐镜写码的规范**（组件、画法、动效阈值）——系统会把"
+            "同一份正文里这几块直接喂给写手，规划阶段交的是每镜 brief，不用读它们。"
+            if any(v == "writer" for v in tag_of.values()) else "")
     return (f"\n\n（这份技能按小节分了几块：{'；'.join(parts)}。{where}——"
             f'要哪一块单独取：load_skill(name=..., section=键名)；'
-            f"为其中一块翻整份（几十 KB、一次就把上下文预算吃掉大半）不划算。）")
+            f"为其中一块翻整份（几十 KB、一次就把上下文预算吃掉大半）不划算。{note}）")
 
 
 async def _one_chunk(data: bytes) -> AsyncIterator[bytes]:
@@ -335,6 +372,7 @@ class SkillLoader:
             # 分了哪几块，事实保证块真的存在——对账（声明 ⊆ 事实、事实 ⊆ 声明）由
             # `tests/test_skill.py` 判红，不许只写一头。
             declared_sections=_parse_sections(fm.get("sections", "")),
+            readers=_parse_readers(fm.get("readers", "")),
             kind=str(fm.get("kind") or "workflow").strip() or "workflow",
             style_manifest=_parse_manifest(fm.get("style_manifest")),
             owner_user_id=row.get("owner_user_id"),
@@ -534,11 +572,18 @@ class SkillManifestContextSource:
         manifest = "<skills>\n" + "\n".join(s.manifest_lines() for s in skills) + "\n</skills>"
         sections = [manifest]
 
-        # 常驻：always 且可用 → 直接附正文
+        # 常驻：always 且可用 → 附正文。
+        #
+        # 2026-10-20：声明过 `sections:` 的技能按**声明集**装配，而不是整份正文。
+        # 真机上规划模型每轮都背着十多万字的流程技能，用户那几十个字的诉求在里面
+        # 不到千分之一，输出自然收敛成手册里的默认样子（「总是走模板」的根）。声明集
+        # 之外的大块（写码手册、画面目录）留给写手按标题取，不再进规划上下文。
+        # 没声明 `sections:` 的技能原样注入——这一层对它们是纯增益。
         for s in skills:
             if s.always and s.available and s.body:
+                body = s.assemble(s.declared_sections) if s.declared_sections else s.body
                 sections.append(
-                    f'<skill_instructions name="{s.name}">\n{s.body}\n</skill_instructions>'
+                    f'<skill_instructions name="{s.name}">\n{body}\n</skill_instructions>'
                 )
         return "\n\n".join(sections)
 
@@ -727,6 +772,17 @@ class LoadSkillTool(Tool):
             return f"Error: 未找到技能 {name}"
         if not skill.available:
             return f"Error: 技能 {name} 不可用（{skill.unavailable_reason}）"
+        # 记下「这条 run 真读过哪份技能」：工具面据此摘掉结构性岔路（见
+        # `agent._motion_task` 与 `RunState.skills_loaded`）。尽力而为——记不上
+        # 只影响下一轮的工具裁剪，不该让一次读取失败。
+        try:
+            from .hooks import _current_hook_ctx
+            ctx = _current_hook_ctx.get()
+            st = getattr(ctx, "state", None) if ctx is not None else None
+            if st is not None and str(name) not in st.skills_loaded:
+                st.skills_loaded.append(str(name))
+        except Exception:  # noqa: BLE001 - 记账失败不打断读取
+            pass
         rel = (path or "").strip().lstrip("/")
         if rel:
             return await self._read_file(skill, rel, offset=offset, limit=limit)
@@ -746,7 +802,7 @@ class LoadSkillTool(Tool):
             size = len(skill.body.encode("utf-8"))
             if size <= _WHOLE_BODY_MAX_BYTES:
                 return (f"{head}{self._outline(skill.body)}"
-                        f"{section_directory_line(skill.body, included=True)}"
+                        f"{section_directory_line(skill.body, included=True, readers=skill.readers)}"
                         f"\n{SKILL_INDEX_END}"
                         f"\n{skill.body}{self._paging_note(name, skill.body)}")
             # 大正文：只给索引。分段目录必须排在 SKILL_INDEX_END **之前**——折叠闸
@@ -754,7 +810,7 @@ class LoadSkillTool(Tool):
             # 不知道键名，又会开始顺读（见 `_WHOLE_BODY_MAX_BYTES` 的注释）。
             total = len(skill.body.splitlines())
             return (f"{head}{self._outline(skill.body)}"
-                    f"{section_directory_line(skill.body, included=None)}"
+                    f"{section_directory_line(skill.body, included=None, readers=skill.readers)}"
                     f"\n{SKILL_INDEX_END}\n"
                     f"（这份正文共 {total} 行、{size} 字节，超过一次整份给的上限 "
                     f"{_WHOLE_BODY_MAX_BYTES} 字节——**{INDEX_ONLY_NOTE}**。"

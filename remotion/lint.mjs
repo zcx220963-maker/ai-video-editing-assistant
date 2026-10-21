@@ -40,6 +40,12 @@ function commonRules() {
     'dg/font-load-check': 'error',
     'no-restricted-globals': ['error', ...RESTRICTED_GLOBALS],
     'no-restricted-syntax': ['error', ...RESTRICTED_SYNTAX],
+    // 2026-10-20 真机：s05 一镜里 `const backX` 写了两次，lint 回 ok:true，一路走到
+    // 打包才炸（`The symbol "backX" has already been declared`）——而那一炸发生在
+    // 预览静帧那一趟，确认卡上这一镜就只剩「无预览」，渲染时还会整片中停。核心规则
+    // 的 `no-redeclare` 在 TS 解析器下就能报这一句（`'x' is already defined.`），
+    // 零成本、不误伤（它只认同一作用域里的重复绑定）。
+    'no-redeclare': 'error',
   };
 }
 

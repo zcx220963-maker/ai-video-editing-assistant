@@ -94,6 +94,7 @@ from agent_framework.team_tools import (
 from agent_framework.tool import ToolRegistry
 from agent_framework.tools.cron import CronScheduler, register_cron_tools
 from agent_framework.tools.file import register_file_tools, session_workspace_root
+from agent_framework.tools.style import register_style_tools
 from agent_framework.mcp_manager import McpManager
 from agent_framework.tools.mcp import (
     MCPClient,
@@ -368,6 +369,9 @@ def build_runtime(
     register_fetch_media_tools(registry, storage=storage, policy=fetch_policy)
     # rerun_from：从某节点回退并重跑（上游产物复用、产物作用域换新）
     register_run_tools(registry, editing_contract)
+    # 画面风格：用户在对话里说一句（或贴参考视频/图片），直接改这个对话的风格包。
+    # 入口只在对话里——风格工作室与素材库的「沉淀模板」都不再对用户暴露。
+    register_style_tools(registry, storage=storage, llm=llm, mq=mq)
 
     # spawn：子 Agent 可用工具（文件 + 联网检索）；trace_mq 让子 Agent 工具调用也回投到
     # 父会话窗口。

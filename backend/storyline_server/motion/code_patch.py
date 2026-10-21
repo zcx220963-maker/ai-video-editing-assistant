@@ -105,6 +105,14 @@ def _parse_pointer(pointer: str) -> tuple[int, str, str] | str:
         return (i, segs[2], "")
     if len(segs) == 5 and segs[2] == "fields" and segs[4] == "value":
         return (i, "field", segs[3])
+    # 真机 490e71e20a19：模型连写三次 `/shots/4/brief`（brief 是这一镜的一栏，
+    # 但它在**整镜改写**的入口，不在指针白名单里），四次被拒后才放弃并改走
+    # rerun_from(plan_motion) 重做整片。这里把正路直接写进错误文案。
+    if len(segs) == 3 and segs[2] in EDITABLE_SHOT_FIELDS:
+        return (f"指针 {pointer!r} 不在白名单里：{segs[2]} 是整镜改写那一栏，"
+                "请走 shot_sets——{\"shot\": \"<这一镜的镜号>\", "
+                f"\"set\": {{\"{segs[2]}\": …}}}}；指针只收这五条："
+                + "、".join(POINTER_GRAMMAR))
     return (f"指针 {pointer!r} 不在白名单里。能改的就这五条："
             + "、".join(POINTER_GRAMMAR)
             + "；字段清单里还有 min/max/step/label 那几栏，它们不改像素也不该被改——"
@@ -221,12 +229,24 @@ def plan_code_patch(base: dict[str, Any], *,
             continue
         sid = str(item.get("shot") or "")
         current = shot_ids(doc["shots"])
+        if not sid and item.get("id"):
+            # 同一族真机错法：模型把镜号写成 `id`、把要改的栏摊平在条目上。
+            # 只说「不在这一版分镜里」它不知道是键名写错了，于是换个形状再试一遍。
+            _err(errors, f"改写 {n}：镜号的键名是 shot（不是 id）——"
+                         f"每条写成 {{\"shot\": \"{item.get('id')}\", "
+                         "\"set\": {\"brief\": …}}")
+            continue
         if sid not in current:
             _err(errors, f"改写 {n}：{sid} 不在这一版分镜里（现有：{'、'.join(current)}）")
             continue
         raw_set = item.get("set")
         if not isinstance(raw_set, Mapping) or not raw_set:
-            _err(errors, f"改写 {n}：set 必须是非空对象（这一镜要改成什么样的各栏值）")
+            flat = [str(k) for k in item if str(k) not in ("shot", "set")]
+            hint = (f"；你把 {'、'.join(flat)} 放在了条目上，应当放进 set："
+                    f"{{\"shot\": \"{sid}\", \"set\": {{\"{flat[0]}\": …}}}}"
+                    if flat else "")
+            _err(errors, f"改写 {n}：set 必须是非空对象（这一镜要改成什么样的各栏值）"
+                         f"{hint}")
             continue
         if "id" in raw_set:
             _err(errors, f"改写 {n}：set 里不许带 id（镜号是命中表与缓存的锚点）")

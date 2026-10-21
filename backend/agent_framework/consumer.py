@@ -18,6 +18,7 @@ from .connection_manager import OUTBOUND_TOPIC
 # ``storyline_session_id`` 上已经发生过一次）。这里只 import，不另写一份。
 from .identity import session_key
 from .mq import MessageQueue
+from .style_override import set_style_override
 
 CHAT_TOPIC = "chat"
 #: 新消息入口。auto：一句话直接进执行轮，没提到的创作决定由模型自己定，一路做到出片；
@@ -89,10 +90,19 @@ class SessionConsumer:
         # 用户在前端选的风格包；空串 = 不注入。只在**新开**的轮次里用，
         # resume/approve 从 checkpoint scope 取（那里记的是当初选的那个包）。
         style_skill = str(payload.get("style_skill") or "")
+        # 「直接出片」：不预渲静帧、出片前不等确认。同样只对新开的轮次有意义——
+        # 续跑那半截从 checkpoint scope 读回当初这一位（见 ``Agent.run`` 的注释）。
+        # 规划入口（ENTRY_PLAN）不吃这一位：那条路本来就要用户先点卡。
+        go_straight = bool(payload.get("go_straight"))
         # 「继续」是入口处的意图：帧里显式写了 resume 才续跑在途 run，否则新消息开新 run。
         resume = bool(payload.get("resume"))
         action = payload.get("action") or {}
         sid = session_key(user_id, conversation_id)
+        if payload.get("style_explicit"):
+            # 入口下拉里现点的一套是用户的明确决定，先落进会话表再去跑这一轮：
+            # 同一会话里先前在对话里换过的风格会一直压着身份里的值（见
+            # ``style_override``），不显式盖一次，下拉选了也等于没选。
+            set_style_override(sid, style_skill)
         # 有效 run_id：正常情况就是帧里那个；自动续跑时会换成真正在跑的 cp.run_id，
         # 好让终答与回投帧挂在同一条 run 上（否则前端忙等状态对不上，答复被丢）。
         effective_run_id = run_id
@@ -150,7 +160,7 @@ class SessionConsumer:
                     answer = await self.agent.handle(
                         user_id, conversation_id, message, run_id=run_id, stream=True,
                         attachments=attachments, resume=True,
-                        style_skill=style_skill)
+                        style_skill=style_skill, go_straight=go_straight)
                 else:
                     # 同会话有被打断的执行轮时自动续跑，而不是开新规划轮。
                     # 执行轮的 checkpoint 里带着完整的执行上下文（已加载的素材、ASR 结果等），
@@ -220,7 +230,8 @@ class SessionConsumer:
                             answer = await self.agent.handle(
                                 user_id, conversation_id, message, run_id=run_id,
                                 stream=True, attachments=attachments,
-                                style_skill=style_skill)
+                                style_skill=style_skill,
+                                go_straight=go_straight)
         except Exception as e:  # noqa: BLE001  失败也要回执，前端不能干等
             await self.mq.publish(
                 OUTBOUND_TOPIC,

@@ -167,6 +167,11 @@ export const ALLOWED_IMPORTS = new Set([
   // 这张白名单就是全部可用模板；新增模板时与 `backend/.../code_spec.py` 的
   // `_ALLOWED_IMPORTS` 同步。
   '@dg/lib/style/silhouette-history',
+  // 三维写实模板（2026-10-21）「暗房微距」：一件实物、一束光、一张深色台面。
+  // 用户要求「画面要写实」时走这一件——舞台/材质/灯光/相机/调色都在模板里，
+  // 镜头代码只摆实物。它底下的 ThreeCanvas 走 WebGL（容器里是 swangle），
+  // 与上面 `three` 三包同属三维通道；名单同样与 `code_spec.py` 同步。
+  '@dg/lib/style/cinema-studio',
   // 简笔画零件库（2026-10-17）。**逐件列，与 `@dg/lib/*` 同一口径**：每件是一个
   // 文件级的入口，模型 import 一件就拿到一支能被认出的东西的轮廓（人、机器、厂房、
   // 齿轮、图表…）。它们底下走的是 roughjs 的手绘线，所以这些件的 import 在

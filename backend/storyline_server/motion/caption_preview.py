@@ -137,7 +137,7 @@ def _spec(caption_style: str, highlight_style: str) -> dict[str, Any]:
     """合成一份最小整片参数：样张只要画幅、时长与字幕那两维。"""
     return {"fps": PREVIEW_FPS, "aspect": "portrait",
             "width": 1080, "height": 1920, "narration": False,
-            "caption_style": _pick(caption_style, cspec.CAPTION_STYLES, "on_picture"),
+            "caption_style": _pick(caption_style, cspec.CAPTION_STYLES, "outlined"),
             "highlight_style": _pick(highlight_style, cspec.HIGHLIGHT_STYLES, "color"),
             # 整片进出场关掉：那是一层整帧位移，样张要站在原地给人量位置。
             "entrance": "none", "exit": "none"}

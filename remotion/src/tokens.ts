@@ -85,17 +85,17 @@ export const FILM_GEOMETRY: Record<Aspect, FilmGeometry> = {
   portrait: {
     topSafe: 96, bottomSafe: 300, gutter: 72,
     caption: { height: 132, fontSize: 44, side: 72, radius: 14, padX: 34, padY: 18 },
-    bleedCaptionBottom: 120,
+    bleedCaptionBottom: 86,
   },
   landscape: {
     topSafe: 48, bottomSafe: 300, gutter: 60,
     caption: { height: 240, fontSize: 78, side: 108, radius: 25, padX: 60, padY: 32 },
-    bleedCaptionBottom: 72,
+    bleedCaptionBottom: 48,
   },
   square: {
     topSafe: 56, bottomSafe: 260, gutter: 64,
     caption: { height: 132, fontSize: 44, side: 72, radius: 14, padX: 34, padY: 18 },
-    bleedCaptionBottom: 96,
+    bleedCaptionBottom: 48,
   },
 } as const;
 
@@ -203,6 +203,21 @@ export interface FilmStyle {
   ink?: string;
   /** 强调色（色板的 accent）：高亮词块＝它加 40% 透明，撕纸下划线＝它原色。 */
   accent?: string;
+  /** 字幕字号系数（乘在 `fitCaptionFontSize` 上）。**只有风格包在 manifest 的
+   *  `caption.size` 里声明了才出现**（Python：`code_spec.film_style_of` →
+   *  `shot_input_props` 的 `film_style`）。缺席 = 用 `CAPTION_LOOK` 那一档的缺省，
+   *  于是没声明过的片子逐镜像素不变。 */
+  captionSize?: number;
+  /** 中英两行的次序：`en-zh`＝英文在上（缺省）、`zh-en`＝中文在上。同样只在
+   *  风格包 manifest 的 `caption.order` 声明了才出现。 */
+  captionOrder?: 'en-zh' | 'zh-en';
+  /** 满幅字幕**字块底边到画面底**的距离（占画面高的比例，0.005–0.3）。缺省落
+   *  `FILM_GEOMETRY[..].bleedCaptionBottom`（一行字）。同样只在 manifest 的
+   *  `caption.bottom` 声明了才出现。 */
+  captionBottom?: number;
+  /** 字幕字号硬上限（占画面高的比例，0.02–0.08）。缺省中英两行 0.036、只有中文 0.04。
+   *  只在 manifest 的 `caption.cap` 声明了才出现。 */
+  captionCap?: number;
   /** 整片美术方向。**只有 spec 真写了 `art` 才出现**（Python：`code_spec.norm_art`
    *  → `code_render.shot_input_props` 的 `artDirection`）。没写的片子这一栏缺席，
    *  于是所有既有镜的 `film` 读数与像素一个字节都不变。 */

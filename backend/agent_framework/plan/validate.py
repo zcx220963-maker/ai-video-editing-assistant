@@ -19,7 +19,7 @@ from .support import (PLAN_MAX_CANDIDATES, PLAN_STEPS_MAX, PlanIssues,
                       num, topology_view)
 from .structure import StructureChecks
 from .switches import USER_SAYS_MAX, switch_problems, value_rejected
-from .vocab import PlanVocabulary
+from .vocab import SYSTEM_INJECTED_PARAMS, PlanVocabulary
 
 
 class PlanValidator:
@@ -217,6 +217,12 @@ class PlanValidator:
                 continue
             key = clean(raw.get("key"))
             spec = props.get(key)
+            # 系统注入项既不进卡面清单，也不许模型在卡上造：
+            # 造出来就等于替用户决定「跳过预渲静帧 / 跳过出片前确认」。
+            if key in SYSTEM_INJECTED_PARAMS:
+                issues.error(f"计划 {tag} 第 {index} 步的参数「{key}」"
+                             f"由系统注入，不要做成开关。")
+                continue
             if spec is None:
                 # 打回时把**该节点真实的开关键**一并交出（T40 起这条比过去更必要）：
                 # 开关清单不再每个规划轮常发，只发本轮计划命中的那几个节点；冷启动

@@ -433,6 +433,8 @@ function resetEdits() {
   fieldScope.value = "";
   syncAsk.value = false;
   bgmEdit.value = { volume: null, duck: null };
+  Object.keys(filmEdit).forEach((k) => delete filmEdit[k]);
+  preview.value = null; previewErr.value = "";
   // 〈字段〉〈代码〉〈文案·出处〉是代码镜那三页，口播版只有「点一段改它的字段」那一页。
   tab.value = isTrack.value ? "cells" : "fields";
 }
@@ -513,7 +515,8 @@ const dirty = computed(() => Object.keys(deepEdits).length > 0
   || order.value.join(" ") !== baseIds.value.join(" ")
   || changedShots.value.size > 0
   || bgmEdit.value.volume !== null
-  || bgmEdit.value.duck !== null);
+  || bgmEdit.value.duck !== null
+  || filmDirty.value);
 
 // 时长：拖右边缘改的就是 min_duration_sec。有旁白时镜头长度归真实语音时长，
 // 这一栏只剩「下限」的意思——所以拖到配音秒数以下不会有任何效果，这里如实拦住。
@@ -861,6 +864,88 @@ const textureEffective = computed(() => String(rowOf(curSid.value)?.texture || "
 const setTexture = (v) => { if (texturePointer.value) setEdit(texturePointer.value, v); };
 const resetTexture = () => { if (texturePointer.value) delete deepEdits[texturePointer.value]; };
 
+// ---- 整片观感（调参台那四栏）+ 改之前先看三帧 ----
+// 这四栏是**整片**的：配色经 `film_style` 进每一镜的底/字/强调色，字幕形态与强调
+// 方式由片壳画，质感跑在切片之后的滤镜上。它们的候选、默认值、给值看的名字全部
+// 读命中表的 `controls`——前端再抄一份枚举，迟早出现「界面能选、渲出来不认」。
+// 前三栏在按镜缓存键里：换一栏整片重烧；质感不在：换它一镜都不重烧。两种代价在
+// `rebakeNote` 里分开说，不让「预计重烧 1 镜」与「整片重烧」看起来是一回事。
+const FILM_KNOB_LABEL = {
+  palette: "配色", caption_style: "字幕形态", highlight_style: "强调方式", texture: "整片质感",
+};
+const FILM_KNOB_KEYS = Object.keys(FILM_KNOB_LABEL);
+//: 进缓存键的那三栏（与后端 `FILM_KNOBS` 同一口径）：它们一变，全片重烧。
+const FILM_BAKE_KEYS = ["palette", "caption_style", "highlight_style"];
+const filmEdit = reactive({});          // key → 值（只在改过时存在）
+const filmBase = (k) => String(hm.value?.spec?.[k]
+  ?? ctl.value[k]?.default ?? (k === "texture" ? "none" : ""));
+const filmCur = (k) => (k in filmEdit ? filmEdit[k] : filmBase(k));
+const setFilm = (k, v) => {
+  if (String(v) === filmBase(k)) delete filmEdit[k];
+  else filmEdit[k] = String(v);
+};
+const filmKnobs = computed(() => FILM_KNOB_KEYS
+  .filter((k) => ctl.value[k])
+  .map((k) => {
+    const c = ctl.value[k] || {};
+    const labels = c.value_labels || {};
+    return {
+      key: k, label: FILM_KNOB_LABEL[k],
+      value: filmCur(k), now: filmBase(k),
+      options: (c.enum || []).map((o) => String(o)),
+      labelOf: (v) => labels[v] || (v === "none" ? "不加" : v),
+    };
+  }));
+const filmDirty = computed(() => Object.keys(filmEdit).length > 0);
+const filmBake = computed(() => Object.keys(filmEdit).some((k) => FILM_BAKE_KEYS.includes(k)));
+
+// 预览：只渲**播放头这一镜**的 2~3 帧。花的是补丁口百分之一的时间，所以可以边调边看；
+// 成片里其它镜的状态不会因此改变——这一趟不落盘、不动分镜。
+const preview = ref(null);              // {shot, stills, applied, film, rejected, look}
+const previewing = ref(false);
+const previewErr = ref("");
+const previewScale = 0.55;
+function filmBody() {
+  const out = {};
+  Object.entries(filmEdit).forEach(([k, v]) => { out[k] = v; });
+  return out;
+}
+/** 这一镜**声明的字段**里，用户在台上改过的那些（指针 → 值）。 */
+function previewFields(sid) {
+  const idx = baseIds.value.indexOf(sid);
+  const out = {};
+  if (idx < 0) return out;
+  Object.entries(editAccount.value).forEach(([p, value]) => {
+    const ss = segs(p);
+    if (ss[1] !== "shots" || Number(ss[2]) !== idx) return;
+    if (ss[3] === "fields" && ss[5] === "value" && ss[4]) out[ss[4]] = value;
+  });
+  return out;
+}
+async function previewShot() {
+  const sid = focusSid.value;
+  if (!sid || previewing.value) return;
+  previewing.value = true; previewErr.value = ""; preview.value = null;
+  try {
+    const r = await fetch("/motion/shot-preview", {
+      method: "POST", headers: hdr({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        artifact_id: artifact.value, conv_id: props.convId, shot: sid,
+        fields: previewFields(sid), film: filmBody(),
+        at: [0.15, 0.5, 0.85], scale: previewScale,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail?.error || j.detail || `HTTP ${r.status}`);
+    preview.value = j;
+  } catch (e) {
+    previewErr.value = String(e?.message || e);
+  } finally {
+    previewing.value = false;
+  }
+}
+const closePreview = () => { preview.value = null; previewErr.value = ""; };
+
 // ---- 带着这个选区去问（F4）----
 // 选中的是「这一版的这一段/这一块」，光说「把那句字幕改一下」模型得回头猜；
 // 把锚点原样贴进聊天框，AI 改与手工改用的就是同一个选中态。
@@ -929,6 +1014,7 @@ function payload() {
   if (now.join(" ") !== kept.join(" ")) body.reorder = now;
   if (bgmEdit.value.volume !== null) body.bgm_volume = bgmEdit.value.volume;
   if (bgmEdit.value.duck !== null) body.bgm_duck = bgmEdit.value.duck;
+  if (filmDirty.value) body.film = filmBody();
   return body;
 }
 const planBits = computed(() => {
@@ -941,6 +1027,7 @@ const planBits = computed(() => {
   if (p.reorder) bits.push("换序");
   if (p.bgm_volume !== undefined) bits.push(`音量→${p.bgm_volume}`);
   if (p.bgm_duck !== undefined) bits.push(p.bgm_duck ? "人声压低" : "不压低");
+  if (p.film) bits.push(`整片 ${Object.keys(p.film).map((k) => FILM_KNOB_LABEL[k] || k).join("、")}`);
   if (scopeTag.value) bits.push(scopeTag.value);
   return bits;
 });
@@ -970,6 +1057,11 @@ const rebakeNote = computed(() => {
   }
   const p = payload();
   const n = pixelTouched.value.size;
+  // 整片那三栏在按镜缓存键里：换一栏，每一镜的键都变，整片重烧。把这一档单独说，
+  // 不让它混进「预计重烧 N 镜」——后者读起来像一次小改动。
+  if (filmBake.value) {
+    return `整片重烧（配色/字幕形态/强调方式在缓存键里）${n ? ` · 另有 ${n} 镜内容改动` : ""}`;
+  }
   const tail = noBake.value.length
     ? ` · 另 ${noBake.value.length} 镜只改出处或质感（都不进缓存键，一帧不重烧）` : "";
   if (!p.reorder || n) return `预计重烧 ${n} 镜${tail}`;
@@ -1256,6 +1348,8 @@ loadHitmap(props.artifactId);
                   文案 · 出处 · {{ curSid }}</button>
                 <button :class="{ on: tab === 'texture' }" @click="tab = 'texture'">
                   质感 · {{ curSid }}</button>
+                <button :class="{ on: tab === 'film' }" @click="tab = 'film'">
+                  整片观感<em v-if="filmDirty">改过</em></button>
                 <button :class="{ on: tab === 'bgm' }" @click="tab = 'bgm'">
                   配乐</button>
               </template>
@@ -1487,6 +1581,32 @@ loadHitmap(props.artifactId);
               </div>
             </div>
 
+            <div v-else-if="tab === 'film'" class="me-form">
+              <div v-if="!filmKnobs.length" class="me-note">
+                这一版的编辑包里没有整片观感的控件声明（旧产物）——重新出片一次就有了。
+              </div>
+              <div v-for="k in filmKnobs" :key="'film-' + k.key" class="me-frow">
+                <label>{{ k.label }}</label>
+                <div class="me-line me-chips">
+                  <button v-for="o in k.options" :key="k.key + ':' + o"
+                          class="me-mini pick" :class="{ on: k.value === o }"
+                          @click="setFilm(k.key, o)">{{ k.labelOf(o) }}</button>
+                </div>
+                <div class="me-sub">
+                  现在是 <b>{{ k.labelOf(k.value) }}</b>
+                  <span v-if="k.value !== k.now">（这一版是 {{ k.labelOf(k.now) }}）</span>
+                  <button v-if="k.value !== k.now" class="me-mini"
+                          @click="setFilm(k.key, k.now)">↺ 改回</button>
+                </div>
+              </div>
+              <div class="me-note">
+                <b>配色</b>进每一镜的底色、字色与强调色；<b>字幕形态</b>与<b>强调方式</b>由片壳画字幕；
+                <b>整片质感</b>是切片之后那一趟滤镜（颗粒、暗角、偏色）。<br />
+                前三样在<b>按镜缓存键</b>里——换一栏，每一镜都要重烧；质感不在，
+                换它一镜都不重烧。改之前先点下面的「先看三帧」，别拿一整片去试一个颜色。
+              </div>
+            </div>
+
             <div v-else-if="tab === 'bgm'" class="me-form">
               <div class="me-frow">
                 <label>配乐 ref</label>
@@ -1530,6 +1650,9 @@ loadHitmap(props.artifactId);
                 <div class="me-progressbar"><i :style="{ width: `${progress.percent}%` }"></i></div>
                 <span>{{ progress.status }} · {{ progress.stage || "—" }} · {{ progress.percent }}%</span>
               </div>
+              <button class="me-btn" :disabled="!focusSid || previewing" @click="previewShot">
+                {{ previewing ? "正在渲这三帧…" : "👁 先看三帧（不烧片）" }}
+              </button>
               <button class="me-btn primary big" :disabled="!dirty || !!busy" @click="submit">
                 {{ busy ? "局部改进行中…" : `提交局部改（${plan}）` }}
               </button>
@@ -1542,6 +1665,46 @@ loadHitmap(props.artifactId);
           </aside>
         </div>
       </template>
+
+      <!-- 「先看三帧」：只渲播放头这一镜的 2~3 帧，盖在编辑器上面。
+           为什么单开一层而不是塞进右边栏：三张 16:9 并排需要整块宽度；右栏 400px
+           里只能看图钉，看不出配色和字幕形态的差别。 -->
+      <div v-if="preview || previewErr || previewing" class="me-pvwrap" @click.self="closePreview">
+        <div class="me-pv">
+          <header>
+            <b>这一镜改完长什么样</b>
+            <span class="me-sub">只渲 {{ preview?.shot || focusSid }} 的几帧 · 不落盘、不动分镜</span>
+            <button class="me-x" @click="closePreview">✕ 关掉</button>
+          </header>
+          <div v-if="previewing" class="me-note pad">正在渲…（一张静帧约是整镜的百分之一）</div>
+          <div v-else-if="previewErr" class="me-fail">{{ previewErr }}</div>
+          <template v-else-if="preview">
+            <div class="me-pvrow">
+              <figure v-for="s in preview.stills" :key="s.frame">
+                <img :src="`data:image/jpeg;base64,${s.jpeg_b64}`" :alt="`第 ${s.frame} 帧`" />
+                <figcaption>第 {{ s.frame }} 帧<template v-if="s.look && s.look !== '无'"> · {{ s.look }}</template></figcaption>
+              </figure>
+            </div>
+            <div class="me-pvfoot">
+              <span v-if="Object.keys(preview.film || {}).length">
+                整片：{{ Object.entries(preview.film).map(([k, v]) => `${FILM_KNOB_LABEL[k] || k}→${v}`).join("、") }}
+              </span>
+              <span v-if="Object.keys(preview.applied || {}).length">
+                这一镜：{{ Object.entries(preview.applied).map(([k, v]) => `${k}=${v}`).join("、") }}
+              </span>
+              <span v-if="!preview.stills?.length" class="me-sub">没有渲出图（这一镜的代码没交出来）</span>
+            </div>
+            <div v-if="(preview.rejected || []).length" class="me-fail">
+              <b>这几栏没生效</b>
+              <ul><li v-for="r in preview.rejected" :key="r.name">{{ r.name }}：{{ r.why }}</li></ul>
+            </div>
+            <div class="me-note">
+              这是预览，不是成片：改动还没落下去。看着可以，再点「提交局部改」——
+              那时才按镜重烧并生成新版本。
+            </div>
+          </template>
+        </div>
+      </div>
   </div>
 </template>
 
@@ -1697,4 +1860,20 @@ loadHitmap(props.artifactId);
 .me-note { font-size: 11px; color: var(--ink-soft); }
 .me-note.pad { padding: 14px 16px; }
 .me-err { font-size: 12px; color: var(--vermilion); padding: 14px 16px; }
+/* 「先看三帧」：盖在编辑器上面的一层。fixed 而不是 absolute——.me-panel 自己滚动，
+   绝对定位会跟着滚走；这一层要始终压在正在改的那一镜上。 */
+.me-pvwrap { position: fixed; inset: 0; z-index: 40; background: rgba(20, 18, 16, .42);
+  display: flex; align-items: center; justify-content: center; padding: 24px; }
+.me-pv { background: var(--paper); border-radius: 10px; border: 1px solid var(--line);
+  max-width: min(1180px, 96vw); max-height: 90vh; overflow: auto; padding: 14px 16px 16px;
+  display: grid; gap: 10px; box-shadow: 0 18px 48px rgba(0, 0, 0, .28); }
+.me-pv header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.me-pv header b { font-family: var(--serif); font-size: 15px; }
+.me-pv header .me-x { margin-left: auto; }
+.me-pvrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.me-pvrow figure { margin: 0; }
+.me-pvrow img { width: 100%; border-radius: 6px; border: 1px solid var(--line); display: block; }
+.me-pvrow figcaption { font-size: 11px; color: var(--ink-soft); margin-top: 3px; }
+.me-pvfoot { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--ink-soft); }
+.me-fail ul { margin: 4px 0 0; padding-left: 18px; }
 </style>

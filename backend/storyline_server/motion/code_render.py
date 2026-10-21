@@ -47,6 +47,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
@@ -942,6 +943,9 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
     空壳，而没有人会想到去看母版那行代码。
     """
     window = cspec.shot_motion_window(frames)
+    # 片壳（2026-10-20）：选了壳的片子，外框与**底部字幕**由 entry 层的壳画。
+    # 这一栏同时也是渲染入口的结构检查（`server.mjs assertShellContract`）的依据。
+    shell = str(spec.get("shell") or "").strip()
     props: dict[str, Any] = {
         # `shotId` 2026-10-16 摘：它原来只为一件事存在——渲染侧据此把 `publicDir`
         # 指到 `public/assets/<sid>/`，让那一镜的上传件能按镜号找到。上传件不上屏
@@ -959,16 +963,22 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
         "width": int(spec["width"]),
         "height": int(spec["height"]),
         "text": str(shot.get("text") or ""),
+        # 中英双字幕（2026-10-21）：英文那一行是**独立注入**的，不拼进 `text`——
+        # `text` 是逐词点亮与高亮词比对的基准，拼进去会让「某个词在第几个字」全错位。
+        # 空串不发（老片子的 input_props 一个字节不变，母版读不到就当没有英文行）。
+        **({"textEn": str(shot["text_en"])} if str(shot.get("text_en") or "").strip() else {}),
         "highlight": [str(h) for h in (shot.get("highlight") or [])],
         "words": frame_words,
         # 层E2（R19）/ 字幕两维（2026-10-16）：**这一镜**的档——先看镜级覆盖，
         # 没有才回落整片那一档。画字那侧读的就是这两个键，它不必知道「逐镜」这件事：
         # 「整片一档」与「逐镜覆盖」在它看来是同一件事，区别只在注入时谁赢。
-        # 缺省是「贴画面 + 关键词换色」——用户否掉了纸条，缺省就得是那个不像 PPT 的组合。
+        # 缺省是「白字黑边 + 整条同色」——白字黑边是读得出来的一档，关键词换色会让
+        # 几枚词突然变强调色，整条字幕看着不统一（2026-10-20 真机）。要关键词上色，
+        # 就在整片/这一镜显式写 `highlight_style: color`。
         "captionStyle": str(shot.get("caption_style")
-                            or spec.get("caption_style") or "on_picture"),
+                            or spec.get("caption_style") or "outlined"),
         "highlightStyle": str(shot.get("highlight_style")
-                              or spec.get("highlight_style") or "color"),
+                              or spec.get("highlight_style") or "plain"),
         # 这一镜的字幕**由代码自己摆**（代码里有 `<CaptionLayer/>` 或构图的
         # `<CaptionText/>`）——母版那条让位，否则同屏两条字幕。判据是**代码的静态事实**
         # （`cspec.caption_any_by_code`：2026-10-18 起自排字幕是缺省写法，只认整条
@@ -976,7 +986,10 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
         # 代码，而「有没有第二条」此时此地就定了。
         # 一栏布尔，不按「申报了才发」那一套省——母版那侧读的是真值（`=== true`），
         # 缺席与 false 同一件事，少一个「有没有这一栏」的分支。
-        "captionFromCode": cspec.caption_any_by_code(
+        # 片壳模式下字幕**归壳**：镜头代码里就算写了 `<CaptionText>`（招牌、图表上的字
+        # 是画里的东西），也不能让母版让位——否则底部那条整片一致的字幕会消失。
+        # 于是这一栏在选了壳时恒为 false，母版照画。
+        "captionFromCode": False if shell else cspec.caption_any_by_code(
             str(shot.get("code") or ""),
             template_slots=cspec.style_template_slots(spec)),
         "fields": cspec.field_values(shot),
@@ -999,6 +1012,14 @@ def shot_input_props(shot: Mapping[str, Any], spec: Mapping[str, Any], *,
     film_style = cspec.film_style_of(shot, film=spec)
     if film_style:
         props["film_style"] = film_style
+    # 片壳（2026-10-20）：**只在真选了壳时才发**——理由与 `film_style` 同一条：
+    # 给没选壳的镜塞一个空 `shell`，props 白涨字节，而 entry 读不到就当缺省
+    # （原来的测量壳），老片子逐字节不变。`shellLabel` 同理，空串不发。
+    if shell:
+        props["shell"] = shell
+        label = str(spec.get("shell_label") or "").strip()
+        if label:
+            props["shellLabel"] = label[:cspec.SHELL_LABEL_MAX_CHARS]
     # 整片美术方向（2026-10-18）。**只在真写了时才发**——理由与 `film_style` 同一条：
     # 没写 `art` 的片子 props 逐字节不变，缓存命中的老镜一个也不会因此重烧。
     # 读它的是两处：`resolveFilmStyle` 把归一后的缺省合进风格档，镜头代码写
@@ -1066,10 +1087,15 @@ async def _shot_texture(clip: Path, dst_dir: Path, *, shot: Mapping[str, Any],
     # 整片写了 `art` 时，即使这一镜没选质感档也要过这一趟：那一层是**整片统一**
     # 的颗粒/暗角/色温（`render.art_grade`），跳过它就成了「同一版片子里几镜是
     # 统一过的、几镜没统一」，而这件事在成片里没人看得出来，只能靠这里不跳。
-    if kind == "none" and not rpipe.art_grade(art):
+    # 2026-10-20 起同理：亮度低于可见度地板（`render.LUMA_FLOOR`）的切片也要过这一趟，
+    # 哪怕质感档是 none——真机片整部近黑，用户看不清。量一次亮度，传进去复用。
+    avg = (await asyncio.to_thread(rpipe.mean_luma, clip)
+           if rpipe.LUMA_FLOOR > 0 else 0.0)
+    if kind == "none" and not rpipe.art_grade(art) and not rpipe.luma_lift_chain(avg):
         return clip, kind, "", frame
     out_clip = dst_dir / "clip_tex.mp4"
-    chain = await asyncio.to_thread(rpipe.apply_texture, clip, out_clip, kind, art=art)
+    chain = await asyncio.to_thread(rpipe.apply_texture, clip, out_clip, kind,
+                                    art=art, avg_luma=avg)
     if not chain:
         raise MediaError(
             f"{sid}：质感选的是 {kind}，却没拿到滤镜串——交付给拼接的还是原片。"
@@ -1136,6 +1162,19 @@ async def render_code_shot(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
                              if k in ("scale", "image_format", "jpeg_quality", "crf",
                                       "concurrency")}}
         render_key = hashlib.sha256(f"draft|{draft_scale}|{key}".encode()).hexdigest()[:40]
+    elif render_payload is None:
+        # 成片档每镜自己开几个渲染工人（Remotion 缺省 = min(8, 核数/2)，20 核上是 8）。
+        # 外层已经在并行渲 4 镜，8×4 = 32 个工人抢 20 个核，是**超订 1.6 倍**：
+        # 工人之间抢 CPU、每镜的浏览器标签页又各占几百 MB，壁钟时间反而被拖长。
+        # 这里按 env 把每镜压到「核数 ÷ 外并行数」（这台机是 5），整机正好 20 个；
+        # 不设就保持 Remotion 缺省，行为不变。并发数不影响像素，缓存键不用带它。
+        # 2026-10-21：先按 5 落地，下一次真跑看逐镜耗时再定是否再调。
+        try:
+            _n = int(os.environ.get("MOTION_SHOT_CONCURRENCY", "").strip() or 0)
+        except ValueError:
+            _n = 0
+        if _n > 0:
+            render_payload = {"concurrency": min(_n, 32)}
     if cache is not None and draft is None:
         got = await cache.fetch(key, shot_work)
         if got:
@@ -1406,15 +1445,23 @@ def _shot_table(sid: str, index: int, size: tuple[int, int], *,
 
 
 #: 预览静帧：取这一镜的哪个位置（入场动画已落定、内容基本铺开），以及同时在飞的镜数
-#: （容器那侧打包串行、渲染 2 路，3 路在飞正好让一镜打包时另两镜在渲）。
+#: （容器那侧打包串行、逐帧渲染按 `DG_RENDER_SLOTS` 路并发，2026-10-20 起缺省 4）。
+#: 静帧只渲一帧，6 路在飞正好填满渲染槽、打包排队的等待也能被别的镜填掉。
 PREVIEW_AT = 0.7
-PREVIEW_PARALLEL = 3
+PREVIEW_PARALLEL = max(1, int(os.environ.get("MOTION_PREVIEW_PARALLEL", "6") or 6))
 #: 预览静帧的分辨率系数。**2026-10-18 从 0.4 提到 1.0**：0.4 那档是「成本约整镜的
 #: 百分之一」那个年代的余数，而今天这组图是**确认卡上用户唯一看得到的东西**——真机
 #: 上 1920×1080 的片子渲成 768×432、JPEG 80，用户看完说「整体画面质量很低」，判的其实
 #: 是这张缩水图。多付的是每帧几十到一两百毫秒（打包 1~3 秒才是固定成本），换的是
 #: 「看到的就是会渲出来的那一帧」。成片那一趟不走这里（`render.scale` 缺省 1）。
-PREVIEW_SCALE = 1.0
+#: 2026-10-20 从 1.0 落到 0.75（可用 `MOTION_PREVIEW_SCALE` 调）：1.0 是「帧要按成片
+#: 像素验收」那一档，而这张图的用途是**在确认卡上判断画面对不对**——0.75 的 1440×810
+#: 仍然看得清主体、字与构图，像素量少 44%。真要逐像素验收看整镜渲染后的代表帧。
+try:
+    PREVIEW_SCALE = min(1.0, max(0.25, float(
+        os.environ.get("MOTION_PREVIEW_SCALE", "0.75") or 0.75)))
+except (TypeError, ValueError):
+    PREVIEW_SCALE = 0.75
 
 
 def _preview_frames(shot: Mapping[str, Any], spec: Mapping[str, Any]) -> int:
@@ -1428,13 +1475,72 @@ def _preview_frames(shot: Mapping[str, Any], spec: Mapping[str, Any]) -> int:
     return max(2, int(round(sec * int(spec["fps"]))))
 
 
+#: 预览报错里这几处词＝**源码本身编译不过**，串行重试只会再烧一帧同一句错。
+#: 其余失败（30 秒初始挂载超时、`delayRender()` 等根组件加载、连接被掐）先当暂时的：
+#: 2026-10-20 真机 5 张没出的图里 4 张都是这种，单独再渲一次就补上了。
+_PREVIEW_FAIL_FINAL = (
+    "has already been declared", "Module build failed", "Transform failed",
+    "SyntaxError", "Parsing error", "Unexpected token", "Expression expected",
+    "Cannot find module", "is not defined", "Unknown file extension",
+)
+
+
+def _preview_fail_note(sid: str, exc: BaseException) -> str:
+    """把渲染器那一坨报错压成一句能照着改的话。
+
+    原来取 `str(exc)[:120]`：Remotion 的构建错误前一百多个字符全是
+    「Module build failed … /srv/src/user-shots/shot.tsx:65:8」这类外壳，真正的那句
+    `ERROR: The symbol "backX" has already been declared` 恰好被截掉——卡上只写
+    「预览静帧没出成」，人还得回容器里再跑一遍才知道是哪一行。这里按「哪一行最像
+    病因」挑（带 ERROR / `.tsx:行:列` / 上面那组词的优先），空白压成一行。
+    """
+    def rank(line: str) -> tuple[int, int]:
+        score = 0
+        if "ERROR" in line or "error:" in line:
+            score -= 4
+        if re.search(r"\.tsx?:\d+:\d+", line):
+            score -= 2
+        if any(mark in line for mark in _PREVIEW_FAIL_FINAL):
+            score -= 2
+        return score, -len(line)
+
+    raw = str(exc) or ""
+    lines = [ln.strip() for ln in re.split(r"[\r\n]+", raw) if ln.strip()]
+    best = sorted(lines, key=rank) if lines else []
+    # 带 ERROR 的那一行本身就是「位置 + 病因」，再带一句外壳只会把话搅浑。
+    picked = best[:1] if best and ("ERROR" in best[0] or "error:" in best[0]) else best[:2]
+    body = re.sub(r"\s+", " ", " ".join(picked) or raw).strip()
+    if len(body) > 260:
+        body = body[:257].rstrip() + "…"
+    return f"{sid}：预览静帧没出成（{body or '渲染器没有给出原因'}）"
+
+
+def preview_failure_kind(note: str) -> str:
+    """这句话是「代码本身编译不过」（``final``）还是「一时没抢到机器」（``transient``）。
+
+    调用方据此决定要不要让写手重画：编译错重渲一百次也是同一句，而超时那类
+    重画反而会把一份本来能跑的代码换掉。
+    """
+    return "final" if any(mark in str(note or "") for mark in _PREVIEW_FAIL_FINAL) \
+        else "transient"
+
+
 async def preview_stills(spec: Mapping[str, Any], *, client: dict[str, Any],
                          work: Path, storage: Any = None
-                         ) -> tuple[dict[str, Path], list[str], dict[str, dict[str, Any]]]:
-    """每镜渲一张预览静帧（小 JPEG）→ ({镜号: 文件}, 没出成的说明, {镜号: 版面账})。
+                         ) -> tuple[dict[str, Path], list[str], dict[str, dict[str, Any]],
+                                    dict[str, dict[str, str]]]:
+    """每镜渲一张预览静帧（小 JPEG）→ ({镜号: 文件}, 没出成的说明, {镜号: 版面账},
+    {镜号: {kind, detail}})。
+
+    「没出成的说明」是给人/模型看的一句话；第四份是同一件事的结构化版：``kind``
+    ∈ ``final``（代码编译不过，重试与重渲都不会好）/ ``transient``（一时没抢到机器）。
+    调用方据此决定要不要让写手重画这一镜——把两句不同的病当同一种治，要么白烧
+    一次重写，要么把一段坏代码带进渲染。
 
     这是渲染前计划确认卡上的那几张图：人看一眼就知道画面对不对，成本约是整镜渲染的
     百分之一。任何一镜失败只记一句说明、不拦——预览是增益，硬闸在渲染那一趟。
+    并发那几路里「浏览器被别的路挤住」的失败（超时、等根组件）串行再补一次；
+    源码本身编译不过的那类不重试（见 `_PREVIEW_FAIL_FINAL`）。
 
     版面账（`summarize_layout` 那一份形状）是这一趟顺带回来的：字压字、字压图、出画，
     在**还没烧像素**的时候就能点名——那是修一处版面最便宜的时刻（改一镜代码、几秒钟），
@@ -1443,6 +1549,7 @@ async def preview_stills(spec: Mapping[str, Any], *, client: dict[str, Any],
     out: dict[str, Path] = {}
     notes: list[str] = []
     layouts: dict[str, dict[str, Any]] = {}
+    failures: dict[str, dict[str, str]] = {}
     stills_fn = client.get("stills_layout")
     gate = asyncio.Semaphore(PREVIEW_PARALLEL)
     work.mkdir(parents=True, exist_ok=True)
@@ -1458,11 +1565,12 @@ async def preview_stills(spec: Mapping[str, Any], *, client: dict[str, Any],
         if i < len(overlaps):
             acc -= overlaps[i]
 
-    async def one(i: int, shot: Mapping[str, Any]) -> None:
+    async def one(i: int, shot: Mapping[str, Any]) -> tuple[str, str, str]:
+        """渲一张预览 → (镜号, 失败说明, 失败类型)；没失败时后两项为空串。"""
         sid = str(shot.get("id") or f"s{i + 1:02d}")
         code = str(shot.get("code") or "")
         if not code.strip():
-            return
+            return sid, "", ""
         frames = _preview_frames(shot, spec)
         props = shot_input_props(shot, spec, frames=frames, frame_words=[],
                                  film_start_sec=planned_starts[i])
@@ -1481,24 +1589,55 @@ async def preview_stills(spec: Mapping[str, Any], *, client: dict[str, Any],
                         client["stills"], code, props, [int(frames * PREVIEW_AT)],
                         scale=PREVIEW_SCALE)
             except Exception as exc:  # noqa: BLE001 - 预览缺一张不拦
-                notes.append(f"{sid}：预览静帧没出成（{type(exc).__name__}: {str(exc)[:120]}）")
-                return
+                note = _preview_fail_note(sid, exc)
+                return sid, note, preview_failure_kind(note)
         b64 = str((stills[0] if stills else {}).get("jpeg_b64") or "")
         if not b64:
-            notes.append(f"{sid}：预览静帧是空的")
-            return
+            return sid, f"{sid}：预览静帧是空的", "transient"
         dst = work / f"preview_{sid}.jpg"
         dst.write_bytes(base64.b64decode(b64))
+        # 预览也过一遍可见度地板：用户是在确认卡上看这几张图做决定的，如果成片会
+        # 被提亮、预览却保持近黑，他会在「看不清」上做一次错误的取舍。同一把尺、
+        # 同一条 gamma（见 `render.lift_still`）。
+        await asyncio.to_thread(rpipe.lift_still, dst)
         out[sid] = dst
+        return sid, "", ""
 
-    await asyncio.gather(*(one(i, s) for i, s in enumerate(spec.get("shots") or [])))
-    return out, notes, layouts
+    shots_now = list(shots_for_clock)
+    first = await asyncio.gather(*(one(i, s) for i, s in enumerate(shots_now)))
+    retry: list[tuple[int, Mapping[str, Any]]] = []
+    for (sid, note, kind), i, shot in zip(first, range(len(shots_now)), shots_now):
+        if not note:
+            continue
+        if kind == "final":
+            notes.append(note)  # 源码编译不过：重试一百次也是同一句
+        else:
+            retry.append((i, shot))
+    # 并发那几路里「浏览器被别的路挤住」的那类，串行再来一次就出；补上的镜也留
+    # 一行回执，免得下一个人以为是运气。
+    for i, shot in retry:
+        sid, note, kind = await one(i, shot)
+        if not note:
+            notes.append(f"{sid}：第一次预览没出成，串行重试后补上了")
+            continue
+        notes.append(note)
+        failures[sid] = {"kind": kind or "transient", "detail": note}
+    for sid, note, kind in first:
+        if note and kind == "final":
+            failures[sid] = {"kind": kind, "detail": note}
+    return out, notes, layouts, failures
 
 
-#: 预览版面读数里**值得模型当场改**的那几类（字压字、字压图、出画）。
+#: 预览版面读数里**值得模型当场改**的那几类（字压字、出画）。
 #: 引线落空（`dangling`）不在此列：它在静帧上常是「引线还在画、终点还没到」的中间态，
 #: 拿一帧去要求改，误报多于真病——整镜渲染那一趟的读数照旧会报它。
-PREVIEW_LAYOUT_KINDS = frozenset({"overlap", "overlap_subject", "clipped"})
+#:
+#: **字压图（`overlap_subject`）2026-10-20 也从这一档删了。** 探针把每一个
+#: `<path|rect|circle|…>` 都当主体，于是「铭文压在色块上」「标签放在物件下方」这类
+#: 刻意的叠压几乎每一镜都会命中；真机上它把好好的画面报成问题，模型照着去挪本来没
+#: 问题的字。结构化账里仍保留这条读数（`describe_layout` 与整镜那一趟照旧报），
+#: 只是不再拿它去驱动预览阶段的返工。
+PREVIEW_LAYOUT_KINDS = frozenset({"overlap", "clipped"})
 
 
 def _layout_trustworthy(lay: Mapping[str, Any]) -> bool:
@@ -1565,7 +1704,9 @@ class FrameBudget:
 
 #: 同时在烧的镜数。渲染容器那侧打包串行、逐帧渲染按 DG_RENDER_SLOTS 路并发，
 #: 这一侧并发提交才吃得到那几路（串行提交时容器的多路永远只用上一路）。
-RENDER_PARALLEL = max(1, int(os.environ.get("MOTION_RENDER_PARALLEL", "2") or 2))
+#: 2026-10-20 从 2 提到 4：20 核机器上单路约占 5 核 / 2.1 GB，4 路刚好吃饱核数、
+#: 内存也还在 16 GB 的余量内（见 docker-compose 的 app-env 与 remotion 服务）。
+RENDER_PARALLEL = max(1, int(os.environ.get("MOTION_RENDER_PARALLEL", "4") or 4))
 
 
 #: TTS 预取的并发路数：配音是网络请求，开太多会被 TTS 服务限流，4 路足够跑在渲染前面。

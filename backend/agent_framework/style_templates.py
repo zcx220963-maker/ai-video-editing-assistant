@@ -35,12 +35,31 @@ USER_MODULE_PREFIX = "@dg/lib/style/generated/"
 
 
 def seed_templates() -> list[dict[str, Any]]:
-    """系统模板种子。文件缺失/写坏时返回空表——模板库空着仍能自由画。"""
+    """系统模板种子。文件缺失/写坏时返回空表——模板库空着仍能自由画。
+
+    种子里可以写 `"probe_file": "probes/<name>.tsx"`：预览样例的 TSX 放在单独文件里，
+    不必把几十行代码塞进 JSON 的一个字符串。读不到就当这一份没有 probe（预览那只
+    接口会如实报「这套模板没有预览样例」），不让种子读取失败拖垮整张表。
+    """
     try:
         raw = json.loads(SEED_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    return [r for r in raw if isinstance(r, Mapping) and r.get("name")]
+    out: list[dict[str, Any]] = []
+    for r in raw:
+        if not (isinstance(r, Mapping) and r.get("name")):
+            continue
+        item = dict(r)
+        rel = str(item.get("probe_file") or "").strip()
+        if rel and not str(item.get("probe") or "").strip():
+            try:
+                path = (SEED_FILE.parent / rel).resolve()
+                if path.is_relative_to(SEED_FILE.parent):
+                    item["probe"] = path.read_text(encoding="utf-8")
+            except OSError:
+                pass
+        out.append(item)
+    return out
 
 
 async def seed_system_templates(storage: Any) -> int:
@@ -63,6 +82,12 @@ async def seed_system_templates(storage: Any) -> int:
         )
         if before is None:
             added += 1
+        elif str(item.get("probe") or "").strip() and not str(before.get("probe") or "").strip():
+            # 老库里已经有一行、只是当初没带预览样例：把样例补上。只补空的，
+            # 绝不覆盖——用户沉淀的模板自己带 probe，种子没有资格改它。
+            setter = getattr(storage.style_templates, "set_probe", None)
+            if setter is not None:
+                await setter(str(item["name"]), str(item["probe"]))
     return added
 
 

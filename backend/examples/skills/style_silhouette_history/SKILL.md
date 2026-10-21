@@ -4,7 +4,7 @@ display: 剪影年轮
 kind: style
 caption_style: on_picture
 description: 【STYLE SKILL】侧向行走的剪影穿过一层层时代背景，一块发光矩形贯穿全片；同一个姿势、同一个构图、同一处字幕，只换时代与道具。适合讲一段长时段的历史、技术或生活变迁。
-style_manifest: {"version": 1, "template": "silhouette-history", "palette": {"sky": ["#0b1020", "#3a2a3f", "#e8a06a"], "ground": "#07070a", "ink": "#050507", "accent": "#ff7a2f", "paper": "#f2e6d0"}, "composition": {"figure_x": 0.32, "figure_h": 0.46, "ground_y": 0.82, "horizon": 0.62, "camera": "slow push-in 1.02x to 1.06x, no cuts"}, "repeat_composition": true, "recurring_pose": "walk left to right, pause beside the glow, lean 8 degrees, continue", "recurring_prop": "a glowing rectangle at 0.70W / 0.34H, same size and position every shot", "caption": {"look": "overlay", "position": "bottom-center", "width": 0.62}, "inscription": {"position": "top-right", "style": "small serif, 0.022H"}, "motion": {"camera": "1.02 to 1.06 slow push, no cuts", "grain": 0.12, "vignette": 0.35}, "avoid": ["CaptionFrame band", "PPT cards", "face details", "external images", "camera shake"], "narration_avoid": ["沉迷", "上瘾", "危害"]}
+style_manifest: {"version": 1, "template": "silhouette-history", "use_template": false, "auto_select": ["侧身行走", "剪影", "发光的矩形", "发光矩形", "年代·地点"], "caption_style": "outlined", "highlight_style": "plain", "protagonist": {"look": "瘦高、侧面轮廓的行走者：额头、鼻梁、下颌有转折，头发/帽子与衣服随时代换；不是圆头，也不画正面五官", "kind": "人", "render": "silhouette", "wardrobe": "兽皮斗篷 → 托加/长袍 → 长外套与礼帽 → 连帽衫（手里有手机）；版型、袖型、头饰与持物逐镜按时代换", "height": 0.46, "foot_y": 0.82, "facing": "right", "stride_sec": 1.0, "light": "火光橙 → 煤气灯暖黄 → CRT 冷蓝 → 手机屏冷蓝"}, "palette": {"sky": ["#0b1020", "#3a2a3f", "#e8a06a"], "ground": "#07070a", "ink": "#050507", "accent": "#ff7a2f", "paper": "#f2e6d0"}, "composition": {"figure_x": 0.32, "figure_h": 0.46, "ground_y": 0.82, "horizon": 0.62, "camera": "slow push-in 1.02x to 1.06x, no cuts"}, "repeat_composition": true, "recurring_pose": "walk left to right, pause beside the glow, lean 8 degrees, continue", "recurring_prop": "a glowing rectangle at 0.70W / 0.34H, same size and position every shot", "caption": {"look": "overlay", "position": "bottom-center", "width": 0.62}, "inscription": {"position": "top-right", "style": "small serif, 0.022H"}, "motion": {"camera": "1.02 to 1.06 slow push, no cuts", "grain": 0.12, "vignette": 0.35}, "avoid": ["CaptionFrame band", "PPT cards", "正面五官与肤色写实", "external images", "camera shake"], "narration_avoid": ["沉迷", "上瘾", "危害"]}
 ---
 
 # 剪影年轮：这套视觉怎么用
@@ -31,11 +31,26 @@ style_manifest: {"version": 1, "template": "silhouette-history", "palette": {"sk
 换的是时代背景、服装轮廓、道具内容与光色。不要为了「有变化」换机位、换主体位置，
 也不要给某一镜加第二个人、第二块光、第二条字幕——那会立刻把这套语法打散。
 
+## 人：同一副骨架，换衣服
+
+「同一个人」靠骨架、身高、步态、朝向守住，**不靠每镜重画一个人**。人的外形是侧面
+剪影：额头、鼻梁、下颌有转折，后脑有头发或帽子的轮廓；不画正面五官，也不做肤色写实。
+
+这个人的**每一笔都由你自己画**，不要 import 任何现成的人物组件。如果这一轮的消息
+里附了参考片静帧，先看清它的轮廓怎么转折、头身比多少、勾边光从哪一侧来，再落笔。
+衣服、头发、头饰、持物**逐镜按时代换**，不是写死的一套；但头、颈、肩、躯干、四肢
+的连接方式与身高、脚底线、朝向整片不变——换的是外壳，不是换一个人。
+第一镜通过之后，后续镜会拿到**你自己写的第一镜代码**：照那份代码里的人物画法写，
+不要重画一个不同的人。
+
 ## 字幕与铭文
 
 字幕只有一条，**叠在画面上**，底部居中，宽度约画面宽的 0.62，字号小于主体，
 不要字幕带、不要横幅、不要卡片。右上角另有一行小号衬线铭文，写「年代 · 地点」，
 它是画面的一部分，不参与字幕，也不要和字幕抢位置。
+
+**整片用了片壳（`shell`）时**，底部这条字幕归片壳统一画（全片同一位置与字号）；
+你只画人物、光块与右上角铭文，不要自己再排字幕，也不要另画底色、色条或钟。
 
 ## 留白与质感
 
@@ -46,5 +61,6 @@ style_manifest: {"version": 1, "template": "silhouette-history", "palette": {"sk
 ## 与流程技能的关系
 
 这套视觉只回答「画面长什么样」。分镜、逐镜写码、闸、渲染仍由流程技能负责；
-风格包不会替你做决定，也不会改变出片流程。模板已经提供了人物、光块、铭文与字幕，
-每一镜只需要画这一镜的时代背景和那一下代价动作。
+风格包不会替你做决定，也不会改变出片流程。这一套里没有预置的人物组件——
+人物、光块、铭文与字幕都由你按这一镜的 brief 画；参考帧和第一镜的画法只帮你
+守住「同一个人、同一处光、同一条字幕」，不替你决定画什么。

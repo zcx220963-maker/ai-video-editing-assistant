@@ -231,6 +231,9 @@ class StorylineServer:
             # 风格包只在声明了它的节点（今天只有 plan_motion）上出现；其余节点
             # args 里根本没有这个键，pop 的缺省空串不会改变任何既有行为。
             style_skill = str(args.pop("style_skill", "") or "")
+            # 「直接出片」同一口径：只在声明了它的节点（今天只有 plan_motion）上出现，
+            # 其余节点 args 里没有这个键，pop 出来的假值不会改变任何既有行为。
+            go_straight = _flag_on(args.pop("go_straight", False))
             if sid == DEFAULT_SESSION and uid:
                 # 会话作用域取注入身份，不能跟 user_request 走：模型逐轮改写请求文本，
                 # 作用域随之漂移会让后续节点看不到上游产物、补齐时重跑根节点而报缺参。
@@ -252,6 +255,7 @@ class StorylineServer:
             state.user_id = uid
             state.conversation_id = cid
             state.style_skill = style_skill
+            state.go_straight = go_straight
             state.lang = str(args.pop("lang", "zh") or "zh")
             state.mode = str(args.pop("mode", "auto") or "auto")
             if node.name in LONG_RUNNING_NODES:

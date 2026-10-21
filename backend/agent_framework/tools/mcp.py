@@ -918,8 +918,30 @@ class MCPTool(Tool):
                 kwargs["artifact_id"] = ident.artifact_id
             # 风格包同一口径：只有声明了这个参数的节点（今天只有 plan_motion）才收，
             # 且值来自本轮身份，模型自填的值被覆写。
-            if "style_skill" in props and ident.style_skill:
-                kwargs["style_skill"] = ident.style_skill
+            #
+            # 2026-10-21：用户在对话里刚换过风格时，工具在**另一个任务**里执行，
+            # 身份 contextvar 的改动传不回来；`style_override` 按会话记下那一次，
+            # 这里优先读它，同一轮的分镜才用得上新风格。
+            if "style_skill" in props:
+                from ..style_override import get_style_override
+                ov = get_style_override(ident.session_id)
+                chosen = str(ident.style_skill or "") if ov is None else ov
+                if chosen:
+                    kwargs["style_skill"] = chosen
+                else:
+                    # 「用回默认」也是一条明确的决定：不能因为它是空串，就把模型
+                    # 自己填的包名放过去（那等于取消没生效）。
+                    kwargs.pop("style_skill", None)
+            # 用户原话同一口径（2026-10-20）：节点里的 `user_request` 以前靠模型自己
+            # 填一句概括，逐层转述之后画镜头的写手已经看不到用户到底说了什么。这里
+            # 用 run 入口记下的原话覆写；没记到（离线直调）就保留模型传的值。
+            if "user_request" in props and ident.user_request:
+                kwargs["user_request"] = ident.user_request
+            # 「直接出片」同理：声明了这个参数的节点（今天只有 plan_motion）收这一位，
+            # 值来自本轮入口，模型编不出一个开关。只在为真时覆写——为假时保留模型
+            # 传的值没有意义（布尔只有两档），但也不该把缺省路径写出一个多余的键。
+            if "go_straight" in props and ident.go_straight:
+                kwargs["go_straight"] = True
         result = await self._client.call_tool(self._raw_name, kwargs, self._timeout)
         return extract_text(result)
 

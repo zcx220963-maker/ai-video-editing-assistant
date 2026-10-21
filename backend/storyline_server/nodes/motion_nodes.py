@@ -272,10 +272,16 @@ class MotionPatchBase(MotionRenderBase):
         sess = state.session_id
         base = str(inputs.get("base_artifact_id") or "").strip()
         if not base:
+            # 这条文案要回答的是**模型下一步该调哪个工具**，不只是说明它错在哪。
+            # 2026-10-20 真机 run 3920dfd725e7：用户说「人都一个样」，模型在还没出过片的
+            # 时候先调了局部改，被这句挡住后没有回头改分镜，转去 read_node_history 换键名
+            # 试，两轮把预算烧完——用户看到的是「卡死」，实际是一次错误的补救方向。
+            # 所以把「还没出过片」那条路原样写进来。
             raise ValueError(
                 "局部改：必须指定 base_artifact_id——要改的是哪一版成片"
-                "（出片返回体顶层的 artifact_id）。不指定就等于凭空造一版，"
-                "那条路叫重新出片，不叫局部改")
+                "（出片返回体顶层的 artifact_id）。如果还没出过片，就没有可改的基准："
+                "要改分镜就用 plan_motion 传 shots_patch，只交要改的那几镜的 brief，"
+                "然后调 render_motion_code 出片")
 
         bundle = await self._bundle(sess, base)
         spec_base, whence, fp = await self._base_spec(sess, base, bundle)
@@ -291,6 +297,18 @@ class MotionPatchBase(MotionRenderBase):
         want_texture = str(inputs.get("texture") or "").strip()
         if want_texture:
             patched["texture"] = want_texture
+        # 调参台那几栏整片观感（2026-10-21）：配色 / 字幕样式 / 强调方式 / 质感。
+        # 前三栏在 `FILM_KNOBS` 里——换它们等于换了每一镜的像素，会重烧整片；
+        # 质感不在（跑在切片之后），换它一镜都不重烧。代价不同，但入口是同一个。
+        # 值不在这里判：认不出的色板/档名由 `patch_validator`（`validate_code_spec`）
+        # 带镜号退回，那一份才是出片与局部改共用的唯一判据。这里放行一个拼错的
+        # 值是**安全**的——它会在校验那一步被退回，而不是静默落成「没选」。
+        film = inputs.get("film")
+        if isinstance(film, Mapping):
+            for key in ("palette", "caption_style", "highlight_style", "texture"):
+                value = film.get(key)
+                if value is not None and str(value).strip():
+                    patched[key] = str(value).strip()
         # 配乐音量与人声压低开关同 texture 一样在烧完像素之后的那一趟上（配乐在母带合流、
         # 质感在每一镜切片的滤镜上），都不进按镜缓存键，改它们一镜都不重烧，所以也算局部改。
         bgm_conf = dict(patched.get("bgm") or {})

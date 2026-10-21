@@ -391,16 +391,43 @@ function toggleEntryMode() {
   entryMode.value = entryMode.value === "auto" ? "plan" : "auto";
   localStorage.setItem("ca.entryMode", entryMode.value);
 }
-// —— 风格包：入口选一套视觉，随 /chat 送到服务端，由 plan_motion 注入分镜 ——
-// 只列 `kind=style` 的技能；留空＝自动（模型按选题自己定）。选择本身不改变流程，
-// 只改变画面契约——所以它不占计划卡旋钮、也不需要在卡上逐项确认。
+// —— 直接出片：不预渲静帧、出片前不等确认，一口气到成片 ——
+// 只对「全自动」有意义：先出计划那条路本来就要人点卡。记住上次的选择，免得每轮重勾；
+// 它只影响这一轮，服务端不写进对话历史。
+const goStraight = ref(localStorage.getItem("ca.goStraight") === "1");
+watch(goStraight, (v) => localStorage.setItem("ca.goStraight", v ? "1" : "0"));
+// —— 风格包：入口选一套现成的，或者直接说一句让助手做一套新的 ——
+// 下拉只列 `kind=style` 的技能行。值来自服务端推回的 style 帧（聊天里换风格时）
+// 或 localStorage（刷新后）。它不改变流程，只改变画面契约——所以不占计划卡旋钮，
+// 也不需要在卡上逐项确认。
 const styleSkill = ref(localStorage.getItem("ca.styleSkill") || "");
 watch(styleSkill, (v) => localStorage.setItem("ca.styleSkill", v || ""));
-const styleOptions = computed(() =>
-  (skillsAdmin.value || []).filter((s) => s && s.kind === "style"));
+// 在下拉里点过一次，就把这一选当「明确决定」随消息带上：同一会话里之前在对话里
+// 换过的风格会记在服务端的会话表上，不显式盖一次的话，下拉选的这套会被它压住。
+const styleExplicit = ref(localStorage.getItem("ca.styleExplicit") === "1");
 function styleLabel(name) {
   const hit = (skillsAdmin.value || []).find((s) => s && s.name === name);
   return (hit && (hit.display || hit.name)) || name;
+}
+function styleChoices() {
+  return (skillsAdmin.value || []).filter((s) => s && s.kind === "style");
+}
+function pickStyle(ev) {
+  const v = String((ev && ev.target && ev.target.value) || "");
+  if (v === "__new__") {
+    // 新风格是「说一句话」做出来的，不是在这里填参数：把光标放进输入框，
+    // 并给一句能接着写完的开头。下拉先还原成当前这套，别显示一个假选项。
+    if (ev && ev.target) ev.target.value = styleSkill.value || "";
+    draft.value = "换成这样的画面：";
+    nextTick(() => {
+      const el = document.querySelector(".composer textarea");
+      if (el) el.focus();
+    });
+    return;
+  }
+  styleSkill.value = v;
+  styleExplicit.value = true;
+  localStorage.setItem("ca.styleExplicit", "1");
 }
 // —— 风格模板库：从参考片沉淀出来的**可执行模板**（TSX） ——
 // 与素材库分开列：素材是原料，模板是已经过闸、能直接复用的成品。系统模板随镜像
@@ -982,7 +1009,7 @@ async function loadMaterials() {
 async function toggleLibrary() {
   activePanel.value = activePanel.value === 'library' ? null : 'library';
   // 模板库与素材库同屏：一个列原料，一个列「已经沉淀好的可复用成品」。
-  if (activePanel.value === 'library') await Promise.all([loadMaterials(), loadStyleTemplates()]);
+  if (activePanel.value === 'library') await loadMaterials();
 }
 
 // ---- 音乐库：GD Studio 在线搜索 + 试听 + 指定配乐 ----
@@ -2161,6 +2188,276 @@ function restorePrevManifest() {
   skillsMsg.value = "已把上一版 manifest 填回表单；点保存才生效。";
 }
 
+// ——— 旧风格工作室的遗留状态（界面已撤）———
+// 风格现在只在对话里改（`style_look`）。这些 ref 与函数已不被模板引用，构建时会被
+// 摇掉；留在这里只是因为撤销时没动它们，后续清理可整段删除。
+const studioTab = ref("style");
+const studioName = ref("");
+const studioDetail = ref(null);
+const studioBody = ref("");
+const studioManifest = ref(null);
+const studioMsg = ref("");
+const studioErr = ref("");
+const studioBusy = ref("");
+const studioStills = ref([]);
+const studioOpenTpl = ref("");
+// 「一句话生成」：用户写需求，模型写数据（名字/正文/manifest），落成自己的一份风格。
+// 不生成模板代码——模板仍走沉淀/换件那条链；这里只决定挂哪份现成模板或不挂。
+const studioIdea = ref("");
+const studioGen = ref(false);
+// 「改这一版」：一句话改数据（manifest/正文），改完仍是草稿；不碰模板代码。
+const studioSay = ref("");
+const studioSayBusy = ref(false);
+
+const STUDIO_COLORS = [
+  ["page", "底色"], ["surface", "台面"], ["field", "场景深处"],
+  ["text", "文字"], ["muted", "次要字"], ["accent", "强调"],
+  ["border", "边框"], ["light", "主光"], ["rim", "边光"],
+];
+
+function studioStyles() {
+  return (skillsAdmin.value || []).filter((s) => s && s.kind === "style");
+}
+
+/** 工作副本：四个块先补成对象，模板里的 `v-model` 才不会因为缺键而写不进去。 */
+function normManifest(m) {
+  const out = (m && typeof m === "object" && !Array.isArray(m))
+    ? JSON.parse(JSON.stringify(m)) : {};
+  for (const k of ["palette", "composition", "caption", "motion"]) {
+    if (!out[k] || typeof out[k] !== "object" || Array.isArray(out[k])) out[k] = {};
+  }
+  return out;
+}
+
+function studioPx() {
+  // 1080p 上「这个比例是多少像素」——滑杆旁边那行小字，比 0.045 好读。
+  const c = studioManifest.value && studioManifest.value.caption;
+  return c ? Math.round(1080 * Number(c.bottom || 0)) : 0;
+}
+
+/** 配色只列 `#rrggbb` 的项：`sky` 这种三段色数组另走一行文本，色块控件吃不了数组。 */
+function studioPaletteEntries() {
+  const p = (studioManifest.value && studioManifest.value.palette) || {};
+  return Object.entries(p).filter(([, v]) => typeof v === "string"
+    && /^#[0-9a-fA-F]{6}$/.test(v)).map(([k, v]) => ({ key: k, value: v }));
+}
+
+function setStudioList(key, text) {
+  if (!studioManifest.value) return;
+  studioManifest.value[key] = String(text || "")
+    .split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+async function loadStudio(name = studioName.value) {
+  studioErr.value = "";
+  studioMsg.value = "";
+  studioStills.value = [];
+  if (!name) { studioDetail.value = null; studioManifest.value = null; return; }
+  studioBusy.value = "load";
+  try {
+    await ensureIdentity();
+    const r = await fetch(`/skills/${encodeURIComponent(name)}`, { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    studioName.value = name;
+    studioDetail.value = j;
+    studioBody.value = j.body || "";
+    studioManifest.value = normManifest(j.style_manifest);
+  } catch (e) {
+    studioDetail.value = null;
+    studioErr.value = "读不到这份风格包：" + e.message;
+  } finally {
+    studioBusy.value = "";
+  }
+}
+
+function studioPayload(name, display, body, manifest) {
+  const d = studioDetail.value || {};
+  // 三处补充要求：空着就**不留键**。留着空串会让「这一项到底写没写过」看不出来，
+  // 也会让每存一次 manifest 都多三行噪声；保存端只收有字的那几条。
+  const clean = { ...(manifest || {}) };
+  for (const k of ["writer_note", "art_note", "review_note"]) {
+    const text = String(clean[k] || "").trim();
+    if (text) clean[k] = text; else delete clean[k];
+  }
+  return {
+    display: display || d.display || name,
+    description: d.description || "",
+    always: !!d.always,
+    requires: d.requires || "",
+    body,
+    kind: "style",
+    style_manifest: clean,
+    sections: d.sections || [],
+    exclude: d.exclude || [],
+  };
+}
+
+async function generateStudio() {
+  const idea = studioIdea.value.trim();
+  if (idea.length < 4) {
+    studioErr.value = "先用一句话说清想要的视觉（至少四个字）。";
+    return;
+  }
+  studioGen.value = true;
+  studioErr.value = "";
+  studioMsg.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch("/style/packs/generate", {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ description: idea }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    await loadSkillsAdmin();
+    await loadStudio(j.name);
+    studioMsg.value = `已生成《${j.display}》：可以直接出三帧，或改一改；`
+      + "不满意就再说一句重生成一份。";
+    studioIdea.value = "";
+  } catch (e) {
+    studioErr.value = "生成失败：" + e.message;
+  } finally {
+    studioGen.value = false;
+  }
+}
+
+async function reviseStudio() {
+  const say = studioSay.value.trim();
+  if (!studioManifest.value) return;
+  if (say.length < 2) {
+    studioErr.value = "先说一句想改哪里。";
+    return;
+  }
+  studioSayBusy.value = true;
+  studioErr.value = "";
+  studioMsg.value = "";
+  try {
+    await ensureIdentity();
+    const r = await fetch(
+      `/style/packs/${encodeURIComponent(studioName.value)}/revise`, {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          instruction: say,
+          manifest: studioManifest.value,
+          body: studioBody.value,
+        }),
+      });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    studioManifest.value = normManifest(j.manifest);
+    if (j.body) studioBody.value = j.body;
+    studioMsg.value = j.note || "已改，点「出三帧预览」看看。";
+    if (j.needs_template) {
+      studioMsg.value += " 这一步要在「模板」页做：从参考片沉淀一套，或给现有模板换件。";
+      studioTab.value = "templates";
+    }
+    studioSay.value = "";
+  } catch (e) {
+    studioErr.value = "没改成：" + e.message;
+  } finally {
+    studioSayBusy.value = false;
+  }
+}
+
+function restoreStudioPrev() {
+  const d = studioDetail.value;
+  if (!d || !d.style_manifest_prev) return;
+  // 只载入、不自动保存：先看一眼上一版长什么样，再决定要不要写回去。
+  studioManifest.value = normManifest(d.style_manifest_prev);
+  studioMsg.value = "已载入上一版；要写回就点「保存」，只是看看就不用管。";
+}
+
+async function saveStudio() {
+  const d = studioDetail.value;
+  if (!d) return;
+  if (d.system) {
+    studioErr.value = "系统内置风格只读：点「另存为我的风格」改一份自己的。";
+    return;
+  }
+  studioBusy.value = "save";
+  studioErr.value = "";
+  try {
+    const r = await fetch(`/skills/${encodeURIComponent(studioName.value)}`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify(studioPayload(studioName.value, d.display,
+                                         studioBody.value, studioManifest.value)),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    studioMsg.value = "已保存；下一版分镜会按这份契约走。";
+    await loadSkillsAdmin();
+    await loadStudio(studioName.value);
+  } catch (e) {
+    studioErr.value = "保存失败：" + e.message;
+  } finally {
+    studioBusy.value = "";
+  }
+}
+
+async function saveStudioAsMine() {
+  const d = studioDetail.value;
+  if (!d) return;
+  const base = studioName.value.replace(/_mine\d*$/, "");
+  let name = `${base}_mine`;
+  for (let i = 2; i < 20 && (skillsAdmin.value || []).some((s) => s && s.name === name); i += 1) {
+    name = `${base}_mine${i}`;
+  }
+  studioBusy.value = "copy";
+  studioErr.value = "";
+  try {
+    const r = await fetch(`/skills/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify(studioPayload(name, `${d.display || name}（我的）`,
+                                         studioBody.value, studioManifest.value)),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    studioMsg.value = `已另存为「${name}」，接下来改的是它。`;
+    await loadSkillsAdmin();
+    await loadStudio(name);
+  } catch (e) {
+    studioErr.value = "另存失败：" + e.message;
+  } finally {
+    studioBusy.value = "";
+  }
+}
+
+async function previewStudio() {
+  if (!studioDetail.value) return;
+  studioBusy.value = "preview";
+  studioErr.value = "";
+  studioStills.value = [];
+  try {
+    const r = await fetch(`/style/packs/${encodeURIComponent(studioName.value)}/preview`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ manifest: studioManifest.value }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    studioStills.value = (j.stills || []).map(
+      (s) => `data:image/jpeg;base64,${s.jpeg_b64}`);
+    studioMsg.value = `已按「${j.template}」渲了 ${studioStills.value.length} 帧（还没保存）。`;
+  } catch (e) {
+    studioErr.value = "预览没渲出来：" + e.message;
+  } finally {
+    studioBusy.value = "";
+  }
+}
+
+async function openStudio(name) {
+  activePanel.value = "studio";
+  await loadSkillsAdmin();
+  await loadStyleTemplates();
+  await loadPrompts();
+  await loadStudio(name || studioName.value || ((studioStyles()[0] || {}).name || ""));
+}
+
 async function saveSkillForm() {
   const f = skillForm.value;
   if (!f || !f.name.trim()) { skillsMsg.value = "技能名必填"; return; }
@@ -3303,6 +3600,15 @@ function onFrame(cid, p) {
     // 候选计划：一张卡一条消息，等待用户在卡上点确认（服务端把这一份也存进了指针行）
     if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
     planBubble(cid, p);
+  } else if (p.type === "style") {
+    // 对话里把风格换了：服务端同时改了技能库，这里只把「当前风格」接过来。
+    // 之后每条消息照旧带 style_skill 回服务端，所以换页/刷新也不会丢。
+    styleSkill.value = p.style_skill || "";
+    if (p.style_skill && p.display
+        && !(skillsAdmin.value || []).some((s) => s && s.name === p.style_skill)) {
+      skillsAdmin.value = [...(skillsAdmin.value || []),
+        { name: p.style_skill, display: p.display, kind: "style" }];
+    }
   } else if (p.type === "plan reconciliation") {
     // 对账只观测：先记在 run 上，进度卡挂角标；偏离理由等 answer 定稿再补一条气泡
     if (p.run_id) runAudit[p.run_id] = {
@@ -3344,6 +3650,11 @@ async function send() {
         // 选中的风格包名（空串＝自动）。服务端会校验归属与 kind，
         // 不可用时只回一句「按默认视觉继续」，不会让这次请求失败。
         style_skill: styleSkill.value || "",
+        // 这一选是在下拉里点出来的（不是从对话里继承的旧值）：服务端据此把它
+        // 记成明确决定，免得同一会话里先前对话换的风格盖住它。
+        style_explicit: styleExplicit.value,
+        // 不预览、不确认，直接跑完成片。只在「全自动」下生效。
+        go_straight: entryMode.value === "auto" && goStraight.value,
       }),
     });
     const j = await r.json().catch(() => ({}));
@@ -4941,13 +5252,19 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                   ? '全自动：一句话直接做到出片，没提到的由助手自己定，渲染前弹一张计划确认卡'
                   : '先出计划：先给计划卡逐项确认，再开始执行'"
                 @click="toggleEntryMode">{{ entryMode === "auto" ? "全自动" : "先出计划" }}</button>
-        <select v-model="styleSkill" class="clip style-pick"
-                :class="{ on: !!styleSkill }"
-                title="风格包：选一套已经定好的视觉；留空＝按你说的选题自己定">
+        <button v-if="entryMode === 'auto'" class="clip" :class="{ on: goStraight }"
+                :title="goStraight
+                  ? '直接出片：不预渲画面、出片前不弹确认卡，一句话跑到成片'
+                  : '出片前先看预览：每镜一张静帧，确认后才渲染'"
+                @click="goStraight = !goStraight">{{ goStraight ? "直接出片" : "先预览" }}</button>
+        <select class="clip style-pick" :class="{ on: !!styleSkill }"
+                :value="styleSkill" @change="pickStyle"
+                :title="'画面风格：选一套现成的。要改它或做一套新的，直接在对话里说一句（例如「底子再冷一点」「换成水墨风」）'">
           <option value="">风格：自动</option>
-          <option v-for="s in styleOptions" :key="s.name" :value="s.name">
-            风格：{{ s.display || s.name }}
+          <option v-for="s in styleChoices()" :key="'sk-' + s.name" :value="s.name">
+            风格：{{ s.display || s.name }}{{ s.owner_user_id ? "" : "（内置）" }}
           </option>
+          <option value="__new__">＋ 做一套新的…</option>
         </select>
         <textarea
           v-model="draft"
@@ -5466,12 +5783,6 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             :disabled="deletingLib"
             @click="deleteSelected"
           >{{ deletingLib ? "删除中…" : `删除选中 ${libSelCount()} 项` }}</button>
-          <button
-            v-if="selectedLibraryVideos().length"
-            class="lib-add-btn"
-            :disabled="!!templateBusy"
-            @click="openTemplateDeposit(selectedLibraryVideos())"
-          >沉淀选中 {{ selectedLibraryVideos().length }} 个视频为模板</button>
         </div>
         <div v-if="!libraryItems.length && !loadingLibrary" class="lib-empty">
           还没有画面素材。上传视频或图片后会出现在这里（音频在「音乐库」）。
@@ -5499,251 +5810,9 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <span>{{ fmtSize(item.bytes) }}<template v-if="item.duration"> · {{ Math.round(item.duration) }}s</template></span>
             </div>
             <button class="lib-add" @click="addFromLibrary(item)">加入本会话</button>
-            <button v-if="item.kind === 'video'" class="lib-add tpl-deposit-btn"
-                    :disabled="!!templateBusy"
-                    @click="openTemplateDeposit(item)">
-              {{ templateBusy === item.material_id ? "沉淀中…" : "沉淀为风格模板" }}
-            </button>
           </div>
         </div>
 
-        <!-- 参考片 → 模板：抽帧读片、写 TSX、过闸后才发布。
-             用弹窗而不是列表末尾的内联块：素材一多，表单会长在滚动区外，
-             点按钮看起来像「没反应」。 -->
-        <div v-if="templateForm" class="modal-mask" @click.self="cancelTemplateDeposit">
-          <div class="modal-card tpl-card">
-            <div class="modal-head">
-              <b>沉淀为风格模板</b>
-              <button class="help" :disabled="!!templateBusy"
-                      @click="cancelTemplateDeposit">取消</button>
-            </div>
-            <div class="modal-body">
-              <p v-if="templateForm.filenames.length > 1" class="modal-note">
-                参考片 {{ templateForm.filenames.length }} 条：{{ templateForm.filenames.join("、") }}。
-                会提炼它们的共同视觉语法，再写 TSX、过闸后才发布，通常 2~5 分钟。
-              </p>
-              <p v-else class="modal-note">
-                参考片：{{ templateForm.filenames[0] }}。会读片、写 TSX、过闸后才发布，通常 1~3 分钟。
-              </p>
-              <label>模板名（中文可以；内部短名由系统生成）</label>
-              <input v-model="templateForm.slug"
-                     placeholder="例：人影风格 / firelight" />
-              <label>补充说明（可选）</label>
-              <textarea v-model="templateForm.note" rows="2"
-                        placeholder="例如「剪影风格，人物不要画写实」"></textarea>
-              <div class="td-row-btns">
-                <button class="help" :disabled="!!templateBusy || !templateForm.slug.trim()"
-                        @click="depositTemplate">
-                  {{ templateBusy ? "读片与写模板中…" : "开始沉淀" }}
-                </button>
-              </div>
-              <div v-if="templateMsg" class="lib-empty">{{ templateMsg }}</div>
-              <div v-if="templateErr" class="lib-empty bad">{{ templateErr }}</div>
-            </div>
-          </div>
-        </div>
-        <div v-if="templateErr && !templateForm" class="lib-empty bad">{{ templateErr }}</div>
-        <div v-if="templateMsg && !templateForm" class="lib-empty">{{ templateMsg }}</div>
-        <div v-if="variantErr && !variantForm" class="lib-empty bad">{{ variantErr }}</div>
-        <div v-if="variantMsg && !variantForm" class="lib-empty">{{ variantMsg }}</div>
-
-        <!-- 换件结果：一句话可能改了好几个零件，每个都给一张画出来的样子。 -->
-        <div v-if="variantResult" class="variant-result">
-          <div class="variant-result-body">
-            <b>已给《{{ variantResult.display }}》改好 {{ variantResult.items.length }} 个零件</b>
-            <span v-if="variantResult.request">你的要求：{{ variantResult.request }}</span>
-            <div v-for="(it, i) in variantResult.items" :key="i"
-                 class="variant-result-item">
-              <img v-if="it.preview" :src="it.preview"
-                   class="variant-result-img" :alt="it.label" />
-              <div class="variant-result-text">
-                <b>{{ it.label }}</b>
-                <span>零件：{{ it.component }}</span>
-                <span v-if="it.spec">理解为：{{ it.spec }}</span>
-              </div>
-            </div>
-            <span v-if="variantResult.failures.length" class="bad">
-              没换成的：{{ variantResult.failures
-                .map((x) => x.label + "（" + x.error + "）").join("；") }}
-            </span>
-            <span>之后的影片会自动用上它们；想回到模板自带的画法，在对话里说「用回默认的」即可。</span>
-            <button class="help" @click="variantResult = null">知道了</button>
-          </div>
-        </div>
-
-        <!-- 换件：挑一个零件，说清换成什么。写出来的只是这一个组件，外壳不动。 -->
-        <div v-if="variantForm" class="modal-mask" @click.self="cancelVariantForm">
-          <div class="modal-card tpl-card">
-            <div class="modal-head">
-              <b>换件 · {{ variantForm.display }}</b>
-              <button class="help" :disabled="variantBusy"
-                      @click="cancelVariantForm">取消</button>
-            </div>
-            <div class="modal-body">
-              <div v-if="variantForm.preview" class="variant-hero">
-                <img :src="variantForm.preview" :alt="variantForm.display" />
-                <span>外壳不动：构图、运镜、配色、字幕都保留，只换画面里的东西。</span>
-              </div>
-
-              <label>① 直接说你想要的效果（可以一次改好几样）</label>
-              <textarea v-model="variantForm.quick" rows="3"
-                        :disabled="variantBusy"
-                        placeholder="例如：我要做一条从古至今娱乐方式进化的片子——背景要能从洞穴、雅典广场、罗马竞技场、宋代街市，一路画到客厅、街机厅、网吧、地铁、出租屋；人物衣服跟着时代变；发光的东西从篝火、火炬、灯笼、煤气灯，变成电视、示波器、街机屏幕、显示器、手机"></textarea>
-              <div class="td-row-btns">
-                <button class="help"
-                        :disabled="variantBusy || !variantForm.quick.trim()"
-                        @click="submitVariant(true)">
-                  {{ variantBusy ? "理解需求、逐个零件写替换件与过闸中…"
-                                 : "按这句话改（系统自己找零件）" }}
-                </button>
-              </div>
-              <p class="modal-note">
-                一句话里同时说人物和背景，系统会拆成几个零件分别改；某个没换好不影响其它。
-                不用写参数名，也不用知道模板里有哪些零件。
-                要做一整片时，直接把整片的想法贴进来：系统会按片子里出现的时代和场景，
-                把每个零件能画的档位一次性补齐，之后这套模板就能反复用。
-              </p>
-
-              <div class="lib-divider"></div>
-              <label>② 或者点一个零件精细改（不点就由系统按你的话判断）</label>
-              <div v-if="variantForm.slots.length" class="variant-parts">
-                <button class="variant-part"
-                        :class="{ on: !variantForm.component }"
-                        :disabled="variantBusy"
-                        @click="pickVariantPart('')">
-                  <span class="vp-icon">🤖</span>
-                  <b>自动判断</b>
-                  <small>按你的话选零件</small>
-                </button>
-                <button v-for="s in variantForm.slots" :key="s.component"
-                        class="variant-part"
-                        :class="{ on: variantForm.component === s.component }"
-                        :disabled="variantBusy"
-                        @click="pickVariantPart(s.component)">
-                  <span class="vp-icon">{{ variantPartIcon(s.kind) }}</span>
-                  <b>{{ s.label }}</b>
-                  <small :title="s.component">{{ s.default || s.component }}</small>
-                  <em v-if="(s.variants || []).length">换过 {{ s.variants.length }} 次</em>
-                </button>
-              </div>
-              <div v-else class="lib-empty bad">这个模板没有可换的零件。</div>
-              <p v-if="variantSlot" class="modal-note variant-part-note">
-                画法（固定）：{{ variantSlot.default || "按模板默认画法" }}
-                <span v-if="variantAxes().length">
-                  · 内容可随镜头变：{{ variantAxes().map(variantAxisLabel).join("、") }}
-                </span>
-                <span v-if="variantContentText(variantSlot)">
-                  · 现在能画：{{ variantContentText(variantSlot) }}
-                </span>
-              </p>
-
-              <div v-if="variantOptions.length" class="variant-suggest">
-                <span class="vs-head">可以直接点，也可以自己写：</span>
-                <button v-for="(o, i) in variantOptions" :key="i"
-                        class="variant-suggest-chip"
-                        :class="{ on: variantForm.target === o.text }"
-                        :disabled="variantBusy"
-                        @click="applyVariantOption(o)">{{ o.text }}</button>
-              </div>
-              <p v-else-if="variantOptionsBusy" class="modal-note">
-                正在按这个模板想几种改法…
-              </p>
-
-              <label>③ 怎么改</label>
-              <div class="variant-modes">
-                <button v-for="m in VARIANT_MODES" :key="m.key"
-                        class="variant-mode"
-                        :class="{ on: variantForm.mode === m.key }"
-                        :disabled="variantBusy"
-                        @click="setVariantMode(m.key)">
-                  <b>{{ m.title }}</b>
-                  <small>{{ m.hint }}</small>
-                </button>
-              </div>
-
-              <template v-if="variantForm.mode === 'by_shot'">
-                <label>跟着什么变（不选就让系统挑）</label>
-                <div v-if="variantAxes().length" class="variant-axes">
-                  <button class="variant-axis"
-                          :class="{ on: !variantForm.follow }"
-                          :disabled="variantBusy"
-                          @click="variantForm.follow = ''">
-                    让系统挑
-                  </button>
-                  <button v-for="a in variantAxes()" :key="a"
-                          class="variant-axis"
-                          :class="{ on: variantForm.follow === a }"
-                          :disabled="variantBusy"
-                          @click="variantForm.follow = a">
-                    {{ variantAxisLabel(a) }}<small>{{ a }}</small>
-                  </button>
-                </div>
-                <p v-else class="modal-note">
-                  这个零件还没有声明「可随镜头变化」的参数；系统会从它的可调项里
-                  挑一个能表达变化的，再按每镜内容逐档画。
-                </p>
-                <p class="modal-note">
-                  换了之后，同一套模板在每一镜会按镜头内容分别传值：这个零件逐镜变化，
-                  不必整片一种；其它零件与外壳不动。
-                </p>
-              </template>
-
-              <label>④ 自己写一句（{{ variantForm.mode === "by_shot" ? "可选" : "必填" }}）</label>
-              <textarea v-model="variantForm.target" rows="3"
-                        :disabled="variantBusy"
-                        :placeholder="variantPlaceholder()"></textarea>
-              <p class="modal-note">
-                说人话就行，不用写参数名。系统会把这句话翻译成画法，
-                画完会告诉你它「理解为：…」。
-              </p>
-
-              <div class="td-row-btns">
-                <button class="help"
-                        :disabled="variantBusy || (variantForm.mode !== 'by_shot'
-                                                  && !variantForm.target.trim())"
-                        @click="submitVariant(false)">
-                  {{ variantBusy ? "理解需求、写替换件与过闸中…"
-                                 : (variantForm.mode === "by_shot"
-                                    ? "按每一镜变" : "开始换件") }}
-                </button>
-              </div>
-              <div v-if="variantMsg" class="lib-empty">{{ variantMsg }}</div>
-              <div v-if="variantErr" class="lib-empty bad">{{ variantErr }}</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="lib-divider"></div>
-        <div class="lib-head">
-          <span class="lib-count">风格模板 · {{ styleTemplates.length }}</span>
-          <button class="help" @click="loadStyleTemplates" :disabled="loadingTemplates">
-            {{ loadingTemplates ? "刷新中…" : "刷新" }}
-          </button>
-        </div>
-        <div v-if="!styleTemplates.length && !loadingTemplates" class="lib-empty">
-          还没有模板。上传一条参考视频，点「沉淀为风格模板」。
-        </div>
-        <div class="lib-grid">
-          <div v-for="t in styleTemplates" :key="t.name" class="lib-item">
-            <img v-if="t.preview_url" :src="t.preview_url" class="lib-thumb"
-                 :alt="t.display || t.name" />
-            <div v-else class="lib-thumb tpl-thumb-empty">无预览</div>
-            <div class="lib-meta">
-              <b>{{ t.display || t.name }}</b>
-              <span v-if="t.variant_of" class="tpl-variant-tag">
-                替换件 · 给《{{ styleTemplateLabel(t.variant_of.template) }}》的
-                {{ t.variant_of.component }} 换成了「{{ t.variant_of.label }}」
-              </span>
-              <span v-else>{{ t.system ? "系统内置" : "我的模板" }} · v{{ t.version }} ·
-                {{ (t.components || []).length }} 个组件</span>
-              <span v-if="t.description" class="tpl-desc">{{ t.description }}</span>
-            </div>
-            <button v-if="!t.system && !t.variant_of" class="lib-add tpl-deposit-btn"
-                    @click="openVariantForm(t)">换件</button>
-            <button v-if="!t.system" class="lib-del-btn"
-                    @click="deleteStyleTemplate(t)">删除</button>
-          </div>
-        </div>
       </div>
 
       <div v-if="activePanel === 'bgm'" class="library">
@@ -5954,6 +6023,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         </template>
       </div>
 
+      <!-- 设置：模型密钥与配额。画面风格不在这里——对话里说一句就行，
+           入口只留一枚「当前风格」的只读标签。 -->
       <div v-if="activePanel === 'settings'" class="settings">
         <!-- LLM 主模型:密钥 + 模型名/地址(可选),一个保存按钮 -->
         <div class="set-line set-head">
@@ -6969,6 +7040,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   background-repeat: no-repeat;
 }
 .style-pick option { color: var(--ink); background: var(--paper); }
+/* 选过风格时用实线朱红（与旁边「全自动」等开关的选中态一致）；「自动」是虚线。 */
+.style-pick.on { border-style: solid; }
 .clip .spin { animation: pulse 0.9s infinite; }
 .paper { position: relative; }
 .paper.dropping { outline: 2px dashed var(--vermilion); outline-offset: -8px; background: rgba(200, 64, 31, 0.04); }

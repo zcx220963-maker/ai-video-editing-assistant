@@ -2,7 +2,12 @@
 name: motion_explainer_skill
 display: 图文科普片（零素材出片）
 description: 【WORKFLOW SKILL】没有视频素材、用户只给一个选题时的出片流程：自己查资料 → 写每镜文案 → 每镜按整片风格自己写镜头代码 → 人声旁白配逐词字幕 → 一条成片。适用于科普、历史、概念解释类短片，或用户明确说「我没有素材，你自己找内容做一条」。A zero-material workflow: research, write per-shot copy, write each shot's code in the film's style, narrate and render.
-sections: film-knobs, patch-motion, sound-design, subject-naming, motion-anchors, draw-floor
+sections: art-direction, film-knobs, patch-motion, sound-design, subject-naming, motion-anchors, draw-floor
+# 分段归属：`writer` = 逐镜写码侧的规范。系统会把这几块直接从同一份正文取去喂
+# 写手（`shot_writer._contract()` 按标题截的那一大段本来就含它们），规划阶段交的
+# 是每镜 brief，读它们只是把同一份手册读第二遍。标了也照样能取，只是目录上先
+# 说明白。`planner` 标的是规划侧要填的整片字段（色板 / `art` / `protagonist`）。
+readers: code-manual=writer, code-rules=writer, draw-parts=writer, motion-density-gate=writer, motion-anchors=writer, draw-floor=writer, art-direction=planner
 exclude: demos/, shots/
 ---
 
@@ -26,8 +31,9 @@ exclude: demos/, shots/
    同一个关键词最多查一次：结果不理想就换说法、换来源，或者删掉这个数直接往下写；
    不要原样重查同一句——返回的是同一份结果，只会把分镜卡在原地。
 2. **写分镜** plan_motion：每镜一句文案 + 一句 **`brief`**（这一镜画什么、怎么构图、
-   怎么分几拍动）+ 高亮词 + 可选旋钮 + 出处；spec 顶层写一句 `style`（整片风格）
-   与一件 `recurring_prop`（贯穿全片的装置，见下）。
+   怎么分几拍动）+ 高亮词 + 可选旋钮 + 出处；spec 顶层写一句 `style`（整片风格）。
+   **`recurring_prop` 不是必填**：只有用户明确要求「同一件东西贯穿全片」时才写；
+   用户没说就不写，让每一镜按自己的文案画（见「贯穿全片的同一主体」一节）。
    **`code` 可省**：不写就由系统按 brief、整片 style 与这一镜文案逐镜单独写代码
    （每镜一次短调用，自动过 lint）。你要自己写某几镜的 code 也可以，写了以你为准。
    写码前系统会先做一遍**美术导演**：把 `style` 拆成网格/色数/边缘/光/材质这几条可执行
@@ -47,6 +53,7 @@ exclude: demos/, shots/
 - **只改几镜就用 `shots_patch`**：只交那几镜（按 id 替换），不必把几十镜代码整份重交。
 - **字色读不出（闸⑩）系统会自动修**；**一个字幕件都没摆的镜系统会补上**（`<CaptionText/>`
   或 `<CaptionLayer/>` 都算摆了）——回执的 `autofix_notes` 里写着改了哪镜。
+  **整片写了片壳（`shell`）时这一条不适用**：字幕归壳，系统不再往镜头代码里补字幕件。
 
 # 用户只给一句话时：默认导演方案
 
@@ -60,6 +67,8 @@ exclude: demos/, shots/
 - **受众**：这个题材的普通好奇者，不是同行；术语第一次出现要用人话解释。
 - **结构**：现象 → 机制（2~4 路解释）→ 为什么是此刻 → 收束。**不要停在「这是什么」。**
 - **声音**：用户没说就带旁白；说了「只要字幕文字」就 `narration=false`。
+- **字幕**：默认 `caption_style: "outlined"`（白字黑边）。压在深色底、浅色底、雾里都读得出来，
+  不用靠镜代码自己猜字色；关键词照旧走 `highlight_style`。用户点名别的样式再换。
 - **配乐**：用户点名了某一首才配；没点名默认不配，不要自己从曲库里挑。
 
 ## 用户的明确要求怎么和这套默认叠加（优先级）
@@ -79,41 +88,33 @@ exclude: demos/, shots/
 另一条边界：用户**明确否定**某样东西（「不要暖色」「不要读数表这种装置」）时，
 它同时也是禁忌——换一套画法，不要把被否定的东西换个名字加回来。
 
-## 内部起手配方（不是给用户看的菜单，也不是模板）
+## 内部起手：从这一镜的文案里长出来（不是一张配方表）
 
-按题材挑一条**起笔**，把画法写进 `style` 与 `art.look`。配方只决定从哪落笔，
-每一镜画什么仍由这一镜的文案与 brief 决定；用户给了风格就**覆盖配方，并在他的方向上加**。
+用户没给风格时，**不要从固定配方表里挑一套**。按选题与这一镜的文案自己起画法：
+先想清文案里那件事物在现实里长什么样、光从哪来、这一镜的动线怎么走，
+再定媒介（平涂 / 线稿 / 像素 / 厚涂 / 拼贴都行）、构图与色彩。
+整片用一种语言，但每一镜画的是这一镜自己的东西；用户给了方向就在他的方向上继续加。
 
-| 题材 | 默认画法（起笔） | 贯穿装置的类型 |
-|------|------------------|----------------|
-| 概念 / 社科 / 经济 / 哲学 / 心理 | 暖雾纸感平涂矢量插画：单一光源、三层纵深、细颗粒暗角、一章一色调；主体是具体物件，不是图标 | 读数表、镜子、会变数字的屏幕 |
-| 历史 / 器物 / 人物 | 档案纸感：牛皮纸底、旧印刷网点、朱砂印色、细线描；像一页手稿或器物图录 | 档案盒、年表、书页、印章 |
-| 科技 / 数据 / 机制 | 冷光深色：发光描线、暗场中的一道曲线、器械面板的微光；不要霓虹赛博 | 示波器、仪表盘、器械 HUD |
-| 身体 / 日常 / 亲密经验 | 自然光室内：皮肤与布料的柔光、窗影、生活器物的质感；不要健身广告的硬光 | 体重秤、手机屏、镜面、衣架 |
+两条通用底线（任何画法都要满足）：
 
-三条通用底线（任何配方都要满足）：
-
-1. **一件贯穿装置**：写进 `recurring_prop`，全片只此一件，反复出现在画面世界的同一个位置；
-   它的读数/状态随叙述变化。不是 UI 贴片，也不要每镜换新的。
-2. **每帧都是关键词的画像**：这一镜文案里能被画出来的那个东西，占住画面、有光有影。
+1. **每帧都是关键词的画像**：这一镜文案里能被画出来的那个东西，占住画面、有光有影。
    整帧只有字和色块＝这一镜没画。
-3. **反 PPT**：卡片墙、九宫格、项目符号、干净的图表页、一排圆角色块——一条都不要。
+2. **反 PPT**：卡片墙、九宫格、项目符号、干净的图表页、一排圆角色块——一条都不要。
    图表要长在场景里（粉笔线、纸面网格、玻璃反光、器械读数）。
 
-例子——用户只说「做个讲薄肌理论的视频」：
+贯穿装置**不是默认项**：只有用户要求「同一件东西在后面每一镜还在」时才写
+`recurring_prop`。用户没要求就不写——每镜都是它自己的画面，不要为了「统一」硬塞一件
+反复出现的东西。
 
-- `style`：暖雾纸感平涂矢量插画：单一光源、三层纵深、细颗粒暗角；一章一色调；
-  一枚贯穿全片的读数装置；衬线标题＋压画面字幕，关键词朱砂红。
-- `recurring_prop`：一枚钉在墙上的「被看见」读数表，刻度随叙述爬升、越界时变红。
-- 结构：现象（薄肌为何刷屏）→ 三路解释（消费与身份 / 自我技术 / 社会比较，
-  每路一个画面＋一个反例）→ 为什么是此刻（平台可见性、展示成本、审美通胀）→ 收束。
+# 这一镜画什么：你交 `brief`，代码由系统逐镜写
 
-# 这一镜画什么：你交 `brief`（代码由系统写，也可以自己写）
+**分工是固定的：你交分镜，系统写代码。** 交付入口只有一个：`plan_motion`。你把每镜的
+`brief` 交进去，系统按 brief 逐镜写码，顺手渲每镜一张静帧并做一轮
+带图评审。分镜入库后调 `render_motion_code`，确认卡上就会带着这些静帧给用户看。
 
-**交付入口只有一个：`plan_motion`。** 想先看画面，可以在工作区里用 `write_file` 写
-`shots/*.tsx` 草稿，再用 `check_shot_code` / `preview_shot` 自查；但**成片不会读这些
-草稿文件**。预览满意后，把这一镜的 `brief`（或 `code`）交进 `plan_motion`，全部镜齐了
-再调 `render_motion_code`。不要反复重写同一份草稿——写入相同内容不会带来任何进展。
+**不要在主对话里写 `shots/*.tsx` 草稿**：成片不读这些文件，写着写着就变成「手写全片
+代码」，几十镜下来既慢又和系统写的那一版对不上。要改哪一镜，用 `shots_patch` 只交
+那一镜的 `{id, brief}`；改过的镜会重写代码、重渲静帧，其余镜原样留着。
 
 **你交的是 `brief`（可带 `entities`），代码由系统逐镜写。** 每一镜写一句画面描述，说清三件事：
 
@@ -130,8 +131,9 @@ exclude: demos/, shots/
 > 右下角一个扛着煤袋的工人剪影，被机器的阴影罩住一半。烟从无到有先起，飞轮随后转起来，
 > 工人最后一拍走到机器旁。
 
-**想自己写整段代码也可以**：那一镜在 `plan_motion` 的 spec 里直接带 `code`（规则与下面
-完全一样），写了就以你为准——是交进 `plan_motion`，不是留在工作区的草稿文件里。
+**例外**：系统逐镜写出来的某一镜确实画错了（比如写手两次都漏掉同一件实体），可以在
+`shots_patch` 里给那一镜直接带 `code`（规则与下面完全一样），写了就以你为准。这是修
+一镜的兜底口，不是交付方式——整片都自己写，等于绕开了逐镜写手、评审与预览。
 
 下面是这套画面系统的全部能力，写 brief 与写 code 用的是同一份：
 
@@ -139,7 +141,7 @@ exclude: demos/, shots/
 - **裸 SVG / `<canvas>`**：不受任何组件限制，`<path>`、渐变、`<filter>`、`clipPath`、逐帧笔触都行；
 - `@dg/lib/brush`：手绘笔刷与材质（`<BrushStroke/>` 可变宽度笔触、`<PaperTexture/>` 纸纹、`<Grain/>` 颗粒、`<LightPool/>` 光池、`<SoftShadow/>` 柔影、`<Vignette/>` 暗角、`<Wash/>` 水彩填充）；
 - `@dg/lib/scene`：场景底板（`<Scene far mid near/>` 前中后三层、`<Horizon/>` 视平线、`<Particles/>` 浮尘）；
-- `@dg/lib/walk`：可选——走路的人的确定性步态（`<WalkingFigure/>`，剪影/平涂/受光/线稿四档）；只在使用 `protagonist` 且主体是人时才考虑它，别的主体自己画。**默认还是自己在镜头代码里画**；这一片带了沉淀风格包时，风格包里的模板和 `WalkingFigure` 都只是可选参考，画什么内容由这一镜的 brief 决定；
+- `@dg/lib/walk`：走路的人的确定性步态（`<WalkingFigure/>`，剪影/平涂/受光/线稿四档）——可选参考件，不用也可以；
 - `@dg/lib/draw/*`：简笔画零件（人、机器、建筑、齿轮、图表……）——**可选参考件**，不是必须；
 - `@dg/film`：`<CaptionText/>`（字幕的字，位置由你给）、`<CaptionLayer/>`（整条预设，只在没有干净区域时用）、`resolveFilmStyle(getInputProps())`（整片底色/墨色/强调色）；
 - `@dg/polish`：字体 `FONT`、字距 `tracking`、颗粒 `Grain`、暗角 `Vignette`；
@@ -163,6 +165,8 @@ exclude: demos/, shots/
    整帧只有字和色块＝这一镜没画。零件库是可选的参考件，不是入场券；画法本身不限
    （见「画面从哪来」与「视觉手艺」）。
 5. **镜数**：一镜 8~12 秒；目标 4 分钟左右就是 20~30 镜。
+
+<!-- section: code-manual -->
 
 ## 反 PPT 语汇清单
 
@@ -216,6 +220,10 @@ exclude: demos/, shots/
 7. **材质层**。纸纹 `<PaperTexture/>`、颗粒 `<Grain/>`、暗角 `<Vignette/>` 三者叠上去，
    画面立刻从「矢量图」变成「印刷品/手稿」。整片用同一套强度；`texture` 档已经是
    `film/glow/bleach` 时别再叠一层同类的。
+   颗粒直接用 `<Grain opacity={0.5} seed={17} blend="normal" />`。**别自己写一块铺满
+   画幅、挂 `feTurbulence` 滤镜的 `<rect>`**：那张噪声每帧都要重算一遍，实测一帧要多
+   花两三倍时间（整片就是几十分钟），而颗粒本身一帧都没变；`<Grain/>` 用的是同一种
+   噪声贴图，浏览器只栅格化一次。
 8. **动效要成组**。同一层元素用同一个 `spring` 参数与 stagger；不同层可以有先后，
    但不要每个元素各用一套缓动。`interpolate` 一定要 `extrapolateLeft/Right: 'clamp'`，
    否则帧数一长数值就飞出画面。
@@ -227,7 +235,8 @@ exclude: demos/, shots/
 ## 画幅、坐标与几条写法纪律
 
 1. **顶层是自包含的 `<AbsoluteFill>`**：底色、边距都由这一镜自己定。母版 `<FilmLayout>` 已下线，
-   **不要 import 它**。
+   **不要 import 它**。**这一片写了片壳（`shell`）时**，纸底、顶部色条、左上圆钟、期号与底部字幕
+   由片壳统一画：这一层只铺画面带里的主体与场景，画布用 `useBody()`，不要自己画外框和字幕。
 2. **坐标按整帧写**：宽高从 `useVideoConfig()` 拿（竖屏 1080×1920、横屏 1920×1080、方屏 1080×1080），
    别按某一种画幅写死数字。
    spec 与 `plan_motion` 顶层的 **`aspect` 就写这三个枚举值之一**：
@@ -250,7 +259,6 @@ import { BRAND } from "@dg/brand";
 // 手绘笔刷与场景底板（可选，但「像手画的」多半靠这一层）
 import { BrushStroke, PaperTexture, Grain, LightPool, SoftShadow, Vignette, Wash } from "@dg/lib/brush";
 import { Scene, Horizon, Particles } from "@dg/lib/scene";
-import { WalkingFigure } from "@dg/lib/walk";   // 可选：贯穿主体是走路的人时才用
 
 // 简笔画零件库（**可选参考件**）：一件＝一个能被认出的东西的轮廓。
 // 用得上就用，用不上就自己用 <path>/<canvas> 画——没有任何闸要求必须用它们
@@ -284,6 +292,10 @@ import { interpolate, useCurrentFrame, useVideoConfig, random, AbsoluteFill, sta
 // 画法通道（在白名单里，按需引入）
 import { fitText as remFitText } from "@remotion/layout-utils";
 ```
+
+<!-- /section -->
+
+<!-- section: art-direction -->
 
 ## 8 套主题色板（整片挑一档，个别镜可覆盖）
 
@@ -332,6 +344,11 @@ import { fitText as remFitText } from "@remotion/layout-utils";
   底色和光色可以一段一段变；变的是色温，不是画风。
 - 历史/文明/器物/传记类选题默认走 `ink-archive`（`vintage-kraft` + `film`/`bleach` +
   `paper`/`ink`）；`midnight` / `deep-ocean` 是数据与科幻的冷调，别拿它配烟火气的内容。
+- **先看得清，再谈气氛**（2026-10-20 真机片整体近黑，用户原话「根本看不清」）：
+  背景的平均亮度要明显高于主体剪影（牛皮纸浅底 + 深剪影是最稳的一档）；暗场戏也必须
+  留一块亮区（火光、灯池、屏幕），不要整幅压到近黑。主体与背景**至少差两档明度**，
+  差不够时加边光或压深剪影，不要靠暗角遮。`film` 那档自带的暗角是轻的，不要再用
+  代码叠一层更重的 vignette。
 - 逐个时代的色温写进 `art.palette_note`（如「火光橙 → 油灯琥珀 → 霓虹粉 → 屏幕冷蓝」），
   它和 `style_grammar` 会一起喂给每一镜的写手。
 
@@ -356,19 +373,49 @@ import { fitText as remFitText } from "@remotion/layout-utils";
 
 有一类片子的力量不在任何一镜的细节，而在**同一个东西**从洞穴走到蒸汽、火箭与手机时代：
 轮廓、比例、朝向、底缘那条线始终是同一个，只有背景与材质在换。这个「东西」可以是人，
-也可以是一头鹿、一辆车、一只箱子、一块发光的矩形。用户给了这类参考片，或选题本身就是
-一条贯穿线索时，在 spec 顶层写一栏 `protagonist`：
+也可以是一头鹿、一辆车、一只箱子、一块发光的矩形。
+
+**同一个人/同一件东西在三个以上的镜里出现，就写这一栏。** 这不是「有参考片才写」的
+可选装饰：不写，每一镜的写手会各自发明一个「大概这么高」的主体，切点一过身高、
+肩宽、步幅全换一套——观众看到的是几十个人，不是一个人走过几十个时代。
 
 ```json
 "protagonist": {
-  "look": "瘦高、圆头、宽肩的剪影；手里那盏灯跟着时代换",
+  "look": "瘦高、侧面轮廓的剪影：额头、鼻梁、下巴有转折，头发/帽子随时代；手里那盏灯跟着时代换",
   "kind": "人",
   "render": "silhouette",
-  "wardrobe": "岩洞：兽皮斗篷 → 蒸汽：工装帽 → 现代：连帽衫（手里有手机）",
+  "wardrobe": "岩洞：兽皮斗篷 → 蒸汽：工装帽与长外套 → 现代：连帽衫（手里有手机）",
   "height": 0.48, "foot_y": 0.86, "facing": "right",
   "stride_sec": 1.0, "light": "火光橙 → 车窗暖黄 → 路灯 → 手机屏冷蓝"
 }
 ```
+
+人用 `@dg/lib/walk` 的 `<WalkingFigure/>` 时，衣服与随身物由 `outfit` 一组参数给，
+**不是每镜另画一套骨架**。整片只选一次 `build`，逐镜只换 `outfit` 里这几项
+（写 brief 时就按时代写清「穿什么、戴什么、手里拿什么」）：
+
+| 参数 | 可选值 |
+|---|---|
+| `garment` | `none` / `tunic` / `robe` / `toga` / `coat` / `dress` / `suit` / `hoodie` / `armor` / `pelt` |
+| `sleeve` | `none` / `fitted` / `wide` / `bell` / `puffed` |
+| `length` | `hip` / `knee` / `calf` / `ankle` / `floor` |
+| `flare` | 0~1，下摆外扩 |
+| `headwear` | `none` / `cap` / `futou` / `tricorn` / `top` / `brim` / `helmet` / `hood` / `straw` / `crown` |
+| `hair` | `short` / `bun` / `ponytail` / `long` / `bald` |
+| `prop` | `none` / `cup` / `book` / `staff` / `cane` / `umbrella` / `lantern` / `torch` / `phone` / `bag` / `scroll` / `tool` |
+| `build` | `male` / `female` / `neutral`（整片只选一档） |
+
+```tsx
+<WalkingFigure x={x} footY={H * 0.86} height={H * 0.48}
+  facing="right" strideSec={1.0} phase={phase}
+  outfit={{ garment: 'robe', sleeve: 'wide', length: 'ankle',
+            headwear: 'futou', hair: 'bun', prop: 'scroll', build: 'male' }}
+  rim="#ffb15c" />
+```
+
+用户说「明代读书人，青衫、乌纱帽、手里一卷书」，就翻成上面这一组；说「18 世纪欧洲
+学者」就换 `coat` + `tricorn` + `book`。翻不到最近的版型时选最近的一档，别自己发明
+新枚举值——认不出的值会落回缺省，画面就变成「没穿那件衣服」。
 
 一块贯穿全片的发光矩形就是这样写：
 
@@ -385,49 +432,31 @@ import { fitText as remFitText } from "@remotion/layout-utils";
 这栏一写，**每一镜的写手都会把这个主体放进去**，包括文案没提到它的镜。所以反过来也成立：
 没有贯穿主体（纯器物轮换、纯数据、纯概念）就**别写**——写了等于让二十几镜硬塞同一个东西。
 
-`render` 是画法方向，不是「必须用某组件」：`silhouette` 剪影 / `flat` 平涂上色 /
-`lit` 受光面与背光面两档（要「不是阴影、是真实的样子」就选它）/ `line` 线稿。
+`render` 是画法方向：`silhouette` 剪影 / `flat` 平涂上色 / `lit` 受光面与背光面两档
+（要「不是阴影、是真实的样子」就选它）/ `line` 线稿。
 
-**画法默认是自己在镜头代码里画**；下面是三条可选路径，按主体挑：
+具体怎么画（姿势、骨架、比例、服饰、动作）由写手按 brief 自己决定；这一栏只给连续性：
+每一镜用同一组 `height` / `foot_y` / `facing` / `stride_sec`。运动相位接**全片时钟**，
+不能每镜从 0 起算（否则切点处换脚、重新起步）：
 
-1. **走路的人**：优先自己画——用 `useCurrentFrame()` 算位移与步态，按这一镜的 brief 画
-   衣服、配件、持物和背景。也可以借 `@dg/lib/walk` 的 `<WalkingFigure>`（可选），它把
-   步态写成帧的确定函数，每一镜传同一组参数，切点两侧就是同一个身影、同一个步姿：
+```tsx
+import { getInputProps, useCurrentFrame, useVideoConfig } from 'remotion';
+const { filmStartSec = 0 } = getInputProps();
+const frame = useCurrentFrame();
+const { fps } = useVideoConfig();
+const phase = ((filmStartSec + frame / fps) / 1.0) % 1; // 0~1 周期相位，不是秒
+```
 
-   ```tsx
-   import { WalkingFigure } from '@dg/lib/walk';
+x 随时间朝 `facing` 方向推进，真的往前走，别整镜钉在一个点上踏步。
 
-   <WalkingFigure
-     x={W * 0.5} footY={H * 0.86} height={H * 0.48}   // 成片像素：主体要大
-     walking facing="right" strideSec={1.0} phase={0}
-     render="silhouette"                               // flat / lit 可上色、出体积
-     wardrobe="cloak"                                  // 只是它已有的几档之一
-     fill="#161218" rim="#ffb15c"                      // 主色 + 跟着主体走的光
-     // 走到 flat / lit 时，fill 换成固有色（如 #9a7a5e 的褐、#8a8f96 的灰），
-     // 别沿用剪影的墨黑——那会画成一块黑，体积没地方落。
-   />
-   ```
+要写实/有体积时选 `render: lit`（上面那行），不要默认纯黑剪影；材质用高光与反射
+区分，而不是一圈黑边。代码能做到的是「有体积的插画」，不是照片——选题要照片级
+实拍时，先跟用户说清楚这一层边界。
 
-   `wardrobe` 是这个组件**已经画好的几档**（`cloak` 斗篷/兽皮、`cap` 工装帽、
-   `coat` 长外套、`hoodie` 连帽衫、`plain`），不是世界上的衣服清单；这一镜的衣服在它
-   之外（盔甲、长袍、西装、雨衣、宇航服、工作围裙……）就自己画，别为了套取值改内容。
-   **轮廓不随衣服变**。连续性参数每一镜原样传：`height`、`footY`、`facing`、
-   `strideSec`、`phase={0}`。要停一拍（抬头看火箭、停下点烟、举起手机）传
-   `walking={false}`。
-
-2. **不是人的主体**（鹿、车、器物、发光的矩形）：**不要套 `<WalkingFigure>`**。在这一镜
-   的代码里用自由 SVG/Canvas 画它，按同一轮廓、同一比例、同一主色画；跨镜只换背景与
-   材质细节。`height` / `foot_y` / `facing` 仍是同一组连续性参数。
-
-3. **要写实/有体积**：不要默认纯黑剪影。自己画受光面/固有色/背光面，或用
-   `render="lit"`（人或自己画的物件都行）；`fill` 给固有色而不是墨黑，主体至少给
-   受光面、固有色、背光面三档明度，落地有影子；材质（金属/布/玻璃/屏幕）
-   用高光与反射区分，而不是一圈黑边。代码能做到的是「有体积的插画」，不是照片——
-   选题要照片级实拍时，先跟用户说清楚这一层边界。
-
-有了贯穿主体，背景要**按它的行进方向往后掠**（近层快、远层慢），它基本停在画面中部
-（x≈画面宽 45%~55%）；每镜换的是时代的那一层（洞穴壁、车窗、发射架、办公室玻璃），
-不是换一个主体。人是剪影时可以不画五官——要指一个人就配一句名字标注。
+有了贯穿主体，背景要**按它的行进方向往后掠**（近层快、远层慢），主体在画面里**真的
+往前走**（x 朝 `facing` 方向推进，别整镜钉在一个点上踏步）；每镜换的是时代的那一层
+（洞穴壁、车窗、发射架、办公室玻璃），不是换一个主体。人是剪影时可以不画五官——
+要指一个人就配一句名字标注。
 
 ## 3 档风格组合（整片默认，不是逐镜配额）
 
@@ -446,6 +475,10 @@ import { fitText as remFitText } from "@remotion/layout-utils";
 `bg`；质感与字幕两维在这一镜单独申报（只有那一镜确有理由才换）。跨镜一致性的账由 ⑩（字色对
 底色的对比度）与 ⑨（跨镜同构）来记；闸⑲ 管的是**构图**那一侧——满幅镜数、质感种数、
 `bg` 申报率，**不管色板种数**：「二十镜共用一个调子」不再是错，那正是用户要的东西。
+
+<!-- /section -->
+
+<!-- section: code-rules -->
 
 ## 代码模板
 
@@ -527,6 +560,8 @@ const palette = palettes["deep-ocean"];        // 只对**这一镜**生效
 4. 位移/缩放/旋转用独立属性（`scale`/`translate`/`rotate`），不拼 `transform` 串。
 5. `interpolate()` 写在 `style` 内联里（闸⑥ 靠它读字段标记）。
 6. 秒→帧用 `useVideoConfig().fps` 换，不许写死 30。
+
+<!-- /section -->
 
 # 一镜有哪些栏
 
@@ -615,6 +650,10 @@ const palette = palettes["deep-ocean"];        // 只对**这一镜**生效
 对齐，都是这一镜的构图决定。母版已下线：画面上没有「系统叠上去的那条字幕」，你在代码里
 把字放在哪，观众就在哪看到它。
 
+**这一片写了片壳（`shell`）时，这一节换成片壳的做法**：底部字幕由片壳统一排，全片同一个
+位置和字号。这一镜不再排旁白字幕，也不要用 `<CaptionText/>`、`<CaptionLayer/>`、
+`<CaptionFrame/>` 去排它；画面下沿照样留出相对干净的一带，给片壳的字幕。
+
 **缺省写法是 `<CaptionText/>` 叠在画面上**：套一个定位盒子放在下沿（`bottom` 约画面高
 3%~5%），`fitWidth` 取画面宽的 **0.58~0.66**。参考片里那条中文字幕只占画面高约 4%——
 **不要用 0.84~0.88 的满宽**，那会把字放大成一条横幅；也不要在画面下方单切一条黑带。
@@ -640,9 +679,9 @@ const palette = palettes["deep-ocean"];        // 只对**这一镜**生效
 | 满幅插画 / 场景 | 叠在画面下沿（或顶部留白） | 用 `<CaptionText/>` 套盒子，`fitWidth≈0.62×宽`；与主体的地平线或视线对齐，下沿留出干净的一带 |
 | 数据卡 / 竖排 | 卡片内底部的说明位 | 与卡片内衬对齐，不跨出卡片边界 |
 
-字的**处理**（同一片子要是一套）：底干净、能腾出一块平面 ⇒ 字直接压画面、关键词换
-这一镜的强调色（`emphasis="color"`）；画面本身明暗乱跳、没有干净区域 ⇒ 才加描边
-（`outline`，用这一镜的墨色或纸色，别用纯黑纯白）。同片别一镜换色一镜描边——观众读到的
+字的**缺省处理**：白字黑边（`outline="#000000"`），整条字同色；**不写 `emphasis`**，
+让它跟整片那一档的高亮样式走。只有用户点名要「关键词换色 / 高亮」时，才写
+`emphasis="color"`。同片别一镜换色一镜描边、也别逐镜各写一份高亮——观众读到的
 不是两种风格，是两种字幕。
 
 ## 硬约束（闸会逐条判）
@@ -688,7 +727,7 @@ import { CaptionFrame, CaptionText, CaptionLayer, useCaptionTiming } from '@dg/f
     position: 'absolute', left: width * 0.19, width: width * 0.62,
     bottom: height * 0.04, textAlign: 'center', color: ink, lineHeight: 1.35,
   }}>
-    <CaptionText fitWidth={width * 0.62} emphasis="color" accent={palette.accent} />
+    <CaptionText fitWidth={width * 0.62} outline="#000000" />
   </div>
 </AbsoluteFill>
 
@@ -706,9 +745,9 @@ import { CaptionFrame, CaptionText, CaptionLayer, useCaptionTiming } from '@dg/f
               width: chartW, fontFamily: serif, lineHeight: 1.42,
               fontWeight: 700, color: ink }}>
   <CaptionText text={text} highlight={highlight} words={words}
-               emphasis="color" accent={palette.accent} fitWidth={chartW} />
+               outline="#000000" fitWidth={chartW} />
 </div>
-//    `emphasis` 省掉就跟着整片那一档的高亮样式走
+//    `emphasis` / `outline` 省掉就跟着整片那一档走；缺省是白字黑边、整条同色
 
 // ③ 整屏都是画面、没有能排字的干净区域：这时才用整条预设
 <CaptionLayer />
@@ -734,8 +773,8 @@ const { reached, charFrames } = useCaptionTiming();
 
 **仍然用这一件，别手写 `<text>` 当字幕**：逐词点亮、断行、字号、描边、高亮色都是它一处
 算的；手写一份，等于每镜各实现一遍用户选的那一档，三十镜就有三十份会走样的样式
-（上一版「白字黑边」渲成黑字就是这么来的）。用户没选过时，缺省是「贴画面 + 关键词换色」，
-你可以用 `emphasis` / `outline` / `accent` / `fontSize` 逐镜自由发挥。
+（上一版「白字黑边」渲成黑字就是这么来的）。用户没选过时，缺省是「白字黑边 +
+关键词换色」；你可以用 `emphasis` / `outline` / `accent` / `fontSize` 逐镜自由发挥。
 
 - **申报 `caption_style: "none"`（不上字幕）的镜别再摆 `<CaptionLayer/>`**：它自守不画，
   闸㉜ 会把那种自相矛盾的代码打回。摆 `<CaptionText/>`（画面里的字）不受这条限制。
@@ -748,12 +787,17 @@ const { reached, charFrames } = useCaptionTiming();
 
 | 栏 | 取值 | 说的是 |
 |----|------|--------|
-| `caption_style` | `on_picture` 贴画面无底（缺省）/ `outlined` 白字黑边 / `paper` 纸条底 / `film_line` 整句电影感 / `big_center` 大字压屏 / `top_banner` 顶部横幅 / `none` 不上字幕 | **整条预设**长什么样、站哪（用 `<CaptionLayer/>` 时生效）；你自排 `<CaptionText/>` 时，它只提示字的**处理**该往哪边靠 |
+| `caption_style` | `outlined` 白字黑边（缺省）/ `on_picture` 贴画面无底 / `paper` 纸条底 / `film_line` 整句电影感 / `big_center` 大字压屏 / `top_banner` 顶部横幅 / `none` 不上字幕 | **整条预设**长什么样、站哪（用 `<CaptionLayer/>` 时生效）；你自排 `<CaptionText/>` 时，它只提示字的**处理**该往哪边靠 |
 | `highlight_style` | `color` 关键词换色（缺省）/ `karaoke` 逐词点亮 / `block` 底色块 / `ink` 撕纸高亮 / `plain` 不强化 | 被点名的词**怎么被点出来** |
 
 两维相乘＝35 种组合都说得出口：要「关键词换色但不要纸条」就写
-`caption_style: "on_picture"` + `highlight_style: "color"`。**别把它们想成一排档**——没有
-哪一档同时锁死这两件事，所以也没有「选了这个就必须接受那个」的时候。
+`caption_style: "outlined"` + `highlight_style: "color"`（白字黑边，换色的词照样换色）。
+**别把它们想成一排档**——没有哪一档同时锁死这两件事，所以也没有「选了这个就必须接受那个」
+的时候。
+
+**整片只写一档**：顶层写 `outlined`（用户没点名别的样式时），逐镜**不要**再写
+`caption_style` 覆盖。真机片里一半镜写 `on_picture`、一半不写，成片里同一部片的字幕
+一会儿有描边一会儿没有，读起来像三个人的片子——这一栏是整片级的缺省，不是逐镜画法。
 
 这两维说的是「**怎么**点出来」，还有一个整片级的 `highlight_color`（`#rrggbb`，空＝跟这一镜
 的色板）说的是「**用哪个色**」——它由用户在「文字库」钉，钉住时**盖过高亮词那一色**，连你在
@@ -883,6 +927,11 @@ const { width, height } = useVideoConfig();   // 竖屏 1080×1920、横屏 1920
 3 秒的镜头配 0.9 秒已经接近上限，短镜（开场呼吸镜那种）要配更短的一档。
 给了配不上短镜的档位，会在**拼接之前**被打回并指出是哪一处接缝。
 
+**这一档决定拼接要多久**：整片 `none` 时逐镜切片的编码参数一致，拼接是纯字节拷贝，
+几秒完事；只要有一处叠化/擦除，整片就要重新编码一遍——四五分钟、五十来镜的片子，
+这一趟约多花八到十分钟，而且是整条链里最重的一步（几十路输入同时解码）。
+没有非叠不可的理由，留在 `none`。
+
 **逐接缝覆盖**（`transition` 写在**某一镜**上，表示**它之后**那一处接缝用什么）：
 专业动效里转场本来就是逐接缝的——整片统一淡叠，但「结论那一镜」用圆开推上去，
 是常见做法。写法：把 `transition` 写在那一镜里（`{"id": "s07", "transition": "circleopen"}`），
@@ -995,6 +1044,8 @@ const { width, height } = useVideoConfig();   // 竖屏 1080×1920、横屏 1920
 回执里未判单列一栏，不等于绿——「没量到」与「量到了没问题」是两件事，并成一格就是把
 没量的说成合格的。闸⑦ 的「每镜必画」三镜片也逐镜判。
 
+<!-- section: picture-catalog -->
+
 # 画面丰富度合同（五类母题怎么选画法）
 
 一条片子要有画面，靠的是**每一镜都真的画了东西**，而画面只有一条路：**你逐镜写 TSX 代码把它画出来**。
@@ -1064,8 +1115,9 @@ const { width, height } = useVideoConfig();   // 竖屏 1080×1920、横屏 1920
 
 **这一族配上 `bleed: true` 才是它该有的样子**：常规版式下画面被裁进中间一条带子里，满版描线
 只能缩着画。三个开关合起来就是「白板讲解」那种观感——`bleed: true`（铺满整帧）+
-`caption_style: on_picture`（无底贴画面，字自己摆 `<CaptionText/>`，逐词点亮与撕纸高亮
-照旧可用）+ 上面这套描线手法。
+`caption_style: outlined`（白字黑边，字自己摆 `<CaptionText/>`，逐词点亮与撕纸高亮
+照旧可用）+ 上面这套描线手法。这一族也不要为了「白板感」把字幕改成无描边：白底黑边
+同样是白板的一部分，字在任何底色上都读得出来。
 
 # 主体具名（闸⑯）
 
@@ -1083,7 +1135,7 @@ const { width, height } = useVideoConfig();   // 竖屏 1080×1920、横屏 1920
 
 # 镜头代码的 import 名单
 
-lint 白名单 68 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
+lint 白名单 69 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 
 `react`、`react-dom`、`remotion`、`@remotion/paths`、`@remotion/shapes`、
 `@remotion/motion-blur`、`@remotion/layout-utils`、
@@ -1106,7 +1158,7 @@ lint 白名单 68 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 `@dg/lib/draw/Book`、`@dg/lib/draw/Scale`、`@dg/lib/draw/Clock`、
 `@dg/lib/draw/Crown`、
 `@dg/lib/brush`、`@dg/lib/scene`、`@dg/lib/walk`、
-`@dg/lib/style/silhouette-history`、
+`@dg/lib/style/silhouette-history`、`@dg/lib/style/cinema-studio`、
 `@dg/lib/helpers/motion`、`@dg/lib/helpers/rand`、`@dg/lib/helpers/shake`、
 `@dg/lib/helpers/camera`、`@dg/themes/palettes.json`。
 
@@ -1130,6 +1182,10 @@ lint 白名单 68 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 要版面尺寸就问 `useVideoConfig()`——自包含的镜画的就是**整帧**（1920×1080 的设计稿怎么
 换算到实际画幅，见「画幅、坐标与几条写法纪律」）。`useBody()` 是**老跑法**（把这一镜包进
 母版 `<FilmLayout>`）才有的东西，新写法不要用它：母版已下线，没有人为你裁画面带。
+
+**整片写了片壳（`shell`）时反过来**：壳会把这一镜夹进画面带，画布就用 `useBody()` 报的
+`w`×`h`。坐标原点是带子的左上角——`useBody()` 的 `x`/`y` 是带子在整帧里的位置，别再加
+进你自己的坐标（加了就整体右移下移）。
 
 母版画面带尺寸（**只有套母版的镜才成立**，列在这里只是让老代码对得上）：
 - 竖屏 portrait：936×1524
@@ -1165,6 +1221,8 @@ lint 白名单 68 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 **别写 `SF Pro Display`/`Avenir`/`Google Fonts` 那一类名字**：镜像里没有、渲染容器也不联网，
 浏览器**不报错**、直接回落成默认字族——代码里写的和画面上出现的不是一回事（闸① 的
 `dg/font-load-check` 就是为这条：`loadFont` 指的字节必须在 `public/fonts/` 里真存在）。
+
+<!-- /section -->
 
 <!-- section: subject-naming -->
 # 主体具名（闸⑯）：每一镜的那个「能被认出的东西」怎么写

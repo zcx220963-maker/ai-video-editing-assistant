@@ -11,6 +11,7 @@ from typing import Any
 
 from ..hooks import _current_hook_ctx
 from ..identity import current_identity
+from ..style_override import effective_style_skill
 from ..tool import Tool, ToolError
 from .support import PLAN_MAX_CANDIDATES
 
@@ -218,9 +219,14 @@ class SubmitPlanTool(Tool):
         # 刷新/换设备/重放同一张卡也不会丢。放在候选上而不是 state 上，是因为
         # 候选会被整份落进 checkpoint 指针行。
         ident = current_identity()
-        if ident is not None and ident.style_skill:
+        # 取「有效」包名而不是身份里那份：同一条消息里用户先说「换成水墨风」再由模型交卡时，
+        # 风格工具是在 gather 的子任务里跑的，它 rebind 的 contextvar 出不了那个任务
+        # （见 ``style_override``）。不读这张会话表，卡上挂的还是换风格之前的旧值。
+        style_now = (effective_style_skill(ident.session_id, ident.style_skill)
+                     if ident is not None else "")
+        if style_now:
             for p in normalized:
-                p["style_skill"] = ident.style_skill
+                p["style_skill"] = style_now
         ctx = _current_hook_ctx.get()
         if ctx is not None:
             ctx.state.plan_candidates = normalized

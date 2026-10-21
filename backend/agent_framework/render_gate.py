@@ -67,12 +67,15 @@ def _dry_run_call(tc: Any) -> bool:
 
 
 def ungated_render_nodes(tool_calls: Any, *, enabled: bool,
-                         already_asked: Any = ()) -> list[str]:
+                         already_asked: Any = (), go_straight: bool = False) -> list[str]:
     """这一批调用里，**门还该拦得住**的出片通道名（去重、保持出现顺序）。
 
-    三条判据都收在这一个函数里，调用方只管「名单非空就挂起」：
+    四条判据都收在这一个函数里，调用方只管「名单非空就挂起」：
 
     * ``enabled`` —— 门开关在配置里，不在这里硬编；关着就一律放行。
+    * ``go_straight`` —— 用户这一轮在入口上选了「直接出片」：不等确认。
+      代价写在这里：少一次人工验收，画面不满意可能已经烧完。但那个开关的意义
+      就是**不打断**；拦下来等于把它变成假开关。
     * 看参数：``dry_run`` 的那一次不出片，它本身就是给用户看的那一眼编排结果——
       再拦一道「确认渲染吗」是把同一道题问两遍。
     * 看**通道**：同一条 run 里用户答过 ``render_video`` 那道题，不等于批准了
@@ -80,7 +83,7 @@ def ungated_render_nodes(tool_calls: Any, *, enabled: bool,
       同一通道答过就不再重问（真机事故：同一道题问了几十遍，见
       ``RunState.render_gate_asked`` 的说明）。
     """
-    if not enabled:
+    if not enabled or go_straight:
         return []
     asked = set(already_asked or ())
     out: list[str] = []
@@ -201,11 +204,17 @@ _PALETTE_LABELS = {"none": "默认（片子的底色）",
 # 「自下浮入」、在出场里是「向上浮出」，共用一张表就会在确认卡上写出一句反话。
 _TRANSITION_LABELS = {"none": "硬切（镜镜直接接）",
                       "fade": "淡叠·前一镜淡出后一镜淡入",
+                      "fadeblack": "黑场·先暗到黑再从黑里亮起来",
                       "dissolve": "溶解·两边互相化开",
                       "wipeleft": "左擦·新画面从右往左推过来",
                       "wiperight": "右擦·新画面从左往右推过去",
                       "slideup": "上滑·新画面自下而上顶入",
-                      "circleopen": "圆开·从中心扩开"}
+                      "circleopen": "圆开·从中心扩开",
+                      "circleclose": "圆收·旧画面向中心收拢",
+                      "zoomin": "推进·画面放大着换过去",
+                      "hblur": "横向拖影·画面被速度拉开",
+                      "radial": "涟漪·圆形波纹从一点荡开",
+                      "smoothleft": "柔推·缓动横移换过去"}
 _TRANSITION_SEC_LABELS = {"0.2": "0.2 秒·一闪而过", "0.4": "0.4 秒·轻叠（默认）",
                           "0.6": "0.6 秒·看得出", "0.9": "0.9 秒·很缓"}
 _ENTRANCE_LABELS = {"none": "直接开始（不动作）", "fade": "淡入",
@@ -394,6 +403,26 @@ def build_render_ask(preview: Mapping[str, Any] | None, *,
         # 唯一还能一句「这几镜太空，重写」的时机，出了片再改就是重烧。
         # 闸⑦「每镜必画」不在这里：它是硬闸，没画画的镜根本走不到确认卡这一步。
         warnings += [str(w) for w in (motion.get("style_warnings") or [])]
+        # 预览没出成也分两种：机器忙的那类不影响出片，**代码本身编译不过**的那类
+        # 一定会在那一镜停下（同一份代码、同一个打包器）。后者已经自动重画过一轮，
+        # 还停在这里就是「等你决定」：卡上必须写清，别让用户点完继续才发现。
+        pf = motion.get("preview_failures")
+        if isinstance(pf, Mapping):
+            stuck = sorted(str(k) for k, v in pf.items() if str(v) == "final")
+            if stuck:
+                warnings.append(
+                    f"{'、'.join(stuck)} 这一镜的画面没能生成：继续渲染会在这里停下。"
+                    "想先看到这一镜，就选「我还要改」，说一下这一镜要画成什么样。")
+            elif pf and not (motion.get("preview_frames") or {}):
+                # 一类是「机器忙」的瞬时失败：不影响出片，但卡面上一张图都没有时，
+                # 用户看到的是「这一版没做预览」——而那会让他以为预览坏了或自己漏选了什么。
+                # 真机 2026-10-21 run `1ff6f17ee840`：渲染服务渲第一镜时崩了，随后
+                # 42 镜全部 Connection refused，卡上却只有质感/结构两条提醒。
+                # 只报不拦：写清「图没出来、不影响出片、想先看就重出一版」。
+                warnings.append(
+                    f"这一版的预览图没有生成（渲染服务中途中断过一次）："
+                    f"{len(pf)} 镜都没出图，不影响出片。想先看到画面，就选「我还要改」，"
+                    "说一句「内容不动，先把这一版的预览图补齐再给我确认」。")
     conflict = duration_conflict(preview)
 
     if conflict:

@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -51,7 +52,11 @@ WRITER_PARALLEL = max(1, int(os.environ.get("MOTION_WRITER_PARALLEL", "8") or 8)
 WRITER_ATTEMPTS = 3
 
 #: 单次编写的输出上限。一镜代码 2~5KB，给 8192 足够，且不让一次跑飞。
-WRITER_MAX_TOKENS = 8192
+#: 2026-10-20 提到 12000：带「本片第一镜已定画法」的整份代码当基准时，模型会把
+#: 人物的路径代码写得比平时长（实测 470~520 行），8192 会在收尾处截断，表现是
+#: 连续的 `[parse-error] '>' expected`——不是它不会写，是没写完。供应商实测
+#: max_tokens 到 32000 都收；仍一镜 40KB 上限挡在 lint 前面。
+WRITER_MAX_TOKENS = max(4096, int(os.environ.get("MOTION_WRITER_MAX_TOKENS", "12000") or 12000))
 
 #: 单次编写超时（秒）。一镜 TSX 常要写四五十秒，60 秒的默认预算是给「一次工具决策」的；
 #: 这个值要装下「思考 + 几千 token 输出」。
@@ -83,6 +88,19 @@ WRITER_MODEL = os.environ.get("MOTION_WRITER_MODEL", "").strip()
 #: 2026-10-18 真机 32 镜那条片子因此把写手阶段的渲染时间从 ~30 s/版压到 ~15 s/版。
 WRITER_MOTION_CHECK = os.environ.get(
     "MOTION_WRITER_MOTION_CHECK", "1") not in ("0", "false", "no")
+
+#: 草稿渲**抽检间隔**：每 N 镜验一次（第一镜必验）。0 ＝ 每镜都验（旧行为）。
+#:
+#: 2026-10-21 真机量到的账：一镜草稿是**整镜 270 帧**的渲染（不是一帧），8 路写手
+#: 同时跑时渲染容器稳定在 1892% CPU（20 核里 19 核）、8.3 GB 内存，写手阶段每镜
+#: 58 秒里有一半是在排队等渲。更糟的是这把渲染槽整个占住：同一条命令里另发一张
+#: 预览静帧，**120 秒超时没渲出来**——预览、成片、草稿排的是同一个队。
+#:
+#: 抽检的口径：第一镜（定全片画法基准的那一镜）**永远验**，其余镜每 N 镜验一镜。
+#: 没被抽到的镜不是「通过」，回执与日志里记成 `skip`；成片渲染那一趟的闸⑭ 仍会
+#: 逐镜判（`MOTION_QC=preview` 只提醒、严格档打回），所以这不是「不判了」，
+#: 而是把「每镜都现场停一下」换成「抽样现场停、其余交给成片闸」。
+WRITER_MOTION_EVERY = int(os.environ.get("MOTION_WRITER_MOTION_EVERY", "4") or 4)
 
 #: 草稿档参数。`scale` 只影响产物体积，不影响闸⑭ 读数（见上）。
 WRITER_DRAFT: dict[str, Any] = {"draft": True, "scale": 0.25}
@@ -131,6 +149,10 @@ _HEADING_SPANS: tuple[tuple[str, str], ...] = (
     # 2026-10-19 改过标题：旧标题「镜头代码：你自己写」会让模型以为交付物是
     # 工作区里的 shots/*.tsx，预览完反复重写草稿。旧标题保留一条，老的技能副本
     # （用户自己存过的那份）仍能截到这一段。
+    # 2026-10-20：标题第三次改词（「代码由系统逐镜写」）。旧标题都保留——用户自己
+    # 存过的技能副本、镜像里的旧种子仍能截到这一段；新标题不登记时**整段静默丢失**，
+    # 写手就收不到「你交 brief、系统写码」这条最重要的分工。
+    ("# 这一镜画什么：你交 `brief`，代码由系统逐镜写", "# 一镜有哪些栏"),
     ("# 这一镜画什么：你交 `brief`（代码由系统写，也可以自己写）", "# 一镜有哪些栏"),
     ("# 镜头代码：你自己写", "# 一镜有哪些栏"),
     ("# 字自己排", "# 版式档：满幅 bleed 与底色 bg"),
@@ -225,6 +247,8 @@ _SYSTEM_HEAD = """你是这条「图形科普片」的镜头画师。你一次�
 · 质感决定「像手画的」还是「像 PPT」：笔触要有粗细变化，画面要有纸纹/颗粒/柔光/暗角，
   物件落地要有影子。纹理用固定 seed（`feTurbulence` 的 `seed` 必须写死），
   **不许 `Math.random`**——逐帧重跑同一份代码，随机数会让画面抖，两次渲染也不是同一部片。
+  颗粒用现成的 `<Grain opacity={0.5} seed={17} blend="normal" />`，别自己写一块铺满
+  画幅、挂 `feTurbulence` 的 `<rect>`：那张噪声每帧重算一遍，一帧要多花两三倍时间。
 · 字幕是**叠在画面上**的一行小字，不是画面下方的一条横幅。每一镜都要把这一镜的整句
   排进构图，缺省写法：`<CaptionText/>` 套一个定位盒子放在画面下沿（`bottom` 约画面高
   3%~5%），`fitWidth` 取画面宽的 0.58~0.66——参考片里那条中文字幕只占画面高约 4%，
@@ -295,13 +319,14 @@ def _protagonist_block(spec: Mapping[str, Any], *,
     """整片贯穿主体（`spec["protagonist"]`）。没写就返回空串——老片子逐字不变。
 
     **不按物种/物件分类**：人、猫、鸟、鱼、车、器物、一块发光的矩形都由写手按
-    这一镜的 brief 自己画。系统只给连续性事实（比例、基准线、朝向、运动节奏）和
-    可选的现成件，不给「你能画哪些类别」的清单——走路的猫、飞行的鸟、游泳的鱼，
-    这张表永远写不完。
+    这一镜的 brief 画。系统只给连续性事实（比例、基准线、朝向、运动节奏），不给
+    「你能画哪些类别」的清单——走路的猫、飞行的鸟、游泳的鱼，这张表永远写不完。
 
     为什么单列一段而不是塞进 brief：二十几镜各自写码时，「同一个东西」靠每镜的
     brief 是守不住的（每个人都按自己的理解画一个「大概这么高」的主体）。这一段
-    给的是**同一组数**，不是同一套组件。
+    给的是**同一组数**（身高/基准线/朝向/节奏），写手照这组数每镜自己画。
+    **怎么画不在这里规定**：2026-10-20 用户否掉了「把人物锁进一套共享骨架」，
+    理由很直接——背景一直是模型自己画的，人也一样画得出来。
     """
     p = spec.get("protagonist")
     if not isinstance(p, Mapping):
@@ -329,56 +354,24 @@ def _protagonist_block(spec: Mapping[str, Any], *,
     render_text = _PROTAGONIST_RENDERS.get(render, _PROTAGONIST_RENDERS["silhouette"])
     wardrobe = str(p.get("wardrobe") or "").strip()
     light = str(p.get("light") or "").strip()
-    # 现成件只给「走路的人」这一种可选捷径：`kind` 是读片/规划时写的自由文本，
-    # 这里只判断它写的是不是人，**不维护一张物种表**。其它主体一律自己画。
-    is_person = "人" in kind
-    walker = (
-        "  工具箱里有个可选的 `WalkingFigure`（`import { WalkingFigure } from "
-        "'@dg/lib/walk'`）——**只适用于走路的人**；猫、鸟、鱼、车、器物、光块等"
-        "其它主体不要套它。如果主体确实是走路的人、你想省事：\n"
-        "  先 `import { getInputProps } from 'remotion';`，再在组件里写 "
-        "`const { filmStartSec = 0 } = getInputProps();`，然后\n"
-        f"  `<WalkingFigure x={{W * 0.5}} footY={{H * {foot:.2f}}} "
-        f"height={{H * {height:.2f}}} facing=\"{facing}\" "
-        f"strideSec={{{stride:.3g}}} "
-        f"phase={{((filmStartSec + frame / fps) / {stride:.3g}) % 1}} "
-        f"render=\"{render}\" wardrobe=\"cloak\" rim=\"#ffb15c\" />`\n"
-        "  `wardrobe` 只是这个组件**已有的档位**（plain / cloak / coat / hoodie / "
-        "cap）；按这一镜的演进线挑一档。它不是衣服清单；这一镜的外形"
-        "（服饰、羽毛、鳞片、配件、持物）在它之外就自己画，"
-        "别为了套取值改内容。\n"
-        # `phase` 是 0~1 的周期相位，不是秒。真机里三镜传了 `frame / fps`，
-        # 步态按「每秒一个周期」跑，与 strideSec=1.1 对不上。**更要紧的是逐镜
-        # 切片各自从 0 帧算**：切点处人物换脚、重新起步。`filmStartSec` 由渲染
-        # 侧按真实时间轴注入（配音时长决定），比在代码里写死估算值可靠。
-        f"  `phase` 是 0~1 的周期相位（不是秒）：按**全片时钟**取模，"
-        f"`((filmStartSec + frame / fps) / {stride:.3g}) % 1`。"
-        "`filmStartSec` 是这一镜在整片里的起点秒数，从 `getInputProps()` 取；"
-        "不要在代码里写死一个估算的起点，也不要每镜从 0 起算——切点会换脚。\n")
+    # 这里不再规定「怎么画」。2026-10-20 用户的原话是「llm 自己明明有能力的，
+    # 为什么非要限制模板」——背景一直是模型自己画的，人也一样；把常识写成规定
+    # 只会挤占它的注意力。只剩风格包模板这一层：选了模板，主体就由模板渲染。
     draw = (
-        "画法：**这一镜的主体由你自己画**——在镜头代码里用 `useCurrentFrame()` 按 brief "
-        "算它怎么动（走、跑、爬、飞、游、滚、流、生长、发光……都行），"
-        "外形与内容按这一镜的 brief 变。**不需要在系统里登记物种或物件类别**；"
-        "`look` 和 brief 写了什么就画什么，走路的猫、飞行的鸟、游泳的鱼都一样。"
-        "跨镜守同一比例、同一底缘/活动基准线、同一朝向、同一运动节奏。\n"
-        + ("  **不要改用 `WalkingFigure`**：模板已经给了这一镜主体的画法，"
-           "套回通用身材会让整片变回同一个人。\n"
-           if template_subject else
-           "  **不套组件也完全可以**：想更自由的姿势或写实画法，就整镜自己画；"
-           "工具箱里的现成件只是可选捷径。\n"
-           + (walker if is_person else
-              "  **不要套 `<WalkingFigure>`**：它不是这一镜的主体；自由按 brief 与 "
-              "`look` 画它的外形和动作。\n"))
-        + "  **任何组件的取值表都不是内容清单**（参考实现的取值表不是内容清单）；"
-          "它画不出这一镜要的东西时，照 brief 和风格不变量自己画，"
-          "别为了迁就取值改内容。\n")
+        "  模板已经给了这一镜主体的画法：用模板的组件，不要另套通用人物骨架。\n"
+        "  模板里带步态的组件如果接受 `phase` / `strideSec` 这类参数，**相位同样按"
+        "全片时钟取**：`phase={((filmStartSec + frame / fps) / strideSec) % 1}`"
+        "（`filmStartSec` 从 `getInputProps()` 读）；其余 props 用模板缺省。"
+        "每镜从 0 起算会在切点处换脚。\n"
+        if template_subject else "")
     return (
         "整片贯穿主体（**同一个东西**穿行各场景，每一镜都要在；"
         "外形按这一镜的 brief 变，比例/朝向/运动节奏不变）：" + look + "\n"
         + (f"主体类型（自由文本）：{kind}。\n" if kind else "")
         + f"画法方向：{render_text}。\n"
         + (f"外观/材质随时代换：{wardrobe}。这一镜按自己的时代画；"
-           "**身份不变，外形按 brief 变**——轮廓与服饰/羽毛/鳞片/配件/持物都属于内容。\n"
+           "**身份不变，外形按 brief 变**——轮廓与服饰/羽毛/鳞片/配件/持物都属于内容。"
+           "衣服、发型、头饰、持物逐镜按时代换；不要每镜另画一个不同的主体。\n"
            if wardrobe else "")
         + f"连续性（每一镜都守）：主体高约 {height:.2f}×画面高、"
           f"底缘/活动基准线 {foot:.2f}×画面高、朝 {facing}。相机可以横移、背景可以"
@@ -393,11 +386,17 @@ def _protagonist_block(spec: Mapping[str, Any], *,
         # 「一直在动」是参考片的核心语法，必须写成缺省而不是可选项。真机里三镜都
         # 写了 `walking = t < 0.62/0.66/0.58`：每镜走一段就站住，三镜拼起来是
         # 「走 → 站 → 切 → 又走 → 站」，不是「同一个东西一直在动」。
-        + ("**默认一直在走（整镜都在动）**：除非这一镜的文案或 brief 明确写「停下 / 站住 / 驻足 / "
-           "悬停」，就让主体整镜保持运动，**不要**写 `walking = t < 0.6` 这类中途停下的"
-           "条件——走两步站住会把「同一个东西穿过时代」断掉。\n"
-           "确实要停一拍时：走路的人传 `walking={false}`（腿并拢、手臂自然下垂）；"
-           "其它主体就让动作停在那一拍——**停的那一镜也别把它画小、画丢**。\n")
+        + ("**默认整镜都在动**：除非这一镜的文案或 brief 明确写「停下 / 站住 / 驻足 / "
+           "悬停」，就让主体一直动，不要走两步就站住——那会把「同一个东西穿过时代」断掉。\n"
+           "确实要停一拍时，就让动作停在那一拍——**停的那一镜也别把它画小、画丢**。\n"
+           # 2026-10-20 真机片：简报里写「站着看戏」的那几镜，写手把主体停住甚至画成
+           # 另一个姿态；用户要的是「一直在走」。简报决定它面对什么，不决定它还走不走。
+           "**走不停**：用户要的是同一副身体从第一镜走到最后一镜。brief 写「站在 / 坐着 / "
+           "看着」时，让它**边走边看、走到那里停半步再走**，不要整镜站死，也不要在这一镜"
+           "换一副身体。只有用户原话明确说「停下来」才停。\n"
+           # 同一副填色：真机片里主体有的镜是深色实心、有的镜只剩一条浅色轮廓。
+           "**画法整片一致**：剪影就整片都是剪影、同一个填色；能变的只有服饰/持物/边光"
+           "颜色这些内容。不要一镜是实心剪影、下一镜变成浅色实心或只剩轮廓线。\n")
         + (f"跟着主体走的那束光：{light}。用这一镜的光色（火把橙/车窗暖黄/"
            "路灯/手机屏冷蓝），按时代换，不要所有时代都用整片 accent。"
            "剪影色用 `fill`，缺省跟随整片墨色。\n" if light else
@@ -419,12 +418,22 @@ def _art_block(spec: Mapping[str, Any]) -> str:
             + "；".join(parts) + "。\n")
 
 
-#: 系统注册的模板名 → (import 路径, 可用组件清单)。用户不能上传 TSX，所以这张表就是
-#: 全部可用的模板；表外的名字一律不 import（写了会过不了闸①，那是白烧一次）。
-_STYLE_TEMPLATES: dict[str, tuple[str, str]] = {
+#: 系统注册的模板名 → (import 路径, 可用组件清单, 模板负责的那几件事)。用户不能上传
+#: TSX，所以这张表就是全部可用的模板；表外的名字一律不 import（写了会过不了闸①，
+#: 那是白烧一次）。第三项只用于提示词里的「模板负责…」，不参与任何分支判断——
+#: 换模板不改代码，只加一行。
+_STYLE_TEMPLATES: dict[str, tuple[str, str, str]] = {
     "silhouette-history": (
         "@dg/lib/style/silhouette-history",
         "SilhouetteStage / GlowRect / SilhouetteWalk / EraInscription / StyleCaption",
+        "人物剪影、贯穿光块、年代铭文、贴画面字幕",
+    ),
+    # 三维写实（2026-10-21）：舞台/灯光/相机/材质/调色都在模板里，镜头代码只摆实物。
+    "cinema-studio": (
+        "@dg/lib/style/cinema-studio",
+        "StudioStage / ContactShadow / Scatter / Dust / GlassMaterial / MetalMaterial / "
+        "CeramicMaterial / WoodMaterial / GranularMaterial / Mark / LineDraw / Screen",
+        "台面、灯光、相机、景深、材质与调色——一镜一件实物的舞台",
     ),
 }
 
@@ -440,6 +449,10 @@ _STYLE_MANIFEST_LABELS: tuple[tuple[str, str], ...] = (
     ("inscription", "铭文"),
     ("motion", "运镜与质感"),
     ("avoid", "不要出现"),
+    # 用户在前端风格工作室里写给这一层的话（2026-10-21）。它属于**这一份风格的数据**，
+    # 不是某套风格的代码分支：换一份包，这段话自然跟着换；空着就整行不出现。
+    # `review_note` / `art_note` 不在这里——写手不该看到评审与导演的补充要求。
+    ("writer_note", "用户补充：写给逐镜写手"),
 )
 
 
@@ -540,8 +553,10 @@ def _free_style_lines(manifest: Mapping[str, Any]) -> list[str]:
     `rhythm`、`texture`……按白名单过滤会把它们全丢掉。
     """
     known = {key for key, _ in _STYLE_MANIFEST_LABELS}
+    # 写手只该看到自己那一层的话：评审/导演的补充要求在别的节点各自渲染，
+    # 落到这里只会变成写手眼里的第二套口径。
     known |= {"layers", "timeline", "facets", "motion_contract", "template",
-              "slots", "blocks", "variants"}
+              "slots", "blocks", "variants", "review_note", "art_note"}
     out: list[str] = []
     for key, value in manifest.items():
         if key in known:
@@ -595,6 +610,20 @@ def _style_invariant_lines(manifest: Mapping[str, Any]) -> list[str]:
     out.append("这些是沉淀分析从参考片量出来的，不是建议。逐镜换内容时照它们执行；"
                "不管用不用模板，都按这些自己画，**不许改这些**。")
     return out
+
+
+def _style_template_usable(spec: Mapping[str, Any]) -> bool:
+    """风格包是否**真的带来了一份能 import 的模板**（模块名已解析）。
+
+    只有这时才说「主体由模板画，不要另起一个」；风格包写了模板名但库里没登记 /
+    不可用时，写手照旧自己画。两者用同一把尺，否则会出现「正文说别用、代码检查
+    说必须用」的对打。
+    """
+    pack = spec.get("style_pack")
+    if not isinstance(pack, Mapping):
+        return False
+    tpl = pack.get("template")
+    return isinstance(tpl, Mapping) and bool(str(tpl.get("module") or "").strip())
 
 
 def template_required(spec: Mapping[str, Any]) -> bool:
@@ -728,15 +757,19 @@ def _style_pack_block(spec: Mapping[str, Any]) -> str:
                 (f"参考模板（**可选**）：`{template}`，模块 `{known[0]}`；"
                  f"参考实现里的组件：{known[1]}。可以 import 来用，也可以只照它的"
                  "剪影语法自己画。"))
+            duty = known[2] if len(known) > 2 else "画面的一致性；具体见模板导出"
             if required:
-                lines.append("模板负责：人物剪影、贯穿光块、年代铭文、贴画面字幕。"
-                             "你只画这一镜的时代背景与代价动作；**不要另画第二个人、"
-                             "第二块光、第二条字幕**。")
+                lines.append(f"模板负责：{duty}。"
+                             "你只画这一镜的主体与它在画面里的动作；**不要另起第二套"
+                             "舞台、第二块主光、第二条字幕**。"
+                             "**这一镜的代码必须真的 import 上面那个模块并渲染它的"
+                             "组件**——只读文字然后在代码里自己重画一遍，等于没有用"
+                             "风格模板。")
             else:
-                lines.append("参考实现里的分工：人物剪影、贯穿光块、年代铭文、"
-                             "贴画面字幕——这些是参考片的画法，不是这一镜必须有的"
-                             "零件。**这一镜由你自己画**，照风格不变量画主体、光块、"
-                             "文字与背景；import 其中某件就不要自己再画第二份。")
+                lines.append(f"参考实现里的分工：{duty}——这些是参考片的画法，"
+                             "不是这一镜必须有的零件。**这一镜由你自己画**，照风格"
+                             "不变量画主体、光块、文字与背景；import 其中某件就不要"
+                             "自己再画第二份。")
             lines.append("**铭文与字幕的缺省值是参考片原文**——如果你用模板的文字组件，"
                          "每一镜必须显式传这一镜自己的文字；不传就会显示参考片那句。"
                          "这一镜不需要那块字，就不要渲染那个组件。")
@@ -865,7 +898,9 @@ def _style_pack_block(spec: Mapping[str, Any]) -> str:
             continue
         got = _style_manifest_value(manifest.get(key))
         if got:
-            lines.append(f"{label}：{got}")
+            # 自由文本（*_note）是用户手写的，长度不受结构字段那套约束；
+            # 截断是为了别让一段几千字的随笔把整镜的提示词挤掉，不是拦。
+            lines.append(f"{label}：{got[:1200]}")
     # 新沉淀没有固定字段：风格参数、层、时间线都由读片模型自己命名。这三段按
     # **结构**渲染，不按某套风格的键名分支；没有它们的旧风格包输出逐字不变。
     lines.extend(_free_style_lines(manifest))
@@ -1060,7 +1095,45 @@ def template_import_missing(spec: Mapping[str, Any], code: str) -> str:
                 f"（{listed}）。风格包要的不是一条 import：用模板组件渲染这一镜"
                 "不需要换的部分；要换的那一件照风格不变量自己画。"
                 "重写**完整的一镜代码**，只回代码块。")
+    # 主角组件必须真的渲染出来。2026-10-20 真机：镜头 import 了模板、也用了舞台与
+    # 光块，唯独把人又手画了一遍——深底 + 深墨，成片里只剩一圈勾边光。风格包在
+    # protagonist.component 里点名了主角组件时，这里量的是代码里有没有这个组件。
+    prot = spec.get("protagonist")
+    want = (str(prot.get("component") or "").strip()
+            if isinstance(prot, Mapping) else "")
+    if want:
+        body = re.sub(r"(?m)^\s*import\b.*$", "", bare)
+        if not re.search(r"\b" + re.escape(want) + r"\b", body):
+            return (f"这一镜没有渲染主角组件 `{want}`——模板 import 了，人却另画了一遍。"
+                    "同一个主角要靠这个组件贯穿全片；衣服/发型/持物用它的 `outfit` "
+                    "参数换。重写**完整的一镜代码**，只回代码块。")
     return ""
+
+
+def _shell_block(spec: Mapping[str, Any]) -> str:
+    """片壳段（2026-10-20）。没选壳时返回空串——老片子的提示词逐字不变。
+
+    为什么写成「结构约定」而不是又一段风格建议：外框是 entry 层套在每一镜外面的，
+    镜头代码本来就没有画它的机会（画在画面带里会被裁，画在带外不存在）。这里说清楚
+    边界，是为了让模型把力气花在主体上，而不是花在重复画纸底和钟上。
+    """
+    shell = str(spec.get("shell") or "").strip()
+    if not shell:
+        return ""
+    label = str(spec.get("shell_label") or "").strip()
+    return (
+        "=== 片壳（整片统一外框，已经是画面事实）===\n"
+        f"这一片选了 `{shell}`：暖纸底、顶部彩色细条、左上角固定圆钟、"
+        + (f"右上角小字「{label}」、" if label else "右上角期号小字（没给就不出现）、")
+        + "底部字幕，全部由片壳统一画、全片位置不变。\n"
+        "**你的代码只画画面带里的东西**：这一镜旁白对应的主体物件与必要场景。\n"
+        "· 不要 import 或使用 `FilmLayout`；\n"
+        "· 不要写 `CaptionLayer` / `CaptionFrame`（渲染入口会直接拒绝这一镜）；\n"
+        "· 不要自己画底色、顶部色条、圆钟、期号或底部字幕；\n"
+        "· 画布用 `useBody()` 报的 `w`×`h`，原点就是带子左上角（`x`/`y` 是带子在整帧"
+        "里的位置，别再加进坐标）；越界会被裁掉。\n"
+        "画面带之外的一切都不归这一镜：外框画在母版之后，镜头代码也盖不住。\n"
+    )
 
 
 def _film_block(spec: Mapping[str, Any]) -> str:
@@ -1072,8 +1145,8 @@ def _film_block(spec: Mapping[str, Any]) -> str:
     grammar = str(spec.get("style_grammar") or "").strip()
     palette = str(spec.get("palette") or cspec.PALETTE_NONE)
     texture = str(spec.get("texture") or "none")
-    cap = str(spec.get("caption_style") or "on_picture")
-    hl = str(spec.get("highlight_style") or "color")
+    cap = str(spec.get("caption_style") or "outlined")
+    hl = str(spec.get("highlight_style") or "plain")
     hl_color = str(spec.get("highlight_color") or "").strip() or "跟色板的 accent"
     listing = "\n".join(
         f"{s.get('id') or '?'}：{str(s.get('text') or '').strip()[:60]}" for s in shots)
@@ -1087,6 +1160,41 @@ def _film_block(spec: Mapping[str, Any]) -> str:
                   "本片**刻意重复同一构图**：主体位置、贯穿光块位置、地平线、字幕位置"
                   "每一镜都一样；只换时代背景、服装、道具内容与光色。"
                   "不要为了「变化」而换机位、换主体位置或换字幕位置。")
+    # 片壳模式下字幕归壳：不能再说「字幕由这一镜的代码排」——两句话同时出现，模型
+    # 一定会照更像「技能正文」的那一句办，于是同屏两条字幕。这一段是唯一的出处。
+    shell = str(spec.get("shell") or "").strip()
+    if shell:
+        caption_block = (
+            f"字幕：{cap} × {hl}，高亮色 {hl_color}。**字幕由片壳统一排在底部**，"
+            "全片同一位置、同一字号、同一描边；镜头代码**不画字幕**，"
+            "也不要把主体或高对比花纹压进最底下那一条。\n"
+            f"字幕安全区：画面最底下 {zone}px 留给片壳那条字幕，"
+            "主体与场景到那里为止。\n"
+            "画面里的招牌、门牌、图表标注这类**画中的字**可以用 `<CaptionText/>` 或 "
+            "`<text>`——它们不是字幕，但同样要自己保证不与主体相撞。\n"
+        )
+    else:
+        caption_block = (
+            f"字幕：{cap} × {hl}，高亮色 {hl_color}。**字幕叠在画面上，由这一镜的代码排**。"
+            "缺省写法：`<CaptionText/>` 套定位盒子放在画面下沿，`fitWidth` 取画面宽的 "
+            "0.58~0.66，字号交给它自己求——参考片那条中文字幕只占画面高约 4%，"
+            "**不要用 0.84~0.88 的满宽**（字会被放大成横幅）。画面下沿约 12% 要留出相对"
+            "干净的一带（渐隐/暗部/地面兜住），别把主体或高对比花纹塞在那里。"
+            "需要一条独立字幕带（图解、表格、竖屏信息页）时才用 "
+            "`<CaptionFrame>{(art) => …}</CaptionFrame>`——它**自己已经画了这条字幕**，"
+            "不要再另摆一份 `<CaptionText/>` 或 `<CaptionLayer/>`，否则同屏两条字会叠成"
+            "重影；用分带时按 `art.w × art.h` 排画面，底色写在外框的 `style` 上。"
+            "要与画面咬合（字当图注、贴着图表摆）时用 `<CaptionText/>` 套定位盒子，"
+            "字进画里（招牌/卡片/跟着 SVG 坐标走）也用它（可放进 `<foreignObject>`），"
+            "自己保证字盒与主体不撞；别手写 `<text>` 当字幕——用户选的样式只在这一件里落地；"
+            "整屏都是画面、没有干净区域时才用整条 `<CaptionLayer/>`（同样只能有一条）。\n"
+            f"字幕安全区：画面最底下 {zone}px 是字幕常落的一带；别让主体压进这一带，"
+            "若摆 `<CaptionLayer/>`，那一条仍归它，别往里塞任何文字和主体。\n"
+            "字盒先按行数估高：两行 ≈ 字号 × 行高 × 2；宁可写 `bottom: …` 兜住底边，"
+            "不要从上面往下估一个会越界的 `top`。"
+            "`<CaptionText/>` 会在渲染时把自己平移回画内，但挪进来的字往往压住主体——"
+            "一开始就把位置算对。\n"
+        )
     return (
         "=== 整片设定（二十镜共用，别每镜另起一套）===\n"
         f"画幅：{aspect} {spec.get('width')}x{spec.get('height')}，"
@@ -1097,8 +1205,9 @@ def _film_block(spec: Mapping[str, Any]) -> str:
            if grammar else "")
         + _prop_block(spec)
         + _protagonist_block(spec,
-                             template_subject=bool(spec.get("style_pack")))
+                             template_subject=_style_template_usable(spec))
         + _style_pack_block(spec)
+        + _shell_block(spec)
         +
         "这一句是起点，不是模板：在它之上把每一镜文案里的具体东西画出来，"
         "缺的媒介/构图/色彩由你补齐；" + continuity + "\n"
@@ -1115,32 +1224,158 @@ def _film_block(spec: Mapping[str, Any]) -> str:
            "这一档已经带颗粒/暗角/调色；代码里就不要再叠一层同类的，避免压糊。")
         + "笔触的粗细变化、物件的柔影仍要在代码里画出来。\n"
         + _art_block(spec)
+        + caption_block
         +
-        f"字幕：{cap} × {hl}，高亮色 {hl_color}。**字幕叠在画面上，由这一镜的代码排**。"
-        "缺省写法：`<CaptionText/>` 套定位盒子放在画面下沿，`fitWidth` 取画面宽的 "
-        "0.58~0.66，字号交给它自己求——参考片那条中文字幕只占画面高约 4%，"
-        "**不要用 0.84~0.88 的满宽**（字会被放大成横幅）。画面下沿约 12% 要留出相对"
-        "干净的一带（渐隐/暗部/地面兜住），别把主体或高对比花纹塞在那里。"
-        "需要一条独立字幕带（图解、表格、竖屏信息页）时才用 "
-        "`<CaptionFrame>{(art) => …}</CaptionFrame>`——它**自己已经画了这条字幕**，"
-        "不要再另摆一份 `<CaptionText/>` 或 `<CaptionLayer/>`，否则同屏两条字会叠成"
-        "重影；用分带时按 `art.w × art.h` 排画面，底色写在外框的 `style` 上。"
-        "要与画面咬合（字当图注、贴着图表摆）时用 `<CaptionText/>` 套定位盒子，"
-        "字进画里（招牌/卡片/跟着 SVG 坐标走）也用它（可放进 `<foreignObject>`），"
-        "自己保证字盒与主体不撞；别手写 `<text>` 当字幕——用户选的样式只在这一件里落地；"
-        "整屏都是画面、没有干净区域时才用整条 `<CaptionLayer/>`（同样只能有一条）。\n"
-        f"字幕安全区：画面最底下 {zone}px 是字幕常落的一带；别让主体压进这一带，"
-        "若摆 `<CaptionLayer/>`，那一条仍归它，别往里塞任何文字和主体。\n"
-        "字盒先按行数估高：两行 ≈ 字号 × 行高 × 2；宁可写 `bottom: …` 兜住底边，"
-        "不要从上面往下估一个会越界的 `top`。"
-        "`<CaptionText/>` 会在渲染时把自己平移回画内，但挪进来的字往往压住主体——"
-        "一开始就把位置算对。\n"
         "全片镜头（保持同一种视觉语言；"
         + ("相邻镜不要用同一种版式" if not repeat else "每镜同一构图，只换时代与道具")
         + "）：\n"
         f"{listing}\n\n"
-        "=== 技能正文 ===\n"
+        # 片壳这句放在技能正文之前**再提醒一次**：正文很长，模型常按最后读到的契约办，
+        # 而「外框归片壳」是这一片最容易被正文里的旧写法盖掉的一条。
+        + (f"片壳：{shell}——外框（纸底/色条/钟/期号）与底部字幕归片壳，"
+           "你只画画面带里的主体。\n\n" if shell else "")
+        + "=== 技能正文 ===\n"
         f"{_contract()}\n"
+    )
+
+
+#: 用户原话进写手任务块的字符上限。真机上有用户会把整份分镜表贴进对话
+#: （上万字），全量塞进每一镜会把 brief 挤到看不见；截断但保留开头——开头通常是
+#: 「这条片子要什么」，正是最该被写手看到的那一段。
+REQUEST_MAX_CHARS = 4000
+
+
+#: 参考片静帧的进程内缓存：`{material_id}:{object_key} → [jpeg bytes]`。
+#: 同一条片子的所有镜共享同一批参考帧；不缓存的话，每镜一次 ffmpeg 抽帧，
+#: 二十镜就是二十倍的无谓读盘与解码。
+_REFERENCE_CACHE: dict[str, list[bytes]] = {}
+_REFERENCE_MAX = 6
+
+
+def _reference_ids(spec: Mapping[str, Any]) -> list[str]:
+    """这一片要看的参考素材：顶层 `reference_materials` 优先，其次风格包 manifest。
+
+    素材 id 而不是路径：editor 与 app 是不同容器，只有对象存储里的字节是两边都
+    摸得到的真相；路径在另一台机器上必然失效。
+    """
+    raw: Any = spec.get("reference_materials")
+    if not raw:
+        pack = spec.get("style_pack")
+        if isinstance(pack, Mapping):
+            manifest = pack.get("manifest")
+            if isinstance(manifest, Mapping):
+                raw = manifest.get("reference_materials")
+    if isinstance(raw, str):
+        raw = [raw]
+    return [str(x).strip() for x in (raw or [])
+            if str(x).strip() and str(x).strip().startswith("mat-")][:4]
+
+
+async def load_reference_images(storage: Any, spec: Mapping[str, Any],
+                                user_id: str, *, per_video: int = 3,
+                                total: int = _REFERENCE_MAX) -> list[bytes]:
+    """把参考视频抽成静帧（JPEG 字节），给写手/评审当**看图**的输入。
+
+    为什么必须给图：文字里的「剪影」只能让模型画一个大概的深色人形；参考片里
+    真正要复现的是轮廓的转折、头身比、勾边光的方向、背景分层与字幕落点——这些
+    是像素信息，不是词。用户要的是「LLM 自己画」，那至少得让它看见要画成什么样。
+
+    只读本人（或系统共享）的素材；取不到就返回空，不拦写码——没有参考片的
+    老片子逐字不变。
+    """
+    ids = _reference_ids(spec)
+    if not ids or storage is None:
+        return []
+    from agent_framework import style_authoring as sa
+
+    out: list[bytes] = []
+    for mid in ids:
+        if len(out) >= total:
+            break
+        try:
+            row = await storage.materials.get(mid)
+        except Exception:  # noqa: BLE001 —— 素材服务抖动不该让写码失败
+            continue
+        if not row:
+            continue
+        owner = row.get("owner_user_id")
+        if owner and user_id and owner != user_id:
+            continue
+        key = f"{mid}:{row.get('object_key') or ''}"
+        cached = _REFERENCE_CACHE.get(key)
+        if cached is not None:
+            out.extend(cached[:max(0, total - len(out))])
+            continue
+        try:
+            with tempfile.TemporaryDirectory(prefix="ref-frames-") as tmp:
+                path = await storage.objects.localize(
+                    str(row.get("object_key") or ""), Path(tmp))
+                meta = await asyncio.to_thread(sa.probe_video, path)
+                times = sa.pick_times(float(meta["duration"]), per_video)
+                frames = await asyncio.to_thread(
+                    sa.extract_frames, path, Path(tmp) / "frames", times)
+                got = [p.read_bytes() for p in frames]
+        except Exception:  # noqa: BLE001 —— 一条坏片不该拖垮整片
+            continue
+        if not got:
+            continue
+        _REFERENCE_CACHE[key] = got
+        out.extend(got[:max(0, total - len(out))])
+    return out
+
+
+def _reference_block() -> str:
+    """参考帧随消息一起发时，说明「看什么、不要抄什么」。没有图就不发这一段。"""
+    return (
+        "=== 参考片静帧（目标观感，不是这一镜的内容）===\n"
+        "消息里附了几张同一套视觉的参考片截图。看的是**画法**，不是内容：\n"
+        "· 主体的轮廓与比例：头、颈、肩、躯干、四肢怎么连，边缘是什么形状；\n"
+        "· 明暗关系：主体是最暗还是最亮，勾边光从哪一侧来、有多宽；\n"
+        "· 背景分几层、层与层靠什么分开（明度、空气透视、遮挡），不是靠描边；\n"
+        "· 构图：主体与光源各在画面什么位置、留白多少、字幕落在哪、字号多大。\n"
+        "不要照抄图里的人物、场景、道具或文字——这一镜按自己的 brief 画，"
+        "把上面这四件事做到。\n")
+
+
+def _exemplar_block(code: str) -> str:
+    """本片第一镜的代码：同一个模型自己的画法，交给后续镜照着画。
+
+    这不是系统模板，也不是可 import 的组件——它只是「你刚才画的那个人长这样」。
+    一致性靠模型复用自己写过的实现，而不是靠一份人手写的共享骨架。
+    """
+    src = str(code or "").strip()
+    if not src:
+        return ""
+    if len(src) > 14000:
+        src = src[:14000] + "\n// …（截断；照上面的画法写完整的一镜）"
+    return (
+        "=== 本片已经定下的画法（你自己写的第一镜）===\n"
+        "下面是**你**为本片第一镜写的完整代码。后面的镜沿用这套画法：\n"
+        "· 主体用同一副轮廓、同一个填色、同一个勾边光方向——不要重画一个不同的人；\n"
+        "· 只换这一镜的时代背景、服装、道具、光色与动作；\n"
+        "· 不要 import 它（它是那一镜的代码，不是组件）；照它的画法写这一镜自己的完整代码。\n"
+        "```tsx\n" + src + "\n```\n")
+
+
+def _request_block(user_request: str) -> str:
+    """用户原话：整片每一镜都原样带一遍。
+
+    为什么必须进写手的任务块（2026-10-20）：写手前面只有规划模型加工过的
+    `brief`（≤400 字）。用户说的原话在规划那一轮之后就再没出现过——没被写进
+    brief 的意思全部丢失，成片于是像「按流程能做的片子」，而不是用户要的片子。
+    这一段放在这一镜任务块的最前面，让「用户要什么」比「技能默认怎么做」更近。
+    """
+    req = " ".join(str(user_request or "").split())
+    if not req:
+        return ""
+    if len(req) > REQUEST_MAX_CHARS:
+        req = req[:REQUEST_MAX_CHARS].rstrip() + "…（原话过长，已截断；开头这一段最要紧）"
+    return (
+        "=== 用户原话（这条片子的最高事实，逐字保留）===\n"
+        f"{req}\n"
+        "用户点名要的东西、点名不要的东西、说的是哪个年代/哪种语气，都以此为准。\n"
+        "下面的分镜 brief 与技能正文是**执行细节**：与这段原话冲突时，按用户原话做；"
+        "用户没提到的细节，才按 brief 与技能正文补。\n\n"
     )
 
 
@@ -1164,6 +1399,25 @@ def _shot_block(shot: Mapping[str, Any], *, index: int) -> str:
     entities = [str(e).strip() for e in (shot.get("entities") or []) if str(e).strip()]
     entities_text = ("、".join(entities) if entities
                      else "（清单没给，按文案圈能画的实体；只有一件就画一件，别硬凑）")
+    # 分镜阶段申报的动效（`shot.motion`）：从前它只进闸㉑ 的对账，**从不进写手的
+    # 提示词**——写手看不到「这一镜该动几拍、每拍是什么」，只能照 brief 自己猜，
+    # 猜完再被草稿闸数出来「只有一段」，重写一遍。2026-10-20 那条 53 镜的片子：
+    # 39 镜写了两遍，八成墙钟花在重写上。把它摆在 brief 后面，写手照着拍子画。
+    beats = [m for m in (shot.get("motion") or []) if isinstance(m, Mapping)]
+    if beats:
+        lines = "\n".join(
+            f"{i}. {str(m.get('kind') or '').strip() or '（这一条没写是什么动效）'}"
+            f"（锚：{'、'.join(str(a) for a in (m.get('anchors') or [])) or '无'}）"
+            for i, m in enumerate(beats, 1))
+        motion_text = (
+            "这一镜申报的动效（按发生顺序，**每一条都要真的在像素上发生**）：\n"
+            + lines + "\n"
+            "照这份清单排拍子，不要另发明一套：每一拍都要让画面相当一块地方变样"
+            "（满宽或占画面三分之一以上的块面擦入/展开/位移；只有细线在动、只有淡入"
+            "淡出，系统数不出变化段），相邻两拍的起点至少隔 0.4 秒（约 12 帧），"
+            "最后一拍在 80% 时长之前收住。\n")
+    else:
+        motion_text = ""
     return (
         f"=== 这一镜 ===\n"
         f"镜号：{shot.get('id') or f's{index + 1:02d}'}\n"
@@ -1178,6 +1432,7 @@ def _shot_block(shot: Mapping[str, Any], *, index: int) -> str:
         f"高亮词：{highlights}\n"
         f"画面 brief（这一镜画什么、怎么构图、怎么分几拍动）："
         f"{str(shot.get('brief') or '').strip() or '（没写，按文案画）'}\n"
+        f"{motion_text}"
         # 真机 2026-10-19：brief 已写「全片无人物」，评审红镜的自动重写却把主体换回
         # 人影——重写读到的风格包段在说「主体用模板走路组件」，比 brief 那句更响。
         # brief 是这一镜的最高事实，模板只是它没排除那部分的默认画法。
@@ -1196,6 +1451,12 @@ def _shot_block(shot: Mapping[str, Any], *, index: int) -> str:
         f"{fields_text}\n"
         "动起来别是「一帧定格再淡出」：至少两拍——实体先后入画（stagger）→ 主运动"
         "（视差/呼吸/跟随/转场）→ 最后一拍收住，铺满整镜。\n"
+        # 闸⑭ 的实测口径写在第一枪里：真机上几乎所有镜都要写第二遍才过，因为写手把
+        # 「两拍」理解成一根线/一个小圆点在动，而判据量的是**整幅灰度的大块面变化**。
+        # 先把它写清楚，省掉一轮重写（37 镜 × 一次往返）。
+        "系统会真渲一版草稿数变化段，判据是：整幅画面至少**两段大块面变化**，彼此相隔"
+        "≥0.4 秒（约 12 帧），两段都要占画面相当一块——只有一个元素的小幅位移数不出来。"
+        "第二段要在 80% 时长之前完成。\n"
         "交之前按这五条自检（美术评审看的也是这五条）："
         "① 文案点到的**每一件**实体都在画面里（不止一件时都要在），不是一排并排的小图标；"
         "② 主体占 40%~70%，不缩在角落；"
@@ -1351,18 +1612,39 @@ async def _motion_check(shot: Mapping[str, Any], *, spec: Mapping[str, Any],
 
 async def _one_shot(shot: dict[str, Any], *, index: int, system: str,
                     spec: Mapping[str, Any], llm: Any, user_id: str,
-                    conversation_id: str, client: Mapping[str, Any]
+                    conversation_id: str, client: Mapping[str, Any],
+                    user_request: str = "",
+                    references: Sequence[bytes] = (),
+                    exemplar: str = "",
+                    check_motion: bool = True,
                     ) -> tuple[dict[str, Any], str, float, int, dict[str, Any] | None]:
-    """写一镜 → (这一镜的结果, 失败说明, 花费, 尝试次数, 闸⑭ 账)。成功时直接改 shot。"""
+    """写一镜 → (这一镜的结果, 失败说明, 花费, 尝试次数, 闸⑭ 账)。成功时直接改 shot。
+
+    ``references`` 是参考片静帧（JPEG 字节）：有图就随这一镜的 user 消息一起发，
+    让写手「看着画」而不是「听完描述猜」。``exemplar`` 是本片第一镜的代码：
+    后续镜照它的人物画法写，一致性来自模型复用自己的实现，不来自共享模板。
+
+    ``check_motion=False`` 时**不渲草稿**、不收闸⑭ 的读数（见 ``WRITER_MOTION_EVERY``
+    的抽检口径）：这一次调用只做「写 + 闸①」，代价从一镜整渲降到一次网络请求。
+    """
     from .selfcheck import _complete_with_identity
     from agent_framework.cost import cost_yuan
 
     sid = str(shot.get("id") or f"s{index + 1:02d}")
     names = [str(f.get("name") or "") for f in (shot.get("fields") or [])
              if isinstance(f, Mapping) and f.get("name")]
-    ask = _shot_block(shot, index=index)
+    ask = (_request_block(user_request) + _shot_block(shot, index=index)
+           + _exemplar_block(exemplar)
+           + (_reference_block() if references else ""))
+    content: Any = ask
+    if references:
+        content = [{"type": "text", "text": ask}] + [
+            {"type": "image_url",
+             "image_url": {"url": "data:image/jpeg;base64,"
+                           + base64.b64encode(b).decode("ascii")}}
+            for b in references]
     messages: list[dict[str, Any]] = [{"role": "system", "content": system},
-                                      {"role": "user", "content": ask}]
+                                      {"role": "user", "content": content}]
     spent = 0.0
     motion: dict[str, Any] | None = None
     last_errors: list[str] = []
@@ -1412,9 +1694,10 @@ async def _one_shot(shot: dict[str, Any], *, index: int, system: str,
                     continue
                 shot["code"] = code
                 return (shot, f"{sid}：{missed}\n"
-                              "  · 写了多次仍未 import 模板，照收这一稿——"
-                              "**这一镜没有按风格包出画**。", spent, attempt, motion)
-            if not WRITER_MOTION_CHECK:
+                              "  · 写了多次仍未照做，照收这一稿——"
+                              "**这一镜没有按风格包出画 / 连贯性没有守住的保证**。",
+                        spent, attempt, motion)
+            if not check_motion:
                 shot["code"] = code
                 return shot, "", spent, attempt, motion
             # 闸① 过了还不够：闸⑭ 判的是像素。这一版草稿渲出来数一遍——数得过就收，
@@ -1462,43 +1745,87 @@ async def _one_shot(shot: dict[str, Any], *, index: int, system: str,
 async def write_shot_code(spec: dict[str, Any], *, user_id: str = "",
                           conversation_id: str = "", llm: Any = None,
                           client: Mapping[str, Any] | None = None,
-                          parallel: int = WRITER_PARALLEL) -> dict[str, Any]:
+                          parallel: int = WRITER_PARALLEL,
+                          user_request: str = "",
+                          storage: Any = None,
+                          references: Sequence[bytes] | None = None,
+                          ) -> dict[str, Any]:
     """把 spec 里**没有 code** 的镜逐镜写出来（原地填进 ``spec["shots"]``）。
 
     返回一份账：``{written, notes, unwritten, cost_yuan, calls, motion}``。不抛——调用方是分镜
     入库前的那一步，它要把「哪几镜没写成」连同 lint 原文一起交回主对话。
 
+    写码分两段（2026-10-20）：先写第一镜，再把它当 ``exemplar`` 交给其余镜并行写。
+    **一致性来自模型复用自己写的第一镜**，不是人手写的共享组件——用户要的是
+    「LLM 自己画」，那就让它自己画一次，然后照着同一份实现画下去。
+
     这一版多一道**写手侧的自查**：闸① 过了之后先渲一版草稿数闸⑭，红了就把实测读数
     交给模型重写（见 ``WRITER_MOTION_CHECK``）。不想要这 30 s/镜的代价时把它关掉。
+
+    2026-10-21 起自查改成**抽检**（``WRITER_MOTION_EVERY``，缺省每 4 镜一镜、第一镜
+    必验）：每镜都渲一遍草稿会把渲染容器占满，连预览静帧都排不进去。
     """
     client = client or rc.endpoints()
     shots = [s for s in (spec.get("shots") or []) if isinstance(s, dict)]
     todo = [(i, s) for i, s in enumerate(shots) if not str(s.get("code") or "").strip()]
     out: dict[str, Any] = {"written": {}, "notes": [], "unwritten": [],
-                           "cost_yuan": 0.0, "calls": 0, "motion": {}}
+                           "cost_yuan": 0.0, "calls": 0, "motion": {},
+                           "reference_frames": 0}
     if not todo:
         return out
+    if references is None:
+        references = await load_reference_images(storage, spec, user_id)
+    out["reference_frames"] = len(references)
     system = _SYSTEM_HEAD + "\n" + _film_block(spec)
     gate = asyncio.Semaphore(max(1, int(parallel)))
 
-    async def run(i: int, s: dict[str, Any]
+    async def run(i: int, s: dict[str, Any], *, exemplar: str = ""
                   ) -> tuple[dict[str, Any], str, float, int, dict[str, Any] | None]:
+        # 抽检：第一镜（没有 exemplar，它定的就是全片画法基准）必验；其余镜每
+        # `WRITER_MOTION_EVERY` 镜验一镜。见上方那个常量的注释——每镜一验是把渲染
+        # 容器整个占住，连一张预览静帧都排不进去。
+        do_check = WRITER_MOTION_CHECK and (not exemplar
+                                            or WRITER_MOTION_EVERY <= 0
+                                            or i % WRITER_MOTION_EVERY == 0)
         async with gate:
             r = await _one_shot(s, index=i, system=system, spec=spec, llm=llm,
                                 user_id=user_id, conversation_id=conversation_id,
-                                client=client)
+                                client=client, user_request=user_request,
+                                references=references, exemplar=exemplar,
+                                check_motion=do_check)
         # 逐镜留一行进度：整片三四十镜时，这一行是「还在动 vs 卡死」唯一的外部证据
         # （`plan_motion` 是一个工具调用，UI 在它返回之前没有任何中间态）。
         sid = str(s.get("id") or f"s{i + 1:02d}")
         comp = (r[4] or {})
         peaks = [round(float(e.get("peak_diff")), 2) for e in (comp.get("events") or [])
                  if isinstance(e, Mapping) and isinstance(e.get("peak_diff"), (int, float))]
-        print(f"[writer] {sid} attempt={r[3]} motion={comp.get('status') or '-'} "
+        status = comp.get("status") or ("skip" if not do_check else "-")
+        print(f"[writer] {sid} attempt={r[3]} motion={status} "
               f"events={len(comp.get('events') or [])} peaks={peaks} "
               f"cost=¥{r[2]:.4f}", flush=True)
         return r
 
-    results = await asyncio.gather(*(run(i, s) for i, s in todo))
+    if len(todo) > 1:
+        # 第一镜单独写：它的代码就是后面的「画法基准」。多等这一镜，换全片主体
+        # 不漂；其余镜再并行，墙钟只多一镜的时间。
+        #
+        # 但「第一镜」不一定是本次待写的那一镜：重交时上一版第一镜可能已经带着
+        # 代码进来（单镜先写好看过，再整片补齐）。那种情况下基准就是它——一致性
+        # 的定义是「照第一镜的画法继续画」，不是「照本次碰巧排在最前的待写镜」。
+        seeded = next((s for s in shots if str(s.get("code") or "").strip()), None)
+        if seeded is not None and not any(s is seeded for _, s in todo):
+            exemplar = str(seeded.get("code") or "")
+            results = await asyncio.gather(*(run(i, s, exemplar=exemplar)
+                                             for i, s in todo))
+        else:
+            first_i, first_shot = todo[0]
+            first = await run(first_i, first_shot)
+            exemplar = str(first_shot.get("code") or "")
+            rest = await asyncio.gather(*(run(i, s, exemplar=exemplar)
+                                          for i, s in todo[1:]))
+            results = [first, *rest]
+    else:
+        results = await asyncio.gather(*(run(i, s) for i, s in todo))
     for shot, note, cost, calls, motion in results:
         sid = str(shot.get("id") or "?")
         out["cost_yuan"] += cost
@@ -1526,7 +1853,9 @@ async def rewrite_shot_code(shot: dict[str, Any], *, critique: str,
                             spec: Mapping[str, Any], user_id: str = "",
                             conversation_id: str = "", llm: Any = None,
                             client: Mapping[str, Any] | None = None,
-                            still: str | Path | None = None) -> dict[str, Any]:
+                            still: str | Path | None = None,
+                            user_request: str = "",
+                            references: Sequence[bytes] = ()) -> dict[str, Any]:
     """带评审意见重写**已经有一版 code** 的一镜 → ``{ok, note, cost_yuan, calls}``。
 
     与 `_one_shot` 共用同一份 system 与单镜任务块，只在末尾追加「上一版静帧的问题」。
@@ -1554,7 +1883,7 @@ async def rewrite_shot_code(shot: dict[str, Any], *, critique: str,
              if isinstance(f, Mapping) and f.get("name")]
     old = str(shot.get("code") or "").strip()
     system = _SYSTEM_HEAD + "\n" + _film_block(spec)
-    ask = _shot_block(shot, index=index)
+    ask = _request_block(user_request) + _shot_block(shot, index=index)
     ask += ("\n\n=== 上一版静帧的问题（美术评审看的是一张真渲出来的图） ===\n"
             + str(critique or "").strip())
     if old:
@@ -1573,14 +1902,29 @@ async def rewrite_shot_code(shot: dict[str, Any], *, critique: str,
             picture = base64.b64encode(Path(still).read_bytes()).decode("ascii")
         except OSError:
             picture = ""
-    if picture:
+    if references:
+        ask += ("\n\n先附参考片静帧（目标画法）"
+                + ("，最后一张是你上一版渲出来的静帧。" if picture else "。")
+                + "对照参考看轮廓、比例、明暗、勾边光方向与构图；"
+                "这一版要把图上的毛病改掉，不是改文字描述。")
+    if picture and not references:
         ask += ("\n\n下面这张图就是你上一版渲出来的静帧。对照评审指出的地方看："
                 "实体是不是只剩一圈线、细节糊没糊、几件东西是不是并排摆着；"
                 "这一版要把图上的毛病改掉，不是改文字描述。")
-        content: Any = [
-            {"type": "text", "text": ask},
+    if picture:
+        content: Any = [{"type": "text", "text": ask}]
+        content += [{"type": "image_url",
+                     "image_url": {"url": "data:image/jpeg;base64,"
+                                   + base64.b64encode(b).decode("ascii")}}
+                    for b in references]
+        content.append({"type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{picture}"}})
+    elif references:
+        content = [{"type": "text", "text": ask}] + [
             {"type": "image_url",
-             "image_url": {"url": f"data:image/jpeg;base64,{picture}"}}]
+             "image_url": {"url": "data:image/jpeg;base64,"
+                           + base64.b64encode(b).decode("ascii")}}
+            for b in references]
     else:
         content = ask
     messages: list[dict[str, Any]] = [{"role": "system", "content": system},

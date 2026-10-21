@@ -8,6 +8,7 @@ import type { CalculateMetadataFunction } from 'remotion';
 import '@dg/fonts';
 import * as ShotModule from './user-shots/shot';
 import { LayoutProbe } from './lib/LayoutProbe';
+import { SHELLS } from './lib/shells';
 import { ASPECTS } from './tokens';
 import type { Aspect } from './tokens';
 
@@ -49,11 +50,29 @@ const shotMeta: CalculateMetadataFunction<Record<string, unknown>> = ({ props })
  *
  *  壳本身不改一个像素（`display: contents`，见 `LayoutProbe`），套了母版的镜由
  *  `LayoutProbe` 让位、不重复上报。 */
-const MeasuredShot: React.FC<Record<string, unknown>> = (props) => (
-  <LayoutProbe>
-    <UserShot {...props} />
-  </LayoutProbe>
-);
+const MeasuredShot: React.FC<Record<string, unknown>> = (props) => {
+  // 整片片壳（2026-10-20）：选了 `paper-flat` 之类的壳时，外框（纸底、色条、圆钟、
+  // 期号、字幕）由壳里的 `<FilmLayout>` 独占，镜头代码只往画面带里填主体。壳在**这一层**
+  // 套，镜头代码没有「这一镜不套壳」的选择——外框的一致性因此是结构性的，不是提示词
+  // 求出来的。没选壳（缺省）仍走原来的测量壳，一个像素都不变。
+  //
+  // 壳里已经有 `<FilmLayout>`，它自己会发版面回读；外面不再套 `LayoutProbe`，否则
+  // 同一帧会出两份读数（一份扫整帧、一份扫画面带），而 `pickLayout` 只认母版那份。
+  const name = typeof props.shell === 'string' ? props.shell.trim() : '';
+  const Shell = name ? SHELLS[name] : undefined;
+  if (Shell) {
+    return (
+      <Shell {...props}>
+        <UserShot {...props} />
+      </Shell>
+    );
+  }
+  return (
+    <LayoutProbe>
+      <UserShot {...props} />
+    </LayoutProbe>
+  );
+};
 
 export const RemotionRoot: React.FC = () => (
   <Composition

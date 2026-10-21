@@ -92,10 +92,20 @@ services:
       # 图形科普片的出片调优（说明见 .env.example 末段）
       MOTION_QC: ${MOTION_QC:-preview}
       MOTION_PREVIEW_STILLS: ${MOTION_PREVIEW_STILLS:-1}
-      # 须与 remotion 那侧的 DG_RENDER_SLOTS 同步。缺省 3：2026-10-18 实测 20 核机器上
-      # 2 路渲染只用到约 10 个核（单路约 5 核、2.1 GB），32 镜的草稿真渲因此排成 28 分钟；
-      # 3 路仍在 15 GB 机器的余量内（约 6~7 GB）。
-      MOTION_RENDER_PARALLEL: ${MOTION_RENDER_PARALLEL:-3}
+      # 须与 remotion 那侧的 DG_RENDER_SLOTS 同步。缺省 4：2026-10-18 实测 20 核机器上
+      # 单路约 5 核、2.1 GB，2 路只用到约 10 个核；3 路时 40 镜的成片仍要排一小时
+      # （2026-10-20 真机）。4 路刚好吃满 20 核、约 8.5 GB，仍在 15 GB 的余量内。
+      MOTION_RENDER_PARALLEL: ${MOTION_RENDER_PARALLEL:-4}
+      # 每镜内部的渲染工人数。留空 = Remotion 缺省（min(8, 核/2)）；外并行 4 时缺省是
+      # 8×4=32 个工人抢 20 个核，超订 1.6 倍。设成 5 让整机正好吃满，见 code_render。
+      MOTION_SHOT_CONCURRENCY: ${MOTION_SHOT_CONCURRENCY:-}
+      # 预览静帧同时在飞的镜数（只渲一帧，填满渲染槽即可；与上面同源）。
+      MOTION_PREVIEW_PARALLEL: ${MOTION_PREVIEW_PARALLEL:-6}
+      # 预览静帧缩放：0.75 的 1440×810 够看构图，像素少 44%。
+      MOTION_PREVIEW_SCALE: ${MOTION_PREVIEW_SCALE:-0.75}
+      # 逐镜带图评审：缺省关；要抽检就开 1 并把 RATE 设成 0.34（每三镜看一镜）。
+      MOTION_VISUAL_REVIEW: ${MOTION_VISUAL_REVIEW:-0}
+      MOTION_VISUAL_REVIEW_RATE: ${MOTION_VISUAL_REVIEW_RATE:-0.34}
       # 计划阶段的并发与重写预算（说明见 .env.example 末段）。
       # 评审已并进一次带图调用；重写缺省不封顶，红几镜改几镜。
       MOTION_WRITER_PARALLEL: ${MOTION_WRITER_PARALLEL:-8}
@@ -103,6 +113,9 @@ services:
       MOTION_REWRITE_PARALLEL: ${MOTION_REWRITE_PARALLEL:-4}
       MOTION_MAX_VISUAL_REWRITES: ${MOTION_MAX_VISUAL_REWRITES:-}
       MOTION_WRITER_MOTION_CHECK: ${MOTION_WRITER_MOTION_CHECK:-1}
+      # 草稿渲抽检间隔：每 N 镜验一次运动（第一镜必验）；0＝每镜都验。
+      # 缺省 4：每镜一验会让渲染容器 20 核打满，预览静帧都排不进去。
+      MOTION_WRITER_MOTION_EVERY: ${MOTION_WRITER_MOTION_EVERY:-4}
       # 模板作者模型：从零写一份满足 props 合约的 TSX 比逐镜写码难得多，弱模型会
       # 反复把必填 props 写死。留空＝用用户自己的模型；只覆盖「写模板 / 写替换件」
       # 两次调用，分析与保真评审仍走用户配的视觉模型。
@@ -110,6 +123,14 @@ services:
     volumes:
       - whisper-cache:/root/.cache
       - app-runtime:/app/.runtime
+      # 开发档：后端代码与技能正文直接从仓库挂进来——改完重启容器（几秒）就生效，
+      # 不必重建镜像。2026-10-20 的「改完后端要重建容器」就是这一步缺席的代价。
+      # 只挂这几个目录，不挂整个 `/app`：镜像里那几份 remotion 源码副本（离线对账
+      # 用的哨兵）要留着。前端产物仍在镜像里，改前端依旧要重建。
+      - ./backend/agent_framework:/app/agent_framework
+      - ./backend/storyline_server:/app/storyline_server
+      - ./backend/examples:/app/examples
+      - ./backend/prompts:/app/prompts
     depends_on:
       postgres:
         condition: service_healthy
@@ -129,8 +150,9 @@ services:
     container_name: creation-remotion
     # 不映射宿主端口：只给应用容器在 compose 网络内用（remotion:8010）。
     environment:
-      # 同时逐帧渲染的镜数（软件 WebGL 吃内存，16 GB 机器 2 路稳妥）
-      DG_RENDER_SLOTS: ${DG_RENDER_SLOTS:-3}
+      # 同时逐帧渲染的镜数。单路约 5 核 / 2.1 GB：20 核、16 GB 机器上 4 路刚好吃满，
+      # 2026-10-20 从 3 提到 4（40 镜成片原来要排一小时）。内存紧就回到 3。
+      DG_RENDER_SLOTS: ${DG_RENDER_SLOTS:-4}
     volumes:
       # 用户沉淀的模板源码。卷里只是**缓存**：真相在 PG 的 style_templates，
       # 容器重建/新机器由服务启动时的 sync_validated() 重推；挂卷是为了不必每次
@@ -168,6 +190,11 @@ services:
     volumes:
       - whisper-cache:/root/.cache
       - app-runtime:/app/.runtime
+      # 与 editor 同一档：后端代码与技能正文挂仓库，改完重启即可（见 editor 那段注释）。
+      - ./backend/agent_framework:/app/agent_framework
+      - ./backend/storyline_server:/app/storyline_server
+      - ./backend/examples:/app/examples
+      - ./backend/prompts:/app/prompts
     depends_on:
       postgres:
         condition: service_healthy

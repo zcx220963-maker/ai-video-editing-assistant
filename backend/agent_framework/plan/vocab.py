@@ -20,6 +20,15 @@ if False:  # TYPE_CHECKING：只为 planning_registry 的形参标注，避免�
 # 这些工具会改变执行状态（分叉重跑 / 起子 Agent），规划轮同样不给
 _MUTATING_TOOLS = frozenset({"rerun_from", "start_subagent"})
 
+#: **系统注入的参数**：值由入口/运行时传下来，不是给用户勾的开关。
+#:
+#: 判据只能是键名：`props_for` 的类型事实来自 MCP 工具声明，那里只留 type/description，
+#: 带不进自定义标记（试过在 input_schema 里写 ``x-system``，翻成工具声明时就被滤掉了）。
+#: 漏一个的后果不是难看，是**真的会让模型替用户决定**：`go_straight` 是布尔，不挡就会
+#: 变成卡上一枚「直接出片」开关，模型照清单抄一次 true，这一轮就不出预渲静帧、也不等
+#: 确认了。新增同类参数时把键名加到这里，并在对应节点的 schema 里写清「由系统注入」。
+SYSTEM_INJECTED_PARAMS: frozenset[str] = frozenset({"go_straight"})
+
 # 节点 → 这一步干活必须随身的技能。零素材通道没有任何素材事实可依赖（没有 ASR 文本、
 # 没有镜头描述），怎么走、每镜写什么、哪些字段必填全在那份技能正文里；而真机实测
 # 模型交这张卡时 skills_hint 就是空的——只靠卡面声明，整轮都拿不到那份约束。
@@ -258,6 +267,10 @@ class PlanVocabulary:
         for key in sorted(props):
             spec = props[key]
             if not isinstance(spec, Mapping):
+                continue
+            # 系统注入项不进卡面：布尔默认就是一个可勾的开关，而 `go_straight`
+            # 这类值由入口传下来，不该让模型在卡上替用户决定「跳过预渲」。
+            if key in SYSTEM_INJECTED_PARAMS:
                 continue
             source = await self.enum_source(node, key, spec)
             if source is None:

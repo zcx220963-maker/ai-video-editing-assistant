@@ -21,7 +21,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from agent_framework import style_authoring
 from agent_framework.orchestration import NodeState, _safe
@@ -38,7 +38,7 @@ from ..motion import code_spec as cspec
 from ..motion import design_review
 from ..motion import remotion_client as rc
 from ..motion import shot_writer
-from .core_nodes import StoryNode, _obj, _resolve_target_duration
+from .core_nodes import StoryNode, _flag_on, _obj, _resolve_target_duration
 
 #: 分镜卡上每镜文案最多显示这么多字——界面不是文稿编辑器，全文在 motion_spec 里。
 PLAN_TEXT_PREVIEW_CHARS = 24
@@ -357,9 +357,64 @@ async def _attach_style_pack(storage: Any, raw: Mapping[str, Any], name: str,
         if declared in cspec.CAPTION_STYLES:
             spec["caption_style"] = declared
         elif str(cap.get("look") or "") == "overlay":
-            spec["caption_style"] = "on_picture"
+            # 贴画面的一档里，「白字黑边」是用户点名要的（2026-10-20）；不要落到
+            # 无描边的 on_picture——深底上会糊成一片。
+            spec["caption_style"] = "outlined"
+    if not spec.get("highlight_style"):
+        declared = str(manifest.get("highlight_style") or "").strip().lower()
+        if declared in cspec.HIGHLIGHT_STYLES:
+            spec["highlight_style"] = declared
     if not spec.get("recurring_prop") and manifest.get("recurring_prop"):
         spec["recurring_prop"] = str(manifest["recurring_prop"])
+    # 片壳（2026-10-20）：风格包可以指定整片外框（数据驱动，后端不按风格名写分支）。
+    # 分镜显式写了的优先；manifest 里没写或写了不认识的名字就当没选壳，不拦分镜。
+    if not spec.get("shell"):
+        declared = str(manifest.get("shell") or "").strip().lower()
+        if declared in cspec.SHELLS:
+            spec["shell"] = declared
+            if not spec.get("shell_label") and manifest.get("shell_label"):
+                spec["shell_label"] = str(manifest["shell_label"])
+    # 整片底色与质感（2026-10-21）：风格包说得出「这一套是深墨蓝、带胶片颗粒」，
+    # 却要模型在每份分镜里再抄一遍，抄漏一次画面就回到缺省的米色纸。这里按名字
+    # 补空格——分镜显式写了的优先；认不出的名字不填，交给下游契约层去说。
+    if not spec.get("palette"):
+        declared = cspec.norm_palette(manifest.get("palette_name"))
+        if declared:
+            spec["palette"] = declared
+    if not spec.get("texture"):
+        declared = str(manifest.get("texture") or "").strip().lower()
+        if declared in cspec.TEXTURES:
+            spec["texture"] = declared
+    # 满幅（2026-10-21）：深色底 + 非满幅 = 画面被夹在中间一条带子里，**四边一圈黑**，
+    # 字幕站在带子外面的底色上——用户在成片上看到的就是「字幕和画面分家」，像嵌了一张
+    # 图，不像一支片子；而镜头代码多半按整帧坐标画，被夹进去之后构图还会被裁歪。
+    # 风格包能说「这一套是满幅的」，就不该让五十份分镜各抄一遍（抄漏一镜，那一镜
+    # 立刻变回黑边）。只补**没申报**的镜：分镜显式写了 `bleed`（哪怕是 false）就听它的。
+    if manifest.get("bleed") is True:
+        # 满幅镜要同时有底色（闸⑲ 的第③条，也是闸④ 判空的基准色）。风格包的
+        # `palette.page` 就是这一套的底色；分镜自己写了 `bg` 的不动。
+        page = ""
+        mpal = manifest.get("palette") if isinstance(manifest.get("palette"), Mapping) else {}
+        if isinstance(mpal, Mapping):
+            page = str(mpal.get("page") or "").strip().lower()
+        for s in (spec.get("shots") or []):
+            if not isinstance(s, dict):
+                continue
+            if not isinstance(s.get("bleed"), bool):
+                s["bleed"] = True
+            if page and not str(s.get("bg") or "").strip():
+                s["bg"] = page
+    # 贯穿主体也可以由风格包给定：它的构图/人物参数本来就是按同一副骨架写死的，
+    # 分镜再手写一遍容易漏（真机 37 镜的 spec 里根本没有 `protagonist`，于是每镜
+    # 各画一个人）。分镜显式写了的优先，风格包只填空格。
+    if isinstance(manifest.get("protagonist"), Mapping):
+        # 分镜自己写了的键优先，风格包只补空格：真机里模型写了 look/wardrobe，
+        # 但没写 `component`，于是模板 import 检查不知道主角该由哪件组件渲染，
+        # 画面里人又被手画了一遍（2026-10-20）。补齐 component 后这项检查才有落点。
+        merged = dict(manifest["protagonist"])
+        if isinstance(spec.get("protagonist"), Mapping):
+            merged.update(spec["protagonist"])
+        spec["protagonist"] = merged
     if not spec.get("style") and display:
         spec["style"] = display
     if not spec.get("style_grammar") and manifest.get("recurring_pose"):
@@ -521,16 +576,17 @@ class PlanMotionNode(StoryNode):
         "React/TSX（每镜一次短调用，写完自动过 lint，最多改两次）。写了 `code` 的镜以你"
         "写的为准。这样几十镜的代码不会挤在主对话上下文里。"
         "画面全部来自代码逐帧画出来——裸 SVG、`<canvas>`、roughjs、three.js、katex 都行，"
-        "不联网、不引用任何外部图片。每镜的代码是**自包含**的：顶层 `<AbsoluteFill>` 铺满整帧，"
+        "不联网、不引用任何外部图片。每镜的代码是**自包含**的：顶层 `<AbsoluteFill>` 铺满"
+        "自己的画布（没写片壳时是整帧；写了片壳时是 `useBody()` 报的画面带），"
         "**先把这一镜文案里能被画出来的东西圈出来**——一个具体物件、一个人物、一个动作、"
         "一组关系，画面就是它的舞台或特写；**这一镜单独截一帧下来要是一幅画，不是一页排版**"
         "（大标题 + 色块 + 几行字那种）。画法不限制：`@dg/lib/draw/*` 与 `@dg/lib/brush` "
         "只是可选参考件，用不上就自己画。"
         "用户对风格只给了一点点方向时，**在那句方向之上自己组合**媒介、笔触、光线、构图与配色，"
         "把整片的美术语言补齐——是往上加，不是照单执行；整片所有镜共用这一套语言。"
-        "顶层再给一件 `recurring_prop`：**一个**在画面世界里反复出现的具体道具，"
-        "让抽象概念在它身上看得见（如一枚随叙述变化的读数表、一面映出数字的镜子）；"
-        "它出现在每一镜写码的提示词里，合适就摆、不硬塞，全片只此一件。"
+        "**`recurring_prop` 是可选的**：只有用户明确要『同一件东西贯穿全片』时才给一件"
+        "在画面世界里反复出现的具体道具；用户没要求就不写，让每一镜按自己的文案画。"
+        "写了它，它就会出现在每一镜写码的提示词里，届时全片只此一件。"
         "**用户只给一个选题/一句话时，自己补全**：受众、时长（默认 3~4 分钟）、"
         "叙事结构（现象→机制→此刻→收束）与画法都自己定，不要反问一串；"
         "只有『要不要配音』『配乐用哪一首』这类真正影响成片、又无法从资料里判断的事才问一次。"
@@ -542,8 +598,16 @@ class PlanMotionNode(StoryNode):
         "先分带、再把画面排进 `art` 那一格（字与图由结构保证不重叠）；要咬合版面时用 "
         "`<CaptionText/>` 套定位盒子自己摆；整屏都是画面、找不到能排字的干净区域时，"
         "才用整条 `<CaptionLayer/>`。不许每一镜都在底部丢一个整条预设。"
+        "**整片选了片壳（`shell`）时这一条不适用**：纸底、色条、钟、期号与底部字幕由片壳统一画，"
+        "每镜只画画面带里的主体与场景（画布用 `useBody()`），brief 也只写主体与场景。"
         "**brief 里要写清两件事：这一镜文案里哪几个词变成了画面上的什么东西（怎么摆、光从哪来），"
         "以及字幕排在哪、和画面里什么元素对齐。**"
+        "**每镜还要交 `motion`（按发生顺序写两条）**：写手看不到别的，它就照这两条排拍子；"
+        "系统渲一版草稿按像素数变化段，数得出来才算过。每条写清「是什么动效」，"
+        "锚用 `subtitle:<本镜第几个词>`（最稳）或 `fields.<本镜字段名>`。"
+        "两条都要是**够大的一处变化**——满宽色带擦入、面板展开收拢、成块的东西整体位移；"
+        "只做淡入淡出、只让细线或小图标动，像素差数不出来，这一镜会被判成「动了一下就停了」，"
+        "写手要重写一遍。两条的起点也要分开（隔开一秒以上最好）。"
         "整片的底色与字幕统一由**顶层入参**承载（见下），每一镜用 "
         "`resolveFilmStyle(getInputProps())` 取那一份，不要写死颜色。"
         "出处要过一道账：本会话被 web_search / fetch_url 真打开过的页面才算查证过，"
@@ -574,8 +638,8 @@ class PlanMotionNode(StoryNode):
                            "系统按 brief 单独写代码；写了 code 的镜以你写的为准。"
                            "本节点是**校验闸**：文案超出字幕容量、高亮词不是文案子串、"
                            "字段声明越界都会带镜号退回，改完重调即可，不烧像素。"
-                           "顶层 style 是整片美术语言的起点（用户只给一点方向就在上面加），"
-                           "recurring_prop 是全片唯一那件贯穿道具。"
+                           "顶层 style 是整片美术语言的起点（用户只给一点方向就在上面加）；"
+                           "recurring_prop 可选——只有用户要求贯穿全片时才写。"
                            "source 请如实填出处——机器不判真伪，它会如实出现在分镜卡与逐镜账上。"
                            "**出处还要过一道账**：本会话被 web_search / fetch_url 真打开过的页面"
                            "才算查证过，对不上账的会被打回（没查到就写「未核实：…」）。"
@@ -603,6 +667,18 @@ class PlanMotionNode(StoryNode):
         "style_skill": {
             "type": "string",
             "description": "用户选中的风格包名（可空）。由系统注入，模型不要自己编。",
+        },
+        # 同上：只在入口勾了「直接出片」时由系统注入为真。模型不填就是普通流程
+        # （先出预渲静帧给人看、出片前再确认一次）。
+        "go_straight": {
+            "type": "boolean",
+            # 系统注入的布尔项**不上计划卡**：布尔在 `knob_facts_for` 里默认就会变成
+            # 一个可勾的开关，模型照着清单抄一次 `go_straight: true`，这一轮就不出
+            # 预渲静帧、也不等确认了。这不是用户点名要的开关，是入口那个「直接出片」
+            # 传下来的状态。键名记在 `plan/vocab.py` 的 `SYSTEM_INJECTED_PARAMS`，
+            # 计划层按那份名单跳过它（值仍随计划步骤传得到节点）。
+            "description": "用户这一轮选了直接出片：不出预渲静帧、出片前不等确认。"
+                           "由系统注入，模型不要自己设。",
         },
     })
 
@@ -658,10 +734,22 @@ class PlanMotionNode(StoryNode):
         # 取不到、不是 style、不属于本人，都只写一句回执继续，不拦分镜。
         style_skill = str(inputs.get("style_skill")
                           or getattr(state, "style_skill", "") or "").strip()
+        # 「直接出片」：入口上勾了就不预渲静帧（省下每镜一次 0.75 倍尺寸的整镜渲染，
+        # 以及随之而来的带图视觉评审）。代价写在预览那一段：没有静帧给人看，也没有
+        # 「红镜带意见重写一遍」——画面好不好只能等成片。开关是用户在入口上显式选的，
+        # 所以这里照办，不再二次确认。
+        go_straight = _flag_on(inputs.get("go_straight")
+                               if inputs.get("go_straight") is not None
+                               else getattr(state, "go_straight", False))
         style_note = ""
+        # 「风格：自动」= 空串：**不套任何风格包、不套模板**。用户没点名风格时，
+        # 画面只由对话框里那段话决定（`user_request` 原样进每一镜的提示词）。
+        # 从前这里会按特征词自动套一份风格包，那等于把视觉规则从对话搬回库里——
+        # 用户要的是「我写成什么样，就画成什么样」，所以这一层不做了。
         if style_skill:
-            raw, style_note = await _attach_style_pack(
+            raw, attached_note = await _attach_style_pack(
                 self.storage, raw, style_skill, state.user_id)
+            style_note = "；".join(n for n in (style_note, attached_note) if n)
             if style_note:
                 state.summary.notes.append(style_note)
         # `code_from` 先展开：复用别镜代码的那一镜算「带了 code」，不该被判成取材/写码混交。
@@ -700,7 +788,8 @@ class PlanMotionNode(StoryNode):
             aspect = (cspec.norm_aspect(inputs.get("aspect") or raw.get("aspect"))
                       or "landscape")
             return forage_payload(account, target=f_target, shots=len(forage),
-                                  aspect=aspect)
+                                  aspect=aspect,
+                                  shell=str(raw.get("shell") or ""))
         # 顶层开关先并进来再校验：卡上勾了 landscape 就得渲成横屏，模型在 spec 里写的
         # portrait 让位；并早并晚都要过校验器，越界照样回清单。
         # 质检档：spec 没写就按产品缺省（MOTION_QC，缺省 preview——见 cspec.QC_MODES）。
@@ -728,6 +817,12 @@ class PlanMotionNode(StoryNode):
                 " shots_patch 只交那几镜）：\n"
                 + "\n".join(f"  · {e}" for e in errors[:12])
                 + (f"\n  · …另有 {len(errors) - 12} 条同类错误" if len(errors) > 12 else ""))
+        # 贯穿人物没写 `protagonist`：只报不拦。写码马上要开始，这句排在写手之前，
+        # 模型看到回执还来得及补交顶层这一栏（主角约定进复用键，补了会整片重写）。
+        if not spec.get("protagonist"):
+            note = missing_protagonist_note(spec)
+            if note:
+                state.summary.notes.append(note)
         # 自动落地检查（2026-10-19）：用户只在对话框说片子，不该先学换件面板。
         # 分镜里明确要的「洞穴/客厅/地铁」「篝火/电视/手机」若模板现在画不了，
         # 先按换件同一套闸补一件，再重新解析槽位——后面的写手直接用新件。
@@ -769,7 +864,8 @@ class PlanMotionNode(StoryNode):
             for s in spec.get("shots") or []:
                 if not isinstance(s, Mapping) or not str(s.get("code") or "").strip():
                     continue
-                miss = shot_writer.template_import_missing(spec, str(s.get("code") or ""))
+                miss = shot_writer.template_import_missing(
+                    spec, str(s.get("code") or ""))
                 if miss:
                     writer_notes.append(f"{s.get('id') or '?'}：{miss}")
         if not cspec.DEMOS_ENABLED:
@@ -779,10 +875,13 @@ class PlanMotionNode(StoryNode):
             # 写手没有落点。这一步让第一次落笔就有具体画面；失败不拦，原 brief 照用。
             directed = await art_director.concretize(
                 spec, user_id=state.user_id or "",
-                conversation_id=state.conversation_id or "")
+                conversation_id=state.conversation_id or "",
+                user_request=getattr(state, "user_request", "") or "")
             wrote = await shot_writer.write_shot_code(
                 spec, user_id=state.user_id or "",
-                conversation_id=state.conversation_id or "")
+                conversation_id=state.conversation_id or "",
+                user_request=getattr(state, "user_request", "") or "",
+                storage=self.storage)
             # 导演的账不能丢：它排在写手之前；若直接用写手那一份覆盖，导演的花费与
             # 「未判/补了美术方向」就永远到不了回执（2026-10-19 修）。
             writer_notes = list(directed["notes"]) + list(wrote["notes"])
@@ -856,7 +955,17 @@ class PlanMotionNode(StoryNode):
         # `<CaptionFrame>` 自己画了字幕，又摆一份 `<CaptionText/>` 就会叠成重影
         # （2026-10-19 真机）。这一步只删第二份，不改判据、不打回。
         spec, dup_notes = cspec.autofix_duplicate_caption(spec)
-        caption_notes = list(caption_notes) + list(dup_notes)
+        # 整屏 `<feTurbulence>` 颗粒改成 `<Grain/>`（2026-10-20 提速）。原来的写法每帧都
+        # 把整幅 1920×1080 的噪声重算一遍——真机一镜 292 帧、每帧 ~0.8 秒，一半以上烧在
+        # 这层颗粒上；`<Grain/>` 用固定种子的噪声贴图，只栅格化一次。画面参数（浓度、
+        # 种子）照搬，不改判据、不打回。
+        spec, grain_notes = cspec.autofix_film_grain(spec)
+        # 整片字幕的缺省收敛到「白字黑边」（2026-10-20 用户点名）。排在卡面勾选之后：
+        # 用户自己钉的那一档不在这里，只有模型顺手写的 `on_picture`（无描边）被换掉。
+        spec, cap_default_notes = cspec.autofix_caption_default(
+            spec, user_request=getattr(state, "user_request", "") or "")
+        caption_notes = (list(caption_notes) + list(dup_notes) + list(grain_notes)
+                         + list(cap_default_notes))
         # 闸① 提前到入库前：原先 lint 只在渲染口里跑，一镜代码写错要等前面几镜都烧完、
         # 渲到它才现形，然后整份重写重提。这里所有镜并行过一遍（不烧像素，每镜几百毫秒）。
         # **这一道照旧拦**：它不是判据，是"这段字节编译不编译得过"——一份过不了闸① 的
@@ -921,7 +1030,13 @@ class PlanMotionNode(StoryNode):
             payload["shots_replacement"] = replace
         # 预览静帧（主流的「抽几帧看」）：每镜一张小图，渲染前的计划确认卡上给人看。
         # 容器不通、或关了这一档（MOTION_PREVIEW_STILLS=0）就没有图——卡照样弹。
-        if up and os.environ.get("MOTION_PREVIEW_STILLS", "1") not in ("0", "false", "no"):
+        # 「直接出片」也走这一条：用户选了不预览，这几分钟本来只为了让他在确认卡上
+        # 看一眼；连带省掉的带图视觉评审就是那个选择的价格（少一次红镜重写）。
+        if go_straight and up:
+            state.summary.notes.append(
+                "直接出片：这一版没有预渲静帧，画面以成片为准。")
+        if (up and not go_straight
+                and os.environ.get("MOTION_PREVIEW_STILLS", "1") not in ("0", "false", "no")):
             # 补丁轮只渲改动过的镜：上一版的预览图还在 `_PREVIEW_REFS` 里，
             # 合并后卡面仍是全片。整份重交＝全片重渲（并清掉旧缓存）。
             repo_key = (state.session_id, state.artifact_id or "_default")
@@ -929,8 +1044,35 @@ class PlanMotionNode(StoryNode):
                     if changed_ids and _PREVIEW_REFS.get(repo_key) else None)
             if only is None:
                 _PREVIEW_REFS.pop(repo_key, None)
-            refs, notes, layouts, files = await self._publish_previews(
+            refs, notes, layouts, files, failures = await self._publish_previews(
                 state, spec, only=only)
+            # 代码编译不过的镜：趁卡还没弹，让写手照着渲染器的报错重画一版再渲一张。
+            # 缺一格预览图只是难看；带一段编译不过的代码进渲染是整片中停——而用户
+            # 看到「无预览」时并不知道自己该做什么。只修这一类，超时那类不碰。
+            broken = sorted(sid for sid, f in failures.items()
+                            if str(f.get("kind") or "") == "final")
+            if broken:
+                fixed, repair_notes, repair_cost = await self._repair_broken_shots(
+                    state, spec, failures, broken)
+                notes.extend(repair_notes)
+                if repair_cost:
+                    payload["node_cost_yuan"] = round(
+                        float(payload.get("node_cost_yuan") or 0.0) + repair_cost, 4)
+                if fixed:
+                    refs2, notes2, layouts2, files2, bad2 = await self._publish_previews(
+                        state, spec, only=set(fixed))
+                    refs.update(refs2)
+                    files.update(files2)
+                    layouts.update(layouts2)
+                    notes.extend(notes2)
+                    for sid in fixed:
+                        failures.pop(sid, None)
+                    failures.update(bad2)
+            if failures:
+                # 结构化的一份：确认卡按它写「哪几镜的画面没能生成、继续会在那里停」。
+                payload["preview_failures"] = {
+                    sid: str(f.get("kind") or "transient")
+                    for sid, f in failures.items()}
             merged = _remember_previews(
                 state.session_id, state.artifact_id or "_default", refs, spec)
             if merged:
@@ -968,15 +1110,22 @@ class PlanMotionNode(StoryNode):
                 # 让它改的是真渲出来的画面，而不是文字描述在它脑子里的投影。
                 rewritten = await design_review.rewrite_failed(
                     spec=spec, failed=visual["failed"], stills=files,
-                    user_id=state.user_id or "", conversation_id=state.conversation_id or "")
+                    user_id=state.user_id or "", conversation_id=state.conversation_id or "",
+                    user_request=getattr(state, "user_request", "") or "")
                 spent += float(rewritten["cost_yuan"])
                 fixed = [sid for sid, r in rewritten["rewritten"].items() if r.get("ok")]
                 after: dict[str, Any] = {}
                 if fixed:
-                    refs2, notes2, _layouts2, files2 = await self._publish_previews(
+                    refs2, notes2, _layouts2, files2, bad2 = await self._publish_previews(
                         state, spec, only=set(fixed))
                     files.update(files2)
                     notes.extend(notes2)
+                    if bad2:
+                        # 评审重写后仍编译不过：与前面那一轮同一个出口，卡上要能看到。
+                        failures.update(bad2)
+                        payload["preview_failures"] = {
+                            sid: str(f.get("kind") or "transient")
+                            for sid, f in failures.items()}
                     payload["preview_frames"] = _remember_previews(
                         state.session_id, state.artifact_id or "_default",
                         refs2, spec)
@@ -1011,20 +1160,26 @@ class PlanMotionNode(StoryNode):
                               if after else {}),
                 }
                 if visual["failed"]:
-                    lines = [f"带图看了 {visual['checked']} 镜，{len(visual['failed'])} 镜"
-                             "按五条评审没通过（画面作为一张画还不成立）。"]
+                    left = [str(f.get("shot")) for f in after.get("failed", []) if f.get("shot")]
+                    # 头一句必须是「已入库、可出片」：真机 run 901597a97570 里模型先读到
+                    # 33 镜「仍红」，再把 37 镜的 brief 整份重交了一遍（9217 补全 token，
+                    # 约 21 分钟），画面并没有变好——红的是写码层与评审口径，不是 brief
+                    # 少写了一句描述。它原来的位置在清单末尾，等于没说。
+                    lines = ["**分镜已入库，可以直接出片；这一轮不需要再交 plan_motion。**"]
+                    lines.append(f"带图看了 {visual['checked']} 镜，{len(visual['failed'])} 镜"
+                                 "按五条评审没通过（画面作为一张画还不成立）。")
                     if fixed:
                         lines.append(f"已自动按评审意见重写并重渲：{'、'.join(sorted(fixed))}；"
                                      "重写后的结果见 visual_review.after。")
-                    left = [str(f.get("shot")) for f in after.get("failed", []) if f.get("shot")]
                     if left:
                         lines.append(f"重写后仍红：{'、'.join(left)}——照交，**不影响入库**。")
                     if rewritten["skipped"]:
                         lines.append(f"没改成的镜：{'、'.join(rewritten['skipped'])}"
                                      "（重写没写成，已保留上一版能跑的代码）。")
-                    lines.append("**可以直接出片，不必为了这几镜再交一轮分镜。**"
-                                 "要微调就用 shots_patch 只交那几镜；成片后也可以用 "
-                                 "patch_motion_code 单镜重画。")
+                    lines.append("**不要再整份重交分镜**：整份重交＝逐镜重写代码、重渲静帧、"
+                                 "重评一轮，红镜不会因为 brief 换一种说法就变好。"
+                                 "要改只改你确实要换内容的那几镜（shots_patch 只交那几镜），"
+                                 "其余镜原样留着；成片后也可以用 patch_motion_code 单镜重画。")
                     payload["visual_review_hint"] = "\n".join(lines)
                 if spent:
                     payload["node_cost_yuan"] = round(
@@ -1036,8 +1191,10 @@ class PlanMotionNode(StoryNode):
 
     async def _publish_previews(self, state: NodeState, spec: dict[str, Any],
                                 *, only: set[str] | None = None
-                                ) -> tuple[dict[str, str], list[str], dict[str, Any], dict[str, Any]]:
-        """渲每镜预览静帧并发布 → ({镜号: 对象键}, 说明, {镜号: 版面账}, {镜号: 本地图片})。
+                                ) -> tuple[dict[str, str], list[str], dict[str, Any],
+                                           dict[str, Any], dict[str, dict[str, str]]]:
+        """渲每镜预览静帧并发布 → ({镜号: 对象键}, 说明, {镜号: 版面账}, {镜号: 本地图片},
+        {镜号: {kind, detail}})。
 
         ``only`` 只渲这几镜（视觉评审改过的镜要重渲，不必把整片再渲一遍）。
         """
@@ -1048,7 +1205,7 @@ class PlanMotionNode(StoryNode):
             target = {**dict(spec), "shots": [
                 s for s in (spec.get("shots") or [])
                 if str(s.get("id") or "") in only]}
-        files, notes, layouts = await crender.preview_stills(
+        files, notes, layouts, failures = await crender.preview_stills(
             target, client=rc.endpoints(), work=self._work(state, "motion", "preview"),
             storage=self.storage)
         refs: dict[str, str] = {}
@@ -1060,7 +1217,52 @@ class PlanMotionNode(StoryNode):
                 refs[sid] = key
             except Exception as exc:  # noqa: BLE001 - 缺一张预览不拦
                 notes.append(f"{sid}：预览图没发布（{type(exc).__name__}）")
-        return refs, notes, layouts, files
+        return refs, notes, layouts, files, failures
+
+    async def _repair_broken_shots(self, state: NodeState, spec: dict[str, Any],
+                                   failures: Mapping[str, Mapping[str, str]],
+                                   broken: Sequence[str]
+                                   ) -> tuple[list[str], list[str], float]:
+        """编译不过的镜：让写手照着渲染器的报错重画一版 → (改成了的镜, 回执, 花费)。
+
+        为什么由编排自己修、而不是交回主对话：这段错在预览打包时才暴露，而它**一定**
+        会让渲染在那一镜中停（同一份代码、同一个打包器）。交回主对话要再走一轮
+        `shots_patch`，中间用户看到的只是卡上一格「无预览」——他不知道这是要改的。
+
+        只做一轮、只对 `final` 这一类开口：`rewrite_shot_code` 自己会带 lint 报错重试
+        `REWRITE_ATTEMPTS` 次；这里再套循环就会在一镜上反复烧。超时那类是机器忙，
+        重画会把一份本来能跑的代码换掉（真机上四张全是一次重渲就出的）。
+        """
+        items = []
+        for sid in broken:
+            detail = str((failures.get(sid) or {}).get("detail") or "（渲染器没给原因）")
+            items.append({
+                "shot": sid,
+                "why": detail[:400],
+                "fix": "把这段代码改到能编译：重复声明、没闭合的括号、写错的标识符都清掉；"
+                       "画面、构图、字幕文案按原来的分镜保留，别换内容。",
+            })
+        try:
+            got = await design_review.rewrite_failed(
+                spec=spec, failed=items, prefix="这一镜的代码编译不过",
+                user_id=state.user_id or "", conversation_id=state.conversation_id or "",
+                user_request=getattr(state, "user_request", "") or "")
+        except Exception as exc:  # noqa: BLE001 —— 自动修失败不带塌整份分镜
+            return [], [f"自动重画编译不过的镜时出错了（{type(exc).__name__}），"
+                        "这一轮先照原样交：继续渲染会在那几镜停下。"], 0.0
+        fixed = sorted(sid for sid, r in (got.get("rewritten") or {}).items()
+                       if r.get("ok"))
+        notes: list[str] = []
+        if fixed:
+            # 只说重画了；**是否渲得出来由紧跟着的那次重渲回执说**——重画过 lint 但
+            # 打包仍可能炸（另一处错），在这里提前写「预览已重出」会自相矛盾。
+            notes.append("代码编译不过、已自动重画：" + "、".join(fixed) + "。")
+        left = [sid for sid in broken if sid not in set(fixed)]
+        if left:
+            notes.append("代码编译不过、自动重画一次仍未成：" + "、".join(sorted(left))
+                         + "——照原样继续渲染会在这一镜停下；要改就重画这一镜，"
+                         "或把这镜的内容换一种说法。")
+        return fixed, notes, float(got.get("cost_yuan") or 0.0)
 
 
 #: 每个会话最近一版写码轮分镜（补丁轮的底稿）。进程内、有上限：重启后丢了就请模型交整份。
@@ -1185,20 +1387,59 @@ def _brief_key(shot: Mapping[str, Any]) -> str:
     return " ".join(str(shot.get("brief") or "").split())
 
 
-def _style_key(raw: Any) -> tuple[str, str]:
-    """风格包的复用键：`(包名, 模板名)`。空元组表示「没有风格包」。
+def _style_key(raw: Any) -> tuple[str, ...]:
+    """复用键：`(包名, 模板名, 主角约定)`。全空表示「没有风格包、没有主角」。
 
-    只认这两项：它们决定代码长什么样。manifest 里的颜色/构图微调不参与——
-    调一个色号不该让整片重写；但要换风格包或换模板，旧代码就不再成立。
+    只认决定**代码长什么样**的那几项：换风格包/换模板、或改主角的几何与画法
+    方向，旧代码就不再是同一个画面。manifest 里的颜色/构图微调不参与——调一个
+    色号不该让整片重写。
+
+    主角约定进键，是为了留一条**补救路径**：分镜入库后才发现没写 `protagonist`
+    时，模型重交顶层这一栏、其余镜不重交，复用会因键变了而失效，整片按同一个
+    主角重写——而不是「补了约定，画面一个像素都没变」。
     """
     if not isinstance(raw, Mapping):
-        return ("", "")
+        return ("", "", "")
+    p = raw.get("protagonist") if isinstance(raw.get("protagonist"), Mapping) else {}
+    protagonist = "|".join(str(p.get(k) or "") for k in
+                           ("render", "height", "foot_y", "facing", "stride_sec"))
     pack = raw.get("style_pack")
     if not isinstance(pack, Mapping):
-        return ("", "")
+        return ("", "", protagonist)
     manifest = pack.get("manifest") if isinstance(pack.get("manifest"), Mapping) else {}
     return (str(pack.get("name") or ""),
-            str(manifest.get("template") or raw.get("style_template") or ""))
+            str(manifest.get("template") or raw.get("style_template") or ""),
+            protagonist)
+
+
+#: 风格/分镜里出现这些词、且有好几镜时，认为片子里有一个反复出现的人物。
+_RECURRING_PERSON_WORDS = ("剪影", "人物", "主角", "同一个人", "人影", "身影", "人")
+
+
+def missing_protagonist_note(spec: Mapping[str, Any]) -> str:
+    """有贯穿人物却没写 `protagonist` → 一句回执（不拦、不自动编）。
+
+    真机 37 镜《火与光》的 spec 里根本没有这一栏：`style` 里写着「人物脚底
+    28%/82%、身高 44%」，但没有结构化约定，写手只能每镜照 brief 自己画一个，
+    切点一过身高、肩宽、步幅全换。这里只**报**——大部分片子确实没有贯穿人物，
+    自动补一个主语反而会让几十镜硬塞同一件东西。
+    """
+    shots = [s for s in (spec.get("shots") or []) if isinstance(s, Mapping)]
+    if len(shots) < 4:
+        return ""
+    prose = " ".join(str(spec.get(k) or "") for k in ("style", "style_grammar"))
+    person_shots = sum(
+        1 for s in shots
+        if any(w in str(s.get("brief") or "") for w in _RECURRING_PERSON_WORDS))
+    if not any(w in prose for w in _RECURRING_PERSON_WORDS) and person_shots < 3:
+        return ""
+    return ("**这部片没有声明贯穿主体 `protagonist`**：分镜/风格里有人物在多个镜出现，"
+            "写手会每镜各画一个人（真机 37 镜就是这样：切点一过，身高、肩宽、"
+            "步幅、手臂摆法全换一套）。这一版照常写码出片；**要同一个人贯穿**，"
+            "就把 `protagonist` 补进 spec 顶层再交一次（`kind: \"人\"`，"
+            "`height`/`foot_y`/`facing`/`stride_sec` 各给一个数，`look` 写清轮廓）"
+            "——每镜按同一组比例自己画，切点才不换人。主角约定变了，"
+            "旧代码不会复用，整片会按同一组比例重写。其余镜不必重交。")
 
 
 def reuse_coded(base: Any, raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -1336,7 +1577,8 @@ async def _prelint(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
 
 
 def forage_payload(account: dict[str, Any], *, target: float | None = None,
-                   shots: int = 0, aspect: str = "landscape") -> dict[str, Any]:
+                   shots: int = 0, aspect: str = "landscape",
+                   shell: str = "") -> dict[str, Any]:
     """取材轮的产物：被引用 demo 的**全文** + 一份字节账。**不落库、不渲任何东西**。
 
     ``__no_store__`` 是这条链既有的写法（见 ``render_video`` 的 dry_run）：这一次调用
@@ -1364,11 +1606,19 @@ def forage_payload(account: dict[str, Any], *, target: float | None = None,
                  "demo 原样的卡片墙、表格框、霓虹发光这类外观与 style 冲突时，以 style 为准。"
                  "与 demo 的骨架相似度只是提醒，不会因此打回。")
     zone = cspec.CAPTION_ZONE_PX.get(aspect, 300)
-    next_hint += (f"写代码时三件事：① 字幕交给 `<CaptionLayer />`（从 '@dg/film' 引入；"
-                  f"你没摆的话系统会替你补上），它占画面最底下 {zone}px，"
-                  "那一条里别放你自己的字和主体，否则会被字幕压住；"
-                  "② 动作铺满这一镜：最后一个动作的结束帧放在这一镜时长的 80% 以后，"
-                  "别让后半截定格；")
+    if str(shell or "").strip():
+        # 片壳模式：字幕与画面外框都归片壳，镜头代码里不许出现字幕件。
+        next_hint += ("写代码时三件事：① 底部字幕与外框由片壳统一画——这一镜只画画面带里的"
+                      "主体与场景，不要摆 `<CaptionLayer />` / `<CaptionText />` / "
+                      "`<CaptionFrame>`，也不要自己画纸底、色条、钟或期号；"
+                      "② 动作铺满这一镜：最后一个动作的结束帧放在这一镜时长的 80% 以后，"
+                      "别让后半截定格；")
+    else:
+        next_hint += (f"写代码时三件事：① 字幕交给 `<CaptionLayer />`（从 '@dg/film' 引入；"
+                      f"你没摆的话系统会替你补上），它占画面最底下 {zone}px，"
+                      "那一条里别放你自己的字和主体，否则会被字幕压住；"
+                      "② 动作铺满这一镜：最后一个动作的结束帧放在这一镜时长的 80% 以后，"
+                      "别让后半截定格；")
     if target and shots:
         per = target / max(1, shots)
         need = max(shots, round(target / 9.0))

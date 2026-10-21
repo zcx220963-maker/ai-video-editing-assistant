@@ -217,7 +217,14 @@ async def preload_skills(loader: Any, names: Sequence[str], *,
         body = assemble(()) if callable(assemble) else skill.body
         if not body:
             continue
-        directory = section_directory_line(skill.body, planned=want, included=False)
+        # `readers` 声明成 writer 的块不进「本轮计划用得上」：那一行是在教模型
+        # 「这一块与你有关」，而写码侧的块由 `shot_writer._contract()` 直接取去喂
+        # 写手（真机量到的 76 KB 就是这么来的）——同一份正文读两遍，第二遍纯烧
+        # 上下文。判据来自技能自己的声明，不在这里写死段名。
+        readers = getattr(skill, "readers", None) or {}
+        planned = [s for s in want if str(readers.get(s, "")).lower() != "writer"]
+        directory = section_directory_line(
+            skill.body, planned=planned, included=False, readers=readers)
         out.append(f'<skill_instructions name="{skill.name}">\n{body}{directory}\n'
                    f'</skill_instructions>')
         carried.append(skill.name)

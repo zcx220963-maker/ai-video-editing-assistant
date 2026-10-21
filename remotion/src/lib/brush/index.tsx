@@ -176,8 +176,8 @@ export interface TextureProps {
   /** 纹理密度（像素），缺省 240 */
   scale?: number;
   seed?: number;
-  /** multiply 压暗（纸纹）/ overlay 提亮（颗粒） */
-  blend?: 'multiply' | 'overlay' | 'soft-light' | 'screen';
+  /** multiply 压暗（纸纹）/ overlay 提亮（颗粒）/ normal 原样叠上（照搬旧画的整屏噪声） */
+  blend?: 'normal' | 'multiply' | 'overlay' | 'soft-light' | 'screen';
 }
 
 /** `<PaperTexture/>`：整帧纸纹。叠在底色上，`multiply` 让纸的纤维显出来。 */

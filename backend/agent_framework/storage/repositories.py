@@ -1349,6 +1349,16 @@ class StyleTemplatesRepo(_Repo):
         await self.db.update(self.table, values, where={"name": name})
         return await self.get(name)
 
+    async def set_probe(self, name: str, probe: str) -> dict[str, Any] | None:
+        """只补预览样例（不动源码、版本、manifest）。
+
+        系统模板的 probe 来自镜像里的种子文件：老库里那一行是种子还没带样例时插的，
+        重新启动时用它补上；它既不是一版新源码，也不该让版本号 +1。
+        """
+        await self.db.update(self.table, {"probe": str(probe), "updated_at": _now()},
+                             where={"name": name})
+        return await self.get(name)
+
     async def set_manifest(self, name: str,
                            manifest: Mapping[str, Any]) -> dict[str, Any] | None:
         """只换 manifest（不动源码、版本、状态）。

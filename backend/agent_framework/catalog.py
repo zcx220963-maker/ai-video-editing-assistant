@@ -116,6 +116,8 @@ PARAM_LABELS: dict[str, str] = {
     "node": "节点", "nodes": "节点", "seq": "序号", "label": "标签",
     "display": "显示名", "value": "取值", "options": "选项",
     "param_options": "参数选项", "why": "理由", "reason": "原因",
+    # 画面风格工具（style 工具气泡里会原样出现）
+    "action": "动作", "words": "描述",
     "expectation": "预期", "skills_hint": "技能提示", "skill": "技能",
     "skills": "技能", "run_id": "运行", "instruction": "指令",
 }

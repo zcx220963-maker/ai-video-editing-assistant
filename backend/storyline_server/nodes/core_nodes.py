@@ -182,18 +182,63 @@ class StoryNode(BaseNode):
 class SearchMediaNode(StoryNode):
     name = "search_media"
     display_name = "检索素材"
-    description = "在素材库中检索素材（用户未上传时使用）"
-    input_schema = _obj("检索关键词", {"query": {"type": "string"}})
+    # 2026-10-20 真机 run aa8c89717c93：用户说「配乐还用昨天那个」，模型按工具名
+    # 理解成「素材库什么都能搜」，拿曲名连搜 6 轮；这个节点当时写死 `kinds=("video",)`，
+    # 每轮都回 `found: []`，同参重复闸拦下后模型仍原地重试，最后停滞守卫收口。
+    # 现在 kinds 可传，空结果也点明「只搜了视频」——失败要说清失败在哪，模型才换得动。
+    # 配乐其实根本不必检索：`plan_motion` 的 `bgm` 收曲名，渲染前会按文件名解析。
+    description = ("在素材库中检索素材（用户未上传时使用）。默认只搜视频；"
+                   "找配乐传 kinds=['audio']，找图片传 kinds=['image']。"
+                   "配乐也可以不检索，直接在 plan_motion 的 bgm 里写曲名。")
+    input_schema = _obj("检索关键词", {
+        "query": {"type": "string"},
+        "kinds": {"type": "array",
+                  "items": {"type": "string",
+                            "enum": ["video", "audio", "image"]},
+                  "description": "要搜的素材类型；缺省 ['video']。"},
+    })
 
     async def process(self, state, inputs):
         query = str(inputs.get("query") or state.user_request or "").strip()
+        raw = inputs.get("kinds")
+        if raw is None:
+            raw = inputs.get("kind")          # 模型常写成单数
+        if isinstance(raw, str):
+            raw = [raw]
+        kinds = tuple(k for k in (raw or [])
+                      if k in ("video", "audio", "image")) or ("video",)
         rows = await self.storage.materials.search(
             state.user_id, query, conv_id=state.conversation_id or None,
-            kinds=("video",), limit=20)
-        return {"found": [{"material_id": r["id"], "filename": r["filename"],
-                           "kind": r["kind"], "duration": r["duration_sec"]}
-                          for r in rows],
-                "source": "materials"}
+            kinds=kinds, limit=20)
+        # 用户说「配乐还用来昨天那个」时，模型拿曲名调的是这个工具，而它缺省只搜视频，
+        # 于是每轮都拿到 `found: []`。这里**不要求模型先学会 kinds**：曲名里有音乐词
+        # 且视频没命中时，自动回落搜一次音频，并把回落事实写回执。返回更多类型不会
+        # 误导下游——模型仍然自己决定用哪一条（见「堵死比白烧更坏」）。
+        fell_back = False
+        if not rows and kinds == ("video",) and any(
+                w in query.lower() for w in ("曲", "歌", "音乐", "配乐", "音频",
+                                             "音轨", "bgm", "mp3", "ost")):
+            rows = await self.storage.materials.search(
+                state.user_id, query, conv_id=state.conversation_id or None,
+                kinds=("audio",), limit=20)
+            if rows:
+                kinds = ("audio",)
+                fell_back = True
+        out: dict[str, Any] = {
+            "found": [{"material_id": r["id"], "filename": r["filename"],
+                       "kind": r["kind"], "duration": r["duration_sec"]}
+                      for r in rows],
+            "source": "materials",
+            "kinds": list(kinds),
+        }
+        if fell_back:
+            out["hint"] = ("视频没命中，这次按曲名回落搜了音频。配乐也可以不检索，"
+                           "直接在 plan_motion 的 bgm 里写曲名，渲染前会按文件名解析。")
+        elif not rows and kinds == ("video",):
+            out["hint"] = ("这次只搜了视频。找配乐用 kinds=['audio']，找图片用 "
+                           "kinds=['image']；也可以不检索，直接在 plan_motion 的 "
+                           "bgm 里写曲名，渲染前会按文件名解析。")
+        return out
 
 
 class LoadMediaNode(StoryNode):
@@ -3632,10 +3677,11 @@ class PatchVideoNode(RenderVideoNode):
         sess = state.session_id
         base = str(inputs.get("base_artifact_id") or "").strip()
         if not base:
+            # 与代码镜那条同一条口径：挡住之后要指出下一步，否则模型会去别处乱试。
             raise ValueError(
                 "局部改：必须指定 base_artifact_id——要改的是哪一版成片"
-                "（render_video 返回体顶层的 artifact_id）。不指定就等于凭空造一版，"
-                "那条路叫重新出片，不叫局部改")
+                "（render_video 返回体顶层的 artifact_id）。如果还没出过片，就没有可改的"
+                "基准：要改脚本就先改 plan_timeline，再调 render_video 出片")
 
         bundle = await self._bundle(sess, base)
         doc, whence, fp = await self._base_timeline(sess, base, bundle)

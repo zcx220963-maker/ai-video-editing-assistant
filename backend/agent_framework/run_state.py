@@ -45,6 +45,10 @@ class RunState:
     # 真发生过的调用名，含失败的那几次——「执行轮一次步骤都没调用」判据用它算。
     # 那道硬保证不该因为「这一轮是从挂起点续上来的」而打假。
     calls_attempted: list[str] = field(default_factory=list)
+    # 本 run 通过 load_skill 真取过正文的技能名（去重）。工具面据此裁掉「写文件」这类
+    # 结构性岔路：motion 流程里镜头代码由 shot_writer 逐镜写，主对话再写 shots/*.tsx
+    # 只会打转（真机 run 11a0349aae6d / 92377b635645 都是这么烧完的）。
+    skills_loaded: list[str] = field(default_factory=list)
     # 其中**真的跑到了注册表**的那部分（UnknownToolError 的调用从未发生，不算跑过）：
     # 计划对账的输入。
     calls_executed: list[str] = field(default_factory=list)
@@ -67,6 +71,10 @@ class RunState:
     # （``render_video``），不等于批准了零素材那条路（``render_motion_code``）——
     # 那是另一笔不可逆的算力，一位布尔会把第二道门直接放行。
     render_gate_asked: list[str] = field(default_factory=list)
+    # 用户这一轮选了「直接出片」：门题不再问、预渲静帧也不出。
+    # 落在 state 而不是只看入口参数：确认门会有续跑（崩溃恢复 / 用户点继续），
+    # 续跑那一次没人再传这个布尔，只能从指针行读回来。
+    go_straight: bool = False
     # 对账：上一次推给前端的偏差（据此去重），以及终答时算出的完整结论
     audit_pushed: dict[str, Any] | None = None
     plan_audit: dict[str, Any] | None = None
@@ -93,8 +101,10 @@ class RunState:
             "approved_plan": self.approved_plan,
             "calls_attempted": list(self.calls_attempted),
             "calls_executed": list(self.calls_executed),
+            "skills_loaded": list(self.skills_loaded),
             "plan_card_pushed": bool(self.plan_card_pushed),
             "render_gate_asked": list(self.render_gate_asked),
+            "go_straight": bool(self.go_straight),
             "audit_pushed": (dict(self.audit_pushed)
                              if isinstance(self.audit_pushed, Mapping) else None),
             "plan_audit": (dict(self.plan_audit)
@@ -114,9 +124,11 @@ class RunState:
             approved_plan=dict(plan) if isinstance(plan, Mapping) else None,
             calls_attempted=[str(x) for x in (d.get("calls_attempted") or [])],
             calls_executed=[str(x) for x in (d.get("calls_executed") or [])],
+            skills_loaded=[str(x) for x in (d.get("skills_loaded") or [])],
             plan_card_pushed=bool(d.get("plan_card_pushed")),
             render_gate_asked=[str(x) for x in (d.get("render_gate_asked") or [])
                                if isinstance(x, str)],
+            go_straight=bool(d.get("go_straight")),
             audit_pushed=(dict(d["audit_pushed"])
                           if isinstance(d.get("audit_pushed"), Mapping) else None),
             plan_audit=(dict(d["plan_audit"])
@@ -180,6 +192,8 @@ class RunState:
             keep["approved_plan"] = dict(state.approved_plan)
         if state.render_gate_asked:
             keep["render_gate_asked"] = list(state.render_gate_asked)
+        if state.go_straight:
+            keep["go_straight"] = True
         if keep:
             plan[STATE_FIELD] = keep
         else:

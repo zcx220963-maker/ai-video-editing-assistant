@@ -111,7 +111,29 @@ const serialize = (fn) => {
 
 /** 渲染限路闸：打包完的产物是独立目录，逐帧渲染可以多路并发。
  *  释放时把名额**直接交给**下一个等待者（不先减再加），避免两者之间被第三个插队超额。 */
-const RENDER_SLOTS = Math.max(1, Number(process.env.DG_RENDER_SLOTS || 2));
+const RENDER_SLOTS = Math.max(1, Number(process.env.DG_RENDER_SLOTS || 4));
+
+/** `delayRender` 的超时（毫秒）。Remotion 缺省 30 s，这里放到 3 min。
+ *
+ *  为什么：`@dg/fonts` 把中文字体按 unicode-range 切成 101 片，每片一次 `loadFont`
+ *  ＝一次 `delayRender` ＋一次 fetch。这些 font 文件本身很小（000 号 8 KB，最大的
+ *  几十 KB），**单独载一次连 0.1 s 都用不上**；但成片渲染时是 4 路镜头切片 + 8 路
+ *  带图自检静帧同时在烤软件 WebGL，每个标签页还各开一份独立上下文（字体缓存不互通），
+ *  一个页面可能连续几十秒分不到 CPU，30 s 的窗口就被耗光。
+ *
+ *  注意这个窗口管两件事：`delayRender` 本身，以及「等页面把 React 组件渲染出来」
+ *  （Remotion 内部用 `timeoutInMilliseconds + 3000`）。两次真机失败正好各撞上一个：
+ *  `A delayRender() "Loading font Noto Sans SC (url: /public/fonts/NotoSansSC-000.woff2 …"`
+ *  与 `waiting for the page to render the React component failed: timeout 33000ms exceeded`
+ *  （2026-10-21 成片渲染）。同一次渲染里其余切片正常出片，说明不是挂死，是排队。
+ *
+ *  放长窗口＝把「排队等一会儿就能过」和「真的卡死」分开：真卡死的那一路仍会在 3 min
+ *  内失败并报出来，不会拖成无限等。要更紧/更松就设 `DG_DELAY_TIMEOUT_MS`。 */
+const DELAY_TIMEOUT_MS = (() => {
+  const n = Number(String(process.env.DG_DELAY_TIMEOUT_MS ?? '').trim());
+  if (!Number.isFinite(n) || n <= 0) return 180000;
+  return Math.min(Math.max(Math.round(n), 10000), 600000);
+})();
 let slotsBusy = 0;
 const slotWaiters = [];
 function releaseSlot() {
@@ -127,9 +149,49 @@ async function acquireSlot() {
   await new Promise((resolve) => slotWaiters.push(resolve));
 }
 
+/** 片壳模式的**结构**检查：外框与字幕归片壳，镜头代码里不能再出现 `FilmLayout`
+ *  或整条字幕（`CaptionLayer`/`CaptionFrame`）。
+ *
+ *  为什么在渲染入口判而不是交给「看图评审」：这是同一段代码的静态事实，判起来零成本；
+ *  而看图评审要真渲一帧、再花一次模型调用，还把「有没有两条字幕」这种确定的事变成了
+ *  一次猜测。`CaptionText` 仍然允许——招牌、图表上的字是画里的东西，不是字幕。
+ *  报错直接 400，写手拿到一句能照着改的话，不必烧像素。 */
+function assertShellContract(code, inputProps) {
+  const shell = String(inputProps?.shell ?? '').trim();
+  if (!shell) return;
+  const hits = [];
+  if (/<\s*FilmLayout\b/.test(code)) hits.push('FilmLayout');
+  if (/<\s*CaptionLayer\b/.test(code)) hits.push('CaptionLayer');
+  if (/<\s*CaptionFrame\b/.test(code)) hits.push('CaptionFrame');
+  if (!hits.length) return;
+  const err = new Error(
+    `这一片用了统一片壳（${shell}），画面外框和底部字幕由片壳统一画；`
+    + `镜头代码里不能再出现 ${hits.join(' / ')}——只画这一镜的主体。`);
+  err.status = 400;
+  throw err;
+}
+
+/** 打包缓存：同一段代码只 bundle 一次（2026-10-20）。
+ *
+ *  一镜的打包是 1~3 秒的固定成本，而同一段代码在一条流程里至少会被打包两遍：
+ *  预览静帧一遍、整镜渲染一遍；重试与「预览后改一镜」还会再打。缓存的是
+ *  `bundle()` 的产物目录（`serveUrl`），不是代码本身——代码按哈希认，别的输入
+ *  （entry/母版/别名/依赖）在同一个进程里不会变。
+ *
+ *  只缓最近的若干份：一份产物是几 MB，几十镜全留会白占内存；淘汰只从表里摘掉，
+ *  磁盘目录还在，正在渲的那一份不会因为表里没了而消失。 */
+const BUNDLE_CACHE_MAX = Math.max(2, Number(process.env.DG_BUNDLE_CACHE || 24));
+const bundleCache = new Map();   // codeHash -> { serveUrl, bundleMs, at }
+
 /** 打包一镜：写 shot.tsx → bundle()。调用方负责把它放进 `serialize`。 */
 async function bundleShot(code) {
   const { bundle } = await loadRemotion();
+  const codeHash = sha16(Buffer.from(String(code), 'utf8'));
+  const hit = bundleCache.get(codeHash);
+  if (hit) {
+    hit.at = Date.now();
+    return { serveUrl: hit.serveUrl, bundleMs: 0, bundleCached: true };
+  }
   await fs.mkdir(path.dirname(SHOT_FILE), recursiveDir);
   await fs.mkdir(OUT, recursiveDir);
   // publicDir 是 bundle 的入参：目录不存在 bundler 会当场炸。`public/` 随镜像发出去，
@@ -161,7 +223,57 @@ async function bundleShot(code) {
       },
     }),
   });
-  return { serveUrl, bundleMs: Number(process.hrtime.bigint() / 1000000n) - t0 };
+  const bundleMs = Number(process.hrtime.bigint() / 1000000n) - t0;
+  bundleCache.set(codeHash, { serveUrl, bundleMs, at: Date.now() });
+  while (bundleCache.size > BUNDLE_CACHE_MAX) {
+    const oldest = [...bundleCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+    if (!oldest) break;
+    bundleCache.delete(oldest[0]);
+  }
+  return { serveUrl, bundleMs, bundleCached: false };
+}
+
+/** 进程内共用一个 chromium（2026-10-20）。
+ *
+ *  预览这一路从前是「一个请求开一个浏览器」：一条 50 镜的片子要开 50 次，
+ *  每次启动 chromium 是几百毫秒到一秒的固定成本，而真正画一帧只要几十毫秒。
+ *  共用一个实例、每次请求开自己的 page，启动成本就摊成一次。
+ *
+ *  失败即丢弃：共享实例最坏的形态是「崩了之后所有人继续用」，下一个请求重开一个
+ *  就好。这只影响性能，不影响正确性。
+ *
+ *  **丢弃要等最后一个在飞的请求**：预览是并发的（`MOTION_PREVIEW_PARALLEL`），
+ *  一个请求遇到自己的错（比如一帧编码失败）就把共享浏览器关掉，会把同批其余请求
+ *  一起打断——它们看到的是 `Target closed`，而真正的原因在别人那一帧。所以只在
+ *  `stillsInflight <= 1`（自己就是最后一个）时丢弃；真崩了的浏览器会让所有请求各自
+ *  失败，最后一个是它自己关掉的那个。 */
+let sharedBrowser = null;
+let sharedBrowserPromise = null;
+let stillsInflight = 0;
+async function sharedChrome() {
+  if (sharedBrowser) return sharedBrowser;
+  if (!sharedBrowserPromise) {
+    sharedBrowserPromise = (async () => {
+      const { openBrowser } = await loadRemotion();
+      const b = await openBrowser('chrome', {
+        browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
+      });
+      sharedBrowser = b;
+      return b;
+    })();
+  }
+  try {
+    return await sharedBrowserPromise;
+  } catch (err) {
+    sharedBrowserPromise = null;
+    throw err;
+  }
+}
+async function dropSharedChrome() {
+  const b = sharedBrowser;
+  sharedBrowser = null;
+  sharedBrowserPromise = null;
+  if (b) await b.close({ silent: true }).catch(() => {});
 }
 
 /** 一组要渲的静帧：分段（每个 props 各渲自己的帧）与不分段（一份 props 渲几帧）在
@@ -223,16 +335,15 @@ function stillJobs(payload) {
 async function renderStills(payload) {
   const code = String(payload.code ?? '');
   const jobs = stillJobs(payload);
+  if (jobs.length) assertShellContract(code, jobs[0].props);
   const scale = Math.min(1, Math.max(0.2, Number(payload.scale ?? 0.4)));
-  const { selectComposition, renderStill, openBrowser } = await loadRemotion();
+  const { selectComposition, renderStill } = await loadRemotion();
   const { serveUrl, bundleMs } = await serialize(() => bundleShot(code));
   await acquireSlot();
-  let browser = null;
+  const browser = await sharedChrome();
+  stillsInflight += 1;
   try {
     const t0 = Number(process.hrtime.bigint() / 1000000n);
-    browser = await openBrowser('chrome', {
-      browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
-    });
     const stills = [];
     let layout = null;        // 只由不分段那一路填（见上面第 2 条）
     const layoutLines = [];
@@ -253,6 +364,8 @@ async function renderStills(payload) {
       const composition = await selectComposition({
         serveUrl, id: 'shot', inputProps: job.props, puppeteerInstance: browser,
         browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
+        // 选组合这一步就会跑一遍镜头代码，字体那 101 个 delayRender 在这里挂着。
+        timeoutInMilliseconds: DELAY_TIMEOUT_MS,
       });
       const last = composition.durationInFrames - 1;
       const clamp = (f) => Math.max(0, Math.min(last, Math.round(f)));
@@ -269,6 +382,7 @@ async function renderStills(payload) {
           // 会开始糊——那正是「画面质量低」的第一眼来源。每张多几十 KB，可以接受。
           imageFormat: 'jpeg', jpegQuality: 90, scale,
           browserExecutable: BROWSER, chromiumOptions: { gl: GL, headless: true },
+          timeoutInMilliseconds: DELAY_TIMEOUT_MS,
           onBrowserLog,
         });
         // 只为取回读渲的那一张不进 stills：调用方按 `frame` 对号入座，多塞一张会改掉
@@ -290,8 +404,14 @@ async function renderStills(payload) {
       ...(logNotes.length ? { warnings: logNotes } : {}),
       timings: { bundle_ms: bundleMs, render_ms: ms },
     };
+  } catch (err) {
+    // 共享实例出过错就丢掉，下一个请求重开——留着崩溃的浏览器会让后面每一镜都失败。
+    // 但只在**自己是最后一个在飞请求**时丢（见 `stillsInflight` 那段）：同批别的请求
+    // 正用着这只浏览器，为一个局部错误关掉它等于把故障放大到整批。
+    if (stillsInflight <= 1) await dropSharedChrome();
+    throw err;
   } finally {
-    if (browser) await browser.close({ silent: true }).catch(() => {});
+    stillsInflight -= 1;
     releaseSlot();
   }
 }
@@ -378,6 +498,7 @@ async function renderShot(payload) {
   const code = String(payload.code ?? '');
   const declaredFields = declaredFrom(payload);
   const lint = await lintShotCode(code, declaredFields);
+  assertShellContract(code, payload.input_props);
   if (!lint.ok) {
     const err = new Error('闸① lint 未通过');
     err.status = 400;
@@ -464,6 +585,7 @@ async function renderShot(payload) {
     inputProps,
     browserExecutable: BROWSER,
     chromiumOptions: { gl: GL, headless: true },
+    timeoutInMilliseconds: DELAY_TIMEOUT_MS,
   });
   const selectMs = now() - t1;
 
@@ -529,6 +651,7 @@ async function renderShot(payload) {
       outputLocation,
       overwrite: true,
       chromiumOptions: { gl: GL, headless: true },
+      timeoutInMilliseconds: DELAY_TIMEOUT_MS,
       onBrowserLog,
       // 调用方没给的仍吃 Remotion 默认（scale 1、png、crf 18、并发 min(8,核/2)）。
       ...(scale !== 1 ? { scale } : {}),
@@ -784,6 +907,27 @@ const server = http.createServer(async (req, res) => {
       ...(err.lint ? { errors: err.lint } : {}),
     });
   }
+});
+
+// 一只崩掉的浏览器标签页不该带走整个渲染服务。
+//
+// Remotion 的 WebSocket 关闭回调会在请求**已经失败之后**再 reject 一个
+// `ProtocolError (Target.closeTarget): Target closed`；那一枪没有任何人 await，
+// Node 默认把未捕获的 rejection 当致命错误、直接退出进程。2026-10-21 真机
+// run `1ff6f17ee840` 就是这样：6 路并发渲预览静帧，第一镜的标签页一死，
+// 服务退出，余下 41 镜全部 `Connection refused`，确认卡上一张图都没有。
+//
+// 这里只记日志、丢掉那只共享浏览器让下一个请求重开；真正该失败的那次请求
+// 已经在自己的 catch 里失败过了。`uncaughtException` 同样兜住：渲染服务是
+// 常驻的，退出一次会让之后每一镜都失败，代价远大于让一个坏请求自己报错。
+process.on('unhandledRejection', (err) => {
+  console.error('[unhandledRejection]', err?.stack ?? err);
+  if (/Target closed|Target\.closeTarget/.test(String(err?.message ?? err))) {
+    dropSharedChrome().catch(() => {});
+  }
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err?.stack ?? err);
 });
 
 await fs.mkdir(OUT, { recursive: true });

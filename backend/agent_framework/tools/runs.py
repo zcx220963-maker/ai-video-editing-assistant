@@ -50,6 +50,15 @@ class RerunFromTool(Tool):
             "默认回溯本轮这条执行；用户说「回到上次那一版」时给 run_id（本会话内的历史执行，"
             "可只给前缀）。"
             f"可分叉的节点：{', '.join(self._slot.names) or '（剪辑 DAG 未接入）'}"
+            + (
+                "\n注意 `plan_motion` 的分叉＝整片重做：全部分镜的 brief 会被改写、每一镜"
+                "代码重写、静帧重渲、评审重跑（37 镜是分钟级到二十分钟级），并且会覆盖"
+                "当前这一版分镜。只有用户明确说「重做分镜/换一版/整片重来」时才走它；"
+                "只是某几镜画面不对，用 `patch_motion_code` 只交那几镜——"
+                "不要拿 plan_motion 当补丁失败后的兜底（真机 490e71e20a19 就是这样"
+                "在用户没要求的情况下把整片重做了一遍）。"
+                if "plan_motion" in self._slot.names else ""
+            )
         )
 
     @property
