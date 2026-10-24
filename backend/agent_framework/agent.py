@@ -1528,12 +1528,11 @@ class AgentOnceRun:
     ) -> str:
         """一次执行的骨架：开账 → 循环 → 交付。
 
-        循环本身只做三件事：在一致点落盘、叫 LLM、把切出去的三块串起来——
-        ``_tool_round``（这一轮要调工具：审批/渲染/提问三类挂起与分叉交接）、
-        ``_nudge_back``（收尾前的四条硬保证）、``_deliver``（终答的兜底核对与落库）。
-
-        ``context_ledger`` 只有**刚装配过上下文**的那条入口传得出来（``run``）；
-        从断点续跑的三条入口传 None——那半截没有重新装配，账得沿用快照里那份。
+        循环本身只做四件事：在一致点落盘、叫 LLM、把切出去的四块串起来——
+        ``_tool_round``（审批/渲染/提问三类挂起与分叉交接）、``_nudge_back``
+        （收尾前的四条硬保证）、``_deliver``（终答的兜底核对与落库）、
+        ``_answer_round``（叫一次模型并按回答分流）。
+        ``context_ledger`` 只有刚装配过上下文的那条入口传得出来（见 ``_open_run``）。
         """
         r = self._open_run(
             session, messages, start_iteration, cp, run_id=run_id, registry=registry,
@@ -1551,27 +1550,10 @@ class AgentOnceRun:
             try:
                 while r.iteration < limit:
                     if stop := _stop_reason(r.state, r.messages):   # 花费封顶 / 原地打转
-                        # 打转停跑与「摘掉死工具」是同一轮判的（见 `_MAX_STALL_RESCUES`）：
-                        # 真机上第 4 次连续失败正好落在第 6 轮打转那一轮，守卫先停，
-                        # 摘工具的那一轮永远没发出去。这里让停跑先让位一轮，模型终于
-                        # 看见一张没有坏工具的工具面，只能交付或问用户。
-                        dead = _dead_tools(r.ctx.extras.get("_fail_counts") or {})
-                        rescue = (stop == "stalled"
-                                  and r.stall_rescues < _MAX_STALL_RESCUES
-                                  and bool(dead)
-                                  and r.reg.get("submit_plan",
-                                                user_id=r.ctx.session.user_id) is not None)
-                        if not rescue:
-                            r.stop_reason = stop
+                        note = await self._stall_gate(r, stop)
+                        if note is None:
                             break
-                        r.stall_rescues += 1
-                        r.rescue_pending = True
-                        r.messages.append(system(
-                            f"最后给你一轮：工具「{'、'.join(sorted(dead))}」已经从这一轮的"
-                            "工具清单里摘掉，再调它也不会执行。现在用**已经拿到的信息**"
-                            "交付——规划轮调用 `submit_plan`（没核实的数字删掉，不要为了"
-                            "一个数停在原地）；确实没有可交的方案，就调用 `ask_user` 说明"
-                            "卡在哪。"))
+                        r.messages.append(system(note))
                     elif (r.stall_rescues
                           and _stuck_rounds(r.messages,
                                             floor=r.state.stall_floor) > 0):
@@ -1597,35 +1579,12 @@ class AgentOnceRun:
                     # 连续失败的工具有些已经「说了不跑」；把它的 schema 也摘掉，
                     # 否则弱模型会原样再打（见 `_visible_tool_definitions`）。
                     # 让位轮执行完即清：只留出口，逼它交付（见 `_MAX_STALL_RESCUES`）。
-                    resp = await self._invoke(
-                        r.ctx, r.messages,
-                        _visible_tool_definitions(
-                            r.reg, user_id=r.ctx.session.user_id,
-                            fail_counts=r.ctx.extras.get("_fail_counts") or {},
-                            only=_NEVER_HIDE_TOOLS if r.rescue_pending else None,
-                            # motion 流程里把写文件工具从 schema 里摘掉：镜头代码由
-                            # plan_motion 内部的逐镜写手生成，主对话手写 shots/*.tsx
-                            # 只会打转（见 _MOTION_HIDE_TOOLS）。
-                            hide=(_MOTION_HIDE_TOOLS
-                                  if _motion_task(r.state, r.messages) else None)),
-                        stream, resuming)
-                    r.rescue_pending = False
-                    _charge(r.state, resp.usage)
-                    if resp.wants_tools:
-                        pause = await self._tool_round(r, resp)
-                        if pause is not None:
-                            return pause
-                        if r.plan_submitted:
-                            r.final = resp.content or ""
-                            r.reached_limit = False
-                            break
-                        continue
-
-                    if await self._nudge_back(r, resp):
-                        continue
-                    r.final = resp.content
-                    r.reached_limit = False
-                    break
+                    resp_pause = await self._answer_round(r, stream, resuming)
+                    if resp_pause is not None:
+                        return resp_pause
+                    if r.final is not None:
+                        break
+                    continue
             except BaseException:
                 # 真实进程被 kill 时此处不执行，但上一致点已落盘，仍可恢复。
                 if r.cp is not None:
@@ -1638,6 +1597,78 @@ class AgentOnceRun:
         finally:
             _current_hooks.reset(hooks_token)
             _current_hook_ctx.reset(ctx_token)
+
+    async def _stall_gate(self, r: "_Round", stop: str) -> str | None:
+        """花费封顶 / 原地打转的那一格：要么就此停（回 None），要么让位一轮（回那句提示）。
+
+        打转停跑与「摘掉死工具」是同一轮判的（见 `_MAX_STALL_RESCUES`）：真机上第 4 次
+        连续失败正好落在第 6 轮打转那一轮，守卫先停，摘工具的那一轮永远没发出去。
+        所以停跑先让位一轮，模型终于看见一张没有坏工具的工具面，只能交付或问用户。
+
+        为什么单独一块：它判的是「这一轮还发不发出得去」，而 `_drive` 的循环只该管
+        「落盘 → 叫模型 → 把三块串起来」。塞在循环里那 29 行让 `_drive` 又长回 131 行
+        （`test_plan_layout` ④ 钉的上限是 90）。
+        """
+        dead = _dead_tools(r.ctx.extras.get("_fail_counts") or {})
+        rescue = (stop == "stalled"
+                  and r.stall_rescues < _MAX_STALL_RESCUES
+                  and bool(dead)
+                  and r.reg.get("submit_plan",
+                                user_id=r.ctx.session.user_id) is not None)
+        if not rescue:
+            r.stop_reason = stop
+            return None
+        r.stall_rescues += 1
+        r.rescue_pending = True
+        return (f"最后给你一轮：工具「{'、'.join(sorted(dead))}」已经从这一轮的"
+                "工具清单里摘掉，再调它也不会执行。现在用**已经拿到的信息**"
+                "交付——规划轮调用 `submit_plan`（没核实的数字删掉，不要为了"
+                "一个数停在原地）；确实没有可交的方案，就调用 `ask_user` 说明"
+                "卡在哪。")
+
+    def _round_schema(self, r: "_Round") -> list:
+        """这一轮真正发给模型的工具面。
+
+        连续失败的工具有些已经「说了不跑」；把它的 schema 也摘掉，否则弱模型会原样再打
+        （见 `_visible_tool_definitions`）。让位轮只留出口（`_NEVER_HIDE_TOOLS`），
+        逼它交付；执行完即清（见 `_MAX_STALL_RESCUES`）。
+        """
+        return _visible_tool_definitions(
+            r.reg, user_id=r.ctx.session.user_id,
+            fail_counts=r.ctx.extras.get("_fail_counts") or {},
+            only=_NEVER_HIDE_TOOLS if r.rescue_pending else None,
+            # motion 流程里把写文件工具从 schema 里摘掉：镜头代码由 plan_motion 内部的
+            # 逐镜写手生成，主对话手写 shots/*.tsx 只会打转（见 `_MOTION_HIDE_TOOLS`）。
+            hide=(_MOTION_HIDE_TOOLS if _motion_task(r.state, r.messages) else None))
+
+    async def _answer_round(self, r: "_Round", stream: bool, resuming: bool) -> str | None:
+        """叫一次模型并按它的回答分流：要调工具 → 工具轮；否则 → 收尾前的硬保证。
+
+        回值是「这一轮就挂起」时要直接返回给调用方的那句（审批 / 提问 / 分叉交接），
+        None 表示这一轮正常走完——调用方看 ``r.final`` 是否已落位来决定继续还是收尾
+        （``plan_submitted`` 那一支与「模型直接给终答」那一支都落 ``r.final``，
+        被 ``_nudge_back`` 打回的那一支不落，于是循环继续）。
+
+        为什么单独一块：连同 ``_round_schema`` 一起切出去，``_drive`` 才回到
+        「落盘 → 叫模型 → 串起来」的骨架形状（`test_plan_layout` ④ 钉的上限是 90 行）。
+        """
+        resp = await self._invoke(
+            r.ctx, r.messages, self._round_schema(r), stream, resuming)
+        r.rescue_pending = False
+        _charge(r.state, resp.usage)
+        if resp.wants_tools:
+            pause = await self._tool_round(r, resp)
+            if pause is not None:
+                return pause
+            if r.plan_submitted:
+                r.final = resp.content or ""
+                r.reached_limit = False
+            return None
+        if await self._nudge_back(r, resp):
+            return None
+        r.final = resp.content
+        r.reached_limit = False
+        return None
 
     async def _pass_point(self, r: "_Round") -> None:
         """循环里的一致点：**先**折叠更早的工具结果，**再**落盘状态与消息。

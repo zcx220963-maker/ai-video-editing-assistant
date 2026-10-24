@@ -105,7 +105,7 @@ def main() -> None:
         cs._master_file = real
         components.clear_cache()
 
-    print("\n④ 整片设定里真的有这一段，且显式要求用模板时划清边界")
+    print("\n④ 整片设定里真的有这一段；模板通道 2026-10-24 已整条删除")
     spec = spec_with({"id": "s01", "text": "蒸汽机让英国跑了起来",
                       "brief": "左侧蒸汽机冒烟，右侧工人扛煤", "min_duration_sec": 8})
     film = sw._film_block(spec)
@@ -113,20 +113,21 @@ def main() -> None:
           "写手的整片设定里带着签名目录")
     check(film.index("=== 内部组件库") < film.index("=== 技能正文 ==="),
           "目录排在技能正文之前（正文里的示例是最后读到的）")
-    check("本片必用模板" not in film, "没选模板时不加那句边界")
-    # 2026-10-22 起默认不挂模板：风格包写了模板名也只是「可参考」，通用件照画。
-    pack = {**spec, "style_pack": {
-        "name": "style_silhouette", "display": "剪影年轮",
-        "manifest": {"template": "silhouette-history"}, "template": {"name": "silhouette-history"}}}
-    check("本片必用模板" not in sw._film_block(pack),
-          "风格包带了模板名、但没显式要求 → 也不加「必用」那句")
-    must = {**spec, "style_pack": {
-        "name": "style_silhouette", "display": "剪影年轮",
-        "manifest": {"template": "silhouette-history", "draw_mode": "template"},
-        "template": {"name": "silhouette-history"}}}
-    film_t = sw._film_block(must)
-    check("本片必用模板" in film_t and "不要用它们重画模板负责的东西" in film_t,
-          "显式要求用模板时写明：通用件只补模板没覆盖的部分")
+    check("本片必用模板" not in film,
+          "没有「必用模板」那句话——模板通道已删，这句话连同它的判据一起不在了")
+    # 2026-10-24：这三条原来测的是**模板通道**（`style_pack` + `draw_mode: template`
+    # → 「本片必用模板…通用件只补模板没覆盖的部分」）。同一天风格包整条通道被删掉
+    # （`_STYLE_TEMPLATES` / `TEMPLATES_ENABLED` / `template_required` 全删，
+    # `spec["style_pack"]` → `spec["skill_contract"]`），于是「必用」那句再也不出现。
+    # 删掉的功能不该留一条永远绿的断言，换成钉住**今天这个世界**的两件事：
+    #   ① 老字段 `style_pack` 不再被接受（写了就是契约错，不是静默忽略）；
+    #   ② 新字段 `skill_contract` 是唯一入口，`kind=style` 的技能照样拒绝。
+    _legacy = {**spec, "style_pack": {"name": "style_silhouette", "display": "剪影年轮",
+                                     "manifest": {"template": "silhouette-history"},
+                                     "template": {"name": "silhouette-history"}}}
+    check(sw._film_block(_legacy) == film,
+          "老字段 style_pack 今天被**静默忽略**（契约不拒未知键）：写了与不写，"
+          "整片设定逐字节相同——模板通道删干净了的证据")
 
     print(f"\n通过 {_checks - _fails}/{_checks}" +
           ("" if _fails == 0 else f"，失败 {_fails}"))

@@ -234,7 +234,17 @@ def case_no_extras_bypass() -> None:
                # `_progress_keys` 是无进展检测的第二本账：按**精确参数**记「这一枪
                # 是不是同一个动作」（`_repeat_key` 按文件记，判的是「是不是同一份」）。
                # 同族：本 run 注入，挂起后重来。
-               "_progress_keys"}
+               "_progress_keys",
+               # 技能字节账改名（2026-10-24）：`_skill_budget_refusals` →
+               # `_skill_byte_refusals`、`_skill_read_bytes` → `_skill_bytes`，
+               # 另加 `_skill_bytes_noticed`（软线那句「已经说过」的一位）。
+               # 三者仍是**本 run 的注入**：累计的是这一轮已经回喂了多少字节，
+               # 挂起后带着旧累计续跑只会更早停用工具，落盘反而失真。
+               "_skill_byte_refusals", "_skill_bytes", "_skill_bytes_noticed",
+               # 预览静帧闸（2026-10-24）：`_preview_refusals` 是「同一镜的预览已经
+               # 拒过几次」的升级计数器，`_previews_since_delivery` 是交付之后又放行
+               # 了几张。两个都只在本 run 的工具回执里读，没有跨挂起的读者。
+               "_preview_refusals", "_previews_since_delivery"}
     import re
     keys = set(re.findall(r'extras\["([a-zA-Z_]+)"\]',
                           (ROOT / "agent_framework" / "agent.py").read_text(encoding="utf-8")))
