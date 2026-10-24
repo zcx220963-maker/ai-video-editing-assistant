@@ -667,31 +667,63 @@ def build_runtime(
             # Storyline MCP 连接重试：editor 容器可能比 app 晚就绪，
             # depends_on healthcheck 只验端口开不验 MCP 协议就绪，
             # 启动时序竞态致「Connection refused」后不再重试=无剪辑能力。
-            storyline_ok = False
-            for attempt in range(5):
+            #
+            # 2026-10-24 加**延迟接入**（`_storyline_late_attach`）：上面这 5 次只覆盖
+            # 10 秒，而 editor 从起进程到 MCP 就绪实测要 15~25 秒。两个容器一起重启时
+            # 必然全打空，之后再没人重试——界面表现是「右侧文字库空」
+            # （`/motion/text-library` 回 `{}`）+ 剪辑诉求不出计划卡，
+            # 用户只能自己重启 app。**重启顺序不该由用户记住。**
+            async def _attach_storyline() -> bool:
+                """连一次 Storyline MCP，把工具与契约装进注册表。成功回 True。"""
                 try:
                     client = await connect_server(sc)
                     contract = await load_contract(client, timeout=sc.tool_timeout)
                     names = await register_mcp_tools(
                         registry, client, sc, name_prefix=False, contract=contract)
-                    if names:
-                        editing_contract.fill(contract)
-                        mcp_clients.append(client)
-                        _info(f"Storyline 已接入 {len(names)} 个剪辑节点"
-                              f"（DAG 契约 {len(contract.nodes)} 节点，rerun_from 可用）")
-                        storyline_ok = True
-                    else:
+                    if not names:
                         await client.close()
                         _warn("Storyline 未返回任何白名单工具：本服务无剪辑能力")
-                    break
+                        return False
+                    editing_contract.fill(contract)
+                    mcp_clients.append(client)
+                    _info(f"Storyline 已接入 {len(names)} 个剪辑节点"
+                          f"（DAG 契约 {len(contract.nodes)} 节点，rerun_from 可用）")
+                    return True
                 except Exception as exc:  # noqa: BLE001
-                    if attempt < 4:
-                        _warn(f"Storyline MCP 连接失败（第 {attempt+1}/5 次），"
-                              f"2s 后重试：{exc}")
-                        await asyncio.sleep(2)
-                    else:
-                        _warn(f"Storyline MCP（{storyline_path}）5 次重试均未连通："
-                              f"本服务无剪辑能力。{exc}")
+                    _warn(f"Storyline MCP 连接失败：{exc}")
+                    return False
+
+            async def _storyline_late_attach() -> None:
+                """启动时没连上 → 后台每 10 秒再试一次，最多 30 次（5 分钟）。
+
+                接上之后要把出口词表补一遍：`sync_catalog` 在 (d) 那一步只跑一次，
+                而那时这些工具还不存在，补不上就会在界面上退回机器名。
+                """
+                for i in range(30):
+                    await asyncio.sleep(10)
+                    if await _attach_storyline():
+                        try:
+                            sync_catalog(registry, await skill_displays(skill_loader))
+                        except Exception as exc:  # noqa: BLE001
+                            _warn(f"延迟接入后补词表失败（不影响剪辑）：{exc}")
+                        _info(f"Storyline 延迟接入成功（启动后第 {i + 1} 次重试，"
+                              f"约 {(i + 1) * 10} 秒）——文字库与计划门现在可用，"
+                              f"不必重启 app")
+                        return
+                _warn("Storyline 延迟接入 5 分钟仍未成功：本服务仍无剪辑能力")
+
+            storyline_ok = False
+            for attempt in range(5):
+                if await _attach_storyline():
+                    storyline_ok = True
+                    break
+                if attempt < 4:
+                    _warn(f"Storyline MCP 连接失败（第 {attempt + 1}/5 次），2s 后重试")
+                    await asyncio.sleep(2)
+            if not storyline_ok:
+                _warn(f"Storyline MCP（{storyline_path}）5 次重试均未连通："
+                      f"转后台每 10s 重试（最多 5 分钟）")
+                asyncio.create_task(_storyline_late_attach())
 
         # (d) 出口词表补全：远程节点的 title 与技能的 display 到这一步才拿得到。
         #     没装上也不影响服务——界面退回机器名是块 A 的既定降级。
