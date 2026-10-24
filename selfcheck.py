@@ -72,10 +72,29 @@ def run_one(path: Path, timeout: float) -> tuple[str, float, str]:
     return "fail", secs, msg
 
 
+def default_timeout(path: Path) -> float:
+    """单文件超时按**它的行数**给，不再一刀切。
+
+    为什么（2026-10-24 实测）：默认 45s 的时候，`test_code_gates` 单跑要 59.6s、
+    `test_code_spec` 约 40s——它们**全是过的**，却因为「这一轮跑得慢」被判成红。
+    于是一份体检报告把「慢」和「坏」混成一格，读的人先去修一个不存在的 bug。
+
+    按行数给的依据：这些是脚本式测试，耗时大致随断言条数走。给到每千行 6 秒、
+    再兜底 90 秒，`test_code_spec`（1442 行）约 99 秒、`test_code_gates`（944 行）
+    约 96 秒，都在线内；真正会挂住的（联网那几个）仍然远在线上，照旧算超时。
+    """
+    try:
+        lines = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return 90.0
+    return max(90.0, min(300.0, lines / 1000 * 6.0 + 90.0))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="一键体检（逐文件跑，带超时）")
     ap.add_argument("--only", default="", help="只跑文件名含这个词的")
-    ap.add_argument("--timeout", type=float, default=180.0, help="单文件超时秒数")
+    ap.add_argument("--timeout", type=float, default=0.0,
+                    help="单文件超时秒数；缺省按文件行数算（见 default_timeout）")
     ap.add_argument("--fail-fast", action="store_true", help="第一条红就停")
     args = ap.parse_args()
 
@@ -87,11 +106,13 @@ def main() -> int:
         print(f"没有匹配的测试文件（--only={args.only!r}）")
         return 1
 
-    print(f"体检 {len(files)} 个文件（单文件超时 {args.timeout:.0f}s）\n")
+    print(f"体检 {len(files)} 个文件"
+          f"（超时：{'固定 ' + str(args.timeout) + 's' if args.timeout else '按文件行数，90~300s'}）\n")
     bad: list[tuple[Path, str, str]] = []
     t_all = time.time()
     for i, p in enumerate(files, 1):
-        state, secs, msg = run_one(p, args.timeout)
+        limit = args.timeout or default_timeout(p)
+        state, secs, msg = run_one(p, limit)
         mark = {"ok": "ok ", "fail": "XX ", "timeout": "TT "}[state]
         print(f"{mark}{p.name:<44} {secs:6.1f}s  {msg}")
         if state != "ok":
