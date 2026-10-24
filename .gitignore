@@ -147,5 +147,8 @@ openchatcut-src/
 # 是「能不能用」的取证，不是一次性探针——换浏览器或换 three 版本都要重跑。
 !/remotion/tests/bloom-probe.mjs
 !/remotion/tests/effects-probe.mjs
+# 内置贴图包（`public/assets/lib/`）的入场券：证明 `useLoader` + `staticFile` 在
+# 软 GL 上真能贴上（判在像素上：有差 / 高频能量翻倍 / 不是空球）。
+!/remotion/tests/texture-probe.mjs
 /remotion/src/user-shots/fixture-*.tsx
 /remotion/src/lib/helpers/__tests__/

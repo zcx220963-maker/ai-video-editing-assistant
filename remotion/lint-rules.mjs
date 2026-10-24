@@ -1017,10 +1017,13 @@ export const dgPlugin = {
       // `assets` 与投递 manifest）随通道一起没了，判据就缩成这一条还留得下对象的话。
       meta: { type: 'problem', schema: [],
               messages: {
-                notFont: 'staticFile("{{arg}}") 指的东西不在 `public/` 里。现在只有两处是随镜真存在的：'
-                  + '`public/fonts/`（字体）与 `public/assets/`（脚本产出的图）。其余画面得由你'
+                notFont: 'staticFile("{{arg}}") 指的东西不在 `public/` 里。现在只有三处是随镜真存在的：'
+                  + '`public/fonts/`（字体）、`public/assets/lib/`（**随镜像发的内置贴图**：'
+                  + '`roughness-noise.png` / `normal-grain.png` / `metal-brushed.png`）、'
+                  + '`public/assets/`（脚本产出的图）。其余画面得由你'
                   + '自己写代码画出来，摆一张不存在的图不叫画（闸⑦「每镜必画」）。'
-                  + '要取字体写 staticFile(\'fonts/….woff2\')；要取脚本产出的图写 '
+                  + '要取字体写 staticFile(\'fonts/….woff2\')；要取内置贴图写 '
+                  + 'staticFile(\'assets/lib/roughness-noise.png\')；要取脚本产出的图写 '
                   + 'staticFile(\'assets/xxx.png\')。',
                 nonLiteral: 'staticFile 的实参必须是字符串字面量，变量拼路径让机器核对不了它指的是不是字体。',
               } },
@@ -1029,7 +1032,13 @@ export const dgPlugin = {
         // 脚本产出的图（2026-10-23 起的第二条通道）：`run` 把工作区里的 PNG/SVG 推到
         // `public/assets/`，镜头按这个名字取。只认这四种扩展名——`.html` / `.json`
         // 之类还是不许，它们不是「画出来的东西」。
-        const ASSET_OK = /^assets\/[a-z0-9][a-z0-9._-]{0,60}\.(png|jpe?g|webp|svg)$/;
+        //
+        // 2026-10-24 加 `assets/lib/`：**随镜像发的内置贴图**（粗糙度 / 法线 / 金属拉丝，
+        // 由 `tools/gen-textures.py` 程序化生成）。与上面那条的区别是**谁放的**：
+        // `assets/xxx.png` 是运行时脚本推的（那条腿今天还没接），`assets/lib/xxx.png`
+        // 是打进镜像的、一定在。three 的材质只有一个纯色就是塑料感，这一包是让
+        // 「表面有变化」变可能的最小集，所以它必须能被引用。
+        const ASSET_OK = /^assets\/(?:lib\/)?[a-z0-9][a-z0-9._-]{0,60}\.(png|jpe?g|webp|svg)$/;
         return {
           CallExpression(node) {
             if (node.callee.type !== 'Identifier' || node.callee.name !== 'staticFile') return;

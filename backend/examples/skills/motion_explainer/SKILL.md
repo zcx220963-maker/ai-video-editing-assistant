@@ -1105,8 +1105,37 @@ const { width, height } = useVideoConfig();   // 竖屏 1080×1920、横屏 1920
 
 **「每镜必画」的判据就是这张表**：一镜落在 `text` 那一档＝打回，点名到镜号。
 用了几条、哪几条由**代码字节里的 import 与标记**自动识别，不看自报的字段。
-`staticFile` 照样能用，但它只用来取**字体**（`@remotion/fonts` 的 `loadFont` 要求
-`staticFile('fonts/…')`）——它不是画法通道，**摆一张图不叫画**。
+`staticFile` 照样能用，但它**不是画法通道**——摆一张图不叫画。它能取三处东西：
+`fonts/…`（字体，`@remotion/fonts` 的 `loadFont` 要）、`assets/lib/…`（**随镜像发的
+内置贴图**，见下）、`assets/…`（脚本产出的图）。
+
+## 内置贴图包（`assets/lib/`，2026-10-24）
+
+三张程序化生成的贴图，随镜像发，`staticFile('assets/lib/…')` 直接取：
+
+| 文件 | 512×512 | 用途 |
+|---|---|---|
+| `roughness-noise.png` | 灰度 70~215 | `roughnessMap`：表面粗糙度起伏 |
+| `normal-grain.png` | 法线 | `normalMap`：**表面颗粒，这条最关键** |
+| `metal-brushed.png` | 灰度横纹 | 金属件的 `roughnessMap` |
+
+**为什么必须有**：纯色的 `meshStandardMaterial` 全身明暗一致、没有一个高频起伏，
+渲出来就是 3D 玩具。实测同一个球：不贴图球面高频能量 0.90，贴了（`normalScale=1.5`）
+是 17.77——20 倍。观感差别是「塑料球」与「石/陶瓷球」。
+
+```tsx
+const [rough, norm] = useLoader(THREE.TextureLoader, [
+  staticFile('assets/lib/roughness-noise.png'),
+  staticFile('assets/lib/normal-grain.png'),
+]);
+<meshStandardMaterial color="#E8ECF5" metalness={0.15}
+  roughness={1} roughnessMap={rough} normalMap={norm} normalScale={[1.5, 1.5]} />
+// 外面必须包 <Suspense fallback={null}>：贴图是异步加载的
+```
+
+`normalScale` 档位（实测）：**1.2~2.0 细微起伏**（推荐）／4 像月球坑／8 岩石。
+几何越简单越需要它——primitive 只靠灯光明暗分界，一眼就是塑料。
+
 
 另有一条文字约束（只提醒，不打回）：
 - `CONCRETE_SHARE_TARGET = 0.40`（40%）：整片里含具体项（数字/引号术语/拉丁缩写）的镜占比目标 40%。这条只出提醒——地名人名器物名机器认不出，拦它会误伤一整轮重规划。
