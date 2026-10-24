@@ -109,12 +109,59 @@ def brushed(seed: int = 23) -> Image.Image:
     return img
 
 
+def env_studio(w: int = 256, h: int = 128) -> Image.Image:
+    """等距柱状（equirect）环境贴图：一块「暗房 + 一盏主光 + 一块冷补光」的假影棚。
+
+    为什么需要它（2026-10-24）：`metalness` 的物理含义是「这个表面反射环境」——
+    **没有环境贴图时金属就是黑的**。所以纯色材质做金属件只有两条路：渲成黑块，
+    或者干脆不敢用金属。有了这张，金属/玻璃才有上下明暗与高光条，这是「写实感」
+    的第二层（第一层是法线贴图的表面颗粒）。
+
+    equirect 的坐标约定：u 是经度（0→2π），v 是纬度（0=天顶，1=天底）。
+    所以：
+      · 顶部一圈偏亮、底部压黑——这就是「天光 + 地面吸收」，金属球靠它分出上下；
+      · 主光在 u≈0.25 的斜上方，暖白，负责高光；
+      · 补光在 u≈0.75，冷青，负责暗部的色相（不给就是死黑）。
+    做成小图再双三次放大：这些亮斑本来就该是软的，逐像素算 1024×512 只是浪费。
+    """
+    px = []
+    for y in range(h):
+        v = y / (h - 1)                     # 0 天顶 → 1 天底
+        for x in range(w):
+            u = x / (w - 1)
+            # 天光：天顶最亮、地平线次之、天底压黑。**用 smoothstep 过渡**——
+            # 第一版是 `max(0, 1-|v-0.5|*4)`，渲到球上是一条硬邦邦的横线
+            # （第一张图就是那样），像贴了一张纸。
+            if v < 0.5:
+                t = v / 0.5
+                base = 0.62 + (0.30 - 0.62) * (t * t * (3 - 2 * t))
+            else:
+                t = (v - 0.5) / 0.5
+                base = 0.30 + (0.05 - 0.30) * (t * t * (3 - 2 * t))
+            # 地平线一圈柔和的辉光（真实环境里那是地面反光）
+            base += 0.10 * 2.718281828 ** (-((v - 0.5) / 0.11) ** 2)
+            r, g, b = base * 150, base * 168, base * 205      # 冷蓝的天光
+            # 主光（暖白）：u=0.25、v=0.22
+            d = ((u - 0.25) * 2.2) ** 2 + ((v - 0.22) * 1.4) ** 2
+            key = max(0.0, 1 - d / 0.075) ** 2 * 2.2
+            r += key * 255; g += key * 240; b += key * 210
+            # 补光（冷青）：u=0.75、v=0.38，弱一些
+            d2 = ((u - 0.75) * 2.4) ** 2 + ((v - 0.38) * 1.5) ** 2
+            fill = max(0.0, 1 - d2 / 0.12) ** 2 * 0.70
+            r += fill * 60; g += fill * 190; b += fill * 220
+            px.append((min(255, int(r)), min(255, int(g)), min(255, int(b))))
+    img = Image.new("RGB", (w, h))
+    img.putdata(px)
+    return img.resize((1024, 512), Image.BICUBIC)
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     items = {
         "roughness-noise.png": roughness(),
         "normal-grain.png": normal(),
         "metal-brushed.png": brushed(),
+        "env-studio.png": env_studio(),
     }
     for name, img in items.items():
         p = OUT / name

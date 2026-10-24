@@ -150,5 +150,7 @@ openchatcut-src/
 # 内置贴图包（`public/assets/lib/`）的入场券：证明 `useLoader` + `staticFile` 在
 # 软 GL 上真能贴上（判在像素上：有差 / 高频能量翻倍 / 不是空球）。
 !/remotion/tests/texture-probe.mjs
+# 环境贴图的入场券：金属件「不挂 env 就是黑」的对照 + 挂上之后上下差 81.6。
+!/remotion/tests/env-probe.mjs
 /remotion/src/user-shots/fixture-*.tsx
 /remotion/src/lib/helpers/__tests__/

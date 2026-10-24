@@ -1118,6 +1118,7 @@ const { width, height } = useVideoConfig();   // 竖屏 1080×1920、横屏 1920
 | `roughness-noise.png` | 灰度 70~215 | `roughnessMap`：表面粗糙度起伏 |
 | `normal-grain.png` | 法线 | `normalMap`：**表面颗粒，这条最关键** |
 | `metal-brushed.png` | 灰度横纹 | 金属件的 `roughnessMap` |
+| `env-studio.png` | 1024×512 等距柱状 | **环境光**：金属/玻璃的反射来源 |
 
 **为什么必须有**：纯色的 `meshStandardMaterial` 全身明暗一致、没有一个高频起伏，
 渲出来就是 3D 玩具。实测同一个球：不贴图球面高频能量 0.90，贴了（`normalScale=1.5`）
@@ -1135,6 +1136,32 @@ const [rough, norm] = useLoader(THREE.TextureLoader, [
 
 `normalScale` 档位（实测）：**1.2~2.0 细微起伏**（推荐）／4 像月球坑／8 岩石。
 几何越简单越需要它——primitive 只靠灯光明暗分界，一眼就是塑料。
+
+## 环境贴图：金属件的前提
+
+`metalness` 的物理含义是「这个表面反射环境」，**没有环境贴图时金属就是黑的**。
+`env-studio.png` 是一张程序化影棚（天光 + 一盏暖主光 + 一块冷补光 + 地平线）：
+
+```tsx
+const Env = () => {
+  const { scene } = useThree();
+  const tex = useLoader(THREE.TextureLoader, staticFile('assets/lib/env-studio.png'));
+  useEffect(() => {
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    scene.environment = tex;
+    return () => { scene.environment = null; };
+  }, [tex, scene]);
+  return null;
+};
+// 与贴图一样，要包 <Suspense fallback={null}>
+```
+
+实测（金属球 `metalness=1` / `roughness=0.18`）：不挂 env 球面平均亮度 **6**（几乎全黑），
+挂上 **48.6**，上半比下半亮 **81.6**。
+
+**非金属件也建议挂**：它替代「三盏灯打天下」，暗部会有环境色而不是死黑。
+挂了 env 之后主光别再加太强（`directionalLight` 1.0~1.5 就够），否则高光过曝。
 
 
 另有一条文字约束（只提醒，不打回）：

@@ -205,7 +205,12 @@ const STAMP_FILES = [
   'src/index.ts', 'src/entry.tsx', 'src/FilmLayout.tsx', 'src/tokens.ts',
   'src/fonts.ts',
 ];
-const STAMP_DIRS = ['src/lib', 'src/themes', 'src/demos/_fixtures'];
+// `public` 必须在册（2026-10-24 真机踩的）：`bundle()` 打包时会把 `publicDir` 整个
+// **复制进包**，所以贴图/字体换了一份、镜头代码一个字没动，指纹不变 → 复用旧 bundle
+// → 渲出来还是旧图。改内置贴图那会儿就是这样：`env-studio.png` 从 29KB 换成 32KB，
+// 探针量出的球面亮度两次**一模一样**（25.6），图也逐字节相同。
+// 对生产更要紧：`/assets` 口上传的新素材同样会被旧 bundle 挡住，而且一点提示都没有。
+const STAMP_DIRS = ['src/lib', 'src/themes', 'src/demos/_fixtures', 'public'];
 
 let stampMemo = { at: 0, stamp: '' };
 
