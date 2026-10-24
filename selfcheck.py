@@ -41,7 +41,14 @@ def discover(pattern: str) -> list[Path]:
 
 
 def run_one(path: Path, timeout: float) -> tuple[str, float, str]:
-    """→ (状态, 用时秒, 一句话说明)。状态取 ok / fail / timeout。"""
+    """→ (状态, 用时秒, 一句话说明)。状态取 ok / fail / timeout。
+
+    **输出走临时文件，不走管道**（2026-10-24 踩的）：`subprocess.run(capture_output=True)`
+    用两根管道接子进程，而 pytest 起来的**孙进程**（有几个测试自己再 spawn 一个 python）
+    会继承这两根管道。超时那一刻 `run()` 杀掉的是 pytest，孙进程还活着、管道没 EOF，
+    于是 `communicate()` 一直等——**超时形同虚设**，整轮就卡在那里。
+    改成把 stdout/stderr 直接写文件：没有管道可等，超时就是超时。
+    """
     t0 = time.time()
     env = dict(os.environ)
     # 测试要能 import `storyline_server.*` / `agent_framework.*`：根是 backend/
@@ -49,16 +56,18 @@ def run_one(path: Path, timeout: float) -> tuple[str, float, str]:
     env["PYTHONIOENCODING"] = "utf-8"
     cmd = [sys.executable, "-m", "pytest", str(path), "-q", "--tb=no",
            "-p", "no:cacheprovider"]
-    try:
-        proc = subprocess.run(cmd, cwd=str(ROOT / "backend"), env=env,
-                              capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return "timeout", time.time() - t0, f"超过 {timeout:.0f}s 没结束（多为网络依赖）"
+    out_path = ROOT / ".tmp" / "selfcheck" / (path.stem + ".log")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as fh:
+        try:
+            proc = subprocess.run(cmd, cwd=str(ROOT / "backend"), env=env,
+                                  stdout=fh, stderr=subprocess.STDOUT, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return "timeout", time.time() - t0, f"超过 {timeout:.0f}s 没结束（多为网络依赖）"
     secs = time.time() - t0
     if proc.returncode == 0:
         return "ok", secs, ""
-    # 最后一行通常就是那句「N 通过」或「N failed」，比整段 traceback 好读
-    tail = [ln for ln in proc.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
+    tail = [ln for ln in out_path.read_text("utf-8", "replace").splitlines() if ln.strip()]
     msg = tail[-1][:120] if tail else f"退出码 {proc.returncode}"
     return "fail", secs, msg
 
