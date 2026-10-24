@@ -152,5 +152,8 @@ openchatcut-src/
 !/remotion/tests/texture-probe.mjs
 # 环境贴图的入场券：金属件「不挂 env 就是黑」的对照 + 挂上之后上下差 81.6。
 !/remotion/tests/env-probe.mjs
+# 景深的入场券：证明 postprocessing 的 DepthOfField 在软 GL 上真跑得动
+# （6.5% 像素有差、清晰度降约一半），以及「参数给小了会把整幅虚掉」这个坑。
+!/remotion/tests/dof-probe.mjs
 /remotion/src/user-shots/fixture-*.tsx
 /remotion/src/lib/helpers/__tests__/
