@@ -1108,8 +1108,16 @@ def main() -> int:
     check(_cf["errors"] == _f7[0] and _cf["warnings"] == _f7[1]
           and _cf["undetermined"] == _f7[2],
           f"check_film 与整片判据逐字相同（工具 {_cf['errors'][:1]} vs 出口 {_f7[0][:1]}）")
-    check(_cf["verdict"] == "green",
+    check(_cf["verdict"] in ("green", "undetermined"),
           f"闸⑦ 撤出后，只犯这一条的片子不再被判红（实际 {_cf['verdict']}）")
+    # 2026-10-24：这一条原来断言 `verdict == "green"`，而它成立的原因是个 **bug**——
+    # `check_ink_contrast` 的未判档跟着 `WHOLE_FILM_GATES` 一起被裁掉，`style_unjudged`
+    # 恒为空，于是「没人量过」被折算成了「量过且通过」。修好之后这份夹具露出真话：
+    # 它的代码里一个**字面颜色**都没有（只有 `<svg />` 与 `<CaptionLayer />`），
+    # 闸⑩ 因此量不出底色与字色 → 未判档恰一条。
+    # 未判不是红，但也不许读成绿——T28 的三态就落在这一句上。
+    check(len(_f7[2]) == 1 and "未判" in _f7[2][0] and "对比度" in _f7[2][0],
+          f"这份夹具唯一量不出的是字色对比度，且它单列在未判档、没被折算成通过：{_f7[2][:1]}")
     # —— 工具返回值**必须真的能进 JSON**（2026-10-16 真机事故的回归守卫）——
     #    上面那三条断言是**绿的**，而工具在真机上每次调用都回
     #    `Error: Object of type set is not JSON serializable`（run 9272c7f59501，

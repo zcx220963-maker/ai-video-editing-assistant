@@ -5554,6 +5554,23 @@ def whole_film_gate_results(shots: list[dict[str, Any]]
         if len(got) > 2:
             undetermined.extend(got[2])
     errors.extend(check_motion_anchors(shots))
+    # 两道**刻意不进元组**的闸，但它们的非打回出口仍要进这三个格子（2026-10-24 修）。
+    #
+    # ⑦（`check_draw_floor`）与 ⑩（`check_ink_contrast`）的打回项不进这里是有意的：
+    # 回执上各自有一行报它们（`style_facts` 的 `text_only` / `contrast`），再进 errors
+    # 就是同一件事两处各写一遍。但并档那天它们的**提醒**与**未判**跟着元组一起被裁掉了，
+    # 而这两个出口没有第二条路：
+    #   · `check_draw_floor` 的「文案具体项低于 40%」——回执的 `style_warnings` 因此恒为
+    #     空数组，模型与用户都看不到那条线（`test_code_gates` 的 4 条断言钉着它）；
+    #   · `check_ink_contrast` 的「认不出底色/字色」——`style_unjudged` 恒为空，
+    #     「未判档（阻断）」那一行于是永远显示「六道闸每一档都真量过」，
+    #     把「没人量过」写成了「量过且通过」，正是 T28 要消掉的那种混法。
+    # 所以这里只接那两个出口，errors 照旧不走这条路。
+    warns.extend(check_draw_floor(shots)[1])
+    ink = check_ink_contrast(shots)
+    warns.extend(ink[1])
+    if len(ink) > 2:
+        undetermined.extend(ink[2])
     return errors, warns, undetermined
 
 
