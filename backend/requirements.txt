@@ -35,3 +35,7 @@ redis>=5.0
 # 站点解析器会随对方改版失效——2026-09-21 B 站取料报 HTTP 412，根因就是
 # 2026.3.17 过期，2026.8.19 已修好。遇到「解析失败」先 pip install -U yt-dlp。
 yt-dlp>=2026.8.19
+
+# 外部技能（xilo-opus-video / dashi-animationstyle 等）的执行期依赖：
+# 它们的 render.py 用 playwright.sync_api 逐帧截图出片。2026-10-23 装上。
+playwright>=1.40

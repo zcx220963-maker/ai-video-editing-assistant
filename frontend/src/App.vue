@@ -353,6 +353,16 @@ const streamCur = {};        // convId -> 当前流式气泡
 const askedCards = reactive({});
 const connected = reactive({});
 const draft = ref("");
+// 输入框跟着内容长高：换行的长句不用挤在一条横线里，到 240px 封顶后再内部滚动。
+// 高度由 scrollHeight 反推（先归零再量），回车/删除/粘贴都会走同一条 watch。
+const draftEl = ref(null);
+function fitDraft() {
+  const el = draftEl.value;
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 240) + "px";
+}
+watch(draft, () => nextTick(fitDraft));
 const scroller = ref(null);
 
 const toolLib = ref(null);
@@ -371,6 +381,8 @@ const mcpMsg = ref("");
 const skillsAdmin = ref([]);
 const loadingSkillsAdmin = ref(false);
 const skillsMsg = ref("");
+// 技能面板的拖放态：拖到面板上高亮，松手即读取整个文件夹。
+const skillsDragOver = ref(false);
 // —— 条目弹窗：工具 / 技能 / MCP 服务 的详情与增删改 ——
 const itemModal = ref(null);      // {kind:'tool'|'skill'|'mcp', ...}
 const skillForm = ref(null);      // null=查看态;非空=编辑态
@@ -385,49 +397,15 @@ function toggleRail() {
 function openThumb(url) {
   if (url) window.open(url, "_blank", "noopener");
 }
-// —— 入口模式：auto 一句话直接做到出片（渲染前弹计划确认卡）；plan 先出计划卡再执行 ——
-const entryMode = ref(localStorage.getItem("ca.entryMode") === "plan" ? "plan" : "auto");
-function toggleEntryMode() {
-  entryMode.value = entryMode.value === "auto" ? "plan" : "auto";
-  localStorage.setItem("ca.entryMode", entryMode.value);
-}
-// —— 直接出片：不预渲静帧、出片前不等确认，一口气到成片 ——
-// 只对「全自动」有意义：先出计划那条路本来就要人点卡。记住上次的选择，免得每轮重勾；
-// 它只影响这一轮，服务端不写进对话历史。
-const goStraight = ref(localStorage.getItem("ca.goStraight") === "1");
-watch(goStraight, (v) => localStorage.setItem("ca.goStraight", v ? "1" : "0"));
-// —— 风格包：入口选一套现成的，或者直接说一句让助手做一套新的 ——
-// 下拉只列 `kind=style` 的技能行。值来自服务端推回的 style 帧（聊天里换风格时）
-// 或 localStorage（刷新后）。它不改变流程，只改变画面契约——所以不占计划卡旋钮，
-// 也不需要在卡上逐项确认。
-const styleSkill = ref(localStorage.getItem("ca.styleSkill") || "");
-watch(styleSkill, (v) => localStorage.setItem("ca.styleSkill", v || ""));
-// 在下拉里点过一次，就把这一选当「明确决定」随消息带上：同一会话里之前在对话里
-// 换过的风格会记在服务端的会话表上，不显式盖一次的话，下拉选的这套会被它压住。
-const styleExplicit = ref(localStorage.getItem("ca.styleExplicit") === "1");
+// —— 入口只有一个：全自动 ——
+// 用户只写一句话，技能与节点由助手在规划轮自己找（`find_skill` 搜画面契约、
+// 节点从白名单里挑）。2026-10-22 用户明确要求「前端只有自动入口」，所以入口按钮、
+// 「直接出片」开关、风格下拉都撤了：之前那三样都是让人替模型做决定。
+// 服务端仍保留 `mode` / `style_skill` 两个入参（对话里换风格、脚本调用要用），
+// 只是这一端不再提供「选」的动作。
 function styleLabel(name) {
   const hit = (skillsAdmin.value || []).find((s) => s && s.name === name);
   return (hit && (hit.display || hit.name)) || name;
-}
-function styleChoices() {
-  return (skillsAdmin.value || []).filter((s) => s && s.kind === "style");
-}
-function pickStyle(ev) {
-  const v = String((ev && ev.target && ev.target.value) || "");
-  if (v === "__new__") {
-    // 新风格是「说一句话」做出来的，不是在这里填参数：把光标放进输入框，
-    // 并给一句能接着写完的开头。下拉先还原成当前这套，别显示一个假选项。
-    if (ev && ev.target) ev.target.value = styleSkill.value || "";
-    draft.value = "换成这样的画面：";
-    nextTick(() => {
-      const el = document.querySelector(".composer textarea");
-      if (el) el.focus();
-    });
-    return;
-  }
-  styleSkill.value = v;
-  styleExplicit.value = true;
-  localStorage.setItem("ca.styleExplicit", "1");
 }
 // —— 风格模板库：从参考片沉淀出来的**可执行模板**（TSX） ——
 // 与素材库分开列：素材是原料，模板是已经过闸、能直接复用的成品。系统模板随镜像
@@ -441,19 +419,12 @@ const templateMsg = ref("");
 const templateErr = ref("");
 
 async function loadStyleTemplates() {
-  loadingTemplates.value = true;
-  try {
-    await ensureIdentity();
-    const r = await fetch("/style/templates", { headers: authHeaders() });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
-    styleTemplates.value = j.templates || [];
-  } catch (e) {
-    styleTemplates.value = [];
-    templateErr.value = "模板库加载失败：" + e.message;
-  } finally {
-    loadingTemplates.value = false;
-  }
+  // 2026-10-24：风格包通道已从项目里删除（后端路由、生成工具、种子全部移除），
+  // 视觉风格一律由 skill 提供。这里不再发请求——留着会拿到 405 并在界面上挂一条
+  // 「模板库加载失败」，而那个入口本来就已经不该存在了。
+  styleTemplates.value = [];
+  templateErr.value = "";
+  loadingTemplates.value = false;
 }
 
 // 文件名 → 合法短名：只留小写字母数字与 `-`，截 20 位。服务端还会再校验一次。
@@ -549,9 +520,7 @@ async function depositTemplate() {
     const refs = Number(j.references || 0);
     templateMsg.value = `已沉淀模板《${j.display || j.name}》`
       + (refs > 1 ? `（${refs} 条参考片）` : "")
-      + "，已加入入口的「风格」下拉";
-    // 刚沉淀的就是用户想要的：直接选上，省一次下拉操作。
-    if (j.name) styleSkill.value = j.name;
+      + "，已进技能库——下一句话里提到它（或者说「用刚沉淀的那套」）就会自己用上";
     await Promise.all([loadStyleTemplates(), loadSkillsAdmin()]);
   } catch (e) {
     templateMsg.value = "";     // 失败时别把「正在读片」和错误一起挂着
@@ -569,7 +538,6 @@ async function deleteStyleTemplate(t) {
                           { method: "DELETE", headers: authHeaders() });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
-    if (styleSkill.value === t.name) styleSkill.value = "";
     templateMsg.value = "已删除：" + (t.display || t.name);
     await Promise.all([loadStyleTemplates(), loadSkillsAdmin()]);
   } catch (e) {
@@ -908,20 +876,125 @@ async function submitVariant(quick = false) {
 
 // —— 工具库两级导航:父列表(分类) → 二级清单 ——
 const toolView = ref(null);       // null=父列表;'tools'|'skills'|'mcp'=已进入的分类
-const catManage = ref(null);      // 分类管理弹窗:null|'tools'|'skills'|'mcp'
 const toolCount = computed(() => {
   const g = toolLib.value && toolLib.value.groups;
   return g ? Object.values(g).reduce((n, items) => n + items.length, 0) : 0;
 });
-function openCatManage(cat) { catManage.value = cat; }
-function toggleCat(cat) {
-  // 再点一次已展开的分类 = 收起;父列表永远常驻
-  toolView.value = toolView.value === cat ? null : cat;
+
+// —— 工具库的「文件夹」形态 ——
+//
+// 一个技能就是磁盘上的一个目录：`SKILL.md` 是入口，其余（demos/、scripts/、示例）
+// 都是它自己的文件。原来界面只给一串平铺的名字 + 一份手写表单，用户看不出包里
+// 有什么、也看不出自己拖进来的东西被装成了什么。这里把三类内容都折成树：
+// 技能 → 类型文件夹 / 包 / 包内文件（一层一屏）；工具 → 分类文件夹；MCP → 服务 → 工具。
+// 展开状态按名字记在几张小表里（缺省：工具/服务展开），刷新清单不会丢。
+const skillDirOpen = ref({});   // "技能名/目录路径" → 是否展开
+const toolCat = ref("");        // 工具：已点进去的分类；空＝停在分类这一层
+const mcpPicked = ref("");      // MCP：已点进去的服务名；空＝停在服务这一层
+const fileView = ref(null);     // 文件预览弹窗 {skill,path,loading,text,binary,url,...}
+
+// 注意：这几个函数是从模板里调的，而模板里的 ref 会被**自动解包**——传进来的是
+// 那张普通对象，不是 ref。所以这里一律直接用 `bag[key]`，不要再取 `.value`
+// （2026-10-22：写成 `.value` 时整个工具库面板渲染抛错，点开是一片空白）。
+function treeToggle(bag, key) { bag[key] = !bag[key]; }
+// dragleave 在子元素之间移动也会触发：光标还在面板里就别收起提示，否则一闪一闪。
+function onToolDrawerDragLeave(ev) {
+  const to = ev && ev.relatedTarget;
+  if (to && ev.currentTarget && ev.currentTarget.contains(to)) return;
+  skillsDragOver.value = false;
 }
-function createSkillFromManage() {
-  itemModal.value = { kind: "skill", create: true, detail: null, loading: false };
-  editSkillForm(true);
-  catManage.value = null;
+
+// relpath 清单 → 目录树（目录在前、同层按名字排）。
+function fileTreeOf(paths) {
+  const root = { dirs: {}, files: [] };
+  for (const raw of paths || []) {
+    const parts = String(raw || "").split("/").filter(Boolean);
+    if (!parts.length) continue;
+    let node = root;
+    for (const seg of parts.slice(0, -1)) {
+      if (!node.dirs[seg]) node.dirs[seg] = { dirs: {}, files: [] };
+      node = node.dirs[seg];
+    }
+    node.files.push(parts[parts.length - 1]);
+  }
+  return root;
+}
+
+// 目录树 → 行清单（模板只要一层 v-for，不必写递归组件）。
+function flattenSkillFiles(skillName, paths) {
+  const rows = [];
+  const walk = (node, prefix, depth) => {
+    for (const dir of Object.keys(node.dirs).sort()) {
+      const path = prefix ? `${prefix}/${dir}` : dir;
+      const key = `${skillName}/${path}`;
+      const open = !!skillDirOpen.value[key];
+      rows.push({ kind: "dir", depth, name: dir, path, key, open });
+      if (open) walk(node.dirs[dir], path, depth + 1);
+    }
+    for (const name of node.files.slice().sort()) {
+      rows.push({ kind: "file", depth, name, path: prefix ? `${prefix}/${name}` : name });
+    }
+  };
+  walk(fileTreeOf(paths), "", 0);
+  return rows;
+}
+
+// 技能按「类型文件夹 → 技能包 → 包内文件」三层收，一次只显示当前一层：父级与
+// 子级不同屏，跟资源管理器一样点进去才换下一层。类型用契约里的 kind（缺省当流程）。
+const SKILL_KIND_ORDER = [
+  { key: "workflow", label: "流程" },
+  { key: "capability", label: "能力" },
+  // 2026-10-24：「风格包」这一档已删除（通道整条撤掉，视觉风格由 skill 承载）。
+];
+const skillKind = ref("");        // 空＝根目录（类型文件夹）
+const skillOpened = ref("");      // 已点进去的技能名；空＝还停在技能清单
+const skillFolders = computed(() => {
+  const list = skillsAdmin.value || [];
+  return SKILL_KIND_ORDER
+    .map((k) => ({ ...k, count: list.filter((s) => (s.kind || "workflow") === k.key).length }))
+    .filter((f) => f.count);
+});
+const skillKindLabel = (k) => (SKILL_KIND_ORDER.find((x) => x.key === k) || {}).label || "流程";
+const skillListOfKind = computed(() => (skillsAdmin.value || [])
+  .filter((s) => (s.kind || "workflow") === skillKind.value));
+const openedSkill = computed(() => (skillsAdmin.value || [])
+  .find((s) => s.name === skillOpened.value) || null);
+const openedSkillRows = computed(() => (openedSkill.value
+  ? flattenSkillFiles(openedSkill.value.name, openedSkill.value.files || []) : []));
+
+const toolFolders = computed(() => Object.entries(
+  (toolLib.value && toolLib.value.groups) || {}
+).map(([cat, items]) => ({ cat, items: items || [] })));
+// 当前点进去的那个工具分类（空＝分类这一层）。
+const toolCatFolder = computed(() => (toolCat.value
+  ? toolFolders.value.find((f) => f.cat === toolCat.value) || null : null));
+// 当前点进去的那台 MCP 服务。
+const mcpPickedServer = computed(() => (mcpPicked.value
+  ? mcpServers.value.find((s) => s.name === mcpPicked.value) || null : null));
+
+async function openSkillFile(skillName, path) {
+  if (path === "SKILL.md") { openSkillModal(skillName); return; }
+  fileView.value = { skill: skillName, path, loading: true, text: "", binary: false,
+                     url: "", bytes: 0, err: "" };
+  try {
+    await ensureIdentity();
+    const r = await fetch(
+      `/skills/${encodeURIComponent(skillName)}/file?path=${encodeURIComponent(path)}`,
+      { headers: authHeaders() });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+    fileView.value = { skill: skillName, path: j.path || path, loading: false,
+                       text: j.text || "", binary: !!j.binary, url: j.url || "",
+                       bytes: j.bytes || 0, mime: j.mime || "", err: "" };
+  } catch (e) {
+    fileView.value = { skill: skillName, path, loading: false, text: "", binary: false,
+                       url: "", bytes: 0, err: e.message };
+  }
+}
+// 工具库一次只显示一层：根目录（工具/技能/MCP）→ 分类 / 技能类型 / 服务 → 里面。
+function openToolLibRoot() {
+  toolView.value = null; toolCat.value = ""; mcpPicked.value = "";
+  skillKind.value = ""; skillOpened.value = "";
 }
 // 服务端词表（/tools 的 name_display）灌进来的 {机器名: 中文名}：界面标签的第一来源。
 // 拉不到（离线装配 / Storyline 未连通）时退回 TOOL_LABELS，再退机器名本身。
@@ -933,7 +1006,9 @@ const activePanel = ref(null);
 // 抽屉宽度**按面板各记一份**：文字库那一屏是左右两栏（样张 248px 钉在左边 + 右边两列卡），
 // 拢共要 ~750px；380px 底下那两栏会被挤成一条，还不如原来的竖排。
 // 别的面板沿用老宽度、老键 `ca.drawerW`——用户之前拖出来的宽度不会丢。
-const DRAWER_W_DEFAULT = { textlib: 760 };
+// 四个库改成资源管理器那种两栏（左文件夹、右内容）之后，380px 连一行表格都排不下；
+// 这几屏各给一个够宽的初值。用户拖过的宽度仍按 `ca.drawerW.<panel>` 记着，不会被覆盖。
+const DRAWER_W_DEFAULT = { textlib: 960, library: 760, bgm: 760, tools: 620 };
 const DRAWER_W_MIN = 300;
 const DRAWER_W_MAX = 1000;      // 上限跟着抬高：样张那一屏宽一点才排得开两列卡
 const DRAWER_W_FALLBACK = 380;
@@ -970,6 +1045,48 @@ const libraryItems = ref([]);
 const loadingLibrary = ref(false);
 const libSelected = reactive({});   // material_id -> true
 const deletingLib = ref(false);
+// 四个库同一种形状：左边一列文件夹（类型 / 来源 / 维度），右边是这个文件夹里的东西。
+const MATERIAL_KINDS = [
+  { key: "video", label: "视频" },
+  { key: "image", label: "图片" },
+  { key: "audio", label: "音频" },
+];
+const materialFolders = computed(() => {
+  const groups = MATERIAL_KINDS.map((k) => ({
+    ...k, items: libraryItems.value.filter((it) => (it.kind || "") === k.key),
+  }));
+  // 认不出的类型不丢：归到「其他」，否则素材传上来了却在库里看不见。
+  const rest = libraryItems.value.filter(
+    (it) => !MATERIAL_KINDS.some((k) => k.key === it.kind));
+  if (rest.length) groups.push({ key: "other", label: "其他", items: rest });
+  return groups.filter((g) => g.items.length);
+});
+
+// ---- 四个库共用的浏览骨架：一次只显示一层 ----
+// 空串＝文件夹这一层（只列文件夹）；点进去以后才是里面那一层，靠顶部「返回」回上一级。
+// 不再常驻左栏：父级和子级不同屏，跟资源管理器点进文件夹一样。
+// 视图模式按库各记一份；素材/音乐缺省看图标（缩略图本来就是挑素材的主要依据），
+// 文字库缺省看详细。
+const libPicked = ref({ library: "", bgm: "", textlib: "" });
+const libMode = ref({ library: "icons", bgm: "icons", textlib: "details" });
+const materialFolder = computed(() => (materialFolders.value
+  .find((f) => f.key === libPicked.value.library) || null));
+const bgmFolder = computed(() => {
+  const k = libPicked.value.bgm;
+  return k === "imported" || k === "online" ? k : "";
+});
+// 详细视图里正在试听的那一行（键：m:<素材> / b:<已导入> / o:<曲目>）；同一时刻只留一个。
+const libPlaying = ref("");
+function toggleLibPlaying(key) {
+  libPlaying.value = libPlaying.value === key ? "" : key;
+}
+// 在线曲目要先取直链，再铺到详情视图里那一行。
+async function playBgmRow(item) {
+  const key = "o:" + item.track_id + "|" + item.source;
+  if (!bgmAudioUrl.value[key]) await playBgm(item);
+  if (bgmAudioUrl.value[key]) libPlaying.value = key;
+}
+const mediaLabel = (kind) => ({ video: "视频", image: "图片", audio: "音频" }[kind] || "文件");
 
 const timelineList = ref([]);
 const editingTimeline = ref(null);
@@ -1023,7 +1140,6 @@ const bgmAudioUrl = ref({});
 const bgmImported = ref([]);
 const loadingBgmImported = ref(false);
 const deletingBgm = ref("");
-
 async function loadBgm() {
   loadingBgm.value = true;
   bgmError.value = "";
@@ -1109,6 +1225,34 @@ const presetDims = computed(() => {
 const subtitleDims = computed(() => presetDims.value.filter((k) => !SOUND_DIMS.includes(k)));
 const libReady = computed(() => !!(textLib.value.presets || []).length
   || !!(textLib.value.voice_groups || []).length);
+// 音色总数：文件夹标题上要报个数，和工具库那边的「N 个」同一种读法。
+const voiceTotal = computed(() => (textLib.value.voice_groups || [])
+  .reduce((n, g) => n + (g.items || []).length, 0));
+
+// 文字库的左侧文件夹：每组预设一档、每个自由取色维度一档、音色一档。
+// 名单全部从契约现取（`presetGroups` / `colorDims` / `voice_groups`），不另写一份。
+const textFolders = computed(() => {
+  const out = [];
+  for (const g of presetGroups.value) {
+    out.push({ key: "g:" + g, label: dimTitle(g), count: presetsOf(g).length,
+      kind: "preset", group: g });
+  }
+  for (const dim of colorDims.value) {
+    out.push({ key: "c:" + dim, label: dimTitle(dim), count: 2, kind: "color", dim });
+  }
+  out.push({ key: "voice", label: dimTitle("voice"), count: voiceTotal.value, kind: "voice" });
+  return out;
+});
+const textFolder = computed(() => (textFolders.value
+  .find((f) => f.key === libPicked.value.textlib) || null));
+// 音色不再逐层点开文件夹：一屏列出全部，组名进「类型」一列，找起来更快。
+const voiceRows = computed(() => {
+  const out = [];
+  for (const g of textLib.value.voice_groups || []) {
+    for (const v of g.items || []) out.push({ ...v, group: g.label });
+  }
+  return out;
+});
 
 function labelOf(dim, value) {
   return ((textLib.value.dims || {})[dim]?.value_labels || {})[value] || value;
@@ -1864,7 +2008,7 @@ async function ensureCatalog() {
 async function toggleHelp() {
   activePanel.value = activePanel.value === 'tools' ? null : 'tools';
   if (activePanel.value === 'tools') {
-    toolView.value = 'tools';         // 默认进入"工具"分类
+    openToolLibRoot();                // 从最外层文件夹开始，一次一层
     await loadTools();
     loadMcpAdmin();
     loadSkillsAdmin();
@@ -1975,6 +2119,8 @@ async function delMcp(s, sink = mcpMsg) {
   const j = await r.json().catch(() => ({}));
   if (!r.ok) { sink.value = "删除失败：" + (j.detail || r.status); return; }
   sink.value = "已删除：" + j.deleted;
+  // 正停在这台服务的详情上：删完退回服务清单，别留一屏空白。
+  if (mcpPicked.value === s.name) mcpPicked.value = "";
   await loadMcpAdmin();
 }
 
@@ -2047,6 +2193,182 @@ async function uploadSkillZip(ev) {
   await loadSkillsAdmin();
 }
 
+// ---- 技能文件夹导入：拖一个文件夹进来就能读能用的那条路 ------------------
+//
+// 浏览器不让页面读本地目录的绝对路径，只给「文件 + 相对路径」。所以这里做三件事：
+// 递归把一个目录展开成文件清单、按扩展名决定走文本还是 base64，再整包发给
+// `/skills/import_folder`（服务端拼回 zip，走与 zip 上传同一条安装路径）。
+// 大目录（node_modules / .git / 图片素材库）在展开时就丢掉——技能包只需要正文与
+// 它点名的附属文件，把整个仓库塞上去只会撞条目数上限。
+
+const SKILL_TEXT_EXT = new Set([
+  ".md", ".txt", ".json", ".yaml", ".yml", ".tsx", ".ts", ".js", ".jsx",
+  ".py", ".sh", ".css", ".html", ".csv", ".toml", ".mjs", ".cjs",
+]);
+const SKILL_SKIP_DIR = new Set([
+  "node_modules", ".git", ".github", "dist", "build", "__pycache__",
+  ".venv", "venv", "target", ".idea", ".vscode",
+]);
+
+function skillRelPath(raw) {
+  let rel = String(raw || "").replace(/\\/g, "/");
+  while (rel.startsWith("./")) rel = rel.slice(2);
+  rel = rel.replace(/^\/+/, "");
+  const parts = rel.split("/").filter((p) => p && p !== ".");
+  if (parts.some((p) => p === "..")) return "";
+  return parts.join("/");
+}
+
+function skillFileSkipped(path) {
+  const parts = path.split("/");
+  if (parts.some((p) => SKILL_SKIP_DIR.has(p))) return true;
+  return parts.some((p) => p.startsWith(".") && p !== ".well-known");
+}
+
+function readAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const s = String(fr.result || "");
+      resolve(s.slice(s.indexOf(",") + 1));
+    };
+    fr.onerror = () => reject(fr.error);
+    fr.readAsDataURL(file);
+  });
+}
+
+function readAsText(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result || ""));
+    fr.onerror = () => reject(fr.error);
+    fr.readAsText(file);
+  });
+}
+
+async function skillPayloadOf(file, path) {
+  const ext = ("." + (path.split(".").pop() || "")).toLowerCase();
+  // 文本按 UTF-8 读；其余（字体、图片）走 base64。判据是扩展名而不是「读失败再试」：
+  // 一个二进制文件被当文本读不会报错，只会变成一堆替换字符——装上去了、内容却是坏的。
+  if (SKILL_TEXT_EXT.has(ext) && file.size < 512 * 1024) {
+    return { path, text: await readAsText(file) };
+  }
+  if (file.size > 4 * 1024 * 1024) return null;  // 单个附属文件上限
+  return { path, b64: await readAsBase64(file) };
+}
+
+function walkDirEntry(entry, prefix, out) {
+  return new Promise((resolve) => {
+    if (entry.isFile) {
+      entry.file((f) => {
+        out.push({ file: f, path: prefix + entry.name });
+        resolve();
+      }, () => resolve());
+      return;
+    }
+    if (!entry.isDirectory) return resolve();
+    if (SKILL_SKIP_DIR.has(entry.name)) return resolve();
+    const reader = entry.createReader();
+    const all = [];
+    // readEntries 一次最多回 100 条，要一直读到空批——不循环的话，大目录会静默
+    // 只装前 100 个文件（技能包通常没这么多，但参考片/脚本多一点的包就会中招）。
+    const readBatch = () => reader.readEntries((batch) => {
+      if (!batch.length) {
+        (async () => {
+          for (const e of all) await walkDirEntry(e, prefix + entry.name + "/", out);
+          resolve();
+        })();
+        return;
+      }
+      all.push(...batch);
+      readBatch();
+    }, () => resolve());
+    readBatch();
+  });
+}
+
+async function importSkillFolderPayload(files, root) {
+  if (!files.length) {
+    skillsMsg.value = "这个文件夹是空的（或只有被忽略的目录）";
+    return;
+  }
+  // 只挡「一个入口都没有」：一个技能文件夹、或一个装着若干技能文件夹的父文件夹，
+  // 里面都至少有一份 SKILL.md。具体的层级由服务端剥壳判定（多套一层也能装）。
+  if (!files.some((f) => f.path.split("/").pop() === "SKILL.md")) {
+    skillsMsg.value = "没有找到 SKILL.md：拖一个技能文件夹，或一个装着若干技能文件夹的父文件夹";
+    return;
+  }
+  skillsMsg.value = `读取 ${files.length} 个文件…`;
+  const payload = [];
+  for (const f of files) {
+    const item = await skillPayloadOf(f.file, f.path);
+    if (item) payload.push(item);
+  }
+  skillsMsg.value = `安装中（${payload.length} 个文件）…`;
+  const r = await fetch("/skills/import_folder", {
+    method: "POST",
+    headers: { ...authHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ files: payload, root: root || "" }),
+  });
+  const j = await r.json().catch(() => ({}));
+  skillsMsg.value = r.ok
+    ? "已装好：" + (j.imported || []).join("、")
+    : "失败：" + (j.detail || r.status);
+  await loadSkillsAdmin();
+  // 装完就停在技能库，并落到刚装的那个包的类型里——装了一个就直接进包内，
+  // 装了多个就停在那类技能清单上，免得用户自己一层层找。
+  toolView.value = "skills";
+  const names = j.imported || [];
+  const first = (skillsAdmin.value || []).find((s) => s.name === names[0]);
+  if (first) {
+    skillKind.value = first.kind || "workflow";
+    skillOpened.value = names.length === 1 ? first.name : "";
+  }
+}
+
+async function importSkillFolderFromInput(ev) {
+  const list = Array.from(ev.target.files || []);
+  ev.target.value = "";
+  if (!list.length) return;
+  const root = String(list[0].webkitRelativePath || "").split("/")[0] || "";
+  const files = [];
+  for (const f of list) {
+    const rel = skillRelPath(f.webkitRelativePath || f.name);
+    if (!rel || skillFileSkipped(rel)) continue;
+    files.push({ file: f, path: rel });
+  }
+  await importSkillFolderPayload(files, root);
+}
+
+async function dropSkillFolder(ev) {
+  skillsDragOver.value = false;
+  const dt = ev.dataTransfer;
+  if (!dt) return;
+  const collected = [];
+  const items = Array.from(dt.items || []);
+  const entries = items
+    .map((it) => (it.webkitGetAsEntry ? it.webkitGetAsEntry() : null))
+    .filter(Boolean);
+  if (entries.length) {
+    for (const e of entries) await walkDirEntry(e, "", collected);
+  } else {
+    for (const f of Array.from(dt.files || [])) collected.push({ file: f, path: f.name });
+  }
+  const files = [];
+  for (const f of collected) {
+    const rel = skillRelPath(f.path);
+    if (!rel || skillFileSkipped(rel)) continue;
+    files.push({ file: f.file, path: rel });
+  }
+  const root = files[0] ? files[0].path.split("/")[0] : "";
+  await importSkillFolderPayload(files, root);
+}
+
+function pickSkillFolder() {
+  const el = document.getElementById("skill-folder");
+  if (el) el.click();
+}
+
 async function reloadSkillsDir() {
   skillsMsg.value = "重扫中…";
   const r = await fetch("/skills/reload", { method: "POST", headers: authHeaders() });
@@ -2063,6 +2385,7 @@ async function delSkill(s) {
                         { method: "DELETE", headers: authHeaders() });
   const j = await r.json().catch(() => ({}));
   skillsMsg.value = r.ok ? "已删除：" + j.deleted : "失败：" + (j.detail || r.status);
+  if (r.ok && skillOpened.value === s.name) skillOpened.value = "";
   await loadSkillsAdmin();
 }
 
@@ -2102,13 +2425,10 @@ async function openSkillModal(name) {
   }
 }
 
-function editSkillForm(create) {
+function editSkillForm() {
   const d = itemModal.value.detail;
-  skillForm.value = (create || !d) ? {
-    name: "", display: "", always: false, description: "", requires: "", body: "",
-    kind: "workflow", sectionsText: "", excludeText: "",
-    manifestText: "{}",
-  } : {
+  if (!d) return;
+  skillForm.value = {
     name: d.name, display: d.display || "", always: !!d.always,
     description: d.description || "", requires: (d.requires || []).join(", "),
     body: d.body || "", kind: d.kind || "workflow",
@@ -2159,30 +2479,12 @@ function manifestPretty(m) {
   }
 }
 
-// 系统内置只读：复制成一份属于本人的风格包。名字必须换一个——
-// 同名 PUT 会被服务端的系统技能只读校验挡回来。
-function duplicateAsMine() {
-  const d = itemModal.value.detail;
-  if (!d) return;
-  editSkillForm(true);
-  const f = skillForm.value;
-  f.name = `${d.name}_mine`;
-  f.display = (d.display || d.name) + "（我的）";
-  f.description = d.description || "";
-  f.body = d.body || "";
-  f.kind = d.kind || "workflow";
-  f.manifestText = JSON.stringify(d.style_manifest || {}, null, 2);
-  f.sectionsText = (d.sections || []).join(", ");
-  f.excludeText = (d.exclude || []).join(", ");
-  skillsMsg.value = "已复制一份草稿；改完点保存即成你自己的风格包。";
-}
-
 // 教程里那条「Studio 改动会写回代码，调参前先留版本」的最小实现：
 // 服务端在 manifest 变化时把旧值存进 `style_manifest_prev`，这里把它填回表单。
 function restorePrevManifest() {
   const d = itemModal.value.detail;
   if (!d || !d.style_manifest_prev) return;
-  editSkillForm(false);
+  editSkillForm();
   skillForm.value.manifestText = JSON.stringify(d.style_manifest_prev, null, 2);
   if (skillForm.value.kind !== "style") skillForm.value.kind = "style";
   skillsMsg.value = "已把上一版 manifest 填回表单；点保存才生效。";
@@ -2523,7 +2825,7 @@ async function fromConversationAsSkill() {
     skillsMsg.value = "已沉淀：" + j.name + "（净 " + j.steps + " 步，剔 " +
       (j.dropped || 0) + " 次重复/失败" + (j.llm_polished ? "，模型润色" : "，模板") + "）";
     await openSkillModal(j.name);
-    editSkillForm(false);
+    editSkillForm();
   } catch (e) {
     alert("沉淀失败：" + e.message);
   }
@@ -3145,7 +3447,9 @@ function planCardOf(src) {
     // 帧上的 run_id（= 规划轮的 run）：提问卡的签名、冷启动补弹都按它对齐
     frame_run_id: src.run_id || "",
     plans, warnings: src.warnings || [],
-    style: src.style_skill || plans[0].style_skill || "",
+    // 卡级的 style 只记「用户这一次明确选的那套」；模型在候选上自己挑的风格挂在
+    // 每份候选上（三份可以各选一套），显示时按当前选中的那份取（见 planStyleOf）。
+    style: src.style_skill || "",
     chosen: plans[0].plan_id,
     final: {}, custom: {}, skip: {}, general: "",
     feedback: "", askFeedback: false, submitting: false, error: "", exec_run: "",
@@ -3173,6 +3477,14 @@ function planBubble(cid, src) {
 
 function planChosen(card) {
   return card.plans.find((p) => p.plan_id === card.chosen) || card.plans[0] || { steps: [] };
+}
+
+// 这一版按哪套视觉排：用户明确选的那套压过候选上自带的那套。
+// 候选上的风格是助手自己搜出来的（用户只说了「剪影风」这种自然语言）——
+// 不显示出来，用户就无从发现它挑错了。
+function planStyleOf(card) {
+  if (!card) return "";
+  return card.style || planChosen(card).style_skill || "";
 }
 
 // 参数在链路面板上显示的取值：就是它的默认值（= 用户确认时不用改就按这个跑）。
@@ -3601,9 +3913,8 @@ function onFrame(cid, p) {
     if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
     planBubble(cid, p);
   } else if (p.type === "style") {
-    // 对话里把风格换了：服务端同时改了技能库，这里只把「当前风格」接过来。
-    // 之后每条消息照旧带 style_skill 回服务端，所以换页/刷新也不会丢。
-    styleSkill.value = p.style_skill || "";
+    // 对话里把风格换了：服务端同时改了技能库，这里只把新名字补进本地清单（卡面上
+    // 显示中文名要用它）。当前风格记在服务端会话表上，这一端不需要再存一份。
     if (p.style_skill && p.display
         && !(skillsAdmin.value || []).some((s) => s && s.name === p.style_skill)) {
       skillsAdmin.value = [...(skillsAdmin.value || []),
@@ -3646,15 +3957,9 @@ async function send() {
       body: JSON.stringify({
         conversation_id: cid, message: text,
         attachments: atts0.map((a) => a.material_id),
-        mode: entryMode.value,
-        // 选中的风格包名（空串＝自动）。服务端会校验归属与 kind，
-        // 不可用时只回一句「按默认视觉继续」，不会让这次请求失败。
-        style_skill: styleSkill.value || "",
-        // 这一选是在下拉里点出来的（不是从对话里继承的旧值）：服务端据此把它
-        // 记成明确决定，免得同一会话里先前对话换的风格盖住它。
-        style_explicit: styleExplicit.value,
-        // 不预览、不确认，直接跑完成片。只在「全自动」下生效。
-        go_straight: entryMode.value === "auto" && goStraight.value,
+        // 只有一个入口：一句话进来，技能和节点由助手自己找。不传 mode 以外的
+        // 任何「选择」——风格、是否直出都由服务端按这句话自己判断。
+        mode: "auto",
       }),
     });
     const j = await r.json().catch(() => ({}));
@@ -5019,7 +5324,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <div class="plan-inline" :class="m.state">
                 <span class="pi-ico">🗂</span>
                 <b>{{ planChosen(m).label || '剪辑方案' }}</b>
-                <span v-if="m.style" class="pi-tag style">风格 · {{ styleLabel(m.style) }}</span>
+                <span v-if="planStyleOf(m)" class="pi-tag style">风格 · {{ styleLabel(planStyleOf(m)) }}</span>
                 <button
                   v-if="m.state === 'waiting'"
                   class="clip pi-open"
@@ -5222,7 +5527,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       <div v-if="planModal && planModal.state === 'waiting'" class="plan-banner">
         <span class="pb-icon">🗂</span>
         <span class="pb-label">{{ planChosen(planModal).label || '剪辑方案' }}</span>
-        <span v-if="planModal.style" class="pb-style">风格 · {{ styleLabel(planModal.style) }}</span>
+        <span v-if="planStyleOf(planModal)" class="pb-style">风格 · {{ styleLabel(planStyleOf(planModal)) }}</span>
         <span class="pb-hint">已在右侧列出完整链路，确认后即执行</span>
         <button class="pb-btn primary" :disabled="planModal.submitting" @click="confirmPlan(planModal)">
           {{ planModal.submitting ? '提交中…' : '按此执行' }}
@@ -5236,6 +5541,8 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 
       <footer class="composer">
         <input ref="fileInput" type="file" multiple accept="video/*,audio/*,image/*" hidden @change="onFiles" />
+        <!-- 按钮单独占一行，放在输入框上方：输入框可以整行铺开，长句不用在按钮中间挤着换行。 -->
+        <div class="composer-bar">
         <button class="clip" :class="{ busy: uploading }"
                 :title="uploading ? '上传中：' + uploading + ' ' + (uploadPercent ? uploadPercent + '%' : '') : '上传素材（也可直接拖入）'"
                 @click="pickFiles">
@@ -5247,32 +5554,18 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           {{ cancelling ? "取消中…" : "取消上传" }}
         </button>
         <button class="clip" :class="{ busy: fetchingLink, on: linkOpen }" title="按链接取素材" @click="toggleLink">＋链接</button>
-        <button class="clip" :class="{ on: entryMode === 'plan' }"
-                :title="entryMode === 'auto'
-                  ? '全自动：一句话直接做到出片，没提到的由助手自己定，渲染前弹一张计划确认卡'
-                  : '先出计划：先给计划卡逐项确认，再开始执行'"
-                @click="toggleEntryMode">{{ entryMode === "auto" ? "全自动" : "先出计划" }}</button>
-        <button v-if="entryMode === 'auto'" class="clip" :class="{ on: goStraight }"
-                :title="goStraight
-                  ? '直接出片：不预渲画面、出片前不弹确认卡，一句话跑到成片'
-                  : '出片前先看预览：每镜一张静帧，确认后才渲染'"
-                @click="goStraight = !goStraight">{{ goStraight ? "直接出片" : "先预览" }}</button>
-        <select class="clip style-pick" :class="{ on: !!styleSkill }"
-                :value="styleSkill" @change="pickStyle"
-                :title="'画面风格：选一套现成的。要改它或做一套新的，直接在对话里说一句（例如「底子再冷一点」「换成水墨风」）'">
-          <option value="">风格：自动</option>
-          <option v-for="s in styleChoices()" :key="'sk-' + s.name" :value="s.name">
-            风格：{{ s.display || s.name }}{{ s.owner_user_id ? "" : "（内置）" }}
-          </option>
-          <option value="__new__">＋ 做一套新的…</option>
-        </select>
-        <textarea
-          v-model="draft"
-          rows="1"
-          placeholder="把想法落在此处，Enter 落笔，Shift+Enter 换行；素材点「＋素材」/拖入或「＋链接」贴网址，会挂在输入框上方随消息发出…"
-          @keydown="onKey"
-        ></textarea>
-        <button class="send" :class="{ off: !draft.trim() && !atts(active).length }" @click="send">落笔 ➤</button>
+        </div>
+
+        <div class="composer-row">
+          <textarea
+            ref="draftEl"
+            v-model="draft"
+            rows="1"
+            placeholder="把想法落在此处，Enter 落笔，Shift+Enter 换行；素材点「＋素材」/拖入或「＋链接」贴网址，会挂在输入框上方随消息发出…"
+            @keydown="onKey"
+          ></textarea>
+          <button class="send" :class="{ off: !draft.trim() && !atts(active).length }" @click="send">落笔 ➤</button>
+        </div>
       </footer>
     </main>
 
@@ -5280,7 +5573,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
     <aside v-if="activePanel" class="drawer" :style="{ width: drawerW + 'px' }">
       <div class="drawer-grip" title="拖拽调宽" @mousedown="startResize"></div>
       <header class="drawer-head">
-        <b>{{ activePanel === 'plan' ? '📋 剪辑链路' : activePanel === 'tools' ? '工具库' : activePanel === 'library' ? '素材库' : activePanel === 'bgm' ? '🎵 音乐库' : activePanel === 'textlib' ? '✍️ 文字库' : activePanel === 'timeline' ? '时间线编辑器' : activePanel === 'runs' ? '执行记录 · 时间旅行' : '设置' }}</b>
+        <b>{{ activePanel === 'plan' ? '剪辑链路' : activePanel === 'tools' ? '工具库' : activePanel === 'library' ? '素材库' : activePanel === 'bgm' ? '音乐库' : activePanel === 'textlib' ? '文字库' : activePanel === 'timeline' ? '时间线编辑器' : activePanel === 'runs' ? '执行记录 · 时间旅行' : '设置' }}</b>
         <button class="drawer-x" @click="activePanel = null">×</button>
       </header>
 
@@ -5419,6 +5712,9 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                     class="pp-ver" :class="{ on: planModal.chosen === p.plan_id }"
                     @click="planModal.chosen = p.plan_id">
               {{ p.label }}
+              <!-- 每版各用哪套视觉都要看得见：助手自己挑的也要亮出来，
+                   否则用户只能等出片才发现挑错了。 -->
+              <i v-if="p.style_skill" class="pp-ver-style">· {{ styleLabel(p.style_skill) }}</i>
             </button>
           </div>
           <div class="pp-chain">
@@ -5454,180 +5750,222 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         </template>
       </div>
 
-      <div v-if="activePanel === 'tools'" class="tool-drawer">
+      <!-- 整个工具库面板都是拖放区：技能以文件夹的形式存在，拖进来就该装上。 -->
+      <div v-if="activePanel === 'tools'" class="tool-drawer" :class="{ 'drop-on': skillsDragOver }"
+           @dragenter.prevent="skillsDragOver = true"
+           @dragover.prevent="skillsDragOver = true"
+           @dragleave.prevent="onToolDrawerDragLeave($event)"
+           @drop.prevent="dropSkillFolder($event)">
+        <input type="file" id="skill-zip" accept=".zip" style="display:none"
+               @change="uploadSkillZip" />
+        <input type="file" id="skill-folder" webkitdirectory directory multiple
+               style="display:none" @change="importSkillFolderFromInput" />
         <div v-if="loadingTools" class="lib-empty">正在加载工具库…</div>
         <div v-else-if="toolLib && toolLib.error" class="lib-empty bad">工具库加载失败：{{ toolLib.error }}</div>
-        <div v-else-if="toolLib" class="td-split">
-
-          <div class="td-cats">
-            <div class="cat-row" :class="{ active: !toolView || toolView === 'tools' }" @click="toggleCat('tools')">
-              <div class="cat-top">
-                <b>工具</b>
-                <button class="cat-manage" title="增删工具（经 MCP 服务）"
-                        @click.stop="openCatManage('tools')">管理</button>
-              </div>
-              <span class="cat-count">{{ toolCount }} 个</span>
-            </div>
-            <div class="cat-row" :class="{ active: toolView === 'skills' }" @click="toggleCat('skills')">
-              <div class="cat-top">
-                <b>技能</b>
-                <button class="cat-manage" title="新增 / 删除技能"
-                        @click.stop="openCatManage('skills')">管理</button>
-              </div>
-              <span class="cat-count">{{ skillsAdmin.length }} 个</span>
-            </div>
-            <div class="cat-row" :class="{ active: toolView === 'mcp' }" @click="toggleCat('mcp')">
-              <div class="cat-top">
-                <b>MCP</b>
-                <button class="cat-manage" title="新增 / 删除 MCP 服务"
-                        @click.stop="openCatManage('mcp')">管理</button>
-              </div>
-              <span class="cat-count">{{ mcpServers.length }} 个</span>
-            </div>
-          </div>
-
-          <div class="td-detail">
+        <div v-else-if="toolLib" class="td-detail">
             <template v-if="!toolView">
-              <template v-for="(items, cat) in toolLib.groups" :key="'f-' + cat">
-                <div class="td-group">{{ cat }}</div>
-                <div v-for="t in items" :key="'f-' + t.name" class="td-item">
-                  <div class="td-title">
-                    <b class="td-clickable" @click="openToolModal(t, cat)">{{ toolLabel(t.name, t.name_display) }}</b>
-                  </div>
-                  <span class="td-intro">{{ t.desc }}</span>
-                </div>
-              </template>
-              <div class="td-group">技能（Skill）</div>
-              <div v-for="sk in (toolLib.skills || [])" :key="'f-' + sk.name" class="td-item">
-                  <div class="td-title">
-                    <b class="td-clickable" @click="openSkillModal(sk.name)">{{ toolLabel(sk.name, sk.name_display) }}</b>
-                    <span v-if="sk.available !== '可用'" class="st-bad"
-                          :title="sk.available">⚠</span>
-                  </div>
-                <span class="td-intro">{{ sk.desc }}</span>
+              <!-- 根目录：三类各是一个文件夹，点进去才是它里面的东西。 -->
+              <div class="tree-note">
+                工具库按文件夹组织：一个技能就是一个文件夹（<code>SKILL.md</code> 是入口），
+                工具按能力分类，MCP 服务下挂它提供的工具。把技能文件夹拖进这块面板即可安装；
+                拖一个装着多个技能文件夹的父文件夹，就一次装好几个。
               </div>
-              <div class="td-group mcp-head">
-                <span>MCP 服务（第三方工具源）</span>
-                <span class="td-row-btns">
-                  <button class="help" @click="openMcpModal(null)">＋ 新增</button>
-                </span>
+              <div class="tree-row depth-0" @click="toolView = 'tools'">
+                <span class="tree-caret">▸</span>
+                <b class="tree-name">工具</b>
+                <span class="tree-count">{{ toolCount }} 个 · {{ toolFolders.length }} 个分类</span>
               </div>
-              <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
-              <div v-for="s in mcpServers" :key="'f-' + s.name" class="td-item">
-                  <div class="td-title">
-                    <b class="td-clickable" @click="openMcpModal(s)">{{ s.name }}</b>
-                  </div>
-                <span class="td-name">
-                  <span :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
-                  · {{ (s.tools || []).length }} 个工具
-                </span>
-                <span class="td-intro">{{ (s.config && (s.config.url || s.config.command)) || "—" }}</span>
-                <span class="td-row-btns">
-                  <button class="help" :disabled="mcpBusy" @click="toggleMcp(s)">{{ s.live ? "断开" : "启用" }}</button>
-                  <button class="help danger" @click="delMcp(s)">删除</button>
-                </span>
+              <div class="tree-row depth-0" @click="toolView = 'skills'">
+                <span class="tree-caret">▸</span>
+                <b class="tree-name">技能</b>
+                <span class="tree-count">{{ skillsAdmin.length }} 个包</span>
               </div>
+              <div class="tree-row depth-0" @click="toolView = 'mcp'">
+                <span class="tree-caret">▸</span>
+                <b class="tree-name">MCP 服务</b>
+                <span class="tree-count">{{ mcpServers.length }} 个</span>
+              </div>
+              <div class="skill-drop" :class="{ over: skillsDragOver }">
+                {{ skillsDragOver ? "松开即安装这个文件夹" : "把技能文件夹拖到这里（或拖进本面板任意位置）" }}
+              </div>
+              <div v-if="skillsMsg" class="lib-empty">{{ skillsMsg }}</div>
             </template>
             <template v-else-if="toolView === 'tools'">
-              <template v-for="(items, cat) in toolLib.groups" :key="'t-' + cat">
-                <div class="td-group">{{ cat }}</div>
-                <div v-for="t in items" :key="'t-' + t.name" class="td-item">
-                  <div class="td-title">
-                    <b class="td-clickable" @click="openToolModal(t, cat)">{{ toolLabel(t.name, t.name_display) }}</b>
-                  </div>
-                  <span class="td-intro">{{ t.desc }}</span>
+              <!-- 分类这一层：只列分类，不把里面的工具一起摊开。 -->
+              <template v-if="!toolCat">
+                <div class="tree-row" @click="toolView = null">
+                  <span class="tree-caret">←</span>
+                  <span class="tree-name">返回</span>
+                  <span class="tree-count">工具 · {{ toolFolders.length }} 个分类</span>
+                </div>
+                <div v-for="f in toolFolders" :key="'tf-' + f.cat" class="tree-row"
+                     @click="toolCat = f.cat">
+                  <span class="tree-caret">▸</span>
+                  <b class="tree-name">{{ f.cat }}</b>
+                  <span class="tree-count">{{ f.items.length }} 个</span>
+                </div>
+                <div v-if="!toolFolders.length" class="lib-empty">还没有注册工具。</div>
+              </template>
+              <!-- 工具这一层：只有这个分类里的工具。 -->
+              <template v-else-if="toolCatFolder">
+                <div class="tree-row" @click="toolCat = ''">
+                  <span class="tree-caret">←</span>
+                  <span class="tree-name">返回</span>
+                  <span class="tree-count">{{ toolCatFolder.cat }} · {{ toolCatFolder.items.length }} 个</span>
+                </div>
+                <div v-for="t in toolCatFolder.items" :key="'tf-' + toolCatFolder.cat + t.name"
+                     class="tree-row file" @click="openToolModal(t, toolCatFolder.cat)">
+                  <span class="tree-caret">·</span>
+                  <b class="tree-name">{{ toolLabel(t.name, t.name_display) }}</b>
+                  <span class="tree-sub">{{ t.desc }}</span>
                 </div>
               </template>
             </template>
             <template v-else-if="toolView === 'skills'">
-              <div v-for="sk in (toolLib.skills || [])" :key="'s-' + sk.name" class="td-item">
-                  <div class="td-title">
-                    <b class="td-clickable" @click="openSkillModal(sk.name)">{{ toolLabel(sk.name, sk.name_display) }}</b>
-                    <span v-if="sk.available !== '可用'" class="st-bad"
-                          :title="sk.available">⚠</span>
-                  </div>
-                <span class="td-intro">{{ sk.desc }}</span>
+              <div class="td-row-btns" style="margin-bottom:6px">
+                <button class="help" @click="pickSkillFolder">导入文件夹</button>
+                <button class="help" @click="pickSkillZip">上传 .zip</button>
+                <button class="help" @click="reloadSkillsDir">重扫导入目录</button>
               </div>
+              <div v-if="skillsMsg" class="lib-empty">{{ skillsMsg }}</div>
+
+              <!-- 第一层：类型文件夹（流程 / 能力 / 风格包）。 -->
+              <template v-if="!skillKind">
+                <div class="tree-row" @click="toolView = null">
+                  <span class="tree-caret">←</span>
+                  <span class="tree-name">返回</span>
+                  <span class="tree-count">技能 · {{ skillsAdmin.length }} 个包</span>
+                </div>
+                <div v-for="f in skillFolders" :key="'skf-' + f.key" class="tree-row"
+                     @click="skillKind = f.key">
+                  <span class="tree-caret">▸</span>
+                  <b class="tree-name">{{ f.label }}</b>
+                  <span class="tree-count">{{ f.count }} 个</span>
+                </div>
+                <div v-if="!skillFolders.length && !loadingSkillsAdmin" class="lib-empty">
+                  还没有技能。把技能文件夹拖进这块面板即可安装。
+                </div>
+              </template>
+
+              <!-- 第二层：这一类的技能包。能删的只留一个删除按钮，内置的只标「内置」。 -->
+              <template v-else-if="!skillOpened">
+                <div class="tree-row" @click="skillKind = ''">
+                  <span class="tree-caret">←</span>
+                  <span class="tree-name">返回</span>
+                  <span class="tree-count">{{ skillKindLabel(skillKind) }} · {{ skillListOfKind.length }} 个</span>
+                </div>
+                <div v-for="s in skillListOfKind" :key="'sk-' + s.name" class="tree-row"
+                     @click="skillOpened = s.name">
+                  <span class="tree-caret">▸</span>
+                  <b class="tree-name">{{ s.display || s.name }}</b>
+                  <span class="tree-sub">{{ s.name }}</span>
+                  <span v-if="s.available === false" class="st-bad"
+                        :title="s.unavailable_reason || '依赖未满足'">⚠</span>
+                  <span v-if="s.system" class="tree-count">内置</span>
+                  <span class="tree-actions" @click.stop>
+                    <button v-if="!s.system" class="help danger" @click="delSkill(s)">删除</button>
+                  </span>
+                </div>
+                <div v-if="!skillListOfKind.length" class="lib-empty">这一类还没有技能。</div>
+              </template>
+
+              <!-- 第三层：这个包里的文件。 -->
+              <template v-else-if="openedSkill">
+                <div class="tree-row" @click="skillOpened = ''">
+                  <span class="tree-caret">←</span>
+                  <span class="tree-name">返回</span>
+                  <span class="tree-count">{{ openedSkill.display || openedSkill.name }}</span>
+                </div>
+                <div class="tree-row file" @click="openSkillFile(openedSkill.name, 'SKILL.md')">
+                  <span class="tree-caret">·</span>
+                  <b class="tree-name">SKILL.md</b>
+                  <span class="tree-sub">入口 · 点开看正文 / 编辑</span>
+                </div>
+                <div v-for="r in openedSkillRows" :key="openedSkill.name + ':' + r.path"
+                     class="tree-row" :class="{ file: r.kind !== 'dir' }"
+                     :style="{ paddingLeft: (8 + r.depth * 16) + 'px' }"
+                     @click="r.kind === 'dir' ? treeToggle(skillDirOpen, r.key) : openSkillFile(openedSkill.name, r.path)">
+                  <span class="tree-caret">{{ r.kind === "dir" ? (r.open ? "▾" : "▸") : "·" }}</span>
+                  <b v-if="r.kind === 'dir'" class="tree-name">{{ r.name }}</b>
+                  <span v-else class="tree-name">{{ r.name }}</span>
+                </div>
+                <div v-if="!openedSkillRows.length" class="tree-row file" style="opacity:.55">
+                  <span class="tree-caret">·</span>
+                  <span class="tree-name">（这个包只有正文，没有其他文件）</span>
+                </div>
+              </template>
             </template>
             <template v-else-if="toolView === 'mcp'">
-              <div class="td-row-btns" style="margin-bottom:6px">
-                <button class="help" @click="openMcpModal(null)">＋ 新增</button>
-              </div>
-              <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
-              <div v-if="loadingMcp" class="lib-empty">加载中…</div>
-              <div v-for="s in mcpServers" :key="'m-' + s.name" class="td-item">
-                  <div class="td-title">
-                    <b class="td-clickable" @click="openMcpModal(s)">{{ s.name }}</b>
-                  </div>
-                <span class="td-name">
-                  <span :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
-                  · {{ (s.tools || []).length }} 个工具
-                </span>
-                <span class="td-intro">{{ (s.config && (s.config.url || s.config.command)) || "—" }}</span>
-                <span class="td-row-btns">
-                  <button class="help" :disabled="mcpBusy" @click="toggleMcp(s)">{{ s.live ? "断开" : "启用" }}</button>
-                  <button class="help danger" @click="delMcp(s)">删除</button>
-                </span>
-              </div>
-              <div v-if="!loadingMcp && !mcpServers.length" class="lib-empty">
-                还没有动态 MCP 服务（mcp.json 里的静态服务不在此列）。
-              </div>
+              <!-- 服务这一层：只列服务；点进去才是这一台服务的配置与工具。 -->
+              <template v-if="!mcpPicked">
+                <div class="td-row-btns" style="margin-bottom:6px">
+                  <button class="help" @click="toolView = null">← 返回</button>
+                  <button class="help" @click="openMcpModal(null)">＋ 新增</button>
+                </div>
+                <div v-if="mcpMsg" class="lib-empty">{{ mcpMsg }}</div>
+                <div v-if="loadingMcp" class="lib-empty">加载中…</div>
+                <div v-for="s in mcpServers" :key="'m-' + s.name" class="tree-row"
+                     @click="mcpPicked = s.name">
+                  <span class="tree-caret">▸</span>
+                  <b class="tree-name">{{ s.name }}</b>
+                  <span class="tree-sub" :class="s.live ? 'st-ok' : 'st-bad'">{{ s.live ? "● 在线" : (s.enabled ? "○ 已启用未连" : "○ 停用") }}</span>
+                  <span class="tree-count">{{ (s.tools || []).length }} 个工具</span>
+                </div>
+                <div v-if="!loadingMcp && !mcpServers.length" class="lib-empty">
+                  还没有动态 MCP 服务（mcp.json 里的静态服务不在此列）。
+                </div>
+              </template>
+              <!-- 服务里面：配置 + 它提供的工具，动作只在这里出现。 -->
+              <template v-else-if="mcpPickedServer">
+                <div class="tree-row" @click="mcpPicked = ''">
+                  <span class="tree-caret">←</span>
+                  <span class="tree-name">返回</span>
+                  <span class="tree-count">{{ mcpPickedServer.name }}</span>
+                </div>
+                <div class="td-row-btns" style="margin-bottom:6px">
+                  <button class="help" :disabled="mcpBusy" @click="toggleMcp(mcpPickedServer)">
+                    {{ mcpPickedServer.live ? "断开" : "启用" }}
+                  </button>
+                  <button class="help" @click="openMcpModal(mcpPickedServer)">编辑</button>
+                  <button class="help danger" @click="delMcp(mcpPickedServer)">删除</button>
+                </div>
+                <div class="tree-row file">
+                  <span class="tree-caret">·</span>
+                  <span class="tree-name">配置：{{ (mcpPickedServer.config && (mcpPickedServer.config.url || mcpPickedServer.config.command)) || "—" }}</span>
+                </div>
+                <div v-for="t in (mcpPickedServer.tools || [])" :key="'mt-' + mcpPickedServer.name + t"
+                     class="tree-row file">
+                  <span class="tree-caret">·</span>
+                  <span class="tree-name">{{ t }}</span>
+                </div>
+                <div v-if="!(mcpPickedServer.tools || []).length" class="lib-empty">
+                  这台服务在线后没有报回任何工具。
+                </div>
+              </template>
             </template>
-          </div>
         </div>
       </div>
 
-            <!-- —— 分类管理弹窗：父列表 ✎ 打开，支持该类条目的增删 —— -->
-      <div v-if="catManage" class="modal-mask" @click.self="catManage = null">
+      <!-- —— 技能包里的一个文件：点开就能看（文本给正文，图片给直链） —— -->
+      <div v-if="fileView" class="modal-mask" @click.self="fileView = null">
         <div class="modal-card">
           <div class="modal-head">
-            <b>{{ catManage === "tools" ? "管理：工具"
-                  : catManage === "skills" ? "管理：技能" : "管理：MCP 服务" }}</b>
-            <button class="help" @click="catManage = null">×</button>
+            <b>{{ fileView.skill }} / {{ fileView.path }}</b>
+            <button class="help" @click="fileView = null">×</button>
           </div>
           <div class="modal-body">
-            <template v-if="catManage === 'tools'">
-              <p class="modal-note">内置工具与剪辑节点定义在代码 / 剪辑服务端，不能直接增删；
-                运行期增删工具的唯一通道是 MCP 服务——删除一个服务即移除它注册的全部工具。</p>
-              <div v-for="s in mcpServers" :key="'mt-' + s.name" class="kv">
-                <b>{{ s.name }}</b>
-                <span>{{ (s.tools || []).length }} 个工具 · {{ s.live ? "在线" : "停用" }}</span>
-                <span class="td-row-btns">
-                  <button class="help danger" @click="delMcp(s)">删除</button>
-                </span>
-              </div>
-              <div class="td-row-btns">
-                <button class="help" @click="openMcpModal(null); catManage = null">＋ 注册 MCP 服务（新增工具）</button>
-              </div>
-            </template>
-            <template v-else-if="catManage === 'skills'">
-              <div class="td-row-btns" style="margin-bottom:4px">
-                <input type="file" id="skill-zip" accept=".zip" style="display:none"
-                       @change="uploadSkillZip" />
-                <button class="help" @click="pickSkillZip">上传 .zip</button>
-                <button class="help" @click="reloadSkillsDir">重扫导入目录</button>
-                <button class="help" @click="createSkillFromManage">＋ 新增技能</button>
-              </div>
-              <div v-if="skillsMsg" class="lib-empty">{{ skillsMsg }}</div>
-              <div v-for="sk in skillsAdmin" :key="'ms-' + sk.name" class="kv">
-                <b>{{ sk.display || sk.name }}</b>
-                <span class="cat-desc">{{ sk.name }}</span>
-                <span class="td-row-btns">
-                  <button class="help danger" @click="delSkill(sk)">删除</button>
-                </span>
-              </div>
+            <div v-if="fileView.loading" class="lib-empty">读取中…</div>
+            <div v-else-if="fileView.err" class="lib-empty bad">{{ fileView.err }}</div>
+            <template v-else-if="fileView.binary">
+              <img v-if="(fileView.mime || '').startsWith('image/') && fileView.url"
+                   :src="fileView.url" class="file-img" alt="" />
+              <p class="modal-note">{{ fileView.bytes }} 字节 · {{ fileView.mime || "二进制文件" }}</p>
+              <a v-if="fileView.url" class="help" :href="fileView.url"
+                 target="_blank" rel="noreferrer">打开 / 下载</a>
             </template>
             <template v-else>
-              <div v-for="s in mcpServers" :key="'mm-' + s.name" class="kv">
-                <b>{{ s.name }}</b>
-                <span>{{ s.live ? "在线" : (s.enabled ? "启用未连" : "停用") }} · {{ (s.tools || []).length }} 个工具</span>
-                <span class="td-row-btns">
-                  <button class="help danger" @click="delMcp(s)">删除</button>
-                </span>
-              </div>
-              <div class="td-row-btns">
-                <button class="help" @click="openMcpModal(null); catManage = null">＋ 新增 MCP 服务</button>
-              </div>
+              <p class="modal-note">{{ fileView.bytes }} 字节 · 只读预览</p>
+              <pre class="file-pre">{{ fileView.text }}</pre>
             </template>
           </div>
         </div>
@@ -5639,7 +5977,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           <div class="modal-head">
             <b>{{ itemModal.kind === "tool" ? "工具详情"
                   : itemModal.kind === "mcp" ? (itemModal.create ? "新增 MCP 服务" : "编辑 MCP 服务")
-                  : (itemModal.create ? "新增技能" : "技能详情") }}</b>
+                  : "技能详情" }}</b>
             <button class="help" @click="itemModal = null">×</button>
           </div>
 
@@ -5719,9 +6057,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                   <pre class="skill-pre">{{ itemModal.detail.body }}</pre></div>
                 <div class="td-row-btns">
                   <button v-if="!itemModal.detail.system" class="help"
-                          @click="editSkillForm(false)">✎ 编辑</button>
-                  <button v-if="itemModal.detail.system" class="help"
-                          @click="duplicateAsMine">另存为我的风格</button>
+                          @click="editSkillForm()">✎ 编辑</button>
                   <button v-if="itemModal.detail.style_manifest_prev" class="help"
                           @click="restorePrevManifest">↶ 恢复上一版 manifest</button>
                   <button v-if="!itemModal.detail.system" class="help danger"
@@ -5730,8 +6066,9 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               </template>
             </template>
             <template v-else>
-              <input v-model.trim="skillForm.name" :disabled="!itemModal.create"
-                     placeholder="技能名（字母数字与 _ -，创建后不可改）" />
+              <input v-model.trim="skillForm.name" disabled
+                     title="技能名来自包内的 SKILL.md，导入后不可改"
+                     placeholder="技能名（来自包内 SKILL.md）" />
               <input v-model="skillForm.display" placeholder="中文名（界面显示）" />
               <input v-model="skillForm.description" placeholder="description（触发关键，写清何时用）" />
               <input v-model="skillForm.requires" placeholder="依赖（可选），如 CLI: curl, ENV: KEY" />
@@ -5740,7 +6077,9 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
                 <select v-model="skillForm.kind" class="style-pick">
                   <option value="workflow">工作流（一条出片流程）</option>
                   <option value="capability">能力</option>
-                  <option value="style">风格包（一套视觉契约）</option>
+                  <!-- 2026-10-24：「风格包」这一档已撤（用户要求：风格包这条路删掉、
+                       以后不允许造，视觉风格一律由 skill 提供）。这里不再给入口；
+                       存量数据已清空，`kind=style` 的读取分支保留给老 spec 兜底。 -->
                 </select>
               </label>
               <label class="kv chk"><input type="checkbox" v-model="skillForm.always" /> 常驻注入（每次对话都带上正文）</label>
@@ -5766,8 +6105,9 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         </div>
       </div>
 
-      <div v-if="activePanel === 'library'" class="library">
-        <div class="lib-head">
+      <div v-if="activePanel === 'library'" class="library ex-lib">
+        <!-- 资源管理器那种排法：上面一条工具条，左边文件夹，右边内容。 -->
+        <div class="ex-bar">
           <span class="lib-count">{{ libraryItems.length }} 个素材</span>
           <button class="help" @click="loadMaterials" :disabled="loadingLibrary">
             {{ loadingLibrary ? "刷新中…" : "刷新" }}
@@ -5776,109 +6116,278 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             v-if="libSelCount()"
             class="lib-add-btn"
             @click="addSelectedFromLibrary"
-          >加入选中 {{ libSelCount() }} 项到本会话</button>
+          >加入选中 {{ libSelCount() }} 项</button>
           <button
             v-if="libSelCount()"
             class="lib-del-btn"
             :disabled="deletingLib"
             @click="deleteSelected"
-          >{{ deletingLib ? "删除中…" : `删除选中 ${libSelCount()} 项` }}</button>
+          >{{ deletingLib ? "删除中…" : `删除 ${libSelCount()} 项` }}</button>
+          <span class="ex-view">
+            <button class="ex-vbtn" :class="{ on: libMode.library === 'icons' }"
+                    title="图标" @click="libMode.library = 'icons'">▦</button>
+            <button class="ex-vbtn" :class="{ on: libMode.library === 'details' }"
+                    title="详细信息" @click="libMode.library = 'details'">☰</button>
+          </span>
         </div>
         <div v-if="!libraryItems.length && !loadingLibrary" class="lib-empty">
           还没有画面素材。上传视频或图片后会出现在这里（音频在「音乐库」）。
         </div>
-        <div class="lib-grid">
-          <div
-            v-for="item in libraryItems"
-            :key="item.material_id"
-            class="lib-item"
-            :class="{ sel: libSelected[item.material_id] }"
-          >
-            <label class="lib-check" :title="libSelected[item.material_id] ? '已选中' : '点选删除'">
-              <input
-                type="checkbox"
-                :checked="!!libSelected[item.material_id]"
-                @change="toggleLibSel(item.material_id)"
-              />
-              <span></span>
-            </label>
-            <video v-if="item.kind === 'video'" :src="item.url" class="lib-thumb" preload="metadata" controls></video>
-            <img v-else-if="item.kind === 'image'" :src="item.url" class="lib-thumb" :alt="item.filename" />
-            <audio v-else-if="item.kind === 'audio'" :src="item.url" class="lib-aud" controls preload="none"></audio>
-            <div class="lib-meta">
-              <b>{{ kindIcon(item.kind) }} {{ item.filename }}</b>
-              <span>{{ fmtSize(item.bytes) }}<template v-if="item.duration"> · {{ Math.round(item.duration) }}s</template></span>
-            </div>
-            <button class="lib-add" @click="addFromLibrary(item)">加入本会话</button>
+        <!-- 文件夹这一层：只列类型，不把里面的素材一起摊开。 -->
+        <div v-else-if="!materialFolder" class="ex-flist">
+          <div v-for="f in materialFolders" :key="'mf-' + f.key" class="ex-frow"
+               @click="libPicked.library = f.key">
+            <span class="ex-fname">{{ f.label }}</span>
+            <span class="ex-fcount">{{ f.items.length }} 项</span>
           </div>
         </div>
+        <!-- 文件夹里面：只有这一层的东西，回上一级靠顶部那一行。 -->
+        <section v-else class="ex-main">
+            <div class="ex-back" @click="libPicked.library = ''">
+              <span class="ex-caret">←</span>
+              <span class="ex-fname">返回</span>
+              <span class="ex-fcount">{{ materialFolder.label }} · {{ materialFolder.items.length }} 项</span>
+            </div>
+            <!-- 图标：缩略图网格（挑素材主要看画面）。 -->
+            <div v-if="libMode.library === 'icons'" class="ex-grid">
+              <div v-for="item in materialFolder.items" :key="item.material_id"
+                   class="lib-item" :class="{ sel: libSelected[item.material_id] }">
+                <label class="lib-check" :title="libSelected[item.material_id] ? '已选中' : '点选删除'">
+                  <input type="checkbox" :checked="!!libSelected[item.material_id]"
+                         @change="toggleLibSel(item.material_id)" />
+                  <span></span>
+                </label>
+                <video v-if="item.kind === 'video'" :src="item.url" class="lib-thumb" preload="metadata"></video>
+                <img v-else-if="item.kind === 'image'" :src="item.url" class="lib-thumb" :alt="item.filename" />
+                <div v-else class="lib-thumb ex-thumb-ph">{{ mediaLabel(item.kind) }}</div>
+                <div class="lib-meta">
+                  <b :title="item.filename">{{ item.filename }}</b>
+                  <span>{{ mediaLabel(item.kind) }} · {{ fmtSize(item.bytes) }}<template
+                    v-if="item.duration"> · {{ Math.round(item.duration) }}s</template></span>
+                </div>
+                <audio v-if="item.kind === 'audio'" :src="item.url" class="lib-aud" controls preload="none"></audio>
+                <button class="help" @click="addFromLibrary(item)">加入本会话</button>
+              </div>
+            </div>
 
+            <!-- 详细信息：一张表，列跟资源管理器一样按「名称 / 类型 / 大小」。 -->
+            <table v-else class="ex-table">
+              <colgroup>
+                <col style="width:24px" /><col /><col style="width:56px" />
+                <col style="width:70px" /><col style="width:52px" /><col style="width:104px" />
+              </colgroup>
+              <thead>
+                <tr><th class="ex-thchk"></th><th>名称</th><th>类型</th><th>大小</th><th>时长</th><th></th></tr>
+              </thead>
+              <tbody>
+                <template v-for="item in materialFolder.items" :key="item.material_id">
+                <tr :class="{ sel: libSelected[item.material_id] }">
+                  <td class="ex-tdchk">
+                    <label class="tree-check" :title="libSelected[item.material_id] ? '已选中' : '点选删除'">
+                      <input type="checkbox" :checked="!!libSelected[item.material_id]"
+                             @change="toggleLibSel(item.material_id)" />
+                      <span></span>
+                    </label>
+                  </td>
+                  <td class="ex-name" :title="item.filename">
+                    <video v-if="item.kind === 'video'" :src="item.url" class="lib-thumb-xs" preload="metadata"></video>
+                    <img v-else-if="item.kind === 'image'" :src="item.url" class="lib-thumb-xs" :alt="item.filename" />
+                    <span class="ex-fname">{{ item.filename }}</span>
+                  </td>
+                  <td>{{ mediaLabel(item.kind) }}</td>
+                  <td>{{ fmtSize(item.bytes) }}</td>
+                  <td>{{ item.duration ? Math.round(item.duration) + "s" : "—" }}</td>
+                  <td class="ex-op">
+                    <button v-if="item.kind === 'audio' && item.url" class="help"
+                            @click="toggleLibPlaying('m:' + item.material_id)">
+                      {{ libPlaying === 'm:' + item.material_id ? "收起" : "试听" }}
+                    </button>
+                    <button class="help" @click="addFromLibrary(item)">加入本会话</button>
+                  </td>
+                </tr>
+                <!-- 播放器单占一行：详细视图的列都很窄，塞进任何一格都会把别的格子挤掉。 -->
+                <tr v-if="item.kind === 'audio' && libPlaying === 'm:' + item.material_id"
+                    class="ex-play-row">
+                  <td colspan="6"><audio :src="item.url" controls autoplay></audio></td>
+                </tr>
+                </template>
+              </tbody>
+            </table>
+        </section>
       </div>
 
-      <div v-if="activePanel === 'bgm'" class="library">
-        <div class="lib-head">
+      <div v-if="activePanel === 'bgm'" class="library ex-lib">
+        <div class="ex-bar">
           <span class="lib-count">音乐库 · {{ bgmImported.length }} 首</span>
           <button class="help" @click="loadBgmImported" :disabled="loadingBgmImported">
             {{ loadingBgmImported ? "刷新中…" : "刷新" }}
           </button>
-        </div>
-        <div v-if="bgmImported.length" class="lib-grid">
-          <div v-for="item in bgmImported" :key="item.material_id" class="lib-item">
-            <div class="lib-meta">
-              <b>🎵 {{ item.filename }}</b>
-              <span>{{ item.origin === "bgm" ? "曲库导入" : "本地上传" }} ·
-                {{ fmtSize(item.bytes) }}<template v-if="item.duration"> · {{ Math.round(item.duration) }}s</template></span>
-            </div>
-            <audio v-if="item.url" :src="item.url" class="lib-aud" controls preload="none"></audio>
-            <button class="lib-add" @click="addBgmImported(item)">加入本会话</button>
-            <button class="lib-del-btn" @click="deleteBgmImported(item)" :disabled="deletingBgm === item.material_id">
-              {{ deletingBgm === item.material_id ? "删除中…" : "删除" }}
+          <template v-if="bgmFolder === 'online'">
+            <input
+              v-model="bgmQuery"
+              class="bgm-search"
+              placeholder="搜歌名或歌手…"
+              @keydown.enter.prevent="loadBgm"
+            />
+            <button class="help" @click="loadBgm" :disabled="loadingBgm">
+              {{ loadingBgm ? "搜索中…" : "搜索" }}
             </button>
+          </template>
+          <span class="ex-view">
+            <button class="ex-vbtn" :class="{ on: libMode.bgm === 'icons' }"
+                    title="图标" @click="libMode.bgm = 'icons'">▦</button>
+            <button class="ex-vbtn" :class="{ on: libMode.bgm === 'details' }"
+                    title="详细信息" @click="libMode.bgm = 'details'">☰</button>
+          </span>
+        </div>
+        <!-- 文件夹这一层：已导入 / 在线搜索。 -->
+        <div v-if="!bgmFolder" class="ex-flist">
+          <div class="ex-frow" @click="libPicked.bgm = 'imported'">
+            <span class="ex-fname">已导入</span>
+            <span class="ex-fcount">{{ bgmImported.length }} 首</span>
+          </div>
+          <div class="ex-frow" @click="libPicked.bgm = 'online'">
+            <span class="ex-fname">在线搜索</span>
+            <span class="ex-fcount">{{ bgmItems.length }} 首</span>
           </div>
         </div>
-        <div v-else-if="!loadingBgmImported" class="lib-empty">
-          音乐库还没有音频。可以在下方搜索导入，或直接在对话里上传音频文件——它们都会出现在这里。
-        </div>
-        <div class="lib-divider"></div>
-        <div class="lib-head">
-          <span class="lib-count">{{ bgmHint || "在线搜索" }} · {{ bgmItems.length }} 首</span>
-          <input
-            v-model="bgmQuery"
-            class="bgm-search"
-            placeholder="搜歌名或歌手…"
-            @keydown.enter.prevent="loadBgm"
-          />
-          <button class="help" @click="loadBgm" :disabled="loadingBgm">
-            {{ loadingBgm ? "搜索中…" : "搜索" }}
-          </button>
-        </div>
-        <div v-if="bgmError" class="lib-empty bad">{{ bgmError }}</div>
-        <div v-if="!bgmItems.length && !loadingBgm && !bgmError" class="lib-empty">
-          输入歌名或歌手名搜索，搜到的歌可以试听、导入做配乐。
-        </div>
-        <div class="lib-grid">
-          <div v-for="item in bgmItems" :key="item.track_id + '|' + item.source" class="lib-item">
-            <div class="lib-meta">
-              <b>🎵 {{ item.name }}</b>
-              <span>{{ item.artist }} · {{ item.source }}</span>
+        <section v-else class="ex-main">
+            <div class="ex-back" @click="libPicked.bgm = ''">
+              <span class="ex-caret">←</span>
+              <span class="ex-fname">返回</span>
+              <span class="ex-fcount">{{ bgmFolder === 'online' ? '在线搜索' : '已导入' }} ·
+                {{ bgmFolder === 'online' ? bgmItems.length : bgmImported.length }} 首</span>
             </div>
-            <audio
-              v-if="bgmAudioUrl[item.track_id + '|' + item.source]"
-              :src="bgmAudioUrl[item.track_id + '|' + item.source]"
-              class="lib-aud" controls preload="none"
-            ></audio>
-            <button v-else class="lib-add" @click="playBgm(item)">试听</button>
-            <button class="lib-add" @click="useBgm(item)" :disabled="importingBgm === item.track_id">
-              {{ importingBgm === item.track_id ? "导入中…" : "导入并做配乐" }}
-            </button>
-          </div>
-        </div>
+            <!-- 已导入：音乐库里现有的音频。 -->
+            <template v-if="bgmFolder === 'imported'">
+              <div v-if="!bgmImported.length && !loadingBgmImported" class="lib-empty">
+                音乐库还没有音频。可以在「在线搜索」里导入，或直接在对话里上传音频文件——它们都会出现在这里。
+              </div>
+              <div v-else-if="libMode.bgm === 'icons'" class="ex-grid">
+                <div v-for="item in bgmImported" :key="item.material_id" class="lib-item ex-audio-card">
+                  <div class="lib-meta">
+                    <b :title="item.filename">{{ item.filename }}</b>
+                    <span>{{ item.origin === "bgm" ? "曲库导入" : "本地上传" }} ·
+                      {{ fmtSize(item.bytes) }}<template v-if="item.duration"> · {{ Math.round(item.duration) }}s</template></span>
+                  </div>
+                  <audio v-if="item.url" :src="item.url" class="lib-aud" controls preload="none"></audio>
+                  <div class="ex-card-btns">
+                    <button class="help" @click="addBgmImported(item)">加入本会话</button>
+                    <button class="help" :disabled="deletingBgm === item.material_id"
+                            @click="deleteBgmImported(item)">
+                      {{ deletingBgm === item.material_id ? "删除中…" : "删除" }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <table v-else class="ex-table">
+                <colgroup>
+                  <col /><col style="width:66px" /><col style="width:66px" />
+                  <col style="width:46px" /><col style="width:132px" />
+                </colgroup>
+                <thead>
+                  <tr><th>名称</th><th>来源</th><th>大小</th><th>时长</th><th></th></tr>
+                </thead>
+                <tbody>
+                  <template v-for="item in bgmImported" :key="item.material_id">
+                  <tr>
+                    <td class="ex-name" :title="item.filename">
+                      <span class="ex-fname">{{ item.filename }}</span>
+                    </td>
+                    <td>{{ item.origin === "bgm" ? "曲库导入" : "本地上传" }}</td>
+                    <td>{{ fmtSize(item.bytes) }}</td>
+                    <td>{{ item.duration ? Math.round(item.duration) + "s" : "—" }}</td>
+                    <td class="ex-op">
+                      <button v-if="item.url" class="help"
+                              @click="toggleLibPlaying('b:' + item.material_id)">
+                        {{ libPlaying === 'b:' + item.material_id ? "收起" : "试听" }}
+                      </button>
+                      <button class="help" @click="addBgmImported(item)">加入本会话</button>
+                      <button class="help" :disabled="deletingBgm === item.material_id"
+                              @click="deleteBgmImported(item)">
+                        {{ deletingBgm === item.material_id ? "删除中…" : "删除" }}
+                      </button>
+                    </td>
+                  </tr>
+                  <tr v-if="item.url && libPlaying === 'b:' + item.material_id" class="ex-play-row">
+                    <td colspan="5"><audio :src="item.url" controls autoplay></audio></td>
+                  </tr>
+                  </template>
+                </tbody>
+              </table>
+            </template>
+
+            <!-- 在线搜索：搜到的歌也按文件列。 -->
+            <template v-else>
+              <div v-if="bgmError" class="lib-empty bad">{{ bgmError }}</div>
+              <div v-else-if="!bgmItems.length && !loadingBgm" class="lib-empty">
+                <template v-if="bgmHint">{{ bgmHint }}</template>
+                <template v-else>输入歌名或歌手名搜索，搜到的歌可以试听、导入做配乐。</template>
+              </div>
+              <div v-else-if="libMode.bgm === 'icons'" class="ex-grid">
+                <div v-for="item in bgmItems" :key="item.track_id + '|' + item.source"
+                     class="lib-item ex-audio-card">
+                  <div class="lib-meta">
+                    <b :title="item.name">{{ item.name }}</b>
+                    <span>{{ item.artist }} · {{ item.source }}</span>
+                  </div>
+                  <audio
+                    v-if="bgmAudioUrl[item.track_id + '|' + item.source]"
+                    :src="bgmAudioUrl[item.track_id + '|' + item.source]"
+                    class="lib-aud" controls preload="none"
+                  ></audio>
+                  <div class="ex-card-btns">
+                    <button v-if="!bgmAudioUrl[item.track_id + '|' + item.source]" class="help"
+                            @click="playBgm(item)">试听</button>
+                    <button class="help" :disabled="importingBgm === item.track_id"
+                            @click="useBgm(item)">
+                      {{ importingBgm === item.track_id ? "导入中…" : "导入并做配乐" }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <table v-else class="ex-table">
+                <colgroup>
+                  <col /><col style="width:86px" /><col style="width:86px" /><col style="width:124px" />
+                </colgroup>
+                <thead>
+                  <tr><th>名称</th><th>歌手</th><th>来源</th><th></th></tr>
+                </thead>
+                <tbody>
+                  <template v-for="item in bgmItems" :key="item.track_id + '|' + item.source">
+                  <tr>
+                    <td class="ex-name">
+                      <span class="ex-fname" :title="item.name">{{ item.name }}</span>
+                    </td>
+                    <td>{{ item.artist }}</td>
+                    <td>{{ item.source }}</td>
+                    <td class="ex-op">
+                      <button class="help" @click="playBgmRow(item)">试听</button>
+                      <button class="help" :disabled="importingBgm === item.track_id"
+                              @click="useBgm(item)">
+                        {{ importingBgm === item.track_id ? "导入中…" : "做配乐" }}
+                      </button>
+                    </td>
+                  </tr>
+                  <tr v-if="bgmAudioUrl[item.track_id + '|' + item.source]
+                            && libPlaying === 'o:' + item.track_id + '|' + item.source"
+                      class="ex-play-row">
+                    <td colspan="4">
+                      <audio :src="bgmAudioUrl[item.track_id + '|' + item.source]"
+                             controls autoplay></audio>
+                    </td>
+                  </tr>
+                  </template>
+                </tbody>
+              </table>
+            </template>
+        </section>
       </div>
 
       <!-- 文字库：字幕样式与朗读音色。挑过的维度**只对这条对话**生效，其余仍归模型；
            开一册新卷就回到「交给模型自己定」。 -->
-      <div v-if="activePanel === 'textlib'" class="library">
-        <div class="lib-head">
+      <div v-if="activePanel === 'textlib'" class="library ex-lib">
+        <div class="ex-bar">
           <span class="lib-count">
             <template v-if="!active">先开一册卷（或点进一个会话）再挑</template>
             <template v-else-if="!hasPrefs">本对话还没挑过——字幕与声音都由模型定</template>
@@ -5889,11 +6398,28 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             </template>
           </span>
           <button v-if="hasPrefs" class="help" :disabled="!!savingPrefs" @click="clearPrefs">
-            {{ savingPrefs ? "恢复中…" : "恢复默认（交给模型决定）" }}
+            {{ savingPrefs ? "恢复中…" : "恢复默认" }}
           </button>
           <button class="help" @click="refreshTextLib" :disabled="loadingTextLib || loadingPreview">
             {{ (loadingTextLib || loadingPreview) ? "刷新中…" : "刷新" }}
           </button>
+          <!-- 语速只跟音色有关，所以只在音色那格里出现，别在挑字幕样式时占地方。 -->
+          <label class="tl-rate" v-if="textFolder && textFolder.kind === 'voice'" @click.stop>
+            <span>{{ dimTitle("rate") }}</span>
+            <select :value="convPrefs.rate ?? (textLib.dims || {}).rate?.default ?? ''"
+                    :disabled="!!savingPrefs"
+                    @change="pickDim('rate', $event.target.value)">
+              <option v-for="o in ((textLib.dims || {}).rate?.enum || [])" :key="o" :value="o">
+                {{ labelOf("rate", o) }}
+              </option>
+            </select>
+          </label>
+          <span class="ex-view">
+            <button class="ex-vbtn" :class="{ on: libMode.textlib === 'icons' }"
+                    title="图标" @click="libMode.textlib = 'icons'">▦</button>
+            <button class="ex-vbtn" :class="{ on: libMode.textlib === 'details' }"
+                    title="详细信息" @click="libMode.textlib = 'details'">☰</button>
+          </span>
         </div>
         <div v-if="textLibError" class="lib-empty bad">{{ textLibError }}</div>
         <div v-if="!libReady && loadingTextLib" class="lib-empty">正在取字幕样式与音色清单…</div>
@@ -5901,24 +6427,164 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           拿不到清单——剪辑服务还没连上时会这样。稍后点「刷新」重试。
         </div>
 
-        <template v-if="libReady">
-          <!-- 这一屏**左右两栏**：样张钉在左边（滚的时候不动），右边才是要挑的那些卡。
-               从前是一路竖着排下来——样张 440px 高，挑音色要先滚过它，而「看着样张挑」
-               恰恰是这个面板唯一的用法。抽屉拖窄了（放不下两栏）它自己折回上下的老样子。 -->
-          <div class="tl-body">
-            <div class="tl-rail">
-            <!-- 样张：先把「这一对渲出来长什么样」摆出来，再让人挑。
-                 图是渲染容器渲的真帧（同一张样片镜、同一件字幕元件，只换注入的两个样式名
-                 与强调色），不是前端照着档名画的示意图——示意图是第二份实现，它会与成片漂，
-                 而漂出来的样子恰恰是「看着对、渲出来不是」，正是这一块要治的病。
-                 一次只渲**一对**：下面两排各点一档，这里就换成那两档拼出来的样子。 -->
-            <div class="lib-head">
+        <!-- 文件夹这一层：每组预设（字幕样式 / 高亮样式…）、强调色、音色。 -->
+        <div v-else-if="!textFolder" class="ex-flist">
+          <div v-for="f in textFolders" :key="'tf-' + f.key" class="ex-frow"
+               @click="libPicked.textlib = f.key">
+            <span class="ex-fname">{{ f.label }}</span>
+            <span class="ex-fcount">{{ f.count }} 项</span>
+          </div>
+        </div>
+        <div v-else class="ex-body">
+          <section class="ex-main ex-main-text">
+            <div class="ex-back" @click="libPicked.textlib = ''">
+              <span class="ex-caret">←</span>
+              <span class="ex-fname">返回</span>
+              <span class="ex-fcount">{{ textFolder.label }} · {{ textFolder.count }} 项</span>
+            </div>
+            <!-- 预设档：点「看样张」只换右边那张图，点「用这一档」才写进本对话。 -->
+            <template v-if="textFolder.kind === 'preset'">
+              <div v-if="libMode.textlib === 'icons'" class="ex-grid">
+                <div v-for="p in presetsOf(textFolder.group)" :key="p.key"
+                     class="lib-item ex-card" :class="{ sel: presetOn(p) }">
+                  <span class="ex-cardmark">{{ presetOn(p) ? "✓"
+                    : ((shownOf(textFolder.group) || {}).key === p.key ? "◉" : "") }}</span>
+                  <div class="lib-meta">
+                    <b>{{ p.label }}</b>
+                    <span>{{ p.note }}</span>
+                  </div>
+                  <div class="ex-card-btns">
+                    <button class="help" @click="showPreset(p)">看样张</button>
+                    <button class="help" :disabled="!!savingPrefs" @click="pickPreset(p)">
+                      {{ presetOn(p) ? "已选（点击重设）" : "用这一档" }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <table v-else class="ex-table">
+                <colgroup>
+                  <col style="width:30%" /><col /><col style="width:58px" /><col style="width:128px" />
+                </colgroup>
+                <thead>
+                  <tr><th>名称</th><th>说明</th><th>状态</th><th></th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="p in presetsOf(textFolder.group)" :key="p.key"
+                      :class="{ sel: presetOn(p) }">
+                    <td class="ex-name"><span class="ex-fname">{{ p.label }}</span></td>
+                    <td class="ex-sub">{{ p.note }}</td>
+                    <td>{{ presetOn(p) ? "已选"
+                      : ((shownOf(textFolder.group) || {}).key === p.key ? "正在看" : "—") }}</td>
+                    <td class="ex-op">
+                      <button class="help" @click="showPreset(p)">看样张</button>
+                      <button class="help" :disabled="!!savingPrefs" @click="pickPreset(p)">
+                        {{ presetOn(p) ? "已选" : "用这一档" }}
+                      </button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </template>
+
+            <!-- 强调色：不钉＝跟色板走，钉住＝整条片子按这个色。 -->
+            <template v-else-if="textFolder.kind === 'color'">
+              <table class="ex-table">
+                <colgroup>
+                  <col style="width:92px" /><col /><col style="width:76px" /><col style="width:78px" />
+                </colgroup>
+                <thead>
+                  <tr><th>名称</th><th>说明</th><th>当前</th><th></th></tr>
+                </thead>
+                <tbody>
+                  <tr :class="{ sel: !previewColor }">
+                    <td class="ex-name"><span class="ex-fname">跟随色板</span></td>
+                    <td class="ex-sub">各镜用自己的那套色板</td>
+                    <td>{{ !previewColor ? "已选" : "—" }}</td>
+                    <td class="ex-op">
+                      <button class="help" :disabled="!!savingPrefs"
+                              @click="pickDim(textFolder.dim, null)">
+                        {{ !previewColor ? "已选" : "用这一档" }}
+                      </button>
+                    </td>
+                  </tr>
+                  <tr :class="{ sel: !!previewColor }">
+                    <td class="ex-name"><span class="ex-fname">钉一个颜色</span></td>
+                    <td class="ex-sub">整条片子的高亮词都用它（镜头代码里自己写的那一色也盖过）</td>
+                    <td>{{ previewColor || "—" }}</td>
+                    <td class="ex-op">
+                      <input type="color" class="tl-color-input" :value="previewColor || colorSeed"
+                             :disabled="!!savingPrefs"
+                             @change="pickDim(textFolder.dim, $event.target.value)" />
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </template>
+
+            <!-- 音色：一屏列出全部，组名进「类型」一列；语速在工具条上。 -->
+            <template v-else-if="textFolder.kind === 'voice'">
+              <div v-if="libMode.textlib === 'icons'" class="ex-grid">
+                <div v-for="v in voiceRows" :key="v.value" class="lib-item ex-card ex-audio-card"
+                     :class="{ sel: convPrefs.voice === v.value }">
+                  <span class="ex-cardmark">{{ convPrefs.voice === v.value ? "✓" : "" }}</span>
+                  <div class="lib-meta">
+                    <b>{{ v.label }}</b>
+                    <span>{{ v.group }} · {{ v.value }}</span>
+                  </div>
+                  <audio v-if="previewKey === vkey(v.value)" :src="voicePreviewUrls[vkey(v.value)]"
+                         class="lib-aud" controls autoplay></audio>
+                  <div class="ex-card-btns">
+                    <button class="help" :disabled="loadingVoice === v.value"
+                            @click="auditionVoice(v.value)">
+                      {{ loadingVoice === v.value ? "合成中…"
+                         : (previewKey === vkey(v.value) ? "重听" : "试听") }}
+                    </button>
+                    <button class="help" :disabled="!!savingPrefs" @click="pickDim('voice', v.value)">
+                      {{ convPrefs.voice === v.value ? "已选（点击重设）" : "用这个音色" }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <table v-else class="ex-table">
+                <colgroup>
+                  <col style="width:32%" /><col style="width:82px" /><col /><col style="width:146px" />
+                </colgroup>
+                <thead>
+                  <tr><th>名称</th><th>类型</th><th>音色 ID</th><th></th></tr>
+                </thead>
+                <tbody>
+                  <template v-for="v in voiceRows" :key="v.value">
+                  <tr :class="{ sel: convPrefs.voice === v.value }">
+                    <td class="ex-name"><span class="ex-fname">{{ v.label }}</span></td>
+                    <td>{{ v.group }}</td>
+                    <td class="ex-mono">{{ v.value }}</td>
+                    <td class="ex-op">
+                      <button class="help" :disabled="loadingVoice === v.value"
+                              @click="auditionVoice(v.value)">
+                        {{ loadingVoice === v.value ? "合成中…"
+                           : (previewKey === vkey(v.value) ? "重听" : "试听") }}
+                      </button>
+                      <button class="help" :disabled="!!savingPrefs" @click="pickDim('voice', v.value)">
+                        {{ convPrefs.voice === v.value ? "已选" : "用这个音色" }}
+                      </button>
+                    </td>
+                  </tr>
+                  <tr v-if="previewKey === vkey(v.value) && voicePreviewUrls[vkey(v.value)]"
+                      class="ex-play-row">
+                    <td colspan="4"><audio :src="voicePreviewUrls[vkey(v.value)]" controls autoplay></audio></td>
+                  </tr>
+                  </template>
+                </tbody>
+              </table>
+            </template>
+          </section>
+
+          <!-- 预览窗格（资源管理器右边那一栏）：图是渲染容器渲的真帧，只换注入的那几个
+               样式名与强调色；不是前端照着档名画的示意图——示意图会和成片漂。 -->
+          <aside v-if="drawerW >= 760" class="ex-preview">
+            <div class="ex-prev-head">
               <b>字幕样张</b>
-              <span class="lib-count">
-                <template v-if="previewPairLabel">正看：{{ previewPairLabel }}</template>
-                两排各点一档的说明即换样张；这里只看不选，要生效仍按下面卡片点头。
-                底是一块空白（只留一层明暗，好看对比度）——画面由镜头代码自由画，不在这里挑
-              </span>
+              <span v-if="previewPairLabel">正看：{{ previewPairLabel }}</span>
             </div>
             <div class="tl-preview">
               <img v-if="previewUrl" class="tl-shot" :src="previewUrl"
@@ -5926,101 +6592,16 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               <div v-else class="tl-shot tl-shot-empty">
                 <template v-if="loadingPreview">正在渲样张…（同一对只渲这一次，之后走缓存）</template>
                 <template v-else-if="previewErr">{{ previewErr }}</template>
-                <template v-else-if="previewAsked">这一对这次没渲出来——换一档看，或点右上「刷新」重来</template>
-                <template v-else>点下面任一档即可看到它在真实渲染下的样子</template>
+                <template v-else-if="previewAsked">这一对这次没渲出来——换一档看，或点「刷新」重来</template>
+                <template v-else>点任一档的「看样张」即可看到它在真实渲染下的样子</template>
               </div>
             </div>
-            </div>
-            <div class="tl-cols">
-            <!-- 两排卡：字幕样式 × 高亮样式。排数、栏名、取值全部按契约现取——两维正交，
-                 挑哪一档只写它自己那一维，另一维原样留着。 -->
-            <template v-for="g in presetGroups" :key="g">
-              <div class="lib-divider"></div>
-              <div class="lib-head">
-                <b>{{ dimTitle(g) }}</b>
-                <span class="lib-count">挑一档＝整片默认；某一镜要单独换，仍到计划里改它自己的那一份</span>
-              </div>
-              <div class="lib-grid">
-                <div v-for="p in presetsOf(g)" :key="p.key" class="lib-item"
-                     :class="{ sel: presetOn(p) }">
-                  <div class="lib-meta tl-meta-pick"
-                       :class="{ on: (shownOf(g) || {}).key === p.key }"
-                       @click="showPreset(p)">
-                    <b>{{ p.label }}</b>
-                    <span>{{ p.note }}</span>
-                  </div>
-                  <button class="lib-add" :disabled="!!savingPrefs" @click="pickPreset(p)">
-                    {{ presetOn(p) ? "已选（点击重设）" : "用这一档" }}
-                  </button>
-                </div>
-              </div>
-            </template>
-
-            <!-- 自由取色那一维（高亮词的颜色）：不钉＝跟色板走，钉住＝整条片子按这个色。
-                 键名与栏名照旧从契约现取——上面两排卡是「一排档」，这一维是一条颜色，
-                 形状由契约里的 `kind` 说了算，面板不猜。 -->
-            <template v-for="dim in colorDims" :key="dim">
-              <div class="lib-divider"></div>
-              <div class="lib-head">
-                <b>{{ dimTitle(dim) }}</b>
-                <span class="lib-count">高亮词那一块用哪个色。不钉＝各镜跟自己那套色板；
-                  钉住＝整条片子的高亮词都用这个色（镜头代码里自己写的那一色也盖过）</span>
-              </div>
-              <div class="tl-color">
-                <button class="tl-color-btn" :class="{ sel: !previewColor }"
-                        :disabled="!!savingPrefs" @click="pickDim(dim, null)">
-                  跟随色板
-                </button>
-                <label class="tl-color-pick" :class="{ sel: !!previewColor }">
-                  <input type="color" :value="previewColor || colorSeed"
-                         :disabled="!!savingPrefs"
-                         @change="pickDim(dim, $event.target.value)" />
-                  <span class="tl-color-val">{{ previewColor || "跟色板走" }}</span>
-                </label>
-              </div>
-            </template>
-
-            <div class="lib-divider"></div>
-            <div class="lib-head">
-              <b>{{ dimTitle("voice") }}</b>
-              <label class="tl-rate">
-                <span>{{ dimTitle("rate") }}</span>
-                <select :value="convPrefs.rate ?? (textLib.dims || {}).rate?.default ?? ''"
-                        :disabled="!!savingPrefs"
-                        @change="pickDim('rate', $event.target.value)">
-                  <option v-for="o in ((textLib.dims || {}).rate?.enum || [])" :key="o" :value="o">
-                    {{ labelOf("rate", o) }}
-                  </option>
-                </select>
-              </label>
-              <span class="lib-count">点「试听」会用这个音色读一句固定的话</span>
-            </div>
-            <div v-for="g in (textLib.voice_groups || [])" :key="g.key" class="tl-group">
-              <div class="tl-group-label">{{ g.label }}</div>
-              <div class="lib-grid">
-                <div v-for="v in (g.items || [])" :key="v.value" class="lib-item"
-                     :class="{ sel: convPrefs.voice === v.value }">
-                  <div class="lib-meta">
-                    <b>{{ v.label }}</b>
-                    <span>{{ v.value }}</span>
-                  </div>
-                  <audio v-if="previewKey === vkey(v.value)"
-                         :src="voicePreviewUrls[vkey(v.value)]"
-                         class="lib-aud" controls autoplay></audio>
-                  <button class="lib-add" :disabled="loadingVoice === v.value"
-                          @click="auditionVoice(v.value)">
-                    {{ loadingVoice === v.value ? "合成中…"
-                       : (previewKey === vkey(v.value) ? "重听" : "试听") }}
-                  </button>
-                  <button class="lib-add" :disabled="!!savingPrefs" @click="pickDim('voice', v.value)">
-                    {{ convPrefs.voice === v.value ? "已选（点击重设）" : "用这个音色" }}
-                  </button>
-                </div>
-              </div>
-            </div>
-            </div>
-          </div>
-        </template>
+            <p class="ex-prev-note">
+              点档名或「看样张」只换这张图；要生效仍按「用这一档」。
+              底是一块空白（只留一层明暗，好看对比度）——画面由镜头代码自由画，不在这里挑。
+            </p>
+          </aside>
+        </div>
       </div>
 
       <!-- 设置：模型密钥与配额。画面风格不在这里——对话里说一句就行，
@@ -6999,13 +7580,18 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 .st-ok { color: var(--vermilion); }
 .st-task { color: var(--ink-soft); padding-left: 22px; }
 
-/* 落笔栏 */
+/* 落笔栏：按钮一整行在上，输入框整行在下。
+   按钮挤在输入框左边时，长句的换行宽度只剩一半多；分开以后输入框独占一行。 */
 .composer {
-  display: flex; gap: 12px; align-items: flex-end; padding: 14px 34px 24px;
+  display: flex; flex-direction: column; gap: 10px; align-items: stretch;
+  padding: 14px 34px 24px;
   border-top: 1px solid var(--line); background: linear-gradient(180deg, transparent, rgba(239, 231, 214, 0.5));
 }
+.composer-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.composer-row { display: flex; gap: 12px; align-items: flex-end; }
 .composer textarea {
-  flex: 1; resize: none; max-height: 160px; padding: 12px 16px;
+  flex: 1; min-width: 0; resize: none; max-height: 240px; overflow-y: auto;
+  padding: 12px 16px;
   font-family: var(--sans); font-size: 14.5px; line-height: 1.7; color: var(--ink);
   background: rgba(255, 253, 247, 0.9); border: 1px solid var(--line); border-radius: 4px;
   outline: none; transition: border 0.2s;
@@ -7182,6 +7768,22 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 .lib-empty {
   padding: 24px 0; text-align: center; color: var(--ink-soft);
   font-family: var(--serif); font-size: 13px; letter-spacing: 2px;
+}
+/* 技能文件夹拖放区：虚线框 + 拖到上面才变实。它同时是「能拖」的唯一提示——
+   没有这块，用户不会想到技能可以整包拖进来。 */
+.skill-drop {
+  margin: 6px 0 10px; padding: 14px 10px; border: 1px dashed var(--line);
+  border-radius: 6px; text-align: center; color: var(--ink-soft);
+  font-family: var(--serif); font-size: 12px; letter-spacing: 1px;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.skill-drop.over {
+  border-color: var(--accent, #8a6a3a); color: var(--ink);
+  background: rgba(138, 106, 58, .08);
+}
+.skill-kind {
+  padding: 1px 6px; border: 1px solid var(--line); border-radius: 3px;
+  font-size: 11px; color: var(--ink-soft);
 }
 .lib-divider {
   height: 1px; background: var(--line); margin: 8px 0 12px;
@@ -7673,6 +8275,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
   background: var(--paper); font-size: 12px; cursor: pointer;
 }
 .pp-ver.on { border-color: var(--vermilion); color: var(--vermilion); font-weight: 600; }
+.pp-ver-style { font-style: normal; opacity: 0.7; font-size: 11px; }
 .pp-chain { display: flex; flex-direction: column; gap: 0; }
 .pp-step {
   padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
@@ -8117,32 +8720,189 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 .tool-drawer {
   display: flex; flex-direction: column; flex: 1; min-height: 0;
 }
-.td-split { display: flex; flex: 1; min-height: 0; }
-.td-cats {
-  width: 138px; flex: none; border-right: 1px solid var(--line);
-  padding: 10px 8px; display: flex; flex-direction: column; gap: 6px;
-  background: rgba(246, 248, 250, 0.55); overflow-y: auto;
-}
+/* 工具库一次只显示一层：根目录 → 分类 / 技能类型 / 服务 → 里面。
+   没有常驻左栏，`.td-detail` 就是整块内容区。 */
 .td-detail { flex: 1; min-width: 0; overflow-y: auto; padding: 10px 12px; }
-.cat-row {
-  border: 1px solid var(--line); border-radius: 8px;
-  padding: 8px; cursor: pointer; background: rgba(200, 64, 31, 0.05);
-  display: flex; flex-direction: column; gap: 3px;
-  transition: background .15s, border-color .15s;
+
+/* 文件夹树：技能包 → 包内文件；工具 → 分类；MCP → 服务 → 工具。
+   缩进用行内 padding-left（层级深度在脚本里算好），这里只管一行长什么样。 */
+.tree-note {
+  font-size: 12px; color: #656d76; line-height: 1.75; margin: 2px 0 10px;
 }
-.cat-row:hover { border-color: var(--vermilion-deep, #c8401f); background: rgba(200, 64, 31, 0.12); }
-.cat-row.active {
-  background: rgba(200, 64, 31, 0.10); border-color: var(--vermilion-deep, #c8401f);
-  box-shadow: inset 3px 0 0 var(--vermilion-deep, #c8401f);
+.tree-note code {
+  font-family: ui-monospace, monospace; font-size: 11.5px;
+  background: rgba(246, 248, 250, .9); padding: 0 3px; border-radius: 3px;
 }
-.cat-row.active b { color: var(--vermilion-deep, #c8401f); }
-.cat-top { display: flex; align-items: center; justify-content: space-between; gap: 4px; }
-.cat-top b { font-size: 13.5px; }
-.cat-count { color: var(--ink-soft, #6e7781); font-size: 12px; }
-.td-cats .cat-desc { display: none; }
-.cat-row b { font-size: 15px; }
-.cat-count { color: var(--ink-soft, #6e7781); font-size: 13px; white-space: nowrap; }
-.cat-desc { color: #656d76; font-size: 12px; flex: 1; }
-.cat-back { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-.cat-back b { font-size: 15px; }
+.tree-node { margin-bottom: 2px; }
+.tree-row {
+  display: flex; align-items: center; gap: 6px; min-height: 27px;
+  padding: 3px 5px; border-radius: 4px; cursor: pointer; overflow: hidden;
+}
+.tree-row:hover { background: rgba(200, 64, 31, .07); }
+.tree-row.file { color: var(--ink-soft); }
+.tree-row.file:hover { background: rgba(200, 64, 31, .05); }
+.tree-caret {
+  width: 12px; flex: none; text-align: center; font-size: 11px;
+  color: var(--vermilion-deep, #c8401f); opacity: .8;
+}
+.tree-name {
+  font-family: var(--serif); font-size: 13px; color: var(--ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: none; max-width: 46%;
+}
+.tree-row.file .tree-name { font-weight: 400; }
+.tree-sub {
+  font-size: 11.5px; color: #8a9099; min-width: 0; flex: 1;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tree-count { margin-left: auto; flex: none; font-size: 11px; color: #8a9099; white-space: nowrap; }
+.tree-actions { display: flex; gap: 4px; flex: none; }
+.tree-actions .help { padding: 0 5px; font-size: 11px; }
+/* 四个库共用同一副骨架：素材 / 音乐 / 文字库的列表也是「文件夹 → 叶子」的行。 */
+.lib-tree { display: flex; flex-direction: column; gap: 1px; }
+.tree-row.d1 { padding-left: 18px; }
+.tree-row.d2 { padding-left: 32px; }
+.tree-row.sel { background: rgba(200, 64, 31, .08); }
+.tree-row.sel .tree-name { color: var(--vermilion-deep, #c8401f); }
+/* 行里塞得下播放器与按钮时排一行；塞不下（音频行）就换到第二行，别把按钮挤没。 */
+.tree-row.wrap { flex-wrap: wrap; }
+.tree-row.wrap .lib-aud-xs {
+  flex: 1 0 100%; width: auto; margin: 2px 0 4px 24px;
+}
+.tree-check {
+  position: relative; width: 14px; height: 14px; flex: none;
+  cursor: pointer; display: block;
+}
+.tree-check input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.tree-check span {
+  display: block; width: 14px; height: 14px; border-radius: 3px;
+  border: 1px solid var(--line); background: #fffdf7;
+}
+.tree-check input:checked + span { background: var(--vermilion); border-color: var(--vermilion); }
+.tree-check input:checked + span::after {
+  content: "✓"; display: grid; place-items: center; height: 100%;
+  color: #fff8ec; font-size: 10px;
+}
+.lib-thumb-xs {
+  width: 44px; height: 28px; flex: none; object-fit: cover;
+  border-radius: 3px; background: #16130f;
+}
+.lib-aud-xs { width: 168px; height: 28px; flex: none; }
+/* 文件夹标题上的搜索框：标题/按钮都不缩，只让输入框吃剩下的宽度。 */
+.tree-row .bgm-search { flex: 1 1 70px; min-width: 60px; height: 22px; }
+.tree-row .tree-count { flex: none; }
+.tl-color-input {
+  width: 26px; height: 20px; padding: 0; border: 1px solid var(--line);
+  border-radius: 3px; background: transparent; cursor: pointer;
+}
+
+/* —— 四个库共用的「资源管理器」排法：顶部工具条 / 左文件夹 / 右内容。
+   文字库多一栏预览（资源管理器右边那块「预览窗格」），窄抽屉里自己收起来。 —— */
+.drawer .library.ex-lib { display: flex; flex-direction: column; overflow: hidden; }
+.ex-bar {
+  display: flex; align-items: center; gap: 8px; flex: none; min-width: 0;
+  padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid var(--line);
+}
+.ex-bar .lib-count { flex: none; }
+.ex-bar > .help { flex: none; }
+.ex-bar .bgm-search { flex: 1 1 140px; min-width: 90px; height: 24px; }
+.ex-view { margin-left: auto; display: flex; gap: 2px; flex: none; }
+.ex-vbtn {
+  width: 24px; height: 22px; border: 1px solid var(--line); border-radius: 3px;
+  background: transparent; color: var(--ink-soft); font-size: 12px; line-height: 1;
+  cursor: pointer; display: grid; place-items: center;
+}
+.ex-vbtn.on {
+  border-color: var(--vermilion); color: var(--vermilion-deep, #c8401f);
+  background: rgba(200, 64, 31, .07);
+}
+.ex-body { display: flex; flex: 1; min-height: 0; }
+/* 文件夹这一层：整块宽度都给文件夹行，不跟子级同屏。 */
+.ex-flist { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 0; }
+.ex-frow {
+  display: flex; align-items: center; gap: 8px; min-height: 30px;
+  padding: 4px 8px; border-radius: 4px; cursor: pointer;
+  font-family: var(--serif); font-size: 13px; color: var(--ink);
+}
+.ex-frow:hover { background: rgba(200, 64, 31, .07); }
+.ex-frow .ex-fname { flex: 1; font-weight: 600; }
+/* 进到文件夹里面：顶上只有一行「返回」，父级不再出现在旁边。 */
+.ex-back {
+  display: flex; align-items: center; gap: 6px; min-height: 27px;
+  padding: 3px 6px; margin-bottom: 4px; border-radius: 4px; cursor: pointer;
+  border-bottom: 1px solid var(--line); font-family: var(--serif); font-size: 12.5px;
+  color: var(--ink);
+}
+.ex-back:hover { background: rgba(200, 64, 31, .06); }
+.ex-back .ex-fname { flex: none; }
+.ex-back .ex-fcount { margin-left: auto; }
+.ex-caret { flex: none; font-size: 11px; color: var(--vermilion-deep, #c8401f); }
+.ex-fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ex-fcount { flex: none; font-size: 11px; color: #8a9099; }
+.ex-main { flex: 1; min-width: 0; overflow: auto; padding-bottom: 4px; }
+/* 文字库那一屏右边还有预览窗格：左边内容区自己再成一列。 */
+.ex-main-text { display: flex; flex-direction: column; }
+.ex-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+/* 详细视图：列跟资源管理器一样（名称 / 类型 / 大小 / 时长）。表头钉在滚动区顶上。 */
+/* `table-layout: fixed` + 每张表的 colgroup：抽屉就那么宽，让浏览器按列宽排，
+   否则「说明」那种长句会把操作列顶出可视区（第一版就是这样，按钮被裁在右边界外）。 */
+.ex-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; color: var(--ink-soft); }
+.ex-table th {
+  position: sticky; top: 0; z-index: 1; text-align: left; white-space: nowrap;
+  font-weight: 500; font-size: 11px; letter-spacing: 1px; color: #8a9099;
+  padding: 5px 6px; border-bottom: 1px solid var(--line); background: #fdfaf2;
+}
+.ex-table td { padding: 5px 6px; border-bottom: 1px solid rgba(233, 226, 210, .55); vertical-align: middle; }
+.ex-table tr:hover td { background: rgba(200, 64, 31, .04); }
+.ex-table tr.sel td { background: rgba(200, 64, 31, .07); }
+/* 注意：td 上**不能**改 display（flex/block 会让它脱离表格格子，整行错位——
+   第一版就是这样：说明掉到下一行、状态另起一行）。缩略图与名字用 inline-block 对齐。 */
+.ex-table .ex-name { white-space: nowrap; }
+.ex-table .ex-name > * { vertical-align: middle; }
+.ex-table .ex-name .ex-fname {
+  display: inline-block; max-width: calc(100% - 28px); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  color: var(--ink); font-family: var(--serif); font-size: 12.5px;
+}
+.ex-table .ex-name .lib-thumb-xs { margin-right: 4px; }
+.ex-table .ex-name .lib-thumb-xs + .ex-fname { max-width: calc(100% - 52px); }
+.ex-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ex-mono { font-family: ui-monospace, monospace; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ex-op { text-align: right; white-space: nowrap; }
+.ex-op .help { margin-left: 3px; padding: 0 5px; font-size: 11px; }
+.ex-thchk, .ex-tdchk { width: 22px; }
+/* 试听播放器单占一行，横跨整张表：详细视图的列都窄，塞进哪一格都会挤掉别的。 */
+.ex-play-row td { padding: 4px 6px 8px; background: rgba(200, 64, 31, .03); }
+.ex-play-row audio { width: 100%; height: 30px; display: block; }
+/* 非图片素材在网格里没有缩略图：用一块同高的深色底写类型，别用图标凑。 */
+.ex-thumb-ph {
+  display: flex; align-items: center; justify-content: center;
+  color: #b9b1a3; font-family: var(--serif); font-size: 12px; letter-spacing: 3px;
+}
+.ex-card { position: relative; }
+.ex-cardmark {
+  position: absolute; top: 6px; right: 8px; font-size: 11px;
+  color: var(--vermilion-deep, #c8401f);
+}
+.ex-card .lib-meta span { line-height: 1.5; }
+.ex-card-btns { display: flex; gap: 4px; flex-wrap: wrap; }
+.ex-card-btns .help { flex: 1 1 auto; padding: 3px 6px; font-size: 11px; }
+.ex-audio-card .lib-aud { height: 30px; }
+/* 预览窗格：固定右栏，不参与内容滚动。 */
+.ex-preview {
+  flex: 0 0 240px; width: 240px; overflow-y: auto;
+  border-left: 1px solid var(--line); margin-left: 10px; padding-left: 10px;
+}
+.ex-prev-head { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
+.ex-prev-head b { font-family: var(--serif); font-size: 13px; letter-spacing: 1px; }
+.ex-prev-head span { font-size: 11px; color: var(--ink-soft); }
+.ex-preview .tl-shot { max-height: 380px; width: 100%; object-fit: contain; }
+.ex-preview .tl-shot-empty { width: 100%; height: 300px; }
+.ex-prev-note { margin: 8px 0 0; font-size: 11px; line-height: 1.7; color: var(--ink-soft); }
+.tool-drawer.drop-on { outline: 2px dashed var(--accent, #8a6a3a); outline-offset: -6px; }
+.file-pre {
+  max-height: 56vh; overflow: auto; margin: 6px 0 0; padding: 10px;
+  background: rgba(246, 248, 250, .85); border: 1px solid var(--line); border-radius: 4px;
+  font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+}
+.file-img { max-width: 100%; max-height: 52vh; display: block; margin: 0 auto 8px; border-radius: 4px; }
 </style>

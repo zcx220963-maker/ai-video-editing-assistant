@@ -79,11 +79,70 @@
 
   `progress` 从 0 到 1 就是「线一点点长出来」。要一个点在线上走，用
   `getPointAtLength(d, progress * getLength(d))`。
+- **真数据图不要自己算贝塞尔**，用 `d3-shape` + `d3-scale`（2026-10-23 起可用）：
+
+  ```tsx
+  import { line, area, pie, arc, curveBasis } from 'd3-shape';
+  import { scaleLinear } from 'd3-scale';
+  const x = scaleLinear().domain([0, 1]).range([W * 0.1, W * 0.9]);
+  const y = scaleLinear().domain([0, max]).range([H * 0.75, H * 0.25]);
+  const d = line().x((p) => x(p.t)).y((p) => y(p.v)).curve(curveBasis)(data) ?? '';
+  ```
+
+  `line` / `area` / `pie` / `arc` 都返回路径字符串，直接喂 `<path d={d}>`。
+  刻度、对数轴、band 轴（等距柱子）全在 `d3-scale` 里，不要手写分段。
+- **两条路径之间形变**用 `d3-interpolate-path`（同点数）或 `flubber`（任意形状）：
+
+  ```tsx
+  import { interpolatePath } from 'd3-interpolate-path';
+  import { interpolate as morph } from 'flubber';
+  const d = interpolatePath(progress, pathA, pathB);       // 点数相同
+  const d2 = morph(pathA, pathB)(progress);                 // 任意轮廓
+  ```
+
+  手写形变会在两点数不一致时直接崩，这两件是唯一干净的解法。
+- **图标不要自己画**：`lucide-react` 有 1400+ 个，纯 SVG 组件、可树摇：
+
+  ```tsx
+  import { Sun, ArrowRight, Activity, TrendingUp } from 'lucide-react';
+  <Sun size={120} color="#ffb15c" strokeWidth={1.6} />
+  ```
+
+  `size` 是像素。`color` 走 `currentColor`，`strokeWidth` 控制线粗。
+- **配色推导不要手算 RGB**：`chroma-js` 做明度、混合、对比度：
+
+  ```tsx
+  import chroma from 'chroma-js';
+  const dim = chroma('#ffb15c').darken(0.6).hex();
+  const mix = chroma.mix('#0b1020', '#c4611f', 0.4).hex();
+  ```
 - 基础形状（圆、矩形、星、多边形）用 `@remotion/shapes`，它们返回 `path`，可以接
   `strokeDasharray` 做描线。
 - 手绘感叠一层 `roughjs`：`rough.generator()` 的每个 shape 给固定 `seed`；
   `rough.svg(el)` 产出的节点直接塞进 SVG。
 - 柱状图从基线长：`scaleY` 的锚点用 `transformOrigin: 'bottom'`，或直接算高度。
+
+## 4.5 转场
+
+`@remotion/transitions` 与 `remotion` 同版本（2026-10-23 起可用）。**整片是硬切时不要用**；
+镜与镜之间确实要叠的时候：
+
+```tsx
+import { TransitionSeries, linearTiming } from '@remotion/transitions';
+import { fade } from '@remotion/transitions/fade';
+import { slide } from '@remotion/transitions/slide';
+import { wipe } from '@remotion/transitions/wipe';
+
+<TransitionSeries>
+  <TransitionSeries.Sequence durationInFrames={90}><ShotA /></TransitionSeries.Sequence>
+  <TransitionSeries.Transition presentation={fade()} timing={linearTiming({ durationInFrames: 15 })} />
+  <TransitionSeries.Sequence durationInFrames={90}><ShotB /></TransitionSeries.Sequence>
+</TransitionSeries>
+```
+
+`presentation` 可用：`fade()` / `slide({ direction })` / `wipe({ direction })` / `flip()` /
+`clockWipe({ width, height })`。**注意**：转场会让前后两镜的时间重叠，整片总长会变短
+（两段各 90 帧 + 15 帧转场 = 165 帧，不是 180）——分镜给的时长要按重叠后的实际值算。
 
 ## 5 三维
 

@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -27,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 from . import cost as cost_mod
 from . import judge as judge_mod
-from . import style_templates
 from .ask_gate import (looks_like_asking_user, looks_like_plan_invite,
                        no_popup_note, plan_card_nudge, popup_nudge)
 from .checkpoint import Checkpoint, CheckpointManager
@@ -139,7 +139,14 @@ _MAX_STALL_RESCUES = 1
 # 第二条闸按参数计次，兜的是「每次结果略有不同但同参重复到这个数目」那类抖动型打转。
 _MAX_SAME_RESULT_REPEATS = 2   # 同参同结果最多真跑 2 次，第 3 次不再打后端
 _MAX_SAME_ARGS_ATTEMPTS = 5    # 同参（结果在变，可能有进展）最多真跑 5 次
-_MAX_REFUSALS_BEFORE_FAILURE = 2   # 同样的事实告过两次还照打 → 改记真失败，让老守卫接手
+_MAX_REFUSALS_BEFORE_FAILURE = 2
+
+#: **滑动窗口**防循环（2026-10-23）。上面两道闸都只数**连续**相同的调用，于是
+#: 「在两个变体之间交替」永远撞不到上限。真机 run（09:34-09:42）：`pip install X`
+#: 被工具拒绝后，模型交替着重试不同写法，200 轮打满、1541 万 token、¥1.13，零产出。
+#: 这里按「最近 N 次工具调用里，同一签名出现过几次」记，与连不连续无关。
+_REPEAT_WINDOW = 16              # 看最近这么多次工具调用
+_REPEAT_WINDOW_LIMIT = 5         # 同一签名在窗口里出现这么多次就拦   # 同样的事实告过两次还照打 → 改记真失败，让老守卫接手
 
 # ---- 读卡上限（家族级熔断）----
 #
@@ -235,10 +242,36 @@ _MAX_SKILL_READS_HARD = 20
 # 路径堵死（「堵死比白烧更坏」）。
 #
 # 取值：规划侧真需要的只有预注入的默认集（≈25 KB，不走工具、不计入）+ 色板那类
-# 整片字段（≈11 KB）+ 一两份流程附件。软线 80 KB 过线提醒一句，硬线 110 KB 起不再
-# 放新内容，回执直接点名「用已经读到的开工」。
-_MAX_SKILL_BYTES = 80_000
-_MAX_SKILL_BYTES_HARD = 110_000
+# 整片字段（≈11 KB）+ 一两份流程附件。
+#
+# **2026-10-24 重算：跟着模型窗口走，不再写死。**
+#
+# 原来那组 80/110 KB 是按 **128K 上下文**校准的（170 KB 技能材料 → prompt 19.5 万 token
+# → 供应商掐连接）。但这条链的模型窗口现在是 **1M token**——`compress.DEFAULT_FOLD_AT_BYTES`
+# 早就按 1M 校准过了（1 token ≈ 2.7 字节，1 MB 工具结果 ≈ 37 万 token）。
+# 110 KB ≈ 4 万 token，只有窗口的 4%——在「手册还没读完」的位置就把路封掉，
+# 用户看到的是「读不完整还花钱」。
+#
+# 现在按折叠闸的比例算：技能材料最多占折叠线的 **50% / 70%**
+# （500 KB / 700 KB ≈ 18.5 万 / 26 万 token），剩下的留给模型自己写的代码
+# （真机一条约 67 万字节 ≈ 25 万 token）与历史。
+# 折叠线本身随模型窗口变，所以这两个数也会跟着变，不用再手改。
+#
+# 想自己定：环境变量 `SKILL_BYTES_SOFT` / `SKILL_BYTES_HARD`（单位 KB）。
+def _env_kb(name: str, default_kb: int) -> int:
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return default_kb * 1000
+    try:
+        return max(0, int(float(raw))) * 1000
+    except ValueError:
+        return default_kb * 1000
+
+
+_MAX_SKILL_BYTES = _env_kb("SKILL_BYTES_SOFT",
+                           int(DEFAULT_FOLD_AT_BYTES * 0.5) // 1000)
+_MAX_SKILL_BYTES_HARD = _env_kb("SKILL_BYTES_HARD",
+                                int(DEFAULT_FOLD_AT_BYTES * 0.7) // 1000)
 
 # ---- 流式调用断线的重发 ----
 #
@@ -681,6 +714,15 @@ _EDIT_TOOLS = frozenset({"edit_file"})
 #: 成功但重复也算「不推进」的工具。轮询（`render_status`）不在其中：
 #: 同参同结果的轮询是等在途任务，不是打转。
 _REPEAT_TOOLS = _WRITE_TOOLS | _EDIT_TOOLS
+
+#: 不按「重复」拦的工具：联网检索。
+#:
+#: 2026-10-22 真机 run `1b0170119f18`：同一个查询连打 6 次，每次都被 `_blocked_repeat`
+#: 拒掉；这些拒绝本身以 `Error:` 开头，又被 `_stuck_rounds` 数成「没有进展」，6 轮之后
+#: 整条 run 在规划轮被判打转停下——一分钱没换来一份计划。检索本来就是「搜到就算数」：
+#: 要不要换词、搜到什么时候够，是模型的判断，服务端不替它封路（§2.2）。多跑一次检索
+#: 只多花一次搜索费，按「堵死比白烧更坏」选放行。
+_REPEAT_EXEMPT_TOOLS = frozenset({"web_search"})
 
 #: motion 流程里**不发给主对话**的文件工具。
 #:
@@ -2655,7 +2697,22 @@ class AgentOnceRun:
                 f"或者直接告诉用户卡在哪、给个方案（规划轮就调用 submit_plan）。")
 
         def _blocked_repeat(tc: ToolCall) -> ToolError | None:
+            # ---- 滑动窗口记账（2026-10-23）。每一趟都记，连放行的工具也算——
+            # 否则窗口里少记一次，「最近 N 次」就不是最近 N 次了。
+            # 存在 ctx.extras 里（与 _repeat_tracker 同寿），跨迭代不丢。
+            _seq = ctx.extras.setdefault("_call_seq", [0])
+            _seq[0] += 1
+            _wst = repeats.setdefault(
+                _repeat_key(tc.name, tc.arguments),
+                {"n": 0, "same": 0, "last": "", "refused": 0, "hist": []})
+            _hist = _wst.setdefault("hist", [])
+            _hist.append(_seq[0])
+            del _hist[:-_REPEAT_WINDOW]
+            _wst["w"] = len(_hist)
             """这一枪是不是无进展的重复。命中就根本不打后端，只回喂事实。"""
+            # 检索类一律放行：搜到就算数，不替模型判断「这个词搜过没有」。
+            if tc.name in _REPEAT_EXEMPT_TOOLS:
+                return None
             if str(tc.id) in dup_ids:
                 return ToolError(
                     tc.name,
@@ -2693,6 +2750,17 @@ class AgentOnceRun:
                     f"每次返回的结果**逐字相同**，这次不再执行。"
                     f"再打同一份请求不会得到任何新信息：换参数（换关键词、换节点名）、"
                     f"换工具，或者直接说明卡在哪、给个方案（规划轮就调用 submit_plan）。",
+                    counts_as_failure=harsh)
+            # 滑动窗口：同一签名在最近 _REPEAT_WINDOW 次调用里出现
+            # _REPEAT_WINDOW_LIMIT 次以上。**与连不连续无关**——上面两道闸数的是
+            # 「连续」，交替变体绕得过；这一道绕不过。
+            if st.get("w", 0) >= _REPEAT_WINDOW_LIMIT:
+                return ToolError(
+                    tc.name,
+                    f"Error: {tc.name} 这同一份调用在最近 {_REPEAT_WINDOW} 次里已经出现 "
+                    f"{st['w']} 次，这次不再执行。隔着别的调用穿插着重试同样算打转——"
+                    f"这条路走不通。换工具、换参数，或者直接告诉用户卡在哪、给方案"
+                    f"（规划轮就调用 submit_plan）。",
                     counts_as_failure=harsh)
             if st["n"] >= _MAX_SAME_ARGS_ATTEMPTS:
                 return ToolError(
@@ -2935,7 +3003,9 @@ class AgentOnceRun:
                 f"（软线 {_MAX_SKILL_BYTES // 1000} KB、硬线 "
                 f"{_MAX_SKILL_BYTES_HARD // 1000} KB），这次不再放新的。"
                 f"再翻下去只会把上下文撑爆——真机就是在这个位置被供应商掐断连接。"
-                f"现在用已经读到的内容往下做：调用下一步工具（{action_hint}；"
+                f"**如果你还差某一节，改用 `section=名字` 只取那一段**"
+                f"（比按字节翻整本省得多；分段目录在整份加载时给过）。"
+                f"否则用已经读到的内容往下做：调用下一步工具（{action_hint}；"
                 f"规划轮就交计划）。**已经读过的那份重取不受这条限制。**",
                 counts_as_failure=n > _MAX_REFUSALS_BEFORE_FAILURE)
 
@@ -3004,9 +3074,12 @@ class AgentOnceRun:
             # 给 `_blocked_repeat` 判「幂等写」用：上一次到底是成功还是报错。
             st["last_error"] = is_tool_error(result)
             st["refused"] = 0
-            # 写文件不在 `_blocked_repeat` 里拦（幂等，见那里），所以也不能放这句
-            # 「下一次不会再执行」——说了却不兑现，模型会以为闸坏了。
-            if st["same"] == _MAX_SAME_RESULT_REPEATS and tc.name not in _WRITE_TOOLS:
+            # 写文件不在 `_blocked_repeat` 里拦（幂等，见那里），检索类也不拦
+            # （`_REPEAT_EXEMPT_TOOLS`），所以都不能放这句「下一次不会再执行」——
+            # 说了却不兑现，模型会以为闸坏了。
+            if (st["same"] == _MAX_SAME_RESULT_REPEATS
+                    and tc.name not in _WRITE_TOOLS
+                    and tc.name not in _REPEAT_EXEMPT_TOOLS):
                 repeat_warnings.append(
                     f"「{tc.name}」最近 {st['same']} 次调用参数与返回结果逐字相同。"
                     f"下一次同样的参数不会再执行——现在就换参数、换工具，或如实说明卡点。")
@@ -3241,8 +3314,29 @@ class AgentOnceRun:
             source = dict(stored)
         if source is None:
             return None
-        return {**source, **{k: v for k, v in args.items()
-                              if k in MOTION_KNOBS and v not in (None, "")}}
+        merged = {**source, **{k: v for k, v in args.items()
+                                if k in MOTION_KNOBS and v not in (None, "")}}
+        # 配乐走的是调用自带的 `bgm`（字符串 material_id / 曲名），不在 `MOTION_KNOBS` 里，
+        # 而分镜产物里的 `bgm.ref` 只在分镜轮写过才有。2026-10-22 真机：模型在
+        # `render_motion_code` 里传了 `bgm: mat-1518cc`，卡上却显示「纯人声（无配乐）」
+        # ——用户以为曲子没挂上。这里把调用参数折成 `motion_summary` 读得懂的
+        # `{ref: ...}` 再上卡；取不到字节仍由渲染那一步报错，不在这里判。
+        bgm_arg = args.get("bgm")
+        if isinstance(bgm_arg, str) and bgm_arg.strip():
+            ref = bgm_arg.strip()
+            # 素材号对用户没有信息量：卡上这行字是他按确认前唯一能核对「是不是这首」
+            # 的地方，能查到文件名就显示文件名（查不到就照原样，不是错）。
+            if ref.startswith("mat-") and self.storage is not None:
+                try:
+                    row = await self.storage.materials.get(ref)
+                except Exception:  # noqa: BLE001 - 查不到名字不该拦住确认
+                    row = None
+                name = str((row or {}).get("filename") or "").strip()
+                if name:
+                    ref = name
+            prev = merged.get("bgm") if isinstance(merged.get("bgm"), Mapping) else {}
+            merged["bgm"] = {**prev, "ref": ref}
+        return merged
 
     async def _sign_thumbs(self, ask: dict[str, Any]) -> None:
         """确认卡分镜行的预览图：对象键 → 现签 URL（签不出就不带图，卡照样弹）。"""
@@ -3579,7 +3673,7 @@ class Agent:
             # 自由对话里也可能直接调 plan_motion 写代码：同样要把风格包契约带给
             # 模型，否则它只会收到服务端注入的 spec，而看不到模板与步态。
             sections: list[Section] = []
-            style_text = await self._style_writing_hint(style_skill)
+            style_text = ""
             if style_text:
                 sections.append(Section(
                     name="style_pack", text=style_text, kind="conditional",
@@ -3659,239 +3753,12 @@ class Agent:
                 name="planning_round", text=plan_text, kind="conditional",
                 condition_key="planning_round", referenced_by=("submit_plan",),
                 sub_blocks=plan_blocks)]
-            style_hint = await self._style_hint(style_skill)
-            if style_hint:
-                extra_sections.append(Section(
-                    name="style_pack", text=style_hint, kind="conditional",
-                    condition_key="style_pack", referenced_by=("submit_plan",)))
             return await self.runner.run(
                 session, message, run_id=run_id, stream=stream, attachments=attachments,
                 registry=self._planning_registry(gate), planning=True,
                 extra_sections=extra_sections,
                 style_skill=style_skill,
             )
-
-    async def _style_hint(self, style_skill: str) -> str:
-        """规划轮只给风格包的「名字 + 三条要点」，正文留给 plan_motion 注入。
-
-        塞整份 manifest/正文会挤掉分镜预算，也会诱使模型把风格规格抄进 spec——
-        而规格的唯一出处必须是计划执行期的 ``style_pack``，否则两处一改就漂。
-        这里只保证模型知道「本轮有个包、别自己另发明一套视觉」。
-        """
-        name = str(style_skill or "").strip()
-        if not name or self.skill_loader is None:
-            return ""
-        try:
-            sk = await self.skill_loader.get(name)
-        except Exception:      # noqa: BLE001 - 读不到只退化成无提示，不拦规划
-            return ""
-        if sk is None or sk.kind != "style":
-            return ""
-        m = sk.style_manifest or {}
-        lines = [
-            f"本轮用户选了风格包《{sk.display or sk.name}》（{sk.name}）。",
-            "风格规格在执行期由 plan_motion 注入；分镜只按主题/时代排，"
-            "不要在 spec 里抄风格正文，也不要自己发明第二套视觉。",
-            # 用户在这一轮说的「背景换成城市」「人物穿军装」「第三镜在室内」，
-            # 必须落进对应镜的 brief；只留在旁白里，逐镜写手就只能看字幕猜画面。
-            "用户在对话里明确提出的画面内容（哪个时代/什么场景/人物穿什么/"
-            "拿什么/哪一镜要变）要写进对应镜的 `brief`，不能只留在旁白文案里。",
-        ]
-        cap = m.get("caption") if isinstance(m.get("caption"), Mapping) else {}
-        if cap:
-            lines.append(f"字幕：{cap.get('look') or 'overlay'}，"
-                         f"{cap.get('position') or 'bottom-center'}。")
-        if m.get("repeat_composition"):
-            lines.append("构图：全片刻意重复同一构图，只换时代背景与道具。")
-        if m.get("recurring_prop"):
-            lines.append(f"贯穿道具：{m.get('recurring_prop')}。")
-        if m.get("recurring_pose"):
-            lines.append(f"人物步态：{m.get('recurring_pose')}——brief 要写「人怎么动」，"
-                         "不能只写「一个人站在画面里」。")
-        # 槽位：用户说「把前景的人换成一棵松树」时，规划轮要能把它落成
-        # `style_overrides`；值必须是模板 `manifest.variants` 里登记的替换件名——
-        # 现场编一个名字只会在分镜期降级回默认组件。这里只列清单，不展开正文。
-        slots = await self._style_slots(m)
-        if slots:
-            lines.append("可换的零件（`style_overrides` 只能用这里列出的替换件名）：")
-            for s in slots[:10]:
-                got = "、".join(f"「{v.get('label') or v.get('name')}」"
-                                for v in (s.get("variants") or [])[:6]
-                                if isinstance(v, Mapping) and (v.get("name") or v.get("label")))
-                bound = s.get("bound") if isinstance(s.get("bound"), Mapping) else None
-                lines.append(f"- `{s.get('component')}`"
-                             + (f"（{s.get('label')}）" if s.get("label") else "")
-                             + (f"→ 可换成 {got}" if got else "（暂无替换件，用默认）")
-                             + (f"；已默认换用「{bound.get('label') or bound.get('name')}」，"
-                                "不用再写 style_overrides" if bound else ""))
-            lines.append("用户没有要求换件就不要写 `style_overrides`；"
-                         "模板已经标了默认替换件的槽位会自动用它，不用再写。"
-                         "要换的零件还没登记替换件时，先在入口给它换件，不要在 spec 里编名字。")
-        return "\n".join(lines)
-
-    async def _style_slots(self, manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """风格包 → 模板槽位清单。取不到模板/库抖动时返回空表（只损失一段提示）。"""
-        template = str(manifest.get("template") or "").strip()
-        if not template or self.storage is None:
-            return []
-        try:
-            row = await self.storage.style_templates.get(template)
-        except Exception:      # noqa: BLE001 - 模板库抖动不该拦规划
-            return []
-        if not isinstance(row, Mapping):
-            return []
-        slots = style_templates.template_slots(row)
-        return [s for s in slots if isinstance(s, Mapping) and s.get("component")]
-
-    async def _style_writing_hint(self, style_skill: str) -> str:
-        """执行轮写镜头代码时看的风格包**可执行契约**。
-
-        规划轮那份短提示只够让模型「知道有个包」；真正写 TSX 的是确认后的执行轮
-        模型。它拿不到 manifest 时会照技能正文自己画——真机 2026-10-19 的 3 镜
-        就是这样：构图对、光块对，但所有镜的 `figX` 都是常量，人物是一张站着的
-        剪影，用户一眼就发现「人没有在走」。
-
-        所以这里把模板 import、组件清单、步态、贯穿道具、字幕与禁区一次给全。
-        它只进执行轮（以及直接调 plan_motion 的自由对话），不挤规划轮预算。
-        """
-        name = str(style_skill or "").strip()
-        if not name or self.skill_loader is None:
-            return ""
-        try:
-            sk = await self.skill_loader.get(name)
-        except Exception:      # noqa: BLE001 - 读不到只退化成无提示，不拦执行
-            return ""
-        if sk is None or sk.kind != "style":
-            return ""
-        m = sk.style_manifest or {}
-        display = sk.display or sk.name
-        lines = [
-            f"=== 本轮风格包：《{display}》（{sk.name}）===",
-            "每一镜的代码由你写；这份契约优先于技能正文里的默认建议。"
-            "不要另发明第二套视觉：一个主角、一套贯穿道具与字幕，全片共用。",
-        ]
-        template = str(m.get("template") or "").strip()
-        row: Mapping[str, Any] | None = None
-        if template and self.storage is not None:
-            try:
-                got = await self.storage.style_templates.get(template)
-                row = got if isinstance(got, Mapping) else None
-            except Exception:      # noqa: BLE001 - 模板库抖动不该让执行轮少一段提示
-                row = None
-        # 这一整段只从**库里的模板行**取内容：换一套风格、换一个用户沉淀的模板，
-        # 提示词自动跟着变。这里不允许出现某一套模板专有的组件名。
-        comps: list[str] = []
-        rman: Mapping[str, Any] = {}
-        if row is not None:
-            module = str(row.get("module") or "").strip()
-            comps = [str(c.get("name") if isinstance(c, Mapping) else c)
-                     for c in (row.get("components") or [])]
-            comps = [c for c in comps if c.strip()]
-            if module:
-                lines.append(
-                    f"模板：`{template}`，从 `{module}` import；"
-                    f"可用组件：{' / '.join(comps) or '（见模板导出）'}。")
-            usage = style_templates.component_usage(row)
-            if usage:
-                lines.append("组件 props（照这个传参，不要猜）：\n" + usage)
-                # 写手很容易把「可选 prop」读成「不传就是空」。模板组件是从参考片
-                # 那一镜沉淀出来的，不传的 prop 会沿用参考片的内容——字幕就是参考片
-                # 的台词。真机 2026-10-19 菊花镜：`<StyleCaption>` 没传 text，预览里
-                # 显示「到山西，下雪了。新靴，还是没舍得穿。」。这条必须说破。
-                lines.append(
-                    "**不传 ≠ 空**：这些 props 的缺省值来自参考片那一镜（文字组件不传 "
-                    "`text` 就会显示参考片原文）。每一镜必须显式传这一镜的值；"
-                    "这一镜不要的零件就不要渲染那个组件，也不要用 0 / 空串 / 透明"
-                    "把它藏起来——藏起来的零件仍然是参考片的一部分。")
-            rman = row.get("manifest") if isinstance(row.get("manifest"), Mapping) else {}
-            # 沉淀出来的这一句常自带句号；原样拼会得到「…暗角。。优先…」。
-            responsible = str(rman.get("responsible") or "").strip().rstrip("。.；;，,")
-            lines.append(
-                (f"模板负责：{responsible}。" if responsible else "")
-                + "**优先 import 并复用这些组件**，不要另画第二个人、第二块光。"
-                "但这一镜的 brief 明确说不要某个零件时（例如「画面里不要人」），"
-                "就不要渲染那个组件——不要用 0 / 空串 / 透明把它藏进来，"
-                "那仍然是参考片的一部分。")
-            # 槽位：本片选了替换件的零件，import 路径与基模板不同。这里把「哪个组件、
-            # 从哪个模块 import」写死——执行期 `plan_motion` 已经解好了，不靠模型猜。
-            for s in style_templates.template_slots(row)[:12]:
-                comp = str(s.get("component") or "")
-                variants = [v for v in (s.get("variants") or []) if isinstance(v, Mapping)]
-                names = "、".join(f"「{v.get('label') or v.get('name')}」"
-                                  for v in variants[:6])
-                lines.append(
-                    f"- 槽位 `{comp}`"
-                    + (f"（{s.get('label')}）" if s.get("label") else "")
-                    + (f"：可换成 {names}" if names else "：暂无替换件")
-                    + "。没被 `style_overrides` 点名时用模板自带的那一个，"
-                      "不要自己换零件、也不要自己重画。")
-                # 这个零件能画哪些内容：写手要按这一镜的 brief 传值，
-                # 不能整片沿用参考片那一档；中文只是参考片叫法。
-                bits = _style_content_bits(s.get("content"))
-                if bits:
-                    lines.append(f"  现在能画：{bits}。每一镜按分镜传值，"
-                                 "不要整片写死；括号里的中文不要当参数值传。")
-                # 文字槽位（主字幕 / 日期铭文）：内容 prop 不传就显示参考片原文。
-                # 组件名与 prop 名都从沉淀数据里取，不写某一套模板的专有名。
-                text_kind = str(s.get("text_kind") or "").strip()
-                content_prop = str(s.get("content_prop") or "").strip()
-                if text_kind and content_prop:
-                    role = {"caption": "这一镜的主字幕",
-                            "inscription": "这一镜的日期/地点铭文"}.get(
-                                text_kind, f"文字（{text_kind}）")
-                    lines.append(
-                        f"  这是{role}：`{content_prop}` 是**内容**，渲染它就必须显式传"
-                        f"这一镜自己的文字；不传会沿用参考片原文。"
-                        "这一镜不需要这块字，就不要渲染这个组件。")
-        pose = str(m.get("recurring_pose") or "").strip()
-        if pose:
-            lines.append(f"人物步态：{pose}。")
-            # 「谁负责走路」也从组件清单里找，不点名某一套模板的导出。
-            walkers = [c for c in comps
-                       if "walk" in c.lower() or "figure" in c.lower()]
-            how = ("用模板里承担主体的组件"
-                   + ("（" + " / ".join(f"`{c}`" for c in walkers) + "），按上面的 props 传参"
-                      if walkers else
-                      "；模板里没有就自己按帧算肢体摆动"))
-            lines.append(
-                f"**主角必须逐帧动起来**：{how}；没有合适的组件就自己按帧算肢体摆动。"
-                "**不要交一张静止站立的剪影**——"
-                "静帧看着对、成片里人是不动的，这种错只有渲出来才会被发现。"
-                "主体位置也别钉死：模板若有位移用的 props（`x` / `pan` 之类），"
-                "把它算成 `useCurrentFrame()` 的函数，让主体在镜内真的走过去。")
-        comp = m.get("composition")
-        if isinstance(comp, Mapping) and comp:
-            lines.append("构图：" + json.dumps(comp, ensure_ascii=False, separators=(",", ":")))
-        prop = str(m.get("recurring_prop") or "").strip()
-        if prop:
-            lines.append(f"贯穿道具：{prop}")
-        cap = m.get("caption")
-        if isinstance(cap, Mapping) and cap:
-            lines.append("字幕：" + json.dumps(cap, ensure_ascii=False, separators=(",", ":")))
-        palette = m.get("palette")
-        if isinstance(palette, Mapping) and palette:
-            lines.append("色板：" + json.dumps(palette, ensure_ascii=False, separators=(",", ":")))
-        avoid = m.get("avoid")
-        if isinstance(avoid, (list, tuple)) and avoid:
-            lines.append("禁区：" + "、".join(str(a) for a in avoid if str(a).strip()))
-        # 逐镜内容与风格不变量是两件事：模板组件是参考片内容的**默认画法**，不是内容
-        # 上限。执行轮自己写 TSX 时（`code` 直接交给 plan_motion 的那条路）也必须拿到
-        # 同一份不变量，否则 style 随写手心情漂。不变量从模板行的 manifest 里取，
-        # 和 shot_writer / design_review 用的是同一份沉淀数据，这里不写任何某一套
-        # 模板专有的规则。
-        try:
-            from storyline_server.motion.shot_writer import _style_invariant_lines
-            invariant_lines = _style_invariant_lines(rman)
-        except Exception:      # noqa: BLE001 - 取不到只少一段提示，不拦执行轮
-            invariant_lines = []
-        if invariant_lines:
-            lines.extend(invariant_lines)
-            lines.append(
-                "模板组件是参考片内容的**默认画法**，不是内容的上限。这一镜 brief "
-                "要求的内容（对象、外形、场景、服饰、道具、文字）模板画不出时，"
-                "照上面的风格不变量自己画那一件；其余部分继续用模板组件。"
-                "只换内容，不换风格；同一个零件只画一次。")
-        return "\n".join(lines)
 
     async def _prior_plans(self, revise_of: str) -> list[dict[str, Any]]:
         """换一版时要给模型看的旧卡：只有真跑过的那一份（指针行里已校验过的候选）。"""
@@ -4037,7 +3904,7 @@ class Agent:
         # 执行轮就是**写镜头代码的那一轮**：风格包的可执行契约必须在这里进上下文。
         # 只靠 plan_motion 服务端注入的 `spec.style_pack` 够不到模型手里的 TSX——
         # 模型没看到模板 import 与步态要求时，会照技能正文画一张站着不动的剪影。
-        style_text = await self._style_writing_hint(style_skill)
+        style_text = ""
         if style_text:
             sections.append(Section(
                 name="style_pack", text=style_text, kind="conditional",

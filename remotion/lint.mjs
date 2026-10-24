@@ -38,6 +38,26 @@ function commonRules() {
     'dg/staticfile-font-only': 'error',
     'dg/font-family-whitelist': 'error',
     'dg/font-load-check': 'error',
+    // 2026-10-23：字幕只许一个出处。规则写进 `lint-rules.mjs` 不等于生效——规则表是
+    // 这张显式白名单，漏挂一行就是「闸装好了但没通电」：真机 s05 同时摆了
+    // `<StyleCaption>` 与 `<CaptionLayer>`，lint 一路 ok:true，成片上只表现为字变粗。
+    'dg/caption-double': 'error',
+    // 2026-10-23 晚：`interpolate()` 的 outputRange 不许是颜色。
+    //
+    // 真机 s10 写了 `interpolate(skyT, [0,.35,.7,1], ["#0a1226", …])`，语法/导入全对，
+    // 运行到渲那一帧才抛 `Non-numeric strings can only be interpolated using
+    // Easing.step1`，于是这一镜的预览静帧没出成（`preview_failures.s10 = "transient"`），
+    // 用户看到的是「11 张图，缺一张」。改成 error：这条零误伤——只有真把颜色塞进
+    // 数值插值里才会命中，而那种写法本来就跑不起来。
+    'dg/interpolate-color': 'error',
+    // 2026-10-23：通栏矩形不许排在主体之后（会把主体整片盖掉）。
+    //
+    // **2026-10-23 晚降级为 warning。** 这条闸判的是「这条带会不会盖住主体」，而静态
+    // 代码里判不出主体在哪——它只看「通栏 + 不透明 + 排在最后」。剪影系里「最后画一条
+    // 通栏黑块当地面」是最正当的画法之一，于是 6 镜被误判、每镜重写 3 次，一次分镜
+    // 烧掉 326 秒。用户的原话：「你这样用闸限制，会影响效果懂不懂」——他说得对：
+    // 一条靠猜的闸，逼写手改构图，产出的画面只会更差。留成 warning 记账，不拦。
+    'dg/band-over-subject': 'warn',
     'no-restricted-globals': ['error', ...RESTRICTED_GLOBALS],
     'no-restricted-syntax': ['error', ...RESTRICTED_SYNTAX],
     // 2026-10-20 真机：s05 一镜里 `const backX` 写了两次，lint 回 ok:true，一路走到
@@ -95,13 +115,21 @@ export async function lintShotCode(code, declaredFields = []) {
     return { ok: false, errors: [{ rule: 'lint-crash', line: 1, msg: String(err?.message ?? err) }] };
   }
   const messages = reports[0]?.messages ?? [];
-  const errors = messages.map((m) => ({
-    rule: m.ruleId ?? 'parse-error',
-    line: m.line ?? 1,
-    column: m.column ?? 1,
-    msg: m.message,
-  }));
-  return { ok: errors.length === 0, errors, declared };
+  // **按 severity 分开**（2026-10-23）：原来这里把所有 message 一律塞进 `errors`，
+  // 于是把规则降成 `'warn'` 一点用都没有——`ok` 仍然被它拉成 false，写手照样重写。
+  // 「降级一条口味闸」要真的生效，必须在这里就分叉：severity 1 是 warning，2 是 error。
+  const errors = [];
+  const warnings = [];
+  for (const m of messages) {
+    const item = {
+      rule: m.ruleId ?? 'parse-error',
+      line: m.line ?? 1,
+      column: m.column ?? 1,
+      msg: m.message,
+    };
+    if (m.severity === 1) warnings.push(item); else errors.push(item);
+  }
+  return { ok: errors.length === 0, errors, warnings, declared };
 }
 
 /**
@@ -120,12 +148,18 @@ export async function lintTemplateCode(code) {
   } catch (err) {
     return { ok: false, errors: [{ rule: 'lint-crash', line: 1, column: 1, msg: String(err?.message ?? err) }] };
   }
-  const errors = (reports[0]?.messages ?? []).map((m) => ({
-    rule: m.ruleId ?? 'parse-error',
-    line: m.line ?? 1,
-    column: m.column ?? 1,
-    msg: m.message,
-  }));
+  const messages = reports[0]?.messages ?? [];
+  const errors = [];
+  const warnings = [];
+  for (const m of messages) {
+    const item = {
+      rule: m.ruleId ?? 'parse-error',
+      line: m.line ?? 1,
+      column: m.column ?? 1,
+      msg: m.message,
+    };
+    if (m.severity === 1) warnings.push(item); else errors.push(item);
+  }
   if (!/\bexport\s+(default|const|function|class|\{)/m.test(text)) {
     errors.push({ rule: 'dg/template-no-export', line: 1, column: 1,
       msg: '模板文件没有任何导出。至少导出组件，镜头代码才 import 得到。' });
@@ -135,5 +169,5 @@ export async function lintTemplateCode(code) {
     errors.push({ rule: 'dg/template-no-style-import', line: 1, column: 1,
       msg: '模板之间不能互相 import（包括内置模板）。需要的零件请放进模板自己文件里。' });
   }
-  return { ok: errors.length === 0, errors };
+  return { ok: errors.length === 0, errors, warnings };
 }

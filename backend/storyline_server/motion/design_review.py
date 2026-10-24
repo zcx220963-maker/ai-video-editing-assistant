@@ -29,6 +29,8 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from . import style_sections
+
 RUBRIC = ("craft", "composition", "light", "typography", "not_ppt")
 
 _RUBRIC_TEXT = """五条，每条 1~5 分（3 = 及格）：
@@ -106,7 +108,8 @@ def _ask(*, text: str, subject: str, art: Mapping[str, Any],
          prop: str = "", style: str = "", grammar: str = "",
          entities: Sequence[str] = (),
          brief: str = "",
-         style_pack: Mapping[str, Any] | None = None) -> str:
+         caps: Sequence[str] = (),
+         skill_contract: Mapping[str, Any] | None = None) -> str:
     lines = [f"这一镜的文案：「{text}」"]
     if subject:
         lines.append(f"这一镜要画的东西：「{subject}」")
@@ -118,6 +121,13 @@ def _ask(*, text: str, subject: str, art: Mapping[str, Any],
                      f"{str(brief).strip()[:800]}」")
         lines.append("brief 里说**不要**的东西出现在画面里 → pass=false，fix 点名"
                      "「多了什么、删掉它」；brief 没要的东西也别因为它属于模板就留着。")
+        # 2026-10-22 真机：10 镜里 s01/s02/s10 的 brief 都写了「侧躺的人形 /
+        # 一排头肩 / 他坐起来」，代码里却一个人都没有——那几镜恰好不是「走」，
+        # 模板只给了 `SilhouetteWalk`，写手就把他整件拿掉了。评审是最后一道
+        # 能看见这件事的眼睛：brief 点名的人不见，不能只判「画面挺好」。
+        lines.append("brief 点名的人/主体（「人形」「同一个人」「他」「她」）在画面里"
+                     "找不到 → pass=false，fix 写「这一镜少了他，把人补回来」；"
+                     "姿势不是走路也一样在，不能因为模板只画走路就把他删掉。")
     names = [str(e).strip() for e in entities if str(e).strip()]
     if names:
         lines.append("这一镜文案里的实体（逐个找，少了哪件、或只是并排摆成图标行都不算）："
@@ -133,7 +143,7 @@ def _ask(*, text: str, subject: str, art: Mapping[str, Any],
                          if str(v or "").strip())
         if bits:
             lines.append(f"整片美术方向：{bits}")
-    pack = style_pack if isinstance(style_pack, Mapping) else {}
+    pack = skill_contract if isinstance(skill_contract, Mapping) else {}
     manifest = pack.get("manifest") if isinstance(pack.get("manifest"), Mapping) else {}
     if pack:
         # 风格包是用户选定的整片契约：五条评分照旧（**不加第六条键**，
@@ -152,10 +162,6 @@ def _ask(*, text: str, subject: str, art: Mapping[str, Any],
                 value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
             if str(value or "").strip():
                 lines.append(f"  {label}：{str(value)[:1200]}")
-        # 不变量是沉淀分析从参考片量出来的，和写手看到的是同一份数据：
-        # 评审只拿「什么不能换」去判，不拿模板代码的某一种外形去判。
-        from .shot_writer import _style_invariant_lines
-        lines.extend(_style_invariant_lines(manifest))
         lines.append("判读口径（覆盖上面同名的默认说法）：")
         if manifest.get("repeat_composition"):
             lines.append("· composition 判「和全片是否同一构图」，**不是**判「有没有变化」。"
@@ -197,8 +203,18 @@ def _ask(*, text: str, subject: str, art: Mapping[str, Any],
                              + "；".join(changed[:8]) + "。")
         body = str(pack.get("body") or "").strip()
         if body:
-            lines.append("风格包正文（判读依据）：")
-            lines.append(body)
+            # 渐进式风格包：评审只看「整片都成立的那一段 + 这一镜点名的能力」。
+            # 整份正文给它，它会拿这一镜本来没打算用的能力去扣分。
+            if str(manifest.get("progressive") or "").strip().lower() in ("1", "true", "yes", "on"):
+                shown = [style_sections.default_text(body)]
+                for name in caps:
+                    text = style_sections.section_text(body, str(name))
+                    if text:
+                        shown.append(f"### {str(name)}\n{text}")
+                body = "\n\n".join(t for t in shown if t.strip())
+            if body:
+                lines.append("风格包正文（判读依据）：")
+                lines.append(body)
     lines.append("下面是这一镜的一张静帧。按五条打分，"
                  "并判断这一镜要不要重画、像不像整片要的风格。")
     return "\n".join(lines)
@@ -207,7 +223,7 @@ def _ask(*, text: str, subject: str, art: Mapping[str, Any],
 async def review_stills(*, shots: Sequence[Mapping[str, Any]],
                         stills: Mapping[str, Any], art: Mapping[str, Any] | None = None,
                         prop: str = "", style: str = "", grammar: str = "",
-                        style_pack: Mapping[str, Any] | None = None,
+                        skill_contract: Mapping[str, Any] | None = None,
                         references: Sequence[bytes] = (),
                         user_id: str = "", conversation_id: str = "",
                         llm: Any = None) -> dict[str, Any]:
@@ -240,8 +256,9 @@ async def review_stills(*, shots: Sequence[Mapping[str, Any]],
                     text=str(shot.get("text") or ""),
                     subject=str(shot.get("subject") or ""),
                     art=art or {}, prop=prop, style=style,
-                    grammar=grammar, style_pack=style_pack,
+                    grammar=grammar, skill_contract=skill_contract,
                     brief=str(shot.get("brief") or ""),
+                    caps=[str(c) for c in (shot.get("caps") or [])],
                     entities=[str(e) for e in (shot.get("entities") or [])])},
                 {"type": "image_url",
                  "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]
@@ -303,19 +320,54 @@ REWRITE_PARALLEL = max(1, int(os.environ.get("MOTION_REWRITE_PARALLEL", "4") or 
 
 
 def review_enabled(spec: Mapping[str, Any]) -> bool:
-    """这一趟开不开视觉评审：spec 那一栏优先，缺省跟随环境变量，**再缺省关**。
+    """这一趟开不开视觉评审：spec 那一栏优先，其次环境变量，**缺省开**（按 RATE 抽样）。
 
-    2026-10-20 从「缺省开」改成「缺省关」。原因不是评审没用，而是它一直在替一个
-    结构问题兜底：镜头代码自己画整帧，外框/字幕/主体各画各的，于是只能出图后再找
-    一台看图模型去挑「字幕压住主体」。片壳上线后外框由 entry 层独占，这类问题在
-    结构上不成立；其余的批评交给用户自己在成片上抽检——缺省路径上不该有一趟
-    「按镜计费、还要重写重渲」的模型调用。
-    要开就显式设 `MOTION_VISUAL_REVIEW=1`（配 `MOTION_VISUAL_REVIEW_RATE` 抽样）。
+    2026-10-20 曾从「缺省开」改成「缺省关」：那时评审是在替一个结构问题兜底——外框/
+    字幕/主体各画各的，只能出图后找一台看图模型去挑「字幕压住主体」。片壳上线后那
+    类问题在结构上不成立，缺省路径不该再多一趟「按镜计费、还要重写重渲」的调用。
+
+    2026-10-22 又改回缺省开，因为默认形态变了：不再给写手挂预先写死的模板，画面全靠
+    它按契约（技能正文 + manifest）现写——**没人看一眼，就没人知道它写成什么样**。
+    看片闭环现在是这条路的第三根柱子，不再是兜底。代价由两件事压住：
+    · `MOTION_VISUAL_REVIEW_RATE` 抽样（容器里缺省 0.34，每三镜看一镜）；
+    · `MOTION_VISUAL_ROUNDS` 封顶（缺省 2 轮）+ 同一句意见改过一次就停手
+      （见 `same_fix`），不会在同一处来回烧。
+    不想付就设 `MOTION_VISUAL_REVIEW=0`，或在 spec 里写 `visual_review: false`。
     """
     raw = spec.get("visual_review") if isinstance(spec, Mapping) else None
     if isinstance(raw, bool):
         return raw
-    return os.environ.get("MOTION_VISUAL_REVIEW", "0") not in ("0", "false", "no", "")
+    env = os.environ.get("MOTION_VISUAL_REVIEW", "1").strip().lower()
+    return env not in ("0", "false", "no", "off", "")
+
+
+#: 一版分镜最多「看 → 改 → 重渲 → 再看」几轮。缺省 2：
+#: 第一轮按评审改，第二轮确认改对了没有；第三轮起多半是在同一处来回，
+#: 花的钱与墙钟都真，画面不动。
+REVIEW_ROUNDS = max(1, min(4, int(os.environ.get("MOTION_VISUAL_ROUNDS", "2") or 2)))
+
+
+def review_rounds(spec: Mapping[str, Any]) -> int:
+    """这一份分镜走几轮：spec 那一栏优先，其次环境变量（1~4）。"""
+    raw = spec.get("visual_review_rounds") if isinstance(spec, Mapping) else None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return max(1, min(4, raw))
+    return REVIEW_ROUNDS
+
+
+def same_fix(before: Any, after: Any) -> bool:
+    """两轮的红是不是同一句意见（忽略空白，只看前 60 字）。
+
+    上一轮已经照着这句改过、重渲之后评审还是这句 → 再改一次只是同一个来回：
+    写手没理解、或这条意见本身在要求一件代码画不出的东西。停在原地、把这件事
+    如实写进回执，比自动再烧一轮好。
+    """
+    def _norm(text: Any) -> str:
+        return re.sub(r"\s+", "", str(text or ""))[:60]
+
+    left, right = _norm(before), _norm(after)
+    return bool(left) and left == right
+
 
 
 def _review_rate() -> float:

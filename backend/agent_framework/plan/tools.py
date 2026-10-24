@@ -94,6 +94,22 @@ class SubmitPlanTool(Tool):
                             "plan_id": {"type": "string", "description": "p1/p2/p3"},
                             "label": {"type": "string", "description": "卡面标题，一句话思路"},
                             "goal": {"type": "string", "description": "这版要达成什么"},
+                            # 风格包/导入技能 = 这一片的**画面契约**，由 plan_motion 按名
+                            # 注入写手，所以名字只能来自检索结果，不能让模型现编。
+                            # 放在候选上而不是卡面开关里：它不参与节点参数校验，
+                            # 也不是用户要在卡上逐项勾的东西（换风格 = 换一张卡）。
+                            "style_skill": {
+                                "type": "string",
+                                "description":
+                                    "可选：这一片用哪套视觉风格（风格包或用户导入的"
+                                    "技能的机器名，如 style_silhouette_history）。"
+                                    "用户点名了风格（「剪影风」「水墨」）、或任务本身需要"
+                                    "一套成体系的画面语言时，先用 find_skill 搜，把结果里"
+                                    "标着「风格包 / 导入技能」的那个名字原样填进来；"
+                                    "三份候选可以各选一套。没提到风格、也没搜到对得上的，"
+                                    "就留空——写手按默认视觉画。**不要自己编名字**："
+                                    "服务端查不到的会被忽略，卡上也不会显示。",
+                            },
                             "steps": {
                                 "type": "array",
                                 "items": {
@@ -222,6 +238,10 @@ class SubmitPlanTool(Tool):
         # 取「有效」包名而不是身份里那份：同一条消息里用户先说「换成水墨风」再由模型交卡时，
         # 风格工具是在 gather 的子任务里跑的，它 rebind 的 contextvar 出不了那个任务
         # （见 ``style_override``）。不读这张会话表，卡上挂的还是换风格之前的旧值。
+        #
+        # 优先级：用户这一次明确选的（下拉框 / 这句话里说的「换成 X」）压过模型在候选上
+        # 自己挑的。模型挑的那份已经在校验层核过名字、核过是不是风格包，这里原样留着——
+        # 它正是「用户只写自然语言、由 agent 自己找到该用的那套视觉」那条路。
         style_now = (effective_style_skill(ident.session_id, ident.style_skill)
                      if ident is not None else "")
         if style_now:

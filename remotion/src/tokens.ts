@@ -107,8 +107,12 @@ export const FILM_GEOMETRY: Record<Aspect, FilmGeometry> = {
  *  点出来」（`HIGHLIGHT_STYLES`）。拆开之后「要关键词换色、但不要纸条」这类组合才说得出口。
  *
  *  每一档落到画面上是什么样，由本文件下方 `CAPTION_LOOK` **一处**说了算。 */
+// 2026-10-23 加 `by_shot`：字幕交给这一镜的代码自己设计。母版与 `<CaptionLayer/>`
+// 在这一档下都不上屏（见 `FilmLayout.tsx` 的 `NO_MOTHER_CAPTION`），写手拿
+// `getInputProps().text` 自己排位置/字号/入场。**注释不能写进数组**——
+// `tests/test_code_spec.py` 拿正则从这一行抠枚举逐项比，混进注释就会解析错。
 export const CAPTION_STYLES = ['on_picture', 'outlined', 'paper', 'film_line',
-                               'big_center', 'top_banner', 'none'] as const;
+                               'big_center', 'top_banner', 'none', 'by_shot'] as const;
 export type CaptionStyle = (typeof CAPTION_STYLES)[number];
 
 /** 高亮样式：被点名的词怎么被点出来。与上面那一维**正交**，取值域互不相干。

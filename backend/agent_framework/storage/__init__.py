@@ -59,7 +59,6 @@ from .repositories import (
     SecretsRepo,
     TimelinesRepo,
     SkillsRepo,
-    StyleTemplatesRepo,
     SubagentsRepo,
     TasksRepo,
     UploadSessionsRepo,
@@ -129,7 +128,6 @@ class Storage:
         self.jobs = JobsRepo(db)
         self.memories = MemoriesRepo(db)
         self.skills = SkillsRepo(db)
-        self.style_templates = StyleTemplatesRepo(db)
         self.secrets = SecretsRepo(db)
         self.timelines = TimelinesRepo(db)
         self.mcp_servers = McpServersRepo(db)

@@ -916,21 +916,24 @@ class MCPTool(Tool):
             # 上游复用与「不污染父版本」两条语义都会落空。
             if "artifact_id" in props and ident.artifact_id:
                 kwargs["artifact_id"] = ident.artifact_id
-            # 风格包同一口径：只有声明了这个参数的节点（今天只有 plan_motion）才收，
-            # 且值来自本轮身份，模型自填的值被覆写。
+            # 风格包：只有声明了这个参数的节点（今天只有 plan_motion）才收。
             #
-            # 2026-10-21：用户在对话里刚换过风格时，工具在**另一个任务**里执行，
-            # 身份 contextvar 的改动传不回来；`style_override` 按会话记下那一次，
-            # 这里优先读它，同一轮的分镜才用得上新风格。
+            # 优先级：会话里显式改过的 > 本轮身份带的 > **模型自己挑的**。
+            # 2026-10-22 修：以前「身份里没有、也没有改写记录」时会把模型填的
+            # `style_skill` 直接 pop 掉——前端收成单一自动入口之后，身份里永远是
+            # 空串，于是模型每轮挑的风格包都在这一跳被静默删掉（真机 run
+            # `2d77ce0b`：它读了《超现实写实》、也把包名填进了调用，写手却只拿到
+            # 默认视觉，十镜全是色块）。默认入口下「没人点名风格」= **让模型自己
+            # 决定**，不是「替它决定不用」。只有会话里明确记过「用回默认」（空串
+            # 的改写记录）时才清掉模型的值。
             if "style_skill" in props:
                 from ..style_override import get_style_override
                 ov = get_style_override(ident.session_id)
                 chosen = str(ident.style_skill or "") if ov is None else ov
                 if chosen:
                     kwargs["style_skill"] = chosen
-                else:
-                    # 「用回默认」也是一条明确的决定：不能因为它是空串，就把模型
-                    # 自己填的包名放过去（那等于取消没生效）。
+                elif ov is not None:
+                    # 用户明确说过「用回默认」：这一条要压过模型自己挑的。
                     kwargs.pop("style_skill", None)
             # 用户原话同一口径（2026-10-20）：节点里的 `user_request` 以前靠模型自己
             # 填一句概括，逐层转述之后画镜头的写手已经看不到用户到底说了什么。这里

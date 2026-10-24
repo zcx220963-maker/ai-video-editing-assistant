@@ -12,7 +12,7 @@
   动效不够）仍交给静帧评审与重写。
 
 开关：``MOTION_ART_DIRECTOR=0`` 关掉（关掉时不动 spec、不花钱）。
-模型：``MOTION_DIRECTOR_MODEL`` 可单独指定；缺省跟随用户默认模型。
+模型：跟随用户在页面「设置」里配的那一个；不做环境变量覆盖（2026-10-22）。
 """
 from __future__ import annotations
 
@@ -21,15 +21,25 @@ import os
 import re
 from typing import Any, Mapping, Sequence
 
+from . import style_sections
+from .code_spec import MAX_CAPS_PER_SHOT
+
 DIRECTOR_ENABLED = os.environ.get(
     "MOTION_ART_DIRECTOR", "1") not in ("0", "false", "no")
-DIRECTOR_MODEL = os.environ.get("MOTION_DIRECTOR_MODEL", "").strip()
 DIRECTOR_TIMEOUT_SEC = 120.0
 #: 一条 28 镜的片子，逐镜 200 字的落点约 5~6k token；给 8192 免得回话被截在半句。
 DIRECTOR_MAX_TOKENS = 8192
 #: 改写后的 brief 上限。写手的单镜任务块本来就会截，这里先截住，避免一条 brief
 #: 把整份导演回话撑爆。
-BRIEF_MAX_CHARS = 320
+#:
+#: **2026-10-24 实测后从 400 提到 1000。** 400 那一版把 12 镜的 brief **全部**顶到上限、
+#: **全部**截断——`【构图】` 只留下「背景 + 中景」，前景 / 动 / 运镜 / 配色四段被切掉。
+#: 当时以为「brief 太长会挤掉别的」，实测是错的：每镜 prompt 约 **46,700 字**，
+#: brief 400 字只占 **0.9%**；提到 1000 也才 **+1%**。真正的约束不是 context，
+#: 是这个数当初随手定的。
+#:
+#: 与 `code_spec.SHOT_BRIEF_MAX_CHARS` 必须对齐（两边不一致时，下游会二次截断）。
+BRIEF_MAX_CHARS = 1000
 
 _SYSTEM = """你是这条科普片的美术导演。你只改写每一镜的「画面 brief」，不写代码、不改文案，
 也不替用户改选题或事实。你的唯一目标：让镜头画师**第一次落笔**就画出一幅具体的画，
@@ -48,6 +58,25 @@ _SYSTEM = """你是这条科普片的美术导演。你只改写每一镜的「�
       实体都落在带外的那块画面区里，别让主体伸进字幕带。**每件实体再补一句形状**：外轮廓是什么、
       「少了它就不像」的标志物是什么、2 个部件是什么（钱包＝鼓起的软包 + 拉链齿 +
       探出的钞票边角）。如果原 brief 已经具体，保留它，只补缺的部分。
+   c. **给构图骨架**（2026-10-24 新增，每镜必写）：在 brief **末尾**追加一行，
+      固定以 `【构图】` 开头，六段用「｜」隔开：
+
+      `【构图】背景：<底色+网格/暗角/雾/光晕，至少两项>｜中景：<主体群几件、各占画面高多少>｜前景：<刻度尺+两个读数+标注线/括号/坐标轴>｜配色：<底色 + 三个高饱和色相的十六进制 + 饱和色块占画面多少>｜动：<≥4 个元素在动，两处变化各覆盖三分之一以上>｜运镜：<推近/横移/绕转 + 百分比>`
+
+      **背景层与前景 HUD 不算「加实体」**——它们是画面基础设施，不在「文案圈出来的实体」
+      这条限制之内，必须写。一段只有主体、没有背景层与 HUD 的 brief，渲出来就是
+      「一个东西漂在黑底上」，那是这条链最贵的失败模式（2026-10-23《一秒》12 镜
+      评审全不过，全是这个病）。
+
+      **配色那一段要的是「饱和」，不是「亮」**。实测过：深底不是问题——参考片同样
+      深底（平均亮度 25/255），饱和度却有 6.5，因为它是「黑底上的金」；而低饱和的
+      粉彩色（`#ffb46b` 暖金、`#61d9ef` 冷青这一类）渲出来饱和度只有 1.6，
+      观众看到的就是**黑白片**。所以配色必须给**高饱和**的十六进制（如 `#FF6B2C`
+      橙 / `#22D3EE` 青 / `#FFC93C` 黄 / `#34D399` 绿），并写明饱和色块占画面多少
+      （建议 ≥25%）——颜色不能只出现在一根细线或一个圆点上。
+
+      唯一的例外：这一镜的形式本身就是**极简留白**（剪影、纯字、单线），此时写
+      `【构图】极简：只留主体与底色，不加网格与 HUD`——要明确写出来，不许留空。
 
 纪律：
 · 不改文案、不加新事实、不换选题；用户明确要求优先于你的偏好。
@@ -77,7 +106,7 @@ serif-display/sans-editorial/…，`motion` 取 spring/linear/…；`palette_not
 弧线（如「火光橙 → 油灯琥珀 → 霓虹粉 → 屏幕冷蓝」）。枚举拿不准就省略那一栏。
 
 只回一行 JSON，不要别的字：
-{"style_grammar": "…", "art": {"look": "…", "brush": "…", "light": "…", "texture": "…", "type": "…", "motion": "…", "palette_note": "…"}, "shots": [{"id": "s01", "entities": ["…", "…"], "brief": "…"}]}"""
+{"style_grammar": "…", "art": {"look": "…", "brush": "…", "light": "…", "texture": "…", "type": "…", "motion": "…", "palette_note": "…"}, "shots": [{"id": "s01", "entities": ["…", "…"], "caps": ["…"], "brief": "…"}]}"""
 
 
 def _parse(text: str) -> dict[str, Any] | None:
@@ -144,7 +173,7 @@ def _ask(spec: Mapping[str, Any], todo: Sequence[Mapping[str, Any]],
                     "每一镜的 brief 都要写清这一镜的衣着、头饰与持物（照上面的演进线"
                     "和用户原话，按时代换），但**不要另换一副身体**：身高、骨架、"
                     "朝向与步态整片不变，换的只是外面这一层。")
-    pack = spec.get("style_pack") if isinstance(spec.get("style_pack"), Mapping) else {}
+    pack = spec.get("skill_contract") if isinstance(spec.get("skill_contract"), Mapping) else {}
     manifest = pack.get("manifest") if isinstance(pack.get("manifest"), Mapping) else {}
     if pack:
         # 风格包是**用户选定的整片契约**：它排在逐镜输入之前，导演先看到它再排画面。
@@ -240,8 +269,14 @@ def _ask(spec: Mapping[str, Any], todo: Sequence[Mapping[str, Any]],
                 lines.append(f"  - 段 {i}{at}" + (f"：{camera[:120]}" if camera else ""))
         body = str(pack.get("body") or "").strip()
         if body:
-            lines.append("风格包正文：")
-            lines.append(body)
+            # 渐进式风格包：导演只需要「整片都成立的那一段 + 能力索引」，能力正文是
+            # 逐镜写给写手的（写手拿到 brief 点名的那几件）。整份正文给它，它会照着
+            # 正文一步步写进每镜 brief——那正是这套风格要避免的「写死每一步」。
+            if str(manifest.get("progressive") or "").strip().lower() in ("1", "true", "yes", "on"):
+                body = style_sections.default_text(body)
+            if body:
+                lines.append("风格包正文：")
+                lines.append(body)
         lines.append("")
     if isinstance(manifest, Mapping) and manifest.get("repeat_composition"):
         lines.append("构图纪律：本片刻意重复同一构图——主体位置、贯穿光块位置、地平线、"
@@ -249,6 +284,19 @@ def _ask(spec: Mapping[str, Any], todo: Sequence[Mapping[str, Any]],
                      "不要为了变化而换机位、换主体位置或换字幕位置。")
     else:
         lines.append("构图纪律：不要把每一镜写成同一种构图；相邻镜要有变化。")
+    # 能力索引（渐进式加载的第一层）：这套风格正文被分成了若干件「做法」，这里只
+    # 列名字与第一句；逐镜点名的才把正文给写手。没有分段的老风格包不出现这一段。
+    caps_index = []
+    if str(manifest.get("progressive") or "").strip().lower() in ("1", "true", "yes", "on"):
+        caps_index = style_sections.index(str(pack.get("body") or ""))
+    if caps_index:
+        lines.append("这一套风格可用的能力（**做法**，不是内容清单）：")
+        for name, first, _size in caps_index[:24]:
+            lines.append(f"- `{name}`：{first}")
+        lines.append(f"每一镜在 `caps` 里写出这一镜真要用的能力（0–3 件，只能取上面的"
+                     f"名字，最多 {MAX_CAPS_PER_SHOT} 个）。只选这一镜**真的会用**的："
+                     "选了就给正文、就会照着画；选多了等于把整份正文搬回来。")
+        lines.append("")
     lines.append("逐镜输入：")
     for s in todo:
         sid = str(s.get("id") or "")
@@ -271,7 +319,8 @@ def _ask(spec: Mapping[str, Any], todo: Sequence[Mapping[str, Any]],
         lines.append("每一镜的 brief 都要写清**主体怎么动**（从哪走到哪、边走边做什么、"
                      "在哪停半步再走），不能只写「主体在画面里」或「站在某处看着」——"
                      "成片里主体必须一直在动，停也只停半步。")
-    lines.append("给每一镜圈实体、补画面落点；把整片风格拆成可执行做法。只回那一行 JSON。")
+    lines.append("给每一镜圈实体、补画面落点、**在 brief 末尾写 `【构图】` 那一行**；"
+                 "把整片风格拆成可执行做法。只回那一行 JSON。")
     return "\n".join(lines)
 
 
@@ -301,8 +350,6 @@ async def concretize(spec: dict[str, Any], *, user_id: str = "",
                 {"role": "user", "content": _ask(spec, todo, user_request)}]
     kwargs: dict[str, Any] = {
         "max_tokens": DIRECTOR_MAX_TOKENS, "timeout": DIRECTOR_TIMEOUT_SEC}
-    if DIRECTOR_MODEL:
-        kwargs["model_override"] = DIRECTOR_MODEL
     try:
         resp = await _complete_with_identity(
             messages, llm=llm, user_id=user_id,
@@ -343,6 +390,14 @@ async def concretize(spec: dict[str, Any], *, user_id: str = "",
                 f"（{', '.join(f'{k}={v}' for k, v in art.items())}）。")
 
     rows = {str(s.get("id")): s for s in todo}
+    # 能力点名要核对「这套风格真有这一段」：提示词里给的索引与这里用的是同一个来源，
+    # 模型照抄名字就一定能取到正文；抄错的就地丢掉，不把整份分镜打回。
+    _pack = spec.get("skill_contract") if isinstance(spec.get("skill_contract"), Mapping) else {}
+    _manifest = _pack.get("manifest") if isinstance(_pack.get("manifest"), Mapping) else {}
+    caps_index = (
+        style_sections.index(str(_pack.get("body") or ""))
+        if str(_manifest.get("progressive") or "").strip().lower()
+        in ("1", "true", "yes", "on") else [])
     for item in got.get("shots") or []:
         if not isinstance(item, Mapping):
             continue
@@ -367,6 +422,32 @@ async def concretize(spec: dict[str, Any], *, user_id: str = "",
         brief = str(item.get("brief") or "").strip()
         if brief:
             rows[sid]["brief"] = brief[:BRIEF_MAX_CHARS]
+            touched = True
+        # 能力点名（渐进式加载）：只收这套风格**真有**的段名。写错/写了不存在的名字
+        # 就地丢掉——写手那一侧会把它记成「点了但没有」，而这里丢掉只是少加载一件，
+        # 两条路都放行，不因为一个名字打回整份分镜。
+        raw_caps = item.get("caps")
+        if isinstance(raw_caps, str):
+            raw_caps = re.split(r"[、,，;；/\s]+", raw_caps)
+        known = {name for name, _, _ in caps_index}
+        # 这一套风格里「每一镜都成立」的几件（manifest.caps_always）：材质、从文案
+        # 取景这类不变量不该依赖导演每镜记不记得点名，系统按数据补上。名字仍是风格包
+        # 自己的段名，后端不认具体是哪些——换一份风格包，这里自然跟着换。
+        always = [str(x).strip() for x in (_manifest.get("caps_always") or [])
+                  if str(x).strip() in known]
+        picked: list[str] = []
+        for cap in always:
+            if cap not in picked:
+                picked.append(cap)
+        if isinstance(raw_caps, (list, tuple)):
+            for cap in raw_caps:
+                name = str(cap or "").strip()
+                if name in known and name not in picked:
+                    picked.append(name)
+                if len(picked) >= MAX_CAPS_PER_SHOT:
+                    break
+        if picked:
+            rows[sid]["caps"] = picked[:MAX_CAPS_PER_SHOT]
             touched = True
         if touched:
             out["changed"].append(sid)

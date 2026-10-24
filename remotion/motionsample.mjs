@@ -52,6 +52,22 @@ export const MOTION_DIFF_END = MOTION_DIFF_MIN * 0.4;
 // 防「切碎」由回落线负责（A5 那支钉着：中段差掉到地板线下但没停，仍算一段）；
 // 真碎成一格一格的抖动过不了 1.5 的**进入**门槛，回不到段里。
 
+/** 采样图切成几×几块，判据看**区块内**的平均差，不看整幅。
+ *
+ *  **2026-10-23 改这个的原因**：原来用整幅平均差，`MOTION_DIFF_MIN = 1.5` 是拿
+ *  「元素横穿画面」标定的。于是「一根 2px 线从左长到右」这种**局部动效**在 64×36
+ *  的采样图上只动几十个像素，整幅平均差 0.05~0.3，**永远过不了 1.5** ——《一秒》
+ *  实测 s01/s09 被判「0 个变化段、这是一张静帧」，而 brief 明明要求「线向右生长」。
+ *  写手想达标，唯一的路是加**满宽色带**（那正是用户说的「一眼假」）。
+ *
+ *  切成 4×3 之后，同一个「一根线在动」的镜头，它所在那一块的差是整幅的 12 倍左右，
+ *  地板线 1.5 就够得着；而压缩噪声在区块内被平均掉（实测静帧的区块差 <0.5），
+ *  不会把静止判成在动。
+ *
+ *  4×3 而不是更细：64×36 切 4×3 后每块 16×12=192 像素，平均一次足以压住噪声；
+ *  6×4 时每块只剩 10×9，噪声开始露头。 */
+export const MOTION_GRID = [4, 3];
+
 /** 判据：每镜至少这么多个**先后**变化段。 */
 export const MOTION_MIN_EVENTS = 2;
 
@@ -133,8 +149,12 @@ export function judgeDensity(events, {
   return { status: 'ok', events: list };
 }
 
-/** 抽帧并算相邻差。→ `{ok: true, width, height, samples, diffs}` 或
- *  `{ok: false, reason}`（拿不到可判的采样时**不许**折成「没问题」）。 */
+/** 抽帧并算相邻差。→ `{ok: true, width, height, samples, diffs, diffs_all}` 或
+ *  `{ok: false, reason}`（拿不到可判的采样时**不许**折成「没问题」）。
+ *
+ *  `diffs` 是**区块最大差**（判据用它，见 `MOTION_GRID` 的注释）；
+ *  `diffs_all` 是**整幅平均差**，只作读数留在回执里——红的时候能看出
+ *  「是整幅都在动还是只有一块在动」。 */
 export function sampleGray(file, {
   execFileSync, fps, srcWidth, srcHeight, hz = MOTION_SAMPLE_HZ, width = MOTION_SAMPLE_W,
 } = {}) {
@@ -153,18 +173,41 @@ export function sampleGray(file, {
   if (n < 2) {
     return { ok: false, reason: `只抽到 ${n} 张采样（需要 ≥2 张）——片子太短或抽帧没生效` };
   }
+  // 区块索引只算一次（12 块 × 每块 192 像素，共 per 个下标）。
+  const [cols, rows] = MOTION_GRID;
+  const cw = Math.max(1, Math.floor(width / cols));
+  const chh = Math.max(1, Math.floor(height / rows));
+  const cells = [];
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < cols; cx++) {
+      const idx = [];
+      for (let y = cy * chh; y < (cy + 1) * chh; y++) {
+        for (let x = cx * cw; x < (cx + 1) * cw; x++) idx.push(y * width + x);
+      }
+      if (idx.length) cells.push(idx);
+    }
+  }
   const diffs = [];
+  const diffsAll = [];
   for (let i = 0; i + 1 < n; i++) {
     const a = i * per;
     const b = (i + 1) * per;
-    let sum = 0;
-    for (let p = 0; p < per; p++) sum += Math.abs(buf[a + p] - buf[b + p]);
-    diffs.push(sum / per);
+    let sumAll = 0;
+    for (let p = 0; p < per; p++) sumAll += Math.abs(buf[a + p] - buf[b + p]);
+    let best = 0;
+    for (const idx of cells) {
+      let s = 0;
+      for (const p of idx) s += Math.abs(buf[a + p] - buf[b + p]);
+      const v = s / idx.length;
+      if (v > best) best = v;
+    }
+    diffs.push(Number(best.toFixed(3)));
+    diffsAll.push(Number((sumAll / per).toFixed(3)));
   }
   return {
     ok: true,
     width, height, samples: n, hz,
-    diffs: diffs.map((d) => Number(d.toFixed(3))),
+    diffs, diffs_all: diffsAll,
   };
 }
 
@@ -183,11 +226,13 @@ export function motionDensity(file, {
     sample_hz: hz,
     // 曲线与分段都留下：红的时候要能看出「它数到的是几段、每段多大」，
     // 只回一句「密度不够」是没法让人改的。
+    // `diffs` 是**区块最大差**（判据用它）；`diffs_all` 是整幅平均差，只作读数。
     diffs: got.diffs,
+    diffs_all: got.diffs_all ?? [],
     events,
     thresholds: {
       diff_min: MOTION_DIFF_MIN, min_events: MOTION_MIN_EVENTS,
-      min_gap_sec: MOTION_MIN_GAP_SEC, sample_hz: hz,
+      min_gap_sec: MOTION_MIN_GAP_SEC, sample_hz: hz, grid: MOTION_GRID,
     },
   };
 }

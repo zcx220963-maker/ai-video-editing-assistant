@@ -343,7 +343,11 @@ def motion_summary(source: Mapping[str, Any] | None,
             f"{word(key, src.get(key), label)}" for key, label in enters)
     bgm = src.get("bgm") if isinstance(src.get("bgm"), Mapping) else {}
     ref = str(bgm.get("ref") or "") if bgm else ""
-    out["配乐"] = Path(ref).name[:18] if ref else "纯人声（无配乐）"
+    # 去掉扩展名再截：`DJariium, DJAQ - We Never (高燃鼓點版).mp3` 从第 18 个字截，
+    # 用户正好读到「DJariium, DJAQ - W」——曲名那一截全被截掉了，按确认前核对不出来。
+    name = Path(ref).name if ref else ""
+    name = name.rsplit(".", 1)[0] if "." in name else name
+    out["配乐"] = name[:24] if name else "纯人声（无配乐）"
     return out
 
 

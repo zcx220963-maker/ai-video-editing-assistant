@@ -407,7 +407,14 @@ MOTION_ANCHOR_TOLERANCE_DIV = 3
 #: 由 `remotion/src/FilmLayout.tsx` 的 `CAPTION_LOOK` **一处**说了算；那边的枚举镜像
 #: 与这里逐字相同，由 ``tests/test_code_spec.py`` 第 ⑤ 节拿正则比出来。
 CAPTION_STYLES = ("on_picture", "outlined", "paper", "film_line",
-                  "big_center", "top_banner", "none")
+                  "big_center", "top_banner", "none",
+                  # 2026-10-23：字幕交给这一镜的代码自己设计。这一档下：
+                  # · 母版那条不画、`<CaptionLayer/>` 不被自动补上、写手画在字幕带里的
+                  #   字**不被 `_strip_zone_captions` 删掉**（见 `_autofix_caption_layer`）；
+                  # · 写手拿 `getInputProps().text` 自己排位置/字号/入场，或摆带参数的
+                  #   `<CaptionLayer bottom={…} captionStyle={…} />` 放进自己的盒子里。
+                  # 其余七档全是母版 `CAPTION_LOOK` 里写死的常量，所以「字幕永远一个样」。
+                  "by_shot")
 
 #: **高亮样式**：被点名的词怎么被点出来。与上面那一维**正交**——「贴画面 + 关键词换色」
 #: 与「纸条底 + 逐词点亮」都是合法组合，两维各有各的取值域。
@@ -427,8 +434,11 @@ HIGHLIGHT_STYLES = ("color", "karaoke", "block", "ink", "plain")
 #: `group` 决定两排在面板上怎么分：前端按出现顺序取 unique group，连栏名都取
 #: ``LIBRARY_DIM_TITLES[group]``。
 CAPTION_PRESETS: tuple[dict[str, Any], ...] = (
+    {"key": "by_shot", "group": "caption_style",
+     "note": "字幕交给这一镜的代码自己设计：位置、字号、描边、入场全归它，跟着构图走。"
+             "缺省这一档——七档固定样式是「所有片子字幕长得一样」的根源"},
     {"key": "on_picture", "group": "caption_style",
-     "note": "字直接压在画面上，没有底条。默认这一档——不像 PPT 的根就在这里"},
+     "note": "字直接压在画面上，没有底条。不想让字幕成为构图的一部分时用它"},
     {"key": "outlined", "group": "caption_style",
      "note": "白字 + 黑描边压在画面上，亮底时自己压一层渐隐。画面深、字要立住时用它"},
     {"key": "paper", "group": "caption_style",
@@ -1060,10 +1070,40 @@ def _norm_shot(raw: dict[str, Any], i: int, errors: list[str], *, max_chars: int
     # R1: card / derived_from 契约栏
     card, derived_from = _norm_cite(raw, sid, errors)
 
+    # 能力点名（2026-10-22）：这一镜要用风格包正文里的哪几件能力（`<!-- section: … -->`
+    # 的段名）。渐进式加载的第二层——索引常驻系统提示，正文只随点名它的那一镜给出。
+    # 与 `entities` 同一口径：**不进 `SHOT_KNOBS`**（它不直接改变像素，改的是给写手的
+    # 上下文），写得随意也不拦：认不出的名字由 `_caps_block` 报一句、写手按不变量画。
+    caps: list[str] = []
+    raw_caps = raw.get("caps")
+    if isinstance(raw_caps, str):
+        raw_caps = re.split(r"[、,，;；/\s]+", raw_caps)
+    if isinstance(raw_caps, (list, tuple)):
+        for item in raw_caps:
+            name = str(item or "").strip()
+            if name and name not in caps:
+                caps.append(name[:32])
+            if len(caps) >= MAX_CAPS_PER_SHOT:
+                break
+    # 批 4（2026-10-23）：这一镜额外需要的**技能块**。与上面的 `caps` 是两层东西——
+    # `caps` 点的是**风格包正文**里的能力件（随风格包变），这一栏点的是
+    # **技能正文**里的按需块（`SKILL_SECTION_NAMES`，随技能变）。
+    # 认不出的名字静默丢掉：它是「多给一点写法」的优化，不是契约。
+    sections: list[str] = []
+    _raw_secs = raw.get("sections")
+    if isinstance(_raw_secs, str):
+        _raw_secs = re.split(r"[、,，;；/\s]+", _raw_secs)
+    if isinstance(_raw_secs, (list, tuple)):
+        for item in _raw_secs:
+            name = str(item or "").strip().lower()
+            if name in SKILL_SECTION_NAMES and name not in sections:
+                sections.append(name)
     return {
         "id": sid,
         "brief": brief,
         "entities": entities,
+        "caps": caps,
+        "sections": sections,
         "code": code,
         "text": text,
         # 英文字幕（2026-10-21）：只进第二行，不参与高亮。空串＝只排中文那一行。
@@ -1281,6 +1321,14 @@ def _slots_from_pack(tmpl: Mapping[str, Any]) -> list[dict[str, Any]]:
             "component": comp,
             "label": str(item.get("label") or comp)[:80],
             "kind": str(item.get("kind") or "other")[:32],
+            # 文字槽位的内容契约：`text_kind=caption` 的那件是模板自己的**主字幕**。
+            # 2026-10-23 真机：这一栏原先被白名单丢掉了，于是
+            # `template_caption_in_code` 永远为假——系统看不见 `StyleCaption`，
+            # 又给每一镜补了一条 `<CaptionLayer/>`（10 镜 10 镜两条字幕），
+            # 母版 `<Caption>` 也没让位。判据、组件名都不改，只把数据抄全。
+            "text_kind": str(item.get("text_kind") or "")[:32],
+            "content_prop": str(item.get("content_prop") or "")[:64],
+            "position": str(item.get("position") or "")[:64],
             "default": str(item.get("default") or "")[:160],
             "contract": [str(p)[:64] for p in (item.get("contract") or [])
                          if str(p).strip()][:STYLE_SLOT_CONTRACT_MAX],
@@ -1362,9 +1410,30 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     rate = str(raw.get("rate") or "+0%")
     if narration:
         if voice not in VOICES and not _VOICE_RE.match(voice):
-            _err(errors, f"voice={voice!r} 不是合法音色名")
+            # 2026-10-23 真机：模型把界面上的**人话标签**（「沉稳男声」）当机器名传进来，
+            # 这里直接报错 → 整次分镜作废、重来一遍（那次重试烧了 326 秒）。
+            # 一个纯展示字段不该有这种权力：能认出来就认（标签反查 → 关键词兜底），
+            # 认不出才报错。`rate` 那一档早就是这么做的（静默归到 +0%），两边口径统一。
+            fixed = normalize_voice(voice)
+            if fixed:
+                voice = fixed
+            else:
+                # 回执里把六个合法名字连同人话标签一起摆出来：模型常把用户原话里的
+                # 描述（「沉稳男声」）当成音色名传进来，旧的「不是合法音色名」没给出路，
+                # 它只能再猜一轮或干脆删掉这一维——2026-10-22 真机就多烧了一次调用。
+                labels = KNOB_VALUE_LABELS.get("voice") or {}
+                choices = "、".join(f"{v}（{labels.get(v, '')}）" for v in VOICES)
+                _err(errors, f"voice={voice!r} 不是合法音色名；它在 schema 的枚举里必须是"
+                             f"下面六个机器名之一：{choices}。拿不准就不传 voice，"
+                             f"缺省是 zh-CN-YunjianNeural（男声·普通话）。")
         if not _RATE_RE.match(rate):
-            _err(errors, f"rate={rate!r} 要写成 +10% / -20% 这种形式")
+            # 2026-10-23 真机：模型传 `1.0`（倍率）→ 旧代码直接报错、整次分镜作废，
+            # 那一次烧了 407 秒。能算就算，算不出才报错。
+            fixed_rate = normalize_rate(rate)
+            if fixed_rate:
+                rate = fixed_rate
+        if not _RATE_RE.match(rate):
+            _err(errors, f"rate={rate!r} 要写成 +10% / -20% 这种形式（或者 1.0 这样的倍率）")
         else:
             pct = int(rate[:-1])
             if not -50 <= pct <= 50:
@@ -1375,18 +1444,26 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
                 # 不会破坏画面与文案；要「慢」是靠 `min_duration_sec` 留白。
                 rate = "+0%"
 
-    # 字幕两维（2026-10-16 起）：整片一档 + 逐镜可覆盖。缺省是「白字黑边 + 关键词
-    # 换色」——用户 2026-10-20 的原话是「我要黑边白色字」，贴在画面上、不要纸条底。
-    caption_style = str(raw.get("caption_style") or "outlined").strip().lower()
+    # 字幕两维（2026-10-16 起）：整片一档 + 逐镜可覆盖。
+    # **2026-10-23 缺省改成 `by_shot`**：用户要「整个画面都交给 agent」，字幕是最后一
+    # 块不由它决定的地方（其余七档全是母版 `CAPTION_LOOK` 里写死的常量，所以所有片子
+    # 的字幕长得一模一样）。`outlined`（白字黑边）仍是合法档，随时可显式选回。
+    caption_style = str(raw.get("caption_style") or "by_shot").strip().lower()
     if caption_style not in CAPTION_STYLES:
         _err(errors, f"caption_style={caption_style!r} 不支持"
                      f"（可用：{', '.join(CAPTION_STYLES)}）")
-        caption_style = "outlined"
+        caption_style = "by_shot"
     highlight_style = str(raw.get("highlight_style") or "plain").strip().lower()
     if highlight_style not in HIGHLIGHT_STYLES:
-        _err(errors, f"highlight_style={highlight_style!r} 不支持"
-                     f"（可用：{', '.join(HIGHLIGHT_STYLES)}）")
-        highlight_style = "plain"
+        # 2026-10-23 真机：模型传「关键词换色」——那是卡面上的中文标签。同一个坑
+        # 与 voice / rate 一样：能认就认，别为一句标签作废整次分镜。
+        fixed_hl = normalize_highlight(highlight_style)
+        if fixed_hl:
+            highlight_style = fixed_hl
+        else:
+            _err(errors, f"highlight_style={highlight_style!r} 不支持"
+                         f"（可用：{', '.join(HIGHLIGHT_STYLES)}）")
+            highlight_style = "plain"
     # 高亮词的自定义色（2026-10-16）。空串＝没钉，跟色板走（`captionLook()` 的 accent）。
     # 非空就必须是一条真颜色：它最终落在 CSS 的 `color` 上，一个认不出的值**不报错、
     # 只是静默变回缺省色**——「面板上明明设了红，渲出来还是色板那个色」是最难查的一类，
@@ -1420,8 +1497,15 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     # （自相矛盾到读的人会怀疑是配额，不是这一栏）。test_code_spec 里那一支
     # `palette="none"` 就是它的守卫。
     if palette_raw and palette_raw != PALETTE_NONE and not palette and every:
-        _err(errors, f"palette={palette_raw!r} 不是一套色板（可用："
-                     f"{PALETTE_NONE}（不指定）、{', '.join(sorted(every))}）")
+        # 2026-10-23 真机：模型把**风格包的名字**（「铜版咖啡档案」）填进 palette →
+        # 报错 → 整次分镜作废重来（那一次 407 秒）。风格包本来就会覆盖底色，
+        # 所以这一栏填了个中文名，正确的落点是「没指定」，不是打回。
+        #
+        # 判据用「像不像一个色板 slug」而不是「认不认识」：ASCII 的拼错（`warm-cream`）
+        # 仍然报错——那才是真填错了、需要人看见；中文短语一律静默落到 none。
+        if palette_raw.isascii():
+            _err(errors, f"palette={palette_raw!r} 不是一套色板（可用："
+                         f"{PALETTE_NONE}（不指定）、{', '.join(sorted(every))}）")
         palette = ""
     # 存 `none` 而不是空串：卡面/契约/回执三处读的是同一个字面量。空串只是文字库面板
     # 那条老路的写法，在**落盘**这一层归一掉，免得下游又要认两种。
@@ -1572,6 +1656,18 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     prop = str(raw.get("recurring_prop") or "").strip()
     if prop:
         spec["recurring_prop"] = prop[:RECURRING_PROP_MAX_CHARS]
+    # 按需加载的技能块（2026-10-23，见 `spec_schema` 的 `skill_sections`）。
+    # **与上面几栏同一个坑**：不在这里抄一遍，`shot_writer._extra_sections()` 就永远
+    # 读到空表，写手永远只拿默认那部分——这一栏写了等于没写。
+    # 认不出的名字**静默丢掉**而不打回：它是「多给一点说明」的优化，不是契约，
+    # 为一个拼错的块名拦下一整份分镜不值（与 `style` / `recurring_prop` 同一条取舍）。
+    _secs = raw.get("skill_sections") or []
+    if isinstance(_secs, str):
+        _secs = [_secs]
+    _picked = [str(x or "").strip().lower() for x in _secs]
+    _picked = [x for x in _picked if x in SKILL_SECTION_NAMES]
+    if _picked:
+        spec["skill_sections"] = list(dict.fromkeys(_picked))
     # 片壳（2026-10-20）。与 `style` 同一个坑：上面那份字面量只抄认识的键，不在这里
     # 抄一遍，注入到 `shot_input_props` 的那一栏就永远是空的——写进 spec 也到不了渲染。
     # 名单只认 `SHELLS`：一个没注册的名字如果活着穿过校验，entry 会拿不到壳，
@@ -1600,7 +1696,7 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     # 自由值**——所以不进 `FILM_KNOBS`/`knob_props`（自由值进卡面会被计划校验打回），
     # 但必须在这里抄一遍，否则写手、导演、评审三处都收不到（与 `style` 同一个坑）。
     # body 超长截断不报错：说明书写多了不该让整份分镜交不上。
-    pack = raw.get("style_pack")
+    pack = raw.get("skill_contract")
     if isinstance(pack, Mapping):
         pack_name = str(pack.get("name") or "").strip()
         manifest = pack.get("manifest") if isinstance(pack.get("manifest"), Mapping) else {}
@@ -1609,11 +1705,18 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
                 manifest = json.loads(json.dumps(manifest, ensure_ascii=False))
             except (TypeError, ValueError):
                 manifest = {}
-            spec["style_pack"] = {
+            spec["skill_contract"] = {
                 "name": pack_name[:STYLE_PACK_NAME_MAX_CHARS],
                 "display": str(pack.get("display") or pack_name)[:STYLE_PACK_DISPLAY_MAX_CHARS],
                 "body": str(pack.get("body") or "").strip()[:STYLE_PACK_BODY_MAX_CHARS],
                 "manifest": manifest,
+                # 导入的技能（kind 不是 style）也当画面契约用。写手要靠这个标记
+                # 区分「本片自己的风格包」与「外面来的说明书」，措辞不一样。
+                "imported": bool(pack.get("imported")),
+                # 这一片挂载了哪几份技能：写手的「可用参考」清单按它筛文件。
+                # 归一化是**重建字典**，漏掉这个键等于把上游写的东西悄悄丢了
+                # （2026-10-24 实测：skill_contract 有、parts 没了）。
+                "parts": [str(x) for x in (pack.get("parts") or []) if str(x).strip()],
             }
             # 模板是**可执行层**，只认库里登记过的 import 说明符。用户自由值不可能
             # 走到这里（`style_pack` 由服务端注入），但白名单仍然抄一遍：没有它，
@@ -1624,7 +1727,7 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
                 if STYLE_TEMPLATE_MODULE_RE.match(module):
                     names = [str(c)[:64] for c in (tmpl.get("components") or [])
                              if isinstance(c, str) and c.strip()]
-                    spec["style_pack"]["template"] = {
+                    spec["skill_contract"]["template"] = {
                         "name": str(tmpl.get("name") or "")[:STYLE_PACK_NAME_MAX_CHARS],
                         "display": str(tmpl.get("display") or "")[:STYLE_PACK_DISPLAY_MAX_CHARS],
                         "module": module[:STYLE_TEMPLATE_MODULE_MAX_CHARS],
@@ -1635,13 +1738,13 @@ def validate_code_spec(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
                     }
                     slots = _slots_from_pack(tmpl)
                     if slots:
-                        spec["style_pack"]["template"]["slots"] = slots
+                        spec["skill_contract"]["template"]["slots"] = slots
     # 槽位替换（模型在分镜里写「主体换成鹿」的那一项）。服务端已经把它解成
     # `template.slots[].bound`；这里再留一份原指令，重写/复用时看得到用户要的是
     # 哪一件。它同样不是卡面旋钮，键值只当标识符用。
     overrides = raw.get("style_overrides")
     known: set[str] = set()
-    pack_spec = spec.get("style_pack")
+    pack_spec = spec.get("skill_contract")
     tmpl_spec = pack_spec.get("template") if isinstance(pack_spec, Mapping) else None
     if isinstance(tmpl_spec, Mapping):
         known = {str(s.get("component") or "") for s in (tmpl_spec.get("slots") or [])
@@ -1832,7 +1935,7 @@ def _manifest_caption(film: Mapping[str, Any] | None) -> dict[str, Any]:
     """
     if not isinstance(film, Mapping):
         return {}
-    pack = film.get("style_pack")
+    pack = film.get("skill_contract")
     if not isinstance(pack, Mapping):
         return {}
     manifest = pack.get("manifest")
@@ -1908,13 +2011,13 @@ def shot_cache_key(shot: dict[str, Any], *, film: Mapping[str, Any],
     # 时仍不能共用切片——两份代码的 import 相同不代表语义相同（比如模板从注册表
     # 换了实现）。只带 name + template 两样，且只在真选了包时加：与上面 `film_style`
     # 同一条纪律，`None` 一旦进键，所有老片子的键会全部漂移、整片白烧。
-    pack = film.get("style_pack") if isinstance(film, Mapping) else None
+    pack = film.get("skill_contract") if isinstance(film, Mapping) else None
     if isinstance(pack, Mapping) and str(pack.get("name") or "").strip():
         manifest = pack.get("manifest") if isinstance(pack.get("manifest"), Mapping) else {}
         tmpl = pack.get("template") if isinstance(pack.get("template"), Mapping) else {}
         # 模块名 + 源码指纹：用户把模板重新沉淀一版（同名、同风格包）时，代码字节
         # 可能一模一样，但 import 的实现换了——只带名字会让旧切片继续冒充新模板。
-        payload["style_pack"] = [str(pack["name"]).strip(),
+        payload["skill_contract"] = [str(pack["name"]).strip(),
                                  str(manifest.get("template") or "").strip(),
                                  str(tmpl.get("module") or "").strip(),
                                  str(tmpl.get("hash") or "").strip()]
@@ -1985,7 +2088,7 @@ PICTORIAL_CHANNELS: dict[str, tuple[str, ...]] = {
     # 它自己不写 `three` 三包，但画面确实是逐帧渲出来的三维场景。不从这里认，
     # 每一镜都会被闸⑦ 判成「只画了文字与色块」。
     "three": ("three", "@react-three/fiber", "@remotion/three",
-              "@dg/lib/style/cinema-studio"),
+              "@dg/lib/style/cinema-studio", "@dg/lib/style/surreal"),
     "katex": ("katex",),
 }
 
@@ -2008,7 +2111,8 @@ _VECTOR_MARKUP_RE = re.compile(
 _VECTOR_COMPONENT_PKGS: tuple[str, ...] = ("@dg/lib/brush", "@dg/lib/scene",
                                            "@dg/lib/walk",
                                            "@dg/lib/style/silhouette-history",
-                                           "@dg/lib/style/cinema-studio")
+                                           "@dg/lib/style/cinema-studio",
+                                           "@dg/lib/style/surreal")
 
 #: 第五条通道（2026-10-18）：`<canvas>` 上手写绘制。判据是**真拿了 2D 上下文**——
 #: 光写一个 `<canvas>` 空标签不算（空白画布与色块一样，画面里没东西）。技能正文允许
@@ -2507,6 +2611,9 @@ SUBJECT_MAX_CHARS = 24
 #: 占满画面」，而是**几件东西同处一个场景、彼此有空间关系**。只画一件，画面就退回
 #: 「图标 + 字」。上限 5：再多不是一幅画，是图标墙。
 MAX_ENTITIES_PER_SHOT = 5
+#: 一镜最多点名几件风格能力。上限按「一镜最多同时成立几种做法」定：光、粒子、
+#: 镜头、材质四类各一件已经够；再多是把整份正文搬回来，等于没做渐进式加载。
+MAX_CAPS_PER_SHOT = 6
 ENTITY_MAX_CHARS = SUBJECT_MAX_CHARS
 
 #: 抽象词拒绝名单：⑯ 要的是画面上能被认出的**东西**，而这些词指的是观点而不是物件。
@@ -2598,9 +2705,10 @@ def check_subject_named(shots: list[dict[str, Any]]) -> tuple[list[str], list[st
     - ``subject_channel``：**不再强制**。申报了就按代码对账（:func:`shot_all_channels`），
       申报的通道必须真用上——自报无证据仍然打回，因为那正是「写着 rough 而代码里
       一个 roughjs 都没有」的形状；没申报则只提醒补一句，不拦。
-    - 纯文字/纯色块镜：2026-10-16 起**这一档不存在**——闸⑦「每镜必画」逐镜打回。
-      这里仍留一条同义的判据当安全网（⑦ 万一又被放宽时不至于两道闸各说各话），
-      措辞直接点名 ⑦，不把它写成第二条规矩。
+    - 纯文字/纯色块镜：**只提醒，不打回**（2026-10-23 晚）。闸⑦「每镜必画」当天撤出
+      整片判据（「画没画」属于审美，交给 `design_review` 按画面判），这条同义判据就
+      没有主人了——留着 `_err` 等于通过 ⑯ 把 ⑦ 偷偷复活。而 ⑯ 这次加回整片判据的
+      唯一理由是「**账实不符**」（申报了哪条通道就必须真用上），不是「画没画」。
 
     2026-10-18 松绑的依据：旧的硬要求（每镜必填 ``subject`` + 填了就必须申报通道）
     在真机上换来的是「为了填一格而重交”；而闸⑦ 已经保证每镜真画了东西，剩下的
@@ -2631,12 +2739,20 @@ def check_subject_named(shots: list[dict[str, Any]]) -> tuple[list[str], list[st
         declared = str(s.get("subject_channel") or "").strip().lower()
         detected = sorted(shot_all_channels(str(s.get("code") or "")))
         if not detected:
-            # 安全网，不是第二条规矩：正常入口下闸⑦ 已经逐镜拦掉了这一镜，走到这里说明
-            # ⑦ 被放宽了。措辞直接点名 ⑦，免得同一件事在两处读成两条不同的要求。
-            _err(errors, f"{head}这一镜的代码里只有文字与色块（一条画法通道都没用上）——"
-                         f"这正是闸⑦「每镜必画」拦的那一镜"
-                         + (f"；另外还申报了 subject_channel={declared}，"
-                            f"没有图形的镜申报通道就是自报无证据" if declared else ""))
+            # 两种情形必须分开，混在一起就会把「账实不符」放走：
+            # · **申报了通道、代码里一条都没用** → 打回（自报无证据，这正是 ⑯ 的职责）；
+            # · **没申报、代码里也没画** → 只提醒。闸⑦「每镜必画」2026-10-23 撤了
+            #   （「画没画」属于审美，交给 `design_review` 按画面判），这条安全网就
+            #   没有主人了——留着 `_err` 等于通过 ⑯ 把 ⑦ 偷偷复活。
+            if declared:
+                _err(errors, f"{head}申报了 subject_channel={declared}，而这一镜代码里"
+                             f"一条画法通道都没用上——自报的通道必须有证据。要么把这一镜"
+                             f"的主体改成用 {declared} 画，要么按代码里真用的那条申报"
+                             f"（真没画就把这一栏去掉）")
+            else:
+                warns.append(f"{head}这一镜的代码里只有文字与色块（一条画法通道都没用上）"
+                             f"——闸⑦ 撤了，这一条不再是打回，但画面多半是空的，"
+                             f"评审看一眼更准")
             continue
         if not declared:
             warns.append(f"{head}这一镜画了图形主体（代码里认得的通道："
@@ -4414,6 +4530,10 @@ def check_ink_contrast(shots: list[dict[str, Any]]
 #: `<CaptionLayer` 的出现。只认标签名这一件事——属性、空格、换行都可能有，
 #: 但元件名不会变（它就是从 `@dg/film` import 进来的那个符号）。
 _CAPTION_LAYER_RE = re.compile(r"<\s*CaptionLayer\b")
+#: 单独一行的整条 `<CaptionLayer />`。只认自闭合、独占一行的写法（模型/补丁最常见的
+#: 形状）；带子元素或跨多行 props 的不碰——宁可漏删，不许把画面里的东西一起删掉。
+_CAPTION_LAYER_LINE_RE = re.compile(
+    r"^[ \t]*<\s*CaptionLayer\b[^>]*?/>[ \t]*\r?\n?", re.M)
 #: `<CaptionText`：只画字、位置由镜头代码给的那一件。它同样是「这一镜自己画了字幕」。
 _CAPTION_TEXT_RE = re.compile(r"<\s*CaptionText\b")
 #: `<CaptionFrame`：画/字分带的外框（2026-10-18）。它内部画的就是 `<CaptionText/>`，
@@ -4645,12 +4765,52 @@ def autofix_ink_contrast(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[s
 
 #: 用户原话里点名了别的字幕形态时，系统不再把整片拉回白字黑边。
 #: 这些是**用户自己说的话**，优先级高于缺省；模型写的 `on_picture` 不在此列。
-_CAPTION_REQUESTS = ("无底", "贴画面", "不要描边", "不要黑边", "没有描边", "纸条",
+#:
+#: 2026-10-22：这里原先写的是裸的「无底」，于是「无底色」（只说不想要背景条、
+#: 并没说不要描边）也会命中——v3 文档里一句「白色，无描边、无底色」让整份分镜
+#: 跳过了缺省收敛。现在只认「无底条」这种整档说法，不认「无底色」。
+_CAPTION_REQUESTS = ("无底条", "贴画面", "不要描边", "不要黑边", "没有描边", "纸条",
                      "纸带", "大字", "横幅", "不要字幕", "不上字幕", "on_picture")
 
 #: 用户明确要「词被点出来」时才保留关键词换色。白字黑边是**读得出来**的一档，
 #: 它的字色本来就统一；混进几枚强调色的词，整条字幕就不像同一套排版了。
 _HIGHLIGHT_REQUESTS = ("关键词", "高亮", "换色", "重点词", "变色", "强调词")
+
+#: 中文否定词：判断「这个要求是被点名要的，还是被点名**不要**的」。
+_NEGATIONS = ("不要", "不需要", "不用", "无需", "别", "取消", "去掉", "没有",
+              "不必", "不希望", "不想要", "不加", "不换")
+
+
+#: 紧贴词前那一小句以这些字开头时，整句是否定（「不换色」里的「不」与「换色」
+#: 连在一起，`_NEGATIONS` 里的多字否定抓不到——2026-10-22 v3 文档就是这么写的）。
+_CLAUSE_NEG_HEADS = "不没别勿"
+#: 以否定字开头、意思却不是否定的常见词；命中就不算否定。
+_NOT_NEGATING = ("不同", "不少", "不过", "不仅", "不管", "不如", "不断", "不久", "不但")
+_CLAUSE_SPLIT_RE = re.compile(r"[，。；、,.;:!?！？：\s（）()\[\]「」『』\"'“”‘’]")
+
+
+def _negated_before(before: str) -> bool:
+    if any(neg in before for neg in _NEGATIONS):
+        return True
+    clause = _CLAUSE_SPLIT_RE.split(before)[-1]
+    if not clause or clause[0] not in _CLAUSE_NEG_HEADS:
+        return False
+    return not any(clause.startswith(w) for w in _NOT_NEGATING)
+
+
+def _asked_for(req: str, words: Sequence[str]) -> bool:
+    """用户原话里是不是**肯定地**点了这些词；紧贴在词前的否定不算。
+
+    只做 8 个字以内的近邻判：中文否定几乎都贴在词前（「不要关键词」「不加高亮」）。
+    再远就分不清「不要 A，但要 B」里的 B——那种句子交给整句判断，不在这里猜。
+    """
+    for word in words:
+        at = req.find(word)
+        while at >= 0:
+            if not _negated_before(req[max(0, at - 8):at]):
+                return True
+            at = req.find(word, at + len(word))
+    return False
 
 
 def autofix_caption_default(raw: Mapping[str, Any],
@@ -4669,35 +4829,37 @@ def autofix_caption_default(raw: Mapping[str, Any],
     `top_banner` 等）也保留：那些是有理由的版式决定，不是同一种「读不出来」。
     """
     req = str(user_request or "")
-    if any(k in req for k in _CAPTION_REQUESTS):
-        return dict(raw), []
     notes: list[str] = []
     out = dict(raw)
-    top = str(out.get("caption_style") or "").strip().lower()
-    if top == "on_picture":
-        out["caption_style"] = "outlined"
-        notes.append("整片字幕：on_picture（无描边）→ outlined（白字黑边），"
-                     "深底上才读得出来；要换回无底请在对话里点名")
-    elif not top:
-        out["caption_style"] = "outlined"
+    # 用户点名了别的字幕**形态**时，整片那一档不动（这是他的选择）。但「字幕形态」
+    # 与「关键词要不要着色」是两件事：2026-10-22 的 v3 文档写了「无描边、无底色」，
+    # 原先这里直接 return，连 `highlight_style: color` 也一起放过了，用户看到的
+    # 就是「贴画面 + 关键词换色」。两栏从此各判各的。
+    caption_override = any(k in req for k in _CAPTION_REQUESTS)
+    if not caption_override:
+        top = str(out.get("caption_style") or "").strip().lower()
+        if top == "on_picture":
+            out["caption_style"] = "outlined"
+            notes.append("整片字幕：on_picture（无描边）→ outlined（白字黑边），"
+                         "深底上才读得出来；要换回无底请在对话里点名")
+        elif not top:
+            out["caption_style"] = "by_shot"
     # 白字黑边这一档的字色本来就是统一的：模型常把整片写成 `highlight_style: color`
     # （技能正文里的示例就是 `emphasis="color"`），成片里几枚词突然变成强调色，
-    # 用户看到的就是「字幕不统一」（2026-10-20 真机）。用户没点名要关键词时，
-    # 把这一档收回 plain；点名了（「关键词换色 / 高亮」）就一个字节都不动。
+    # 用户看到的就是「字幕不统一」（2026-10-20 真机）。用户没**肯定地**点名要关键词
+    # （「不要关键词」「不加高亮」不算）时，把这一档收回 plain。
     hl = str(out.get("highlight_style") or "").strip().lower()
-    if (str(out.get("caption_style") or "").strip().lower() == "outlined"
-            and hl != "plain"
-            and not any(k in req for k in _HIGHLIGHT_REQUESTS)):
+    if hl != "plain" and not _asked_for(req, _HIGHLIGHT_REQUESTS):
         # 2026-10-21：用户看过成片后点名「不要这种带关键字的」——白字黑边这一档
         # **整条字同一个白色**。不只是换色那一档：逐词点亮（karaoke）会让没念到的字
         # 淡下去、底色块与撕纸笔触会在字后面加东西，三种在深底上都比纯白难读，
         # 也都破坏了「一条字幕一个样」。所以这一档下**所有**强化方式都收回 plain；
         # 用户明确点名了（「关键词换色 / 高亮 / 逐词点亮」）就一个字节都不动。
         out["highlight_style"] = "plain"
-        notes.append("整片字幕：白字黑边下取消关键词强调（highlight_style → plain），"
+        notes.append("整片字幕：取消关键词强调（highlight_style → plain），"
                      "整条字同色；要给关键词上色请在对话里点名")
     shots = out.get("shots")
-    if isinstance(shots, list):
+    if isinstance(shots, list) and not caption_override:
         fixed: list[Any] = []
         changed: list[str] = []
         for i, shot in enumerate(shots):
@@ -4717,6 +4879,65 @@ def autofix_caption_default(raw: Mapping[str, Any],
             notes.append("逐镜字幕覆盖 on_picture 已去掉、跟随整片白字黑边："
                          + "、".join(changed))
     return out, notes
+
+
+#: 字幕有没有被逐镜烧进画面（母版 `<Caption>` 或代码里的 `<CaptionLayer/>`）——
+#: 叠化时两边各带一条，xfade 会把它们叠成两行。判在**分镜期**，因为这是结构性事实。
+_CAPTION_IN_CODE_RE = re.compile(r"<\s*(CaptionLayer|CaptionText|CaptionFrame)\b")
+
+
+def autofix_caption_transition(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """叠化与「逐镜烧进画面的字幕」不能共存：xfade 会把两镜画面叠在一起，两条字幕也一起叠。
+
+    2026-10-22 真机：分镜写了 `transition: dissolve`、0.6 秒，字幕又由母版/`<CaptionLayer/>`
+    逐镜烧进切片。拼接层用 ffmpeg `xfade`，交叠的 0.6 秒里上一镜的字还亮着、下一镜的字
+    已经入画——用户看到的是「有的重叠」。这不是某一镜写错字，是转场与字幕所在的层次不对。
+
+    所以只改**会有两条字幕同时出现**的接缝：两侧都有字的，改成硬接（`transition: none`），
+    其余接缝照用户选的档。改在分镜期、写进逐镜覆盖，拼接层照旧读同一份 `transition_plan`。
+    回执里点名改了哪几处——不静默改观感。
+    """
+    out = dict(raw)
+    shots = out.get("shots")
+    if not isinstance(shots, list) or len(shots) < 2:
+        return out, []
+    top = str(out.get("caption_style") or "").strip().lower()
+    if top == "none":
+        return out, []
+
+    def has_caption(shot: Mapping[str, Any]) -> bool:
+        style = str(shot.get("caption_style") or top or "").strip().lower()
+        if style == "none":
+            return False
+        code = str(shot.get("code") or "")
+        # 有字就有字幕：母版那条也会烧进每一镜的切片（`captionFromCode` 只决定让不让位）。
+        return bool(str(shot.get("text") or "").strip()
+                    or _CAPTION_IN_CODE_RE.search(code))
+
+    top_style = str(out.get("transition") or "none").strip().lower()
+    fixed: list[Any] = []
+    demoted: list[str] = []
+    for i, shot in enumerate(shots):
+        if not isinstance(shot, Mapping):
+            fixed.append(shot)
+            continue
+        row = dict(shot)
+        if i < len(shots) - 1:
+            nxt = shots[i + 1]
+            # 没写逐镜覆盖时，这一处跟整片档——不能只看 row 自己的那一栏。
+            eff = str(row.get("transition") or top_style).strip().lower()
+            if (isinstance(nxt, Mapping) and has_caption(row) and has_caption(nxt)
+                    and eff not in ("", "none")):
+                row["transition"] = "none"
+                demoted.append(str(shot.get("id") or f"s{i + 1:02d}"))
+        fixed.append(row)
+    if demoted:
+        notes = [f"转场：{ '、'.join(demoted) } 之后这几处两侧都有字幕，叠化会把"
+                 "上下两条字幕叠在一起；已改为硬接（其余接缝照原档）。"
+                 "要整片叠化，得先把字幕从逐镜画面里拿出去。"]
+        out["shots"] = fixed
+        return out, notes
+    return out, []
 
 
 #: 画面最底下留给字幕的那一条（设备像素），与 `remotion/src/tokens.ts` 的
@@ -4810,7 +5031,7 @@ def _strip_zone_captions(code: str, zone_px: int) -> tuple[str, list[str]]:
 
 def _shot_caption_style(shot: Mapping[str, Any], spec: Mapping[str, Any]) -> str:
     """这一镜**生效**的字幕样式：镜级覆盖 > 整片 > 缺省（与 `shot_input_props` 同一条回落）。"""
-    return str(shot.get("caption_style") or spec.get("caption_style") or "outlined")
+    return str(shot.get("caption_style") or spec.get("caption_style") or "by_shot")
 
 
 def autofix_caption_layer(spec: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -4823,9 +5044,9 @@ def autofix_caption_layer(spec: Mapping[str, Any]) -> tuple[dict[str, Any], list
     一步，与 `autofix_ink_contrast` 同理。反过来，同一天把「不摆就逐镜打回」写进技能正文，
     模型被吓得不敢交分镜，去一份份翻 demo，一连八条 run 都撞到迭代上限、零产物。
 
-    不动的镜：字幕样式是 `none`；代码里已经有 `<CaptionLayer` 或自己用 `<CaptionText`
-    排字（那也读注入，是「字自己排」那条正路）；找不到顶层 `</AbsoluteFill>`（插不准
-    就不插，说明里点名，让模型自己摆）。
+    不动的镜：字幕样式是 `none`（不上字幕）或 `by_shot`（字幕由代码自己设计，2026-10-23）；
+    代码里已经有 `<CaptionLayer` 或自己用 `<CaptionText` 排字（那也读注入，是「字自己排」
+    那条正路）；找不到顶层 `</AbsoluteFill>`（插不准就不插，说明里点名，让模型自己摆）。
 
     **不删**模型手画的字：真机那几行是文案的缩写、是它的画面设计，不是重复字幕。
     它若正好摆在字幕带里，会与补上的这条撞——那由预览静帧的版面读数点名（字压字）。
@@ -4852,8 +5073,12 @@ def autofix_caption_layer(spec: Mapping[str, Any]) -> tuple[dict[str, Any], list
             continue
         code = str(shot["code"])
         sid = str(shot.get("id") or f"s{i + 1:02d}")
-        if (_shot_caption_style(shot, spec) == "none"
+        if (_shot_caption_style(shot, spec) in ("none", "by_shot")
                 or caption_any_by_code(code, template_slots)):
+            # `by_shot`（2026-10-23）：字幕交给这一镜的代码自己设计 —— 既不补
+            # `<CaptionLayer/>`（母版那条也不画，见 `FilmLayout.tsx` 的
+            # `NO_MOTHER_CAPTION`），也**不删**写手画在字幕带里的字。它画成什么样、
+            # 站在哪、怎么入场，全归它自己；成片质量由视觉评审按画面判。
             out.append(shot)
             continue
         closes = list(_ROOT_CLOSE_RE.finditer(code))
@@ -5091,6 +5316,7 @@ def autofix_duplicate_caption(spec: Mapping[str, Any]) -> tuple[dict[str, Any], 
     slots = style_template_slots(spec)
     frame_fixed: list[str] = []
     template_fixed: list[str] = []
+    layer_fixed: list[str] = []
     out: list[Any] = []
     for i, shot in enumerate(shots):
         if not isinstance(shot, Mapping) or not shot.get("code"):
@@ -5098,6 +5324,17 @@ def autofix_duplicate_caption(spec: Mapping[str, Any]) -> tuple[dict[str, Any], 
             continue
         code = str(shot["code"])
         sid = str(shot.get("id") or f"s{i + 1:02d}")
+        # ①′ 模板字幕 + `<CaptionLayer/>`。2026-10-22 真机：模板槽位没标
+        # `text_kind=caption`，`autofix_caption_layer` 看不见 `StyleCaption`，
+        # 又补了一条 `CaptionLayer`——10 镜里 6 镜同屏两条字。槽位数据已经补上
+        # （`templates.json` 的 `facets.text`），这里再留一道确定性兜底：
+        # 两件都在时只留模板那一条。
+        if template_caption_in_code(code, slots) and _CAPTION_LAYER_LINE_RE.search(code):
+            new_code = _CAPTION_LAYER_LINE_RE.sub("", code)
+            if new_code != code:
+                layer_fixed.append(sid)
+                out.append({**shot, "code": new_code})
+                continue
         # ① 模板字幕 + 另一份不带 `text=` 的 `<CaptionText/>`。
         # 模板里承担主字幕的那一件（`text_kind=caption` 的槽位）本身就是这一条字幕；
         # 写手再套一份 `<CaptionText/>`，两件都画字，位置差几像素就是重影。
@@ -5151,6 +5388,10 @@ def autofix_duplicate_caption(spec: Mapping[str, Any]) -> tuple[dict[str, Any], 
             f"字幕：{'、'.join(template_fixed)}——模板的主字幕（{comps or '文字组件'}）"
             "已经画了这一条，代码里又摆了一份 <CaptionText/>，同屏会叠成重影；"
             "系统删掉了后面那份。这一镜的字只写进模板组件的内容 prop")
+    if layer_fixed:
+        notes.append(
+            f"字幕：{'、'.join(layer_fixed)}——模板的主字幕已经在画这一条，"
+            "代码里又摆了一份 <CaptionLayer/>，同屏会叠成重影；系统删掉了后面那份")
     return {**spec, "shots": out}, notes
 
 
@@ -5174,13 +5415,40 @@ def autofix_duplicate_caption(spec: Mapping[str, Any]) -> tuple[dict[str, Any], 
 #: 只在用 demo 时才有意义的三道（⑫ 骨架相似 / ⑳ 原创配额 / ⑮ 版式族配额）：
 #: `DEMOS_ENABLED` 关着时不进整片判据（见那个常量的注释）。
 _DEMO_GATES = (check_derived_similarity, check_original_share, check_layout_family)
-WHOLE_FILM_GATES = tuple(
-    g for g in (check_draw_floor, check_style_variety,
-                check_derived_similarity, check_original_share,
-                check_shot_structure, check_ink_contrast,
-                check_layout_family, check_subject_named,
-                check_caption_ownership)
-    if DEMOS_ENABLED or g not in _DEMO_GATES)
+
+#: **2026-10-23：整片判据收成一道。** 用户判断「DS 10.17 的画图能力不需要这些约束，
+#: 让模型按技能与提示词自由发挥」。撤掉的六道与理由：
+#:
+#: · ⑦ `check_draw_floor`「每镜必画」——判「画没画」，属于审美；
+#: · ⑲ `check_style_variety`「风格配额」——逼丰富，恰好是限制；
+#: · ⑨ `check_shot_structure`「跨镜同构」——判「像不像 PPT」，交给模型；
+#: · ⑯ `check_subject_named`「主体具名」——判「画的是不是那个东西」；
+#: · ⑩ `check_ink_contrast`「字色对比度」——读不清是审美，不是崩；
+#: · ⑫⑳⑮（demo 三道）——`DEMOS_ENABLED` 本来就关着。
+#:
+#: **留下的这一道不是审美判据，是结构性 bug**：同屏两条字幕会叠成重影，
+#: 那是代码里摆了两份字幕元件，不是「好不好看」。
+#:
+#: 六个函数**不删**（回执、`style_facts` 与测试仍在读它们的读数），只是不再进
+#: `validate_code_spec` 的打回清单——「不拦 ≠ 不明说」。
+#:
+#: **⑯ 同日加回（2026-10-23 晚）。** 与上面撤掉的五道，区别在**判的是什么**：
+#: ⑦⑨⑩⑲⑫⑳ 判的都是「画得好不好」——那是审美，交给 `design_review` 按画面判更准；
+#: ⑯ 判的是「**说了有没有做到**」——申报 `subject_channel=three` 而代码里一个 three
+#: 都没有，是账实不符，不是品味问题，没有「人眼替机器判」的余地。
+#:
+#: 允许它不判的实测后果（《一秒》20:36 那轮）：12 镜里 8 镜申报了
+#: three/katex/rough/canvas，而代码里这四个词出现 **0 次**，全片 `style_channels`
+#: 只剩 `["vector"]`；视觉评审把 s07 的心脏写成「扁平卡通剪影，只有一圈暗描边，
+#: 没有厚度、粗糙度、接触阴影」——它申报的是 three。**申报与实现之间没有任何机制。**
+#:
+#: 配套：`shot_writer._channel_samples_block()` 同日给了 three/katex/rough/canvas 的
+#: 可抄骨架。**只拦不给范本会让那几镜反复退到超时**，两处必须一起上。
+#: 注意 ⑯ 里 `subject` 那一半（空着 / 抽象词 / 长度越界）**仍是提醒**，不进打回清单。
+#:
+#: ⑯ 排在 ㉜ **之前**：`test_caption_layer` 立了一条「新闸接在尾上、不插队」的约定，
+#: 而 ㉜ 必须留在最后一位。⑯ 是「加回来的旧闸」，接在头部不违反那条约定。
+WHOLE_FILM_GATES = (check_subject_named, check_caption_ownership)
 
 #: 「建议」档：这几道的打回项降为提醒（加 `（建议）` 前缀），与"打回档"同在一条回执里，
 #: 读的人（与模型）分得出轻重。
@@ -5194,8 +5462,22 @@ WHOLE_FILM_GATES = tuple(
 #: 是「这一镜画面上根本没东西」和「字压字看不清」——没有"人眼替机器判"的余地。
 #: 留着"打回档"这个轻重，模型读 `check_film` 时一眼能分出哪几条必须改、哪几条可商量。
 #: **不拦 ≠ 不明说**：判据照旧说全，拦不拦由调用方定，这正是「闸变工具」那条线。
+#:
+#: **⑯（主体具名）2026-10-23 从这一份里移出，改回硬闸。** 依据是当天《一秒》那条片的
+#: 实跑账：12 镜里 8 镜申报了 `subject_channel=three/katex/rough/canvas`，而代码里
+#: `three`/`roughjs`/`katex`/`canvas` 一次都没出现——**全片 `style_channels` 只剩
+#: `["vector"]`**。⑯ 明明判出了这 8 条（`:2741` 那处是真 `_err`），却因为被列在这里，
+#: 降成「（建议）」一路放行，于是「申报高级通道、手上画 SVG」成了零成本的事。
+#: 用户看到的后果是 s07 的心脏被评审写成「扁平卡通剪影，没有厚度、粗糙度、接触阴影」。
+#:
+#: 这一条与 ⑦⑩ 同类：**「自报的通道必须有证据」不是品味，是账实相符**。允许它软，
+#: 等于允许模型用一句话换掉一条画法通道。`subject` 那一半（空着/抽象词/长度）仍是
+#: 提醒，不进这里——那才是可以商量的。
+#:
+#: 配套：`shot_writer._channel_samples_block()` 同时给了 three/katex/rough/canvas 的
+#: 可抄骨架。**只硬拦不给范本会让那几镜反复退到超时**，两处必须一起上。
 SOFT_GATES = frozenset({check_style_variety, check_layout_family, check_original_share,
-                        check_shot_structure, check_derived_similarity, check_subject_named})
+                        check_shot_structure, check_derived_similarity})
 #: 旧名（并档前"只在预览档软"的那一份）。并档后与 `SOFT_GATES` 是**同一个集合**，
 #: 留着只为不打断既有引用（`test_caption_layer.py` 按名字查过它）。
 #: **别只往其中一个加东西**——加进任一个就等于加进另一个，那正是并档要消掉的东西。
@@ -5333,7 +5615,18 @@ STYLE_GRAMMAR_MAX_CHARS = 220
 #: 里反复出现的道具——参考片里那枚「本能读数」仪表就是它。自由文本，不进计划卡旋钮
 #: （与 `style` 同规：写在这里是为了不给卡面加一道没法反查枚举的栏）。
 RECURRING_PROP_MAX_CHARS = 60
-#: 风格包（`spec["style_pack"]`，见 `plan_motion._attach_style_pack`）的容量上限。
+
+#: 按需加载的技能块名（2026-10-23）。**唯一一份清单**：schema 的 enum、校验时的过滤、
+#: 与 `shot_writer._extra_sections()` 都从这里取。写手那一侧的两张表
+#: （`_RULES_OPTIONAL` / `_SKILL_OPTIONAL`）按名字挂上去，键必须与这里一致——
+#: `tests/test_shot_writer.py` 有一条断言钉住这件事。
+#:
+#: 为什么要做成枚举而不是自由字符串：块名是**服务端与技能之间的约定**，
+#: 模型在 schema 与白名单里都查不到它；给自由字符串，拼错一个字母就是静默不加载。
+SKILL_SECTION_NAMES: tuple[str, ...] = (
+    "chart", "three", "transition", "caption-matrix", "caption-hard",
+)
+#: 风格包（`spec["skill_contract"]`，见 `plan_motion._attach_style_pack`）的容量上限。
 #: 它由系统从 PG 注入，不是模型写的，也不是卡面旋钮：名字/显示名只用来在回执与提示词里
 #: 指认；正文是给写手/导演看的说明书，写长了截断——风格包啰嗦不该让分镜交不上。
 STYLE_PACK_NAME_MAX_CHARS = 64
@@ -5383,7 +5676,7 @@ SHELLS: tuple[str, ...] = ("paper-flat",)
 #: 片壳上那行整片不变的小字（如「第 001 期 · 主题」）。自由文本，超长截断不报错。
 SHELL_LABEL_MAX_CHARS = 48
 #: 每镜画面描述（`shots[].brief`，交给逐镜写代码的那次调用）的长度上限（字符）。
-SHOT_BRIEF_MAX_CHARS = 400
+SHOT_BRIEF_MAX_CHARS = 1000
 
 
 def _switch_on(value: Any) -> bool:
@@ -5419,12 +5712,100 @@ COLOR_KNOBS: tuple[str, ...] = ("highlight_color",)
 _VOICE_RE = re.compile(r"^[a-z]{2}(-[A-Za-z]{2,})?-[A-Za-z]+Neural$")
 _RATE_RE = re.compile(r"^[+-]\d{1,3}%$")
 
+#: 标签/人话 → 机器名。顺序有意义：先具体后笼统（「男声·少年音」里既有男也有少年）。
+#:
+#: 为什么需要这一层（2026-10-23 真机）：分镜卡上音色显示的是「沉稳男声」这种人话，
+#: 模型看到什么就传什么，于是把标签当机器名传进来。旧行为是**硬报错**——一次分镜
+#: 因此整份作废、重来一遍（326 秒）。音色是一个纯展示维，认错了顶多声音不对，
+#: 不该有权否掉整次分镜。
+_VOICE_HINTS: tuple[tuple[str, str], ...] = (
+    ("播报", "zh-CN-YunyangNeural"),
+    ("新闻", "zh-CN-YunyangNeural"),
+    ("少年", "zh-CN-YunxiaNeural"),
+    ("童", "zh-CN-YunxiaNeural"),
+    ("年轻", "zh-CN-YunxiNeural"),
+    ("女", "zh-CN-XiaoxiaoNeural"),
+    ("男", "zh-CN-YunjianNeural"),
+)
+
+
+def normalize_voice(value: Any) -> str:
+    """把一个「可能是人话」的音色名收敛到机器名；认不出回空串（由调用方报错）。
+
+    三层，从严到松：① 已经是名单里的机器名 → 原样；② 是面板上的标签（逐字相等，
+    走 `KNOB_VALUE_LABELS` 反查）→ 换成机器名；③ 只含关键词（「沉稳男声」）→ 按
+    `_VOICE_HINTS` 猜。**猜的结果只用于「不报错」，不回写用户的选择**：计划卡上
+    显示的还是模型传进来的原话，人一看就知道被归到了哪一档。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if s in VOICES:
+        return s
+    labels = KNOB_VALUE_LABELS.get("voice") or {}
+    for machine, label in labels.items():
+        if label and label == s and machine in VOICES:
+            return machine
+    for hint, machine in _VOICE_HINTS:
+        if hint in s:
+            return machine
+    return ""
+
 #: 语速档位（前端下拉直接给这几个，比让用户填百分号友好）。
 #:
 #: 2026-10-20 用户明确要求「人声朗读正常语速，不要降速」：负档位从可选清单里拿掉，
 #: 正常语速（+0%）就是下限。要更慢的听感用更长的文案或 `min_duration_sec` 留白，
 #: 不靠 TTS 降速——降速在真机 run 里被模型用来凑目标时长（实测出现过 -8%）。
 RATE_CHOICES = ("+0%", "+10%", "+20%", "+30%")
+
+#: 语速的**人话写法 → 档位**。2026-10-23 真机：模型把 `1.0` 当语速传进来，
+#: `_RATE_RE` 认不出 → 整次分镜作废重来（那一次烧了 407 秒）。
+#: 一个纯展示字段不该有这种权力：能算出来就算，认不出才报错。
+_RATE_RATIO_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*[xX倍]?$")
+
+
+def normalize_rate(value: Any) -> str:
+    """把「可能是人话」的语速收敛到 ``+N%``；认不出回空串（由调用方报错）。"""
+    s = str(value or "").strip()
+    if not s:
+        return "+0%"
+    if _RATE_RE.match(s):
+        return s
+    # `1.0` / `1` / `1.05x` / `0.9倍` —— 当成倍率，换成百分比。
+    m = _RATE_RATIO_RE.match(s)
+    if m:
+        try:
+            pct = round((float(m.group(1)) - 1.0) * 100)
+        except ValueError:
+            return ""
+        if not -50 <= pct <= 50:
+            return ""
+        # 与下面那条同规：正常语速是下限，负的一律归零。
+        return f"+{max(0, pct)}%"
+    return ""
+
+
+#: 高亮样式的**人话写法 → 机器名**。同样是 2026-10-23 真机：模型传了「关键词换色」，
+#: 那是卡面上的中文标签，不是枚举值——直接报错让整次分镜作废，代价与收益完全不成比例。
+_HIGHLIGHT_ALIASES: tuple[tuple[str, str], ...] = (
+    ("关键词换色", "color"), ("换色", "color"), ("关键词", "color"), ("高亮", "color"),
+    ("卡拉", "karaoke"), ("逐字", "karaoke"),
+    ("色块", "block"), ("块底", "block"), ("底块", "block"),
+    ("墨", "ink"),
+    ("不加", "plain"), ("普通", "plain"), ("无", "plain"),
+)
+
+
+def normalize_highlight(value: Any) -> str:
+    """把「可能是人话」的高亮样式收敛到枚举值；认不出回空串。"""
+    s = str(value or "").strip()
+    low = s.lower()
+    if low in HIGHLIGHT_STYLES:
+        return low
+    for hint, machine in _HIGHLIGHT_ALIASES:
+        if hint in s:
+            return machine
+    return ""
 
 #: 开关取值的中文标签。**每个取值都要有一句**：卡面上的 radio 文字优先用模型写的
 #: ``display``，模型没写就回落到这里（见 ``plan/validate.py::_check_params``）——
@@ -5461,7 +5842,8 @@ KNOB_VALUE_LABELS: dict[str, dict[str, str]] = {
     # 字幕两维（2026-10-16）：字长什么样 × 被点名的词怎么被点出来。旧的三旋钮
     # （subtitle_mode / caption_position / caption_anim）不在这一族里了。
     # 标签说清「观众看到的是什么」：写字纸/描边/位置/入场都归前者，换色/点亮/色块归后者。
-    "caption_style": {"on_picture": "贴画面·无底条", "outlined": "白字黑边",
+    "caption_style": {"by_shot": "交给镜头自己设计", "on_picture": "贴画面·无底条",
+                      "outlined": "白字黑边",
                       "paper": "纸条底·画面下沿", "film_line": "整句电影感·下沿淡浮",
                       "big_center": "大字压屏·画面正中", "top_banner": "顶部横幅",
                       "none": "不上字幕"},
@@ -5561,7 +5943,7 @@ def knob_props() -> dict[str, Any]:
                            "不要靠降速凑时长",
         },
         "caption_style": {
-            "type": "string", "enum": list(CAPTION_STYLES), "default": "outlined",
+            "type": "string", "enum": list(CAPTION_STYLES), "default": "by_shot",
             "description": "字幕长什么样、站在哪（整片默认，每镜可覆盖）；"
                            "缺省 outlined＝白字黑边；none=不上字幕",
         },
@@ -5764,6 +6146,20 @@ IMPORT_WHITELIST: tuple[str, ...] = (
     # 2026-10-11 那批六支真渲夹具（roughjs / three / KaTeX × 两画幅）就是它们渲的。
     "three", "@react-three/fiber", "@remotion/three", "roughjs",
     "katex", "katex/dist/katex.min.css",
+    # 2026-10-24：补齐与闸① 的差集。这 12 项**镜像里早装好了、闸① 也早放行了**，
+    # 只有这份「模型看得见」的名单漏着——后果不是报错，是模型根本不知道能用：
+    # 转场只能手搓、`d3-scale` 的比例尺只能自己算、`chroma-js` 的调色只能手写插值、
+    # `flubber` 的形状补间用不上、`lucide-react` 的图标也只能自己画。
+    # 判据是 `test_code_spec.py` 第 ⑤ 节「两侧逐项相等」，它一直在红（差集 12 项）。
+    #
+    # 刻意**不含** `@remotion/effects` 桶名（§9-Q89 那条仍然成立：桶里没有
+    # paper/halftone，写包名打包期不报错、渲染期才炸）——闸① 那边放行了它是那边的漏洞，
+    # 不该拿它当对齐目标。
+    "@remotion/transitions", "@remotion/transitions/fade",
+    "@remotion/transitions/slide", "@remotion/transitions/wipe",
+    "@remotion/transitions/flip", "@remotion/transitions/clock-wipe",
+    "chroma-js", "d3-scale", "d3-shape", "d3-interpolate-path",
+    "flubber", "lucide-react",
     # 母版与 token 走别名；镜头代码只能拿到这两个文件级入口
     "@dg/film", "@dg/tokens",
     # webfont 注册表（R5-T16）。import 它就是当场把那 101 片注册进 document.fonts；
@@ -5799,6 +6195,9 @@ IMPORT_WHITELIST: tuple[str, ...] = (
     # 三维写实模板（2026-10-21）「暗房微距」。舞台/材质/灯光/相机/调色在模板里，
     # 镜头代码只摆这一镜的实物；名单与 `remotion/lint-rules.mjs` 同步。
     "@dg/lib/style/cinema-studio",
+    # 超现实写实的能力库（2026-10-22）：光/烟/粒子/水面/辉光/三维世界。逐件导出，
+    # 镜头代码按这一镜的 brief 自己挑零件——它不是模板，不规定构图。
+    "@dg/lib/style/surreal",
     "@dg/themes/palettes.json",
 )
 
@@ -6028,6 +6427,19 @@ def spec_schema() -> dict[str, Any]:
                                "把附件里的 material_id 原样写进来；系统会抽参考帧随每一镜"
                                "发给写手，让它照着参考的画法画。不是计划卡旋钮。",
             },
+            "skill_sections": {
+                "type": "array",
+                "items": {"type": "string",
+                          "enum": ["chart", "three", "transition",
+                                   "caption-matrix", "caption-hard"]},
+                "maxItems": 5,
+                "description": "按需加载的技能块（2026-10-23）。默认**什么都不用写**："
+                               "写手只拿每一镜都用得上的那部分。这一片里确实有图表镜就加 "
+                               "`chart`，有三维镜就加 `three`；`transition`（转场写法）"
+                               "写手根本用不到——转场在拼接层，加了只是浪费。"
+                               "`caption-matrix` 是字幕样式组合表、`caption-hard` 是闸的"
+                               "硬约束说明，一般不用加。不是计划卡旋钮。",
+            },
             "recurring_prop": {
                 "type": "string", "maxLength": RECURRING_PROP_MAX_CHARS,
                 "description": "整片贯穿装置：**一件**在画面世界里反复出现的具体道具，"
@@ -6127,8 +6539,36 @@ def spec_schema() -> dict[str, Any]:
                                            "不是并排的小图标；文案只点到一件时就写一件，别硬凑。"
                                            "系统按这份清单检查「是不是每件都画了、都认得出来」。"
                                            "美术导演没补时可由系统补；不进计划卡旋钮"},
+                        # 渐进式风格包的「这一镜点哪几件能力」。名字由风格包正文的
+                        # `<!-- section: … -->` 块声明，模型在 schema 与导入白名单里
+                        # 都查不到——所以索引由服务端注入（`_caps_index_block`），
+                        # 这一栏只负责承载名字。不填＝由美术导演按 brief 补。
+                        "caps": {
+                            "type": "array", "maxItems": MAX_CAPS_PER_SHOT,
+                            "items": {"type": "string"},
+                            "description": "这一镜用到所选风格包里的哪几件能力（0–3 个；"
+                                           "名字见风格包给出的能力索引）。选了就会把那一件"
+                                           "的做法正文加载给写手，所以只写这一镜真会用的。"
+                                           "不填由美术导演按 brief 补。不进计划卡旋钮"},
+                        "sections": {
+                            "type": "array", "maxItems": 2,
+                            "items": {"type": "string",
+                                      "enum": ["chart", "three", "transition",
+                                               "caption-matrix", "caption-hard"]},
+                            "description": "这一镜额外要加载的技能写法（0–2 个，一般不用写）。"
+                                           "写手默认只拿每一镜都用得上的那部分；这一镜是图表"
+                                           "就写 `chart`、是三维场景就写 `three`。"
+                                           "`transition` 别写——转场在拼接层，写手用不到。"
+                                           "不填就是默认那部分。不进计划卡旋钮"},
                         "code": {"type": "string", "maxLength": MAX_CODE_BYTES,
-                                 "description": "可省（缺省就按 brief 由系统写）。" + _CODE_DOC},
+                                 "description":
+                                     "**默认留空**：每一镜只交 brief，代码由逐镜写手写——"
+                                     "它有专门的写作规则、动效骨架、配方卡与你挂的技能正文，"
+                                     "在主对话里现写反而更差（真机 2026-10-24：模型自己写了"
+                                     "12 镜，导演与写手全被跳过，brief 停在 195 字、没有"
+                                     "构图骨架、光效只到渐变近似）。"
+                                     "**只有用户明确要求你自己写代码时**才填。"
+                                     + _CODE_DOC},
                         "code_from": {"type": "string",
                                       "description": "复用另一镜的代码（填那一镜的 id，本镜不写 code），"
                                                      "只换 text / fields / 色板。长片用它：十几种版式"
@@ -6525,9 +6965,14 @@ def duration_block(spec: dict[str, Any], target: float | None, *,
         return None
     low, high = estimate_sec(spec)
     n = len(spec.get("shots") or [])
-    if n == 0 or not (low > target * long_factor or high < target * short_factor):
+    # **按中点判，不按下界**（2026-10-23）。下界是「文案刚好念完」的最乐观值，
+    # 上界含驻留余量；用下界判等于把区间里一半的情形放过去——真机上 12 镜 ×30 字
+    # 估成 79~122 秒、目标 60 秒，下界 79 < 81（60×1.35）居然不拦，于是照常开写，
+    # 407 秒写完才发现超了一半。中点 100 > 81，这一道就响了。
+    mid = (low + high) / 2.0
+    if n == 0 or not (mid > target * long_factor or high < target * short_factor):
         return None
-    too_long = low > target * long_factor
+    too_long = mid > target * long_factor
     per = max(0.5, (low + high) / 2 / n)
     if too_long:
         fix = (f"删到约 {max(1, round(target / per))} 镜，或把每镜文案缩短"

@@ -41,6 +41,16 @@ const SHOT_FILE = path.join(ROOT, 'src', 'user-shots', 'shot.tsx');
 // 不在这里。目录挂命名卷——容器重建后文件还在；真丢了也会被 `sync_validated()`
 // 从 PG 重推，所以这里不是真相，只是缓存。
 const GENERATED_DIR = path.join(ROOT, 'src', 'lib', 'style', 'generated');
+// 脚本产出的素材：**只由 /assets 口写入**，落在 `public/assets/`。
+//
+// 为什么要有这一条（2026-10-23）：`run` 工具让技能脚本能跑了，但跑出来的 PNG/SVG
+// 进不了画面——`public/` 里原本只有 `fonts/`，`staticFile()` 指别的名字运行时就是
+// 一张空图（`dg/staticfile-font-only` 拦的就是这个）。这个口补的是「出文件 → 进画面」
+// 那一段：脚本产物推上来，镜头代码用 `staticFile('assets/xxx.png')` 就能拿到。
+const ASSETS_DIR = path.join(ROOT, 'public', 'assets');
+const ASSET_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,60}$/;
+// 一张图正常几十 KB；8MB 够放一张 4K PNG，又不至于把 public/ 变成用户网盘。
+const ASSET_MAX_BYTES = 8 * 1024 * 1024;
 const TEMPLATE_NAME_RE = /^[a-z][a-z0-9-]{1,40}$/;
 // 一份模板单文件，正常 5~30KB；200KB 足够画复杂场景，又不至于让写盘/推送变成 DOS。
 const TEMPLATE_MAX_BYTES = 200 * 1024;
@@ -175,18 +185,65 @@ function assertShellContract(code, inputProps) {
  *
  *  一镜的打包是 1~3 秒的固定成本，而同一段代码在一条流程里至少会被打包两遍：
  *  预览静帧一遍、整镜渲染一遍；重试与「预览后改一镜」还会再打。缓存的是
- *  `bundle()` 的产物目录（`serveUrl`），不是代码本身——代码按哈希认，别的输入
- *  （entry/母版/别名/依赖）在同一个进程里不会变。
+ *  `bundle()` 的产物目录（`serveUrl`），不是代码本身。
+ *
+ *  **键里必须带库指纹（2026-10-23 修）。** 原先的键只有镜头代码的哈希，注释里写着
+ *  「别的输入（entry/母版/别名/依赖）在同一个进程里不会变」——这句话只在镜像不变时
+ *  成立。改 `src/lib/style/*` 下的风格包、改母版 `FilmLayout.tsx`、改 `tokens.ts`，
+ *  镜头代码一个字没动，哈希就不变，于是**拿回上一份旧产物**：改了半天，成片一模一样。
+ *  真机上就是这样踩的——`StyleCaption` 从贴底改成贴角，重渲出来的静帧与旧图逐字节
+ *  相同。指纹扫的是「会被打进包、但不属于镜头代码」的那几处，一秒内复用一次，
+ *  两次请求（静帧 + 整镜）不会各扫一遍。
  *
  *  只缓最近的若干份：一份产物是几 MB，几十镜全留会白占内存；淘汰只从表里摘掉，
  *  磁盘目录还在，正在渲的那一份不会因为表里没了而消失。 */
 const BUNDLE_CACHE_MAX = Math.max(2, Number(process.env.DG_BUNDLE_CACHE || 24));
-const bundleCache = new Map();   // codeHash -> { serveUrl, bundleMs, at }
+const bundleCache = new Map();   // codeHash:libStamp -> { serveUrl, bundleMs, at }
+
+/** 库指纹覆盖的路径：会被打进包、但不属于镜头代码的那些。 */
+const STAMP_FILES = [
+  'src/index.ts', 'src/entry.tsx', 'src/FilmLayout.tsx', 'src/tokens.ts',
+  'src/fonts.ts',
+];
+const STAMP_DIRS = ['src/lib', 'src/themes', 'src/demos/_fixtures'];
+
+let stampMemo = { at: 0, stamp: '' };
+
+/** 库指纹：这些文件的 (size, mtime) 列表哈希。文件没变 → 同一个值。 */
+async function libStamp() {
+  if (Date.now() - stampMemo.at < 1000) return stampMemo.stamp;
+  const parts = [];
+  for (const rel of STAMP_FILES) {
+    try {
+      const s = await fs.stat(path.join(ROOT, rel));
+      parts.push(`${rel}:${s.size}:${Math.round(s.mtimeMs)}`);
+    } catch {
+      parts.push(`${rel}:-`);
+    }
+  }
+  for (const dir of STAMP_DIRS) {
+    try {
+      const names = (await fs.readdir(path.join(ROOT, dir), recursiveDir)).sort();
+      for (const n of names) {
+        const abs = path.join(ROOT, dir, n);
+        try {
+          const s = await fs.stat(abs);
+          if (s.isFile()) parts.push(`${dir}/${n}:${s.size}:${Math.round(s.mtimeMs)}`);
+        } catch { /* 扫的过程中被删了，跳过 */ }
+      }
+    } catch {
+      parts.push(`${dir}:-`);
+    }
+  }
+  const stamp = sha16(Buffer.from(parts.join('|'), 'utf8'));
+  stampMemo = { at: Date.now(), stamp };
+  return stamp;
+}
 
 /** 打包一镜：写 shot.tsx → bundle()。调用方负责把它放进 `serialize`。 */
 async function bundleShot(code) {
   const { bundle } = await loadRemotion();
-  const codeHash = sha16(Buffer.from(String(code), 'utf8'));
+  const codeHash = `${sha16(Buffer.from(String(code), 'utf8'))}:${await libStamp()}`;
   const hit = bundleCache.get(codeHash);
   if (hit) {
     hit.at = Date.now();
@@ -864,6 +921,43 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/lint-template') {
       const body = await readBody(req);
       return send(res, 200, await lintTemplateCode(String(body.code ?? '')));
+    }
+    // ---- 脚本产出的素材：写入 / 列举 ----
+    // 只做「文件落地 + 名字与大小校验」，不判这张图好不好看——那是人看片的事。
+    if (req.method === 'GET' && url.pathname === '/assets') {
+      await fs.mkdir(ASSETS_DIR, recursiveDir);
+      const names = await fs.readdir(ASSETS_DIR);
+      return send(res, 200, { ok: true, assets: names });
+    }
+    if (req.method === 'POST' && url.pathname === '/assets') {
+      const body = await readBody(req);
+      const name = String(body.name ?? '').toLowerCase();
+      if (!ASSET_NAME_RE.test(name)) {
+        return send(res, 400, {
+          ok: false,
+          error: `素材名不合法：${name.slice(0, 40)}（小写字母数字开头，可含 . _ -，≤61 位）`,
+        });
+      }
+      let buf;
+      try {
+        buf = Buffer.from(String(body.b64 ?? ''), 'base64');
+      } catch {
+        return send(res, 400, { ok: false, error: 'b64 解不出来' });
+      }
+      if (!buf.length) return send(res, 400, { ok: false, error: '素材是空的' });
+      if (buf.length > ASSET_MAX_BYTES) {
+        return send(res, 400, {
+          ok: false,
+          error: `素材超过 ${Math.round(ASSET_MAX_BYTES / 1024 / 1024)}MB`,
+        });
+      }
+      await fs.mkdir(ASSETS_DIR, recursiveDir);
+      const target = path.join(ASSETS_DIR, name);
+      const tmp = `${target}.tmp-${process.pid}`;
+      await fs.writeFile(tmp, buf);
+      await fs.rename(tmp, target);      // 原子替换：镜头不会读到半张图
+      console.log(`[asset] ${name} ${buf.length}B`);
+      return send(res, 200, { ok: true, name, bytes: buf.length, path: `assets/${name}` });
     }
     if (req.method === 'POST' && url.pathname === '/lint') {
       const body = await readBody(req);

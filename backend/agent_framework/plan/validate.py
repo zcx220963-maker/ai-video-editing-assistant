@@ -118,12 +118,76 @@ class PlanValidator:
                                                    step.get("expectation"))]], issues)
         if not ok:
             return None
-        return {
+        norm = {
             "plan_id": tag,
             "label": clean(plan.get("label")),
             "goal": clean(plan.get("goal")),
             "steps": norm_steps,
         }
+        style = self._check_style(tag, plan.get("style_skill"), skills, issues)
+        if style:
+            norm["style_skill"] = style
+        return norm
+
+    def _check_style(self, tag: str, raw: Any, skills: Mapping[str, Any],
+                     issues: PlanIssues) -> str:
+        """计划级 ``style_skill``：这一片用哪套视觉风格（风格包 / 用户导入的技能）。
+
+        判据只有两条：名字**真实存在**，且它是**画面契约那一类**——``kind=style``
+        的系统/个人风格包，或用户自己导入的技能（导入件由 ``plan_motion`` 注入成
+        ``imported`` 契约）。流程技能与能力技能当风格用没有意义：它们讲的是怎么做，
+        不是长什么样。
+
+        不通过一律**降级成警告并清空**，不让整张卡作废：风格只是可选的画面选择，
+        为了它把一份步骤全对、参数全对的计划打回，代价是白烧一轮迭代；而打回清单
+        里那条「风格名不对」模型也未必改得对——它本来就在猜名字。清空之后写手按
+        默认视觉画，用户看到卡上没有风格，随时能自己点一个。
+        """
+        name = clean(raw)
+        if not name:
+            return ""
+        unreadable = skills.get("__unreadable__")
+        if unreadable is not None:
+            # 与 ``_check_skills`` 同一种处境：没接技能库 ≠ 用户选错了。放行、如实记账。
+            issues.warn(f"计划 {tag} 选的风格「{name}」未能核验（{unreadable}），仍按它执行。")
+            return name
+        skill = skills.get(name)
+        if skill is None:
+            # 模型常把中文名（display）当机器名填进来——用户说的是「剪影年轮」，
+            # 它照抄也能懂。先按显示名认一遍，认到了就换成机器名继续走；
+            # 认不到再清空（这时候才真的是编的名字）。
+            by_display = [s for s in skills.values()
+                          if getattr(s, "display", "") == name
+                          and self._usable_style(s)]
+            if len(by_display) == 1:
+                return str(getattr(by_display[0], "name", "") or "")
+            style_names = [str(getattr(s, "name", "")) for s in skills.values()
+                           if self._usable_style(s)][:8]
+            hint = ("可用的风格：" + "、".join(style_names)) if style_names else \
+                "现在没有任何风格包，这一项留空即可"
+            issues.warn(f"计划 {tag} 选的风格「{name}」不存在，已忽略，按默认视觉执行"
+                        f"（{hint}）。")
+            return ""
+        kind = str(getattr(skill, "kind", "workflow") or "workflow")
+        if kind != "style" and not getattr(skill, "owner_user_id", None):
+            issues.warn(f"计划 {tag} 选的「{name}」不是风格包（它是流程/能力技能），"
+                        f"已忽略，按默认视觉执行。")
+            return ""
+        if not getattr(skill, "available", True):
+            # 不可用也照放：风格正文注入不依赖它声明的外部依赖（依赖是给 load_skill
+            # 判「能不能照着做」用的），拦下来只会让一份本来能画的计划少了风格。
+            issues.warn(f"计划 {tag} 选的风格「{name}」标着不可用"
+                        f"（{getattr(skill, 'unavailable_reason', '')}），仍按它执行。")
+        return name
+
+    @staticmethod
+    def _usable_style(skill: Any) -> bool:
+        """能不能当「这一片长什么样」的契约用：系统风格包，或用户自己导入的技能。
+
+        与 ``_check_style`` 的主判据同口径，抽出来是因为显示名认领那一路也要用它。
+        """
+        kind = str(getattr(skill, "kind", "workflow") or "workflow")
+        return kind == "style" or bool(getattr(skill, "owner_user_id", None))
 
     async def _validate_step(self, step: Any, tag: str, index: int,
                              allowed: set[str], skills: Mapping[str, Any],

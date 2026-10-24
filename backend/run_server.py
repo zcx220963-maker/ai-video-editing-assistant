@@ -78,7 +78,6 @@ from agent_framework.mq import MessageQueue, build_message_queue
 from agent_framework.server import create_app
 from agent_framework.session import SessionManager
 from agent_framework.storage import Storage, build_storage
-from agent_framework import style_templates as style_tpl
 from agent_framework.summary_store import SummaryStore
 from agent_framework.skill import (
     SkillLoader,
@@ -94,7 +93,7 @@ from agent_framework.team_tools import (
 from agent_framework.tool import ToolRegistry
 from agent_framework.tools.cron import CronScheduler, register_cron_tools
 from agent_framework.tools.file import register_file_tools, session_workspace_root
-from agent_framework.tools.style import register_style_tools
+from agent_framework.tools.run import register_run_tool
 from agent_framework.mcp_manager import McpManager
 from agent_framework.tools.mcp import (
     MCPClient,
@@ -360,7 +359,8 @@ def build_runtime(
     registry = ToolRegistry()
     # HITL：按名指定「执行前需人工审批」的工具（逗号分隔）；空 = 不启用审批断点。
     registry.set_approval([t.strip() for t in approve_tools.split(",") if t.strip()])
-    register_file_tools(registry, session_workspace_root(storage.workspace.root))
+    file_root = session_workspace_root(storage.workspace.root)
+    register_file_tools(registry, file_root)
     register_web_tools(registry)
     # 剪辑节点**只**来自 Storyline MCP：DAG、依赖补齐与产物存储都在那台服务上，
     # 本地再无第二套图（video_editing 里的 mock 节点只剩离线测试夹具）。
@@ -371,7 +371,6 @@ def build_runtime(
     register_run_tools(registry, editing_contract)
     # 画面风格：用户在对话里说一句（或贴参考视频/图片），直接改这个对话的风格包。
     # 入口只在对话里——风格工作室与素材库的「沉淀模板」都不再对用户暴露。
-    register_style_tools(registry, storage=storage, llm=llm, mq=mq)
 
     # spawn：子 Agent 可用工具（文件 + 联网检索）；trace_mq 让子 Agent 工具调用也回投到
     # 父会话窗口。
@@ -422,6 +421,17 @@ def build_runtime(
         skill_loader = SkillLoader(storage)
         register_skill_tools(registry, skill_loader)
         context_sources.append(SkillManifestContextSource(skill_loader))
+
+        # `run`：在会话工作区里执行命令（2026-10-23）。
+        #
+        # 这是「导入 skill 就能复用它的全部能力」缺的最后一块：技能包里的 `.py` / `.mjs`
+        # / `.sh` 之前只能读不能跑。传 `skill` 会先把该技能的全部附件落到
+        # `<工作区>/skills/<技能名>/` 再执行，所以 `run(command="python main.py",
+        # skill="某个技能")` 一步就能跑。
+        #
+        # 必须等 `skill_loader` 建好之后才注册：物化技能文件要用它。而它依赖
+        # `storage`，所以这一段不能挪到上面跟文件工具一起注册。
+        register_run_tool(registry, file_root, skill_loader)
     memory_store: MemoryStore | None = None
     if use_memory:
         memory_store = MemoryStore(storage)
@@ -571,18 +581,6 @@ def build_runtime(
                     _warn(f"技能库导入失败（沿用库里已有内容）：{exc}")
             else:
                 _info(f"技能导入源 {skills_import_dir} 不存在，仅使用库里已有的技能")
-
-        # (0b1) 模板库：种子只补缺；已发布的用户模板推给渲染容器。
-        #      推送失败只告警——渲染容器可能还在起，真正用到时 `ensure_remote()` 会补。
-        try:
-            added = await style_tpl.seed_system_templates(storage)
-            pushed = await style_tpl.sync_validated(storage)
-            if added or pushed.get("pushed"):
-                _info(f"模板库：新增系统模板 {added} 条，推送 {pushed.get('pushed')} 条")
-            if pushed.get("failed"):
-                _warn(f"模板推送失败（用到时会重试）：{pushed['failed']}")
-        except Exception as exc:  # noqa: BLE001 - 模板库不该拖垮主服务启动
-            _warn(f"模板库同步失败（沿用库里已有内容）：{exc}")
 
         # (0c) 子 Agent 租约对账：上个进程被 kill 时正在干活的行不再谎报 working
         if team_obj is not None:

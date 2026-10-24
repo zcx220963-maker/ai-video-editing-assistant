@@ -99,6 +99,24 @@ openchatcut-src/
 # 抽帧验证的一次性产物（f228529 混入库，全项目零引用）
 /video_frames/
 
+# ---- 会话临时件（2026-10-24 清账：顶层 82 个 scratch 文件 + 25 个临时目录）----
+# 全是调试期产物：`.dg_tmp_*` 是分镜/规格的快照，`tmp-*` 是某次出片的工作目录，
+# `human-*.png` / `tmp-*-probe.jpg` 是三维造型的对比截图，`user_template.tsx` 是上传试验件。
+# 一条都没被代码引用（`grep` 过），留在工作树里只是每次 `git status` 都要翻一遍。
+/.dg_*
+# 同一批 scratch 在子目录里也有一份（`backend/storyline_server/.dg_*` 58 个：e2e 探针、
+# 代码转储目录、单镜 tsx 快照）。它们与顶层那批是同一种东西，只是当年顺手写在模块旁边。
+.dg_*
+/tmp-*
+/human-*.png
+/user_template.tsx
+/hs_err_pid*.log
+/replay_pid*.log
+# 上一版/本版的产物快照目录（对照用的旧片子，全项目零引用）
+/prev_dump/
+/prev_new/
+/deliverables/
+
 # ---- 交付残渣与内部合同文档（本地保留，不随库分发）----
 # 落地报告/对比截图是一次性验收产物，README 与代码都不引用它们
 /outputs/

@@ -67,8 +67,10 @@ exclude: demos/, shots/
 - **受众**：这个题材的普通好奇者，不是同行；术语第一次出现要用人话解释。
 - **结构**：现象 → 机制（2~4 路解释）→ 为什么是此刻 → 收束。**不要停在「这是什么」。**
 - **声音**：用户没说就带旁白；说了「只要字幕文字」就 `narration=false`。
-- **字幕**：默认 `caption_style: "outlined"`（白字黑边）。压在深色底、浅色底、雾里都读得出来，
-  不用靠镜代码自己猜字色；关键词照旧走 `highlight_style`。用户点名别的样式再换。
+- **字幕**：默认 `caption_style: "by_shot"`——字幕归这一镜的代码设计（位置/字号/描边/入场
+  全由你定），母版不画、也不替你补。这是 2026-10-23 改的缺省：原先七档固定样式让所有片子的
+  字幕长得一模一样。想回到「母版统一排」就写 `outlined`（白字黑边，深浅底都读得出来）。
+  关键词照旧走 `highlight_style`。
 - **配乐**：用户点名了某一首才配；没点名默认不配，不要自己从曲库里挑。
 
 ## 用户的明确要求怎么和这套默认叠加（优先级）
@@ -787,7 +789,7 @@ const { reached, charFrames } = useCaptionTiming();
 
 | 栏 | 取值 | 说的是 |
 |----|------|--------|
-| `caption_style` | `outlined` 白字黑边（缺省）/ `on_picture` 贴画面无底 / `paper` 纸条底 / `film_line` 整句电影感 / `big_center` 大字压屏 / `top_banner` 顶部横幅 / `none` 不上字幕 | **整条预设**长什么样、站哪（用 `<CaptionLayer/>` 时生效）；你自排 `<CaptionText/>` 时，它只提示字的**处理**该往哪边靠 |
+| `caption_style` | `by_shot` 交给这一镜自己设计（缺省，2026-10-23）/ `outlined` 白字黑边 / `on_picture` 贴画面无底 / `paper` 纸条底 / `film_line` 整句电影感 / `big_center` 大字压屏 / `top_banner` 顶部横幅 / `none` 不上字幕 | **整条预设**长什么样、站哪（用 `<CaptionLayer/>` 时生效）；你自排 `<CaptionText/>` 时，它只提示字的**处理**该往哪边靠 |
 | `highlight_style` | `color` 关键词换色（缺省）/ `karaoke` 逐词点亮 / `block` 底色块 / `ink` 撕纸高亮 / `plain` 不强化 | 被点名的词**怎么被点出来** |
 
 两维相乘＝35 种组合都说得出口：要「关键词换色但不要纸条」就写
@@ -795,9 +797,20 @@ const { reached, charFrames } = useCaptionTiming();
 **别把它们想成一排档**——没有哪一档同时锁死这两件事，所以也没有「选了这个就必须接受那个」
 的时候。
 
-**整片只写一档**：顶层写 `outlined`（用户没点名别的样式时），逐镜**不要**再写
+**整片只写一档**：顶层写 `by_shot`（缺省，字幕归这一镜的代码设计），逐镜**不要**再写
 `caption_style` 覆盖。真机片里一半镜写 `on_picture`、一半不写，成片里同一部片的字幕
 一会儿有描边一会儿没有，读起来像三个人的片子——这一栏是整片级的缺省，不是逐镜画法。
+
+**`by_shot` 档下字幕是你的活**（2026-10-23）：母版那条不画、`<CaptionLayer/>` 不会被
+自动补上、你画在字幕带里的字也**不会**被删。文案从 `getInputProps().text` 读，要高亮的
+词在 `highlight` 里。**别用 `<CaptionText/>` / `<CaptionLayer/>` 的缺省形态**——它们的
+字号与描边来自母版的 `CAPTION_LOOK`（0.44 系数 + 黑描边白字），换位置也换不掉那张脸，
+**那正是「所有片子的字幕长得一模一样」的原因**。自己排就用裸 `<div>`/`<span>` 写全样式
+（fontFamily / fontSize / color / textShadow）；确实想复用那两件，就必须显式传
+`sizeScale` / `outline` / `bottom` / `tone`，不要留空。
+
+想回到「母版统一排」的老路，就把整片写成 `outlined`（或别的固定档）——那一档下母版会
+自动补一条字幕，你只管画面，别在字幕带里再放字。
 
 这两维说的是「**怎么**点出来」，还有一个整片级的 `highlight_color`（`#rrggbb`，空＝跟这一镜
 的色板）说的是「**用哪个色**」——它由用户在「文字库」钉，钉住时**盖过高亮词那一色**，连你在
@@ -1135,7 +1148,7 @@ const { width, height } = useVideoConfig();   // 竖屏 1080×1920、横屏 1920
 
 # 镜头代码的 import 名单
 
-lint 白名单 69 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
+lint 白名单 82 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 
 `react`、`react-dom`、`remotion`、`@remotion/paths`、`@remotion/shapes`、
 `@remotion/motion-blur`、`@remotion/layout-utils`、
@@ -1145,6 +1158,9 @@ lint 白名单 69 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 `@remotion/effects/glow`、`@remotion/effects/vignette`、`@remotion/effects/noise`、
 `@remotion/effects/speckle`、`@remotion/effects/roughen-edges`、
 `@remotion/effects/shadows-highlights`、`@remotion/effects/blur`、
+`@remotion/transitions`、`@remotion/transitions/fade`、`@remotion/transitions/slide`、
+`@remotion/transitions/wipe`、`@remotion/transitions/flip`、`@remotion/transitions/clock-wipe`、
+`chroma-js`、`d3-scale`、`d3-shape`、`d3-interpolate-path`、`flubber`、`lucide-react`、
 `three`、`@react-three/fiber`、`@remotion/three`、`roughjs`、
 `katex`、`katex/dist/katex.min.css`、
 `@dg/film`、`@dg/tokens`、`@dg/fonts`、`@dg/motion`、`@dg/polish`、`@dg/brand`、
@@ -1159,6 +1175,7 @@ lint 白名单 69 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 `@dg/lib/draw/Crown`、
 `@dg/lib/brush`、`@dg/lib/scene`、`@dg/lib/walk`、
 `@dg/lib/style/silhouette-history`、`@dg/lib/style/cinema-studio`、
+`@dg/lib/style/surreal`、
 `@dg/lib/helpers/motion`、`@dg/lib/helpers/rand`、`@dg/lib/helpers/shake`、
 `@dg/lib/helpers/camera`、`@dg/themes/palettes.json`。
 
@@ -1408,6 +1425,7 @@ const puff = interpolate(frame, [0, 60], [0, 1]);
    另外只有可画图元进主体计数（`path/rect/circle/ellipse/polygon/polyline/line/img/canvas/video`），
    **div 铺的色块条算 0 主体**——用 div 画的卡片配满幅公式，正好落在「卡片+文字」那条
    联合判据上被打回（同一镜的图元只有 2 个时，折到成片上不足带的 1%）。
+<!-- bands-only -->
 6. **细线零件过不了这道闸——每一镜都要有「块面级」的动**。2026-10-18 真机实测（9 s 横屏、
    0.4 倍草稿档、8 Hz 采样）：齿轮转 + 人走 + 曲线慢慢长，整帧平均差只有 **0.05–0.3**；
    一块满宽强调色带擦入是 **4.6**，一块 36% 宽 × 30% 高的色块长出来是 **3.8**。门槛是 1.5，
@@ -1437,6 +1455,11 @@ const puff = interpolate(frame, [0, 60], [0, 1]);
    切成两截（2026-10-18 真机 s03：0.14~0.20 的色带横穿天平横梁，横梁中间断了一截）。
    不确定主体多高时，色带就贴最上沿，别放在 0.10~0.25 这一带。
    两段的起点至少隔 0.4 s；两块挨在一起会让整段动效被读成一次跳变。
+   **三维/写实的镜不适用这一段**：风格包关掉了满宽色带时（manifest 里带这一位），块面级的动
+   由相机与光来做（推近、横移、主光扫过整幅、雾与粒子的浓度变化），**不要再加色带**——
+   写实场景里横贯一条纯色带，观众第一眼就出戏。
+   2026-10-22 真机：23 镜照着旧规则全都加了贴顶色带，预览里 23 镜顶部都有一条彩条。
+<!-- /bands-only -->
 
 `exit` 与**代表帧**的取舍：缓存里那张代表帧取的是 `durationInFrames-2`，落款淡出会把这一帧
 扫成接近空底；闸④ 的采样点又正好在 0.15/0.5/0.85。所以整片用 `"exit": "none"`、

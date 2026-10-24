@@ -3,9 +3,10 @@
 对应设计文档「SKILL 技能系统」+ spec §3.13、§4：
 - 一个技能 = skills 表一行（name / description / frontmatter / body）
   + skill_files 若干附件行，附件字节存对象存储键 skills/{name}/{relpath}。
-- 渐进式加载：先由 SkillManifestContextSource 注入【轻量清单】(<skills> XML，只有
-  name/description/location)；LLM 命中后用 load_skill 拉【完整正文】，附件再按需
-  load_skill(name, path=相对路径) 取，避免一次塞满上下文。
+- 渐进式加载：先由 SkillManifestContextSource 注入【轻量清单】(<skills> XML，每个技能
+  只有名字 + **一句话**摘要；整段 description 是随正文一起按需取的)；LLM 命中后用
+  load_skill 拉【完整正文】，附件再按需 load_skill(name, path=相对路径) 取，避免一次
+  塞满上下文。清单总长有结构上限，装得多了超出的部分不进清单、由 find_skill 搜。
 - frontmatter always=true 且可用的技能，正文常驻注入，无需再 load。
 - 依赖不满足（如缺 CLI: curl）→ available=false，不加载。
 - 本地目录只是【导入源】(sync_from_dir)：扫盘 → 正文进表、附件进对象存储。
@@ -52,6 +53,27 @@ def default_requirement_checker(token: str) -> tuple[bool, str]:
     return True, t  # 未知前缀按满足处理，避免误杀
 
 
+#: 常驻清单里**每个技能**那一行摘要的字节上限。
+#:
+#: 清单是索引，不是说明书：模型看它只决定「要不要 load_skill」，而 load_skill 会把
+#: 整段 description 原样回给它（见 `load_skill` 的抬头）。所以清单里没有理由放整段。
+#: 真机账（2026-10-22）：用户从外部装了 7 份技能，它们的 description 本身就是整段
+#: 提示词（最长 1,175 B），`<skills>` 从 3,156 B 涨到 **9,408 B**，顶穿闸㉓，
+#: 用户连一句话都发不出去——而涨的这 6 KB 里，模型真正用来「挑不挑这份技能」的
+#: 只有每份的头一句。160 B ≈ 53 个汉字，够说清「这份技能干什么用」。
+_CATALOG_SUMMARY_BYTES = 160
+
+#: 整份 `<skills>` 清单的**结构上限**（字节，按清单正文计；always 技能的正文不算，
+#: 它们走 ``skill_instructions`` 那一块单独记账）。
+#:
+#: 为什么要有它：只砍单条不封顶，清单仍随「用户装了多少份」线性上涨——100 份技能
+#: 又是 25 KB，闸㉓ 迟早再红一次，然后又得有人去抬预算。装了这么多份时，正确的
+#: 做法不是把索引写得更长，而是**不再常驻列出**：超出的技能用 `find_skill` 搜
+#: （名字/说明/正文都能搜），命中后照样 `load_skill`。这也是 Claude Code / Codex
+#: 那一类 agent 的做法——常驻的是「核心那几份」的索引，长尾靠检索。
+_CATALOG_MAX_BYTES = 5_200
+
+
 @dataclass
 class Skill:
     name: str
@@ -80,6 +102,9 @@ class Skill:
     # 按标题截取后逐镜喂给写手。目录写成什么样，模型就读多少；标了 writer 的块
     # 就是告诉它这一块不用读，而不是不给它读。
     readers: dict[str, str] = field(default_factory=dict)
+    # frontmatter `summary:`：清单里用的那一句话。没写就从 description 取第一句
+    # （见 `catalog_summary`）——**这一条是可选增量**，既有技能一个字段都不用改。
+    summary: str = ""
 
     # ---- 分段键（T42，§5.7 第②条）----
 
@@ -101,7 +126,53 @@ class Skill:
         """
         return assemble_sections(self.body, sections)
 
+    def catalog_summary(self, limit: int = _CATALOG_SUMMARY_BYTES) -> str:
+        """清单里那一行摘要：frontmatter ``summary:`` → description 的第一句 → 整段，
+        再按 UTF-8 字节截到 ``limit``（截断处带「…」，好让模型知道后面还有）。
+
+        取「第一句」而不是「前 N 个字」：外部技能的 description 常是「一句话定位 +
+        三大段细则」，第一句恰好是定位句；硬切前 160 B 会切在第二段的半句上，读起来
+        像被截坏的句子。切句找的是「。；！？换行」，以及英文的「. 」——不引入分句库。
+        """
+        text = (self.summary or "").strip()
+        if not text:
+            text = (self.description or "").strip()
+            cut = len(text)
+            for mark in ("。", "；", "！", "？", "\n", ". ", "; "):
+                start = 0
+                while True:
+                    i = text.find(mark, start)
+                    if i <= 0:
+                        break
+                    if mark in (". ", "; "):
+                        # 「e.g.」「i.e.」「Mr.」这类缩写不是句末：点前面那个词太短
+                        # 就放过这一处、往后找。真机见过切在「library (e.g.」上。
+                        word = text[max(0, i - 12):i].rsplit(" ", 1)[-1].strip("(")
+                        if (len(word) <= 3 and word.isalpha()) or ("." in word and len(word) <= 5):
+                            start = i + 1
+                            continue
+                    cut = min(cut, i + len(mark.strip()) or i + 1)
+                    break
+            text = text[:cut].strip()
+        raw = text.encode("utf-8")
+        if len(raw) <= limit:
+            return text
+        # 按 UTF-8 边界砍（`ignore` 把砍半的那个字符丢掉），留 3 B 给省略号
+        head = raw[:max(limit - 3, 0)].decode("utf-8", "ignore").rstrip()
+        # 英文按字节砍容易砍在词中间（真机：「…frame by frame w…」）：末字仍是
+        # 字母/数字、且近处有空格，就退到那个空格——中文没有空格，这条不触发。
+        if head and head[-1].isascii() and head[-1].isalnum():
+            sp = head.rfind(" ")
+            if sp > 0 and len(head) - sp <= 30:
+                head = head[:sp].rstrip()
+        return head + "…"
+
     def manifest_lines(self) -> str:
+        """清单里的一个技能块：名字 + 一句话摘要 + 位置。
+
+        摘要（不是整段 description）是**刻意的**：整段随 `load_skill` 一起给，
+        见模块头部与 `_CATALOG_SUMMARY_BYTES` 的账。
+        """
         attr = "true" if self.available else "false"
         lines = [
             f'  <skill available="{attr}">',
@@ -110,7 +181,7 @@ class Skill:
         if self.display:
             lines.append(f"    <display>{self.display}</display>")
         lines += [
-            f"    <description>{self.description}</description>",
+            f"    <description>{self.catalog_summary()}</description>",
             f"    <location>{self.location}</location>",
         ]
         if not self.available and self.requires:
@@ -193,6 +264,102 @@ def _parse_manifest(raw: Any) -> dict[str, Any]:
             return {}
         return dict(got) if isinstance(got, Mapping) else {}
     return {}
+
+
+# --------------------------------------------------------------------------
+
+
+_H1_RE = re.compile(r"(?m)^#\s+(.+?)\s*$")
+_PAREN_RE = re.compile(r"[（(][^）)]{0,24}[）)]")
+_NAME_PREFIX_RE = re.compile(r"^[A-Za-z0-9_.\-]+\s*[：:]\s*")
+_QUOTED_RE = re.compile(r"[「『《]([^」』》]{2,12})[」』》]")
+_LEAF_NUM_RE = re.compile(r"^[\d０-９]+[-_—.\s]*")
+
+#: 这些目录名是结构，不是能力。中文名一定不是它们，但保险起见列一份。
+_GENERIC_DIRS = {"styles", "demos", "references", "pipeline", "scripts",
+                 "examples", "knowledge", "assets", "tests", "lib", "docs",
+                 "templates", "prompts", "site", "harness", "config"}
+
+
+def _cjk_count(text: str) -> int:
+    return len(re.findall(r"[\u4e00-\u9fff]", str(text or "")))
+
+
+def derive_display(frontmatter: Any, body: str, name: str) -> str:
+    """技能的中文名：frontmatter 没写就从正文的一级标题里取。
+
+    **为什么要在读取时派生，而不是导入时写回库**：写回要 `upsert` 整行（会重写
+    `skill_files`），而且派生的东西是推测——一旦写死，用户以后改了正文也对不上。
+    读取时算一次，零成本、零维护，用户手写的 `display` 永远优先。
+
+    真机（2026-10-23）：用户拖进来的 7 份社区技能里 5 份 `display` 是空的，
+    `find_skill` 只能显示 slug（`dashi-animationstyle`），模型没法判断它是什么。
+    而它们的正文一级标题都写得挺好——「艺术动画」「代码动画工坊」
+    「风格动画（《大师的AI小灶》出品）」，去掉 `name：` 前缀与括号补充就能用。
+    """
+    fm = frontmatter if isinstance(frontmatter, Mapping) else {}
+    got = str(fm.get("display") or "").strip()
+    if got:
+        return got
+    m = _H1_RE.search(str(body or ""))
+    if m:
+        text = _NAME_PREFIX_RE.sub("", m.group(1).strip())
+        text = _PAREN_RE.sub("", text).strip()
+        text = text.strip(" ·—-—")
+        if 2 <= len(text) <= 24 and _cjk_count(text) >= 2:
+            return text
+    return name
+
+
+def capability_phrases(frontmatter: Any, body: str,
+                       files: Any, *, limit: int = 8) -> list[str]:
+    """技能「自称」的能力名——自动挂载时的触发词来源。
+
+    两个来源，都来自文件本身，不需要人写：
+
+    1. **附件里的中文目录名 / 文件名**。社区技能几乎都是「一种能力一个目录」：
+       `dashi/styles/复古剪纸/模板.html`、`mg/demos/01-flat-vector/`。
+       这些中文目录名就是它 7 套画风的名字。
+    2. **正文里被「」『』《》包住的短语**。技能作者写「做旧」这类词时习惯加引号。
+
+    为什么不从 `##` 小标题取：实测七份里小标题几乎全是流程（「第 0 步：检查环境」
+    「工作目录」「遇到这些情况」），当触发词只会把匹配搞脏。
+    """
+    out: list[str] = []
+    leaves: list[str] = []
+    for f in (files or []):
+        rel = str((f or {}).get("relpath") or "").replace("\\", "/")
+        if not rel:
+            continue
+        parts = [p for p in rel.split("/") if p]
+        dirs, leaf = parts[:-1], (parts[-1] if parts else "")
+        for p in dirs:
+            if p.lower() in _GENERIC_DIRS:
+                continue
+            if 2 <= len(p) <= 12 and _cjk_count(p) >= 2:
+                out.append(p)
+        if leaf:
+            stem = _LEAF_NUM_RE.sub("", leaf.rsplit(".", 1)[0]).strip(" -_")
+            if 2 <= len(stem) <= 12 and _cjk_count(stem) >= 2:
+                leaves.append(stem)
+    # 文件名按「跨目录重复次数」筛：`styles/A/模板.html`、`styles/B/模板.html` 里的
+    # 「模板」是结构不是能力。同名的叶子出现在 ≥3 个不同目录就当它是模板文件，
+    # 丢掉；只在一个目录里出现的（「拆解」「复古剪纸」）才是真能力名。
+    freq: dict[str, int] = {}
+    for stem in set(leaves):
+        freq[stem] = leaves.count(stem)
+    out.extend(s for s in leaves if freq.get(s, 0) < 3)
+    for m in _QUOTED_RE.finditer(str(body or "")):
+        p = m.group(1).strip()
+        if 2 <= len(p) <= 12:
+            out.append(p)
+    seen: list[str] = []
+    for p in out:
+        if p not in seen:
+            seen.append(p)
+        if len(seen) >= limit:
+            break
+    return seen
 
 
 # --------------------------------------------------------------------------
@@ -347,6 +514,17 @@ class SkillLoader:
         self._skills = storage.skills
         self._objects = storage.objects
         self._checker = checker
+        #: 导入完成后的**可选**回调：`async (names, owner_user_id) -> None`。
+        #:
+        #: 2026-10-23：技能包里带的 `.tsx` 要登记成可 import 的模板（见
+        #: `skill_templates.py`）。登记逻辑依赖渲染容器与 `style_templates`，
+        #: 属于产品层，不该沉进这个「读路径」模块——所以留成注入点：没接就是
+        #: 今天的行为，一个字节都不变；接了才多跑一步。**回调抛错不拦导入**：
+        #: 技能装不上比少登记一个组件坏得多。
+        self.on_imported: Any = None
+        #: 最近一次导入里「组件 → 模板」的回执（`{技能名: {registered, skipped, warnings}}`）。
+        #: 上传接口把它并进响应，用户才知道包里那几个 `.tsx` 有没有变成可 import 的组件。
+        self.last_import_report: dict[str, Any] = {}
 
     @staticmethod
     def object_key(name: str, relpath: str) -> str:
@@ -366,7 +544,8 @@ class SkillLoader:
             files=list(row.get("files") or []),
             available=available,
             unavailable_reason=reason,
-            display=str(fm.get("display", "") or ""),
+            display=str(fm.get("display", "") or "") or derive_display(
+                fm, row.get("body") or "", row["name"]),
             # frontmatter 的 `sections:` 是**声明**（一行逗号分隔的名字），正文里那几个
             # `<!-- section: … -->` 块是**事实**。两份都要有：声明让人一眼看得出这个技能
             # 分了哪几块，事实保证块真的存在——对账（声明 ⊆ 事实、事实 ⊆ 声明）由
@@ -376,6 +555,7 @@ class SkillLoader:
             kind=str(fm.get("kind") or "workflow").strip() or "workflow",
             style_manifest=_parse_manifest(fm.get("style_manifest")),
             owner_user_id=row.get("owner_user_id"),
+            summary=str(fm.get("summary", "") or ""),
         )
 
     async def discover(self, user_id: str | None = None) -> list[Skill]:
@@ -481,10 +661,20 @@ class SkillLoader:
                 if stale["relpath"] not in keep:
                     await self._objects.delete(stale["object_key"])
             imported.append(name)
+        # 包里带的 `.tsx` → 可 import 的模板。放在**全部技能都落库之后**：回调要读
+        # `skill.files`，而附件清单是上一行 upsert 才写进去的。回调抛错只打一行日志。
+        self.last_import_report = {}
+        if self.on_imported is not None and imported:
+            try:
+                got = await self.on_imported(imported, owner_user_id)
+                if isinstance(got, dict):
+                    self.last_import_report = got
+            except Exception as exc:  # noqa: BLE001 - 组件登记失败不许拦导入
+                print(f"[skills] 组件登记失败（技能本身已可用）：{str(exc)[:300]}")
         return imported
 
     async def import_zip(self, filename: str, data: bytes,
-                         *, max_bytes: int = 20 * 1024 * 1024,
+                         *, max_bytes: int = 40 * 1024 * 1024,
                          owner_user_id: str | None = None) -> list[str]:
         """上传技能包（zip）→ 解到临时目录 → 走同一份 sync_from_dir（幂等覆盖）。
 
@@ -503,8 +693,15 @@ class SkillLoader:
             root = Path(td)
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
                 members = zf.namelist()
-                if len(members) > 500:
-                    raise ValueError(f"压缩包条目过多（{len(members)} > 500）")
+                # 上限按**真实社区技能包**定：video-shotcraft 的正文+配方卡就有
+                # 1013 个文本文件、huashu 369 个，七套一起拖是 1630 个。原来的 500 条
+                # 会把这类包判成「条目过多」，可它们恰恰是用户最想拖进来的那种。
+                # 40 MB / 2000 条仍然远小于一个视频素材库，防的是误拖整个工程目录
+                # （一个前端工程轻松上万条），不是拦常规技能包或一次装几套。
+                if len(members) > 2000:
+                    raise ValueError(
+                        f"压缩包条目过多（{len(members)} > 2000）——只拖技能文件夹，"
+                        "别拖整个源码仓库或素材库")
                 root_resolved = str(root.resolve())
                 for m in members:
                     target = (root / m).resolve()
@@ -554,7 +751,7 @@ class SkillManifestContextSource:
     # 账面（§5.7 第①条）自报：清单每轮无条件发（无技能才返 None），
     # 读它的是 load_skill——清单上的名字就是能被按需拉取的技能。
     ledger_kind = "always"
-    ledger_referenced_by = ("load_skill",)
+    ledger_referenced_by = ("load_skill", "find_skill")
 
     def __init__(self, loader: SkillLoader) -> None:
         self._loader = loader
@@ -569,7 +766,30 @@ class SkillManifestContextSource:
         skills = [s for s in skills if s.kind != "style"]
         if not skills:
             return None
-        manifest = "<skills>\n" + "\n".join(s.manifest_lines() for s in skills) + "\n</skills>"
+        # always 的排前面：它们本来就要附正文，清单里先出现，读起来是同一件事。
+        # 排序键只看 (always, name)，与数据库返回顺序无关，所以清单是**确定的**——
+        # 这一块每轮都在提示词最前面，顺序一漂就把前缀缓存整段作废。
+        skills.sort(key=lambda s: (not s.always, s.name))
+        # 装得多了只常驻前若干份：清单有结构上限（`_CATALOG_MAX_BYTES`），放不下的
+        # 不硬塞，改由 `find_skill` 搜。这样清单长度**不随用户装了多少份往上漂**。
+        listed: list[str] = []
+        used = 0
+        for s in skills:
+            block = s.manifest_lines()
+            size = len(block.encode("utf-8"))
+            if listed and used + size > _CATALOG_MAX_BYTES:
+                continue
+            listed.append(block)
+            used += size
+        hidden = len(skills) - len(listed)
+        manifest = "<skills>\n" + "\n".join(listed)
+        if hidden:
+            manifest += (
+                "\n  <skills_not_listed count=\"%d\">还有 %d 个技能没有列在这里"
+                "（清单有长度上限）。要看有没有对得上这次任务的，用 find_skill 按需求搜"
+                "——名字、说明、正文都能搜到；搜到之后照常用 load_skill 取正文。"
+                "</skills_not_listed>" % (hidden, hidden))
+        manifest += "\n</skills>"
         sections = [manifest]
 
         # 常驻：always 且可用 → 附正文。
@@ -618,6 +838,14 @@ _PAGE_STEP_LINES = 100
 #:
 #: 附件不走这条阈值：附件没有 section 标记，offset/limit 就是它唯一的导航。
 _WHOLE_BODY_MAX_BYTES = 24_000
+
+#: 同一份正文**允许分页几次**（2026-10-24 加）。
+#:
+#: 真机：模型拿 `offset=555/675/905/985/344/474/1105/1225/1335/1435` 把一份
+#: 1422 行的手册**从头顺读了一遍**——分段目录第一次加载时就摆在它面前，它没用。
+#: 一次顺读 ≈ 8~10 枪、几十 KB，用户看到的是「一直在重复加载技能」。
+#: 超过这个次数就直接回分段目录，逼它按节取。
+_MAX_BODY_PAGES = 3
 
 #: 大正文整份加载只回索引时，回执里必有这一句。`agent.py` 的正文窗口闸据此判断
 #: 「这一枪到底把正文发出去没有」——只有真发出去的页才算「本 run 已经给过」。
@@ -791,10 +1019,23 @@ class LoadSkillTool(Tool):
         if str(section or "").strip():
             return self._read_section(skill, str(section).strip())
         head = f"[skill:{name} location={skill.location}]"
+        # 清单里只给了**一句话摘要**；整段 description 在这里补齐。把它放在正文之前
+        # 而不是省掉：外部技能的 description 往往就是「什么时候该用这份技能」的说明，
+        # 清单里截掉的那部分正是模型读完正文要回头核对的东西。
+        shown = skill.catalog_summary()
+        full = (skill.description or "").strip()
+        if full and full != shown:
+            head += f"\n说明：{full}"
         if skill.files:
             head += (f"\n附件（{len(skill.files)} 个，用 "
                      f'load_skill(name, path="相对路径") 读取）：\n'
                      + "\n".join(self._attachment_listing(skill.files)))
+        # 分页闸：同一份正文顺读超过 `_MAX_BODY_PAGES` 次就改回分段目录。
+        # 只拦「按 offset 顺读整本」，`section=` 与读附件都不受影响。
+        if offset is not None:
+            over = self._page_guard(name, skill)
+            if over:
+                return over
         body, err = self._page(skill.body, offset, limit)
         if err:
             return err
@@ -809,20 +1050,51 @@ class LoadSkillTool(Tool):
             # 只保留分隔行以上的部分，排在正文后面就会被折掉，模型下次只剩行号、
             # 不知道键名，又会开始顺读（见 `_WHOLE_BODY_MAX_BYTES` 的注释）。
             total = len(skill.body.splitlines())
+            # 2026-10-24：把 `readers:` 真的用起来。标 `writer` 的段是**写手自己读的**
+            # （系统在 `shot_writer._contract()` 里直接喂给他），规划侧读它们等于把同一份
+            # 手册读第二遍——真机就是这样顺读了 10 页、烧掉几十 KB。
+            writer_only = [k for k, v in (skill.readers or {}).items()
+                           if str(v).strip().lower() == "writer"]
+            skip = (f"\n**标 `[写手侧]` 的那几段不用你读**（写手会直接拿到）："
+                    f"{'、'.join(writer_only)}。规划阶段你只交每镜 brief。"
+                    if writer_only else "")
             return (f"{head}{self._outline(skill.body)}"
                     f"{section_directory_line(skill.body, included=None, readers=skill.readers)}"
                     f"\n{SKILL_INDEX_END}\n"
                     f"（这份正文共 {total} 行、{size} 字节，超过一次整份给的上限 "
                     f"{_WHOLE_BODY_MAX_BYTES} 字节——**{INDEX_ONLY_NOTE}**。"
-                    f"要哪一节就按分段目录 load_skill(name, section=键名)；"
-                    f"正文没有分段就 load_skill(name, offset=行号, "
-                    f"limit≈{_PAGE_STEP_LINES})，一次取一大段。不要从头顺读。）")
+                    f"要哪一节就按分段目录 load_skill(name, section=键名)。"
+                    f"**按 offset 顺读最多 {_MAX_BODY_PAGES} 次**，之后只回目录；"
+                    f"不要从头顺读。）{skip}")
         # 分页那头**不重复整份附件清单**（几百字节到 1 KB 的目录，跟着每一页发一遍
         # 就是按页数翻倍）与**整份章节目录**（它在第一次加载时给过）。名字与位置留着
         # ——模型得能对上「这是刚才那份技能的正文切片」。
         return (f"[skill:{name} location={skill.location}]"
                 f"{self._outline(skill.body, only_from=offset)}"
                 f"\n{SKILL_INDEX_END}\n{body}")
+
+    @staticmethod
+    def _page_guard(name: str, skill: "Skill") -> str:
+        """数「这份正文被分页了几次」；超过上限就回分段目录。
+
+        计数存在本次 run 的 `extras` 里（与 `_skill_bytes` 同一处），
+        拿不到上下文时**放行**——记账失败不该变成新的拦路虎。
+        """
+        try:
+            from .hooks import _current_hook_ctx
+            ctx = _current_hook_ctx.get()
+            if ctx is None:
+                return ""
+            counts = ctx.extras.setdefault("_body_pages", {})
+            counts[name] = int(counts.get(name, 0)) + 1
+            if counts[name] <= _MAX_BODY_PAGES:
+                return ""
+        except Exception:      # noqa: BLE001 - 记不上就放行
+            return ""
+        return (f"Error: 你已经把《{name}》的正文分了 {counts[name]} 次按行顺读。"
+                f"**别顺读了**——分段目录在第一次加载时就给过，"
+                f"要哪一节用 `load_skill(name, section=键名)` 一次取一段。\n"
+                f"{section_directory_line(skill.body, included=None)}")
 
     @staticmethod
     def _read_section(skill: "Skill", section: str) -> str:
@@ -834,7 +1106,28 @@ class LoadSkillTool(Tool):
 
         键名写错时不猜、不模糊匹配：把**在案的键名**列出来（键名是服务端与技能的约定，
         模型没有别的途径查得到），它照着改一个词就行——与附件路径那条错误同一形状。
+
+        **标 ``readers: writer`` 的段直接不给**（2026-10-24）。这条以前只是索引里的一句
+        提示（「标 `[写手侧]` 的那几段不用你读」），模型照读不误：真机那条 run 把 9 段
+        从头读到尾——其中 6 段是写手侧的，写手在 ``shot_writer._contract()`` 里本来就会
+        拿到同一份正文，规划侧读它等于把手册读第二遍。读完还不算完，它又重读一轮，
+        被「同参重复」那道闸判成逐字相同，整条 run 停在规划轮里出不来。
+        契约里既然写了归属，就该按归属拦：**提示管不住的那种模型，只有硬线拦得住**
+        （同 `_shot_card_gate` 的硬线）。回执里把「规划侧该读哪几段」一次说清，
+        它照着换键名就行，不必再试。
         """
+        key = str(section or "").strip()
+        readers = getattr(skill, "readers", None) or {}
+        role = str(readers.get(key) or "").strip().lower()
+        if role == "writer":
+            planner_keys = [f"`{n}`" for n, _title, _size in section_catalog(skill.body)
+                            if str(readers.get(n) or "").strip().lower() != "writer"]
+            return (
+                f"Error: 「{key}」是**写手侧**的段（readers: writer），规划阶段不给你。\n"
+                f"写手在逐镜写代码时会把这一块直接拿到手，你读它等于把同一份手册读第二遍——"
+                f"省下的这些字节换你去把每镜 brief 写完、交计划。\n"
+                f"规划侧可读的段：{'、'.join(planner_keys) if planner_keys else '（这份技能没有）'}。\n"
+                f"这一轮该做的是：每镜一句文案 + 一句 brief 写进 spec，然后 submit_plan。")
         text = section_text(skill.body, section)
         if text is None:
             names = [f"`{name}`" for name, _title, _size in section_catalog(skill.body)]
@@ -1051,5 +1344,166 @@ class LoadSkillTool(Tool):
         return f"[skill:{skill.name} file={rel}]\n{text}"
 
 
+class FindSkillTool(Tool):
+    """按需求搜技能：名字、说明、正文都能搜，返回最相关的几条。
+
+    为什么要有这一条：`<skills>` 清单是**常驻索引**，常驻的东西不能随用户装了多少份
+    无限长（见 `_CATALOG_MAX_BYTES`）。装得多了，超出清单的那部分就只能靠搜——用户
+    的原话是「找需要的不行吗」。Claude Code / Codex 那一类 agent 也是同一套分工：
+    常驻的是核心几份的一行摘要，长尾靠检索，命中之后才取正文。
+
+    检索是**词面**的，不上嵌入模型：查词按空白/标点切，中文长词补两字滑窗
+    （中文不写空格，「篝火剪影」要能命中「篝火」和「剪影」）。名字命中权重最高，
+    其次中文名、说明，正文最低——正文几万字，一个常用字就能命中任何一份技能，
+    权重压得低才不会把「相关」变成「都相关」。
+    """
+
+    #: 各字段的权重与「同一词在这里最多算几次」的上限。上限是为了让一份正文里
+    #: 出现 50 次「视频」的技能，不至于压过名字里就叫「视频」的那一份。
+    _WEIGHT = {"name": 8, "display": 6, "description": 3, "body": 1}
+    _CAP = {"name": 2, "display": 2, "description": 3, "body": 2}
+
+    def __init__(self, loader: SkillLoader) -> None:
+        self._loader = loader
+
+    @property
+    def name(self) -> str:
+        return "find_skill"
+
+    @property
+    def display_name(self) -> str:
+        return "搜索技能"
+
+    @property
+    def description(self) -> str:
+        return (
+            "按需求搜技能：传 query（几个关键词，中文连写也行），返回最相关的几条"
+            "——每条给名字、中文名、一句话说明，并标出它是不是风格包 / 导入技能"
+            "（那两类是「这一片长什么样」的画面契约，不进 <skills> 清单，只能从这里找到）。"
+            "**清单（<skills>）里没列出的技能只能从这里找到**；列在清单里的也可以用它在"
+            "多份相似技能里挑。搜到之后照常用 load_skill(name) 取正文；harness 是词面匹配，"
+            "**一次给两三个关键词**最准，查不到就换个说法再搜一次，别反复搜同一组词。"
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "要搜的关键词，空格分隔，如「剪影 年代 转场」"},
+                "limit": {"type": "integer",
+                          "description": "可选：返回几条，缺省 8，最多 20"},
+            },
+            "required": ["query"],
+        }
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @staticmethod
+    def _terms(query: str) -> list[str]:
+        """查词切分：按空白与常见标点切开；含中文且长过 2 字的词补两字滑窗。"""
+        parts = re.split(r"[\s,，。、；;：:！!？?（）()\[\]【】<>《》\"'“”‘’/|]+",
+                         str(query or ""))
+        terms: list[str] = []
+        for part in parts:
+            t = part.strip().lower()
+            if not t:
+                continue
+            terms.append(t)
+            if len(t) > 2 and any("一" <= ch <= "鿿" for ch in t):
+                terms.extend(t[i:i + 2] for i in range(len(t) - 1))
+        # 去重保序；两字以下的中文单字不进检索（命中率太高、区分度为零）
+        seen: set[str] = set()
+        out: list[str] = []
+        for t in terms:
+            if len(t) < 2 or t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+        return out
+
+    @classmethod
+    def _score(cls, skill: "Skill", terms: Sequence[str]) -> int:
+        fields = {
+            "name": (skill.name or "").lower(),
+            "display": (skill.display or "").lower(),
+            "description": (skill.description or "").lower(),
+            "body": (skill.body or "").lower(),
+        }
+        total = 0
+        for term in terms:
+            for field_name, text in fields.items():
+                if not text:
+                    continue
+                hits = text.count(term)
+                if hits:
+                    total += min(hits, cls._CAP[field_name]) * cls._WEIGHT[field_name]
+        return total
+
+    async def execute(self, query: str, limit: int = 8) -> str:
+        terms = self._terms(query)
+        if not terms:
+            return ("Error: query 里没有能用来检索的词——给几个关键词，"
+                    "如「剪影 年代」「字幕 对齐」「街机 像素」。")
+        try:
+            n = max(1, min(int(limit or 8), 20))
+        except (TypeError, ValueError):
+            n = 8
+        try:
+            user_id = None
+            from .identity import current_identity
+            ident = current_identity()
+            user_id = getattr(ident, "user_id", None) if ident is not None else None
+        except Exception:  # noqa: BLE001 - 拿不到身份就按「全部系统技能」搜
+            user_id = None
+        # 风格包也进来搜：规划轮要自己找到「这一片该用哪套视觉」，而风格包不进常驻
+        # `<skills>` 清单（见 `SkillManifestContextSource.render`），检索是它唯一的入口。
+        # 代价只是命中的那几条多占几十字节；不搜它就等于这套能力在自然语言入口里不存在。
+        skills = list(await self._loader.discover(user_id))
+        scored = sorted(
+            ((self._score(s, terms), s) for s in skills),
+            key=lambda pair: (-pair[0], pair[1].name),
+        )
+        hits = [(score, s) for score, s in scored if score > 0][:n]
+        if not hits:
+            names = "、".join(sorted(s.name for s in skills)[:_MISSING_LIST_MAX])
+            more = "…" if len(skills) > _MISSING_LIST_MAX else ""
+            return (f"没有和「{query}」对得上的技能。在案的技能名：{names}{more}"
+                    f"——也可以直接用 load_skill(name) 按名字取。")
+        lines = [f"搜「{query}」命中 {len(hits)} 份（按相关度）："]
+        contract_hit = False
+        for _score, s in hits:
+            tags = [s.name]
+            if s.display:
+                tags.append(s.display)
+            # 两类「画面契约」要在一行里就能认出来：风格包讲的是长什么样，用户导入的
+            # 技能同理（plan_motion 会把它当 imported 契约注入写手）。它们不是拿来
+            # 照着一步步做的流程，取正文只会在规划轮里白占几万字。
+            if s.kind == "style":
+                tags.append("风格包" if s.owner_user_id is None else "风格包·我的")
+                contract_hit = True
+            elif s.owner_user_id:
+                tags.append("导入技能")
+                contract_hit = True
+            tags.append("可用" if s.available else f"不可用：{s.unavailable_reason}")
+            lines.append(f"- {' · '.join(tags)}\n  {s.catalog_summary()}")
+        lines.append("用 load_skill(name) 取正文；只要其中一块就加 section=。")
+        if contract_hit:
+            # 只对命中的那一轮说：每轮都挂这句，等于把常驻清单又加回来。
+            lines.append("标着「风格包 / 导入技能」的条目不用取正文——把名字填进计划的 "
+                         "style_skill，执行期会把它整份注入写手。")
+            # 2026-10-23：用户导入了一份技能、也有一份同名同类的系统包时，模型挑了系统
+            # 那个（真机日志：11 次 find_skill 之后填的是系统包「剪影年轮」）。用户装进来
+            # 的东西本来就该赢——但这句话得说出来，不然它只按相关度排序。
+            lines.append("同一个需求对上好几份时，**标着「·我的」或「导入技能」的优先**："
+                         "那是用户自己装进来的，比系统内置的更贴近他这次要的东西。")
+        return "\n".join(lines)
+
+
 def register_skill_tools(registry, loader: SkillLoader) -> None:
     registry.register(LoadSkillTool(loader))
+    # 与 load_skill 成对注册：清单里放不下的技能只有它能找到（见 `FindSkillTool`）。
+    registry.register(FindSkillTool(loader))

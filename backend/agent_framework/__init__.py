@@ -96,6 +96,7 @@ from .skill import (
     Skill,
     SkillLoader,
     SkillManifestContextSource,
+    FindSkillTool,
     LoadSkillTool,
     register_skill_tools,
 )
@@ -270,6 +271,7 @@ __all__ = [
     "Skill",
     "SkillLoader",
     "SkillManifestContextSource",
+    "FindSkillTool",
     "LoadSkillTool",
     "register_skill_tools",
     "MessageCenter",

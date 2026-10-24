@@ -32,6 +32,12 @@ from .cron import (
     CronDeleteTool,
     register_cron_tools,
 )
+from .run import (
+    RunTool,
+    ALLOWED_EXE,
+    BANNED_EXE,
+    register_run_tool,
+)
 
 __all__ = [
     "FileToolBase",
@@ -42,6 +48,10 @@ __all__ = [
     "GrepTool",
     "register_file_tools",
     "session_workspace_root",
+    "RunTool",
+    "ALLOWED_EXE",
+    "BANNED_EXE",
+    "register_run_tool",
     "FetchTool",
     "SearchTool",
     "SearchResult",

@@ -19,12 +19,18 @@ FROM python:3.12-slim
 # 装三遍:个别 .deb 每轮都会被网络路丢包(502/500,每次失败的还不一样),单遍必炸
 # exit 100;失败的字节留在 apt 缓存里,后一遍只补没取到的那几个——实测第二遍就过。
 # 结尾的 ffmpeg/fc-list 是硬闸:装没装真上,层自己说话,不留「构建绿了但没有字体」。
+# nodejs/npm：**外部技能的执行期**（2026-10-23）。用户导入了 7 个 Claude Code 风格
+# 的技能（lemo-opuscar / mg-styles-15 / huashu-art-motion / xilo-opus-video …），
+# 它们的 `.mjs` 脚本要 node 才能跑；容器里原先只有 python3/ffmpeg/chromium，
+# 于是 `run` 工具放行了 node 也没有二进制。装在这一层而不是新开一层：同样会撞
+# apt 网络抖动，合进去少一次 502/500 的风险。
 RUN apt-get update -o Acquire::Retries=3 \
-    && { apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk \
-         || apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk \
-         || apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk; } \
+    && { apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk nodejs npm \
+         || apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk nodejs npm \
+         || apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk nodejs npm; } \
     && rm -rf /var/lib/apt/lists/* \
-    && ffmpeg -version | head -1 && fc-list :lang=zh | head -1
+    && ffmpeg -version | head -1 && fc-list :lang=zh | head -1 \
+    && node --version && npm --version
 
 WORKDIR /app
 COPY backend/requirements.txt backend/requirements-storyline.txt ./
@@ -52,6 +58,10 @@ COPY remotion/src/themes/palettes.json /app/remotion/src/themes/palettes.json
 # 当画面底稿（母版照旧画字幕条）。它不参与镜像里的打包，但确实是一份镜头代码——
 # 读不到时预览不出图（不报错、不影响出片），所以少 COPY 这一行的表现是「预览一直是空的」。
 COPY remotion/src/preview/caption-sample.tsx /app/remotion/src/preview/caption-sample.tsx
+# 内部组件目录（`storyline_server/motion/components.py`）是**从这份源码现读**的导出名与
+# `*Props` 字段：不 COPY 它，容器里的目录就是空的——不报错，只是写手又回到「prop 名靠猜」，
+# 猜错静默落缺省值、画面不对也不红。风格模板不在这棵树里（它们由 `style_templates` 单独注入）。
+COPY remotion/src/lib /app/remotion/src/lib
 # server.mjs 也带一份（R1-T5/T4）：它不参与后端运行，但
 # `tests/test_delivery_hygiene.py` 的「孤儿判据」要先认「这是一棵完整源码树」
 # （`src/FilmLayout.tsx` + `server.mjs` 两个哨兵）才肯判——只 COPY 一半，那几条

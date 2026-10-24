@@ -257,6 +257,101 @@ export default Shot;
 const staticNonFont = `${FONT_ONLY_HEAD}const Shot = () => <FilmLayout><img src={staticFile("logo.png")} /></FilmLayout>;
 export default Shot;
 `;
+// 2026-10-23：`run` 把脚本产出的图推到 `public/assets/`，镜头按 staticFile 取。
+// 这条通道必须绿；而 `assets/` 下不是图片的（.json/.html）仍要红。
+const staticAsset = `${FONT_ONLY_HEAD}const Shot = () => <FilmLayout><img src={staticFile("assets/ab12cd-sun.svg")} /></FilmLayout>;
+export default Shot;
+`;
+const staticAssetBad = `${FONT_ONLY_HEAD}const Shot = () => <FilmLayout><img src={staticFile("assets/ab12cd-page.html")} /></FilmLayout>;
+export default Shot;
+`;
+
+// ---- 字幕只许一条（2026-10-23）----
+// 「同屏两条字幕」在成片上只表现为「字变粗、发虚」：两套实现的位置都取自同一张
+// 几何表，几乎逐像素重合。人工看片极易漏过，所以必须有一条静态规则硬拦。
+// 两个入口都要测：只测绿的那一侧，规则写坏成「永远通过」也照样打印 PASS。
+const CAPTION_HEAD = `import React from 'react';
+import { AbsoluteFill } from 'remotion';
+import { E } from '@dg/motion';
+import { StyleCaption } from '@dg/lib/style/silhouette-history';
+import { CaptionLayer } from '@dg/film';
+const _t = E.linear(0);
+`;
+/** 绿：只有模板那一条。 */
+const captionSingle = `${CAPTION_HEAD}const Shot = () => (
+  <AbsoluteFill>
+    <StyleCaption text="一句话。" />
+  </AbsoluteFill>
+);
+export default Shot;
+`;
+/** 红：模板那条 + 母版那条，位置几乎重合（真机 s05 的原样）。 */
+const captionDouble = `${CAPTION_HEAD}const Shot = () => (
+  <AbsoluteFill>
+    <StyleCaption text="面包是发的；钱从粮税里出。" />
+    <CaptionLayer />
+  </AbsoluteFill>
+);
+export default Shot;
+`;
+
+// ---- 通栏矩形不许盖住主体（2026-10-23，只对剪影系生效）----
+// 这条规则要同时证明三件事，缺一条就等于没测：
+//   ① 剪影系里「通栏带排在最后」必须红；
+//   ② 同一段代码不 import 风格包（手写风格）必须绿——这就是「换风格不会被拦」；
+//   ③ 声明了 `data-front` 的前景带必须绿——误伤要有一句话就能解掉的口子。
+const BAND_HEAD = `import React from 'react';
+import { AbsoluteFill, useVideoConfig } from 'remotion';
+import { E } from '@dg/motion';
+const _t = E.linear(0);
+`;
+const SIL_IMPORT = "import { SilhouetteStage } from '@dg/lib/style/silhouette-history';\n";
+const BAND = '<rect x={0} y={H * 0.4} width={W} height={H * 0.2} fill="#c0392b" opacity={0.9} />';
+const SUBJECT = '<path d={`M0 0 L${W} 0 L${W} ${H} Z`} fill="#111111" />';
+/** `first`/`last` 决定通栏带画在主体前还是后。 */
+const bandShot = (importLine, first, last) => `${BAND_HEAD}${importLine}const Shot = () => {
+  const { width: W, height: H } = useVideoConfig();
+  return (
+    <AbsoluteFill>
+      <svg width={W} height={H}>
+        <rect x={0} y={H * 0.7} width={W} height={H * 0.3} fill="#000000" />
+        ${first}
+        ${last}
+      </svg>
+    </AbsoluteFill>
+  );
+};
+export default Shot;
+`;
+/** 红：剪影系，通栏带画在最后（真机 s05 的形状）。 */
+const bandOver = bandShot(SIL_IMPORT, SUBJECT, BAND);
+/** 绿：同一条带，画在主体之前。 */
+const bandBehind = bandShot(SIL_IMPORT, BAND, SUBJECT);
+/** 绿：一模一样，但不 import 任何风格包（手写风格的镜头）——规则必须让路。 */
+const bandNoStyle = bandShot('', SUBJECT, BAND);
+/** 绿：剪影系、带在最后，但声明了 `data-front`（前景剪影带）。 */
+const bandDeclared = bandShot(SIL_IMPORT, SUBJECT, BAND.replace('/>', 'data-front />'));
+
+// 2026-10-23 真机：12 镜里 6 镜全卡在 band-over-subject 上，每镜重写 3 次仍红。
+// 查下来是**地面带被误判**——「最后画一条通栏黑块当地面」是剪影系最正当的画法，
+// 它盖住的只是地平线以下。这两个用例把「地面带必须绿」钉住，否则同一个误伤会再来一次。
+const groundBandShot = (yExpr) => `${BAND_HEAD}${SIL_IMPORT}const Shot = () => {
+  const { width: W, height: H } = useVideoConfig();
+  return (
+    <AbsoluteFill>
+      <svg width={W} height={H}>
+        ${SUBJECT}
+        <rect x={0} y={${yExpr}} width={W} height={H * 0.16} fill="#000000" />
+      </svg>
+    </AbsoluteFill>
+  );
+};
+export default Shot;
+`;
+/** 绿：地面带写在最后，y 是能认出来的下半部（真机那 6 镜的形状）。 */
+const bandGroundNum = groundBandShot('H * 0.84');
+/** 绿：同一个地面带，y 用变量名写的。 */
+const bandGroundIdent = groundBandShot('groundY');
 
 const R = 'dg/fields-declared-unused';
 const U = 'dg/fields-undeclared-read';
@@ -300,7 +395,24 @@ const cases = [
     has(FONT_LOAD, '对不上')],
   ['staticFile：只指字体（必须绿）', staticFontOk, (e) => e.length === 0],
   ['staticFile：指了非字体（必须红 staticfile-font-only）', staticNonFont,
-    has('dg/staticfile-font-only', '指的不是字体')],
+    has('dg/staticfile-font-only', '指的东西不在')],
+  ['staticFile：脚本产出的图 assets/*.svg（必须绿）', staticAsset, (e) => e.length === 0],
+  ['staticFile：assets 下但不是图片（必须红）', staticAssetBad,
+    has('dg/staticfile-font-only', '指的东西不在')],
+  ['字幕：只摆模板那一条（必须绿）', captionSingle, (e) => e.length === 0],
+  ['字幕：模板 + 母版两条（必须红 caption-double）', captionDouble,
+    has('dg/caption-double', '同屏两条字')],
+  // 2026-10-23：这条闸降级成 warning。判据是「通栏 + 不透明 + 排在最后」，而静态代码
+  // 里判不出主体在哪——剪影系里「最后画一条通栏黑块当地面」是最正当的画法。6 镜被误判、
+  // 每镜重写 3 次，一次分镜烧 326 秒。现在它只记账：不进 errors、不拦、回执里看得见。
+  ['通栏带：剪影系画在主体之后（只记账，不许拦）', bandOver,
+    (e, r) => e.length === 0
+      && (r.warnings || []).some((x) => x.rule === 'dg/band-over-subject')],
+  ['通栏带：剪影系画在主体之前（必须绿）', bandBehind, (e) => e.length === 0],
+  ['通栏带：不 import 风格包（必须绿，别的风格不许拦）', bandNoStyle, (e) => e.length === 0],
+  ['通栏带：剪影系但标了 data-front（必须绿）', bandDeclared, (e) => e.length === 0],
+  ['通栏带：地面带画在最后 y=H*0.84（必须绿，不许误判）', bandGroundNum, (e) => e.length === 0],
+  ['通栏带：地面带画在最后 y=groundY（必须绿，不许误判）', bandGroundIdent, (e) => e.length === 0],
 ];
 
 let fail = 0;
@@ -308,7 +420,7 @@ for (const [name, code, predicate, declared] of cases) {
   const r = await lintShotCode(code, declared);
   console.log(`\n=== ${name} → ok=${r.ok}${declared ? ` declared=[${r.declared}]` : ''}`);
   for (const e of r.errors) console.log(`  [${e.rule}] ${e.line}:${e.column} ${e.msg.slice(0, 70)}`);
-  if (predicate && !predicate(r.errors)) { console.log('  !! 不符合预期'); fail++; }
+  if (predicate && !predicate(r.errors, r)) { console.log('  !! 不符合预期'); fail++; }
   if (name.startsWith('违规') && r.ok) { console.log('  !! 违规样本竟然过了'); fail++; }
 }
 

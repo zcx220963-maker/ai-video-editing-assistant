@@ -22,8 +22,8 @@
     },
     "planning_round": {
       "file": "planning_round.md", "phase": "planning", "kind": "conditional",
-      "referenced_by": ["submit_plan"], "fixed": false, "max_bytes": 4765,
-      "desc": "规划轮整段（含 knobs / 同会话历史两个子块），按块守卫条件出现。"
+      "referenced_by": ["submit_plan"], "fixed": false, "max_bytes": 6100,
+      "desc": "规划轮整段（含 knobs / 同会话历史两个子块、风格包自动路由一句），按块守卫条件出现。"
     },
     "editing_round": {
       "file": "editing_round.md", "phase": "editing", "kind": "conditional",

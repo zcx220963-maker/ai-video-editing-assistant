@@ -579,11 +579,26 @@ const splitStageChildren = (children: React.ReactNode) => {
  *  `R3F: Svg is not part of the THREE namespace`，23 张预览静帧一张没出来。
  *
  *  自己的组件要画 `<svg>` / `<div>` 时，用 `<Screen>` 包一层，或者给它加
- *  `domLayer = true` 静态标记——两条路都在下面 `Screen` 的注释里。 */
+ *  `domLayer = true` 静态标记——两条路都在下面 `Screen` 的注释里。
+ *
+ *  **三维元素也是字符串标签**（`<mesh>` / `<group>` / `<boxGeometry>`），所以
+ *  「是字符串就是 DOM」会把三维内容整块挪出 Canvas、在 DOM 里渲染成不显示的未知标签。
+ *  2026-10-22 探针：`<SurrealWorld>` 里一个红方块渲出来整幅只剩底色。改成白名单。 */
+const DOM_TAGS = new Set([
+  'svg', 'g', 'defs', 'path', 'rect', 'circle', 'ellipse', 'line', 'polyline',
+  'polygon', 'text', 'tspan', 'textPath', 'foreignObject', 'image', 'use',
+  'pattern', 'mask', 'clipPath', 'linearGradient', 'radialGradient', 'stop',
+  'filter', 'feGaussianBlur', 'feTurbulence', 'feColorMatrix', 'feBlend',
+  'feOffset', 'feMerge', 'feMergeNode', 'feComponentTransfer', 'feFuncA',
+  'div', 'span', 'section', 'article', 'p', 'b', 'i', 'em', 'strong', 'small',
+  'br', 'img', 'canvas', 'video', 'sub', 'sup', 'pre', 'code',
+]);
 type DomLayerType = { domLayer?: boolean };
-const isDomLayerType = (type: unknown): boolean =>
+const isDomLayerType = (type: unknown): boolean => (
   typeof type === 'string'
-  || Boolean((type as DomLayerType | null)?.domLayer);
+    ? DOM_TAGS.has(type)
+    : Boolean((type as DomLayerType | null)?.domLayer)
+);
 
 export interface StudioStageProps {
   /** 这一镜的三维内容（实物、装置）。台面在 y=0。

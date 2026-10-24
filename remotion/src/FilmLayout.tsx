@@ -284,7 +284,21 @@ export const CAPTION_LOOK: Record<CaptionStyle, CaptionStyleLook> = {
   // 不上字幕：母版与 `<CaptionLayer/>` 都自守不画（见闸㉜）。仍旧给一份配方——
   // `Record` 要铺满，取值取最素的那一档。
   none: { band: false, position: 'bottom', anim: 'fade', size: 0.66, weight: 500, lineHeight: 1.35 },
+  // 字幕交给这一镜的代码自己画（2026-10-23）：母版与 `<CaptionLayer/>` 都不上屏。
+  // 这一份配方只是给 `Record` 铺满、并给「两行不超过画面高 20%」那条字号上限一个基准
+  // ——**它不会真被画出来**，判据见下面的 `NO_MOTHER_CAPTION`。
+  by_shot: { band: false, position: 'bottom', anim: 'fade', size: 0.44, weight: 800, lineHeight: 1.3 },
 };
+
+/**
+ * 这两档字幕**不由母版画**：`none` 是「这一镜没有字幕」，`by_shot` 是「字幕由这一镜
+ * 的代码自己设计」。其余五档都是母版按 `CAPTION_LOOK` 的常量排。
+ *
+ * 为什么要有 `by_shot`：`CAPTION_LOOK` 的每一档都是写死的（位置只有 bottom/center/top、
+ * 动画只有 fade/pop/rise、字号是固定系数），于是所有片子的字幕长得一模一样。用户要
+ * 「整个画面都交给 agent」，字幕是最后一块不由它决定的地方。
+ */
+const NO_MOTHER_CAPTION = new Set<string>(['none', 'by_shot']);
 
 /** 被点名的词怎么被点出来（「高亮样式」那一维的落点，与字幕样式**正交**）。 */
 export interface HighlightLook {
@@ -663,7 +677,7 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
   // 字幕两维（2026-10-16）：整片一档、逐镜可覆盖，注入时已经合成好（`shot_input_props`）。
   // 母版这边只是照着画——它不必知道「逐镜」这件事。
   const captionStyle = pickInjected<CaptionStyle>(captionStyleProp, 'captionStyle',
-                                                  CAPTION_STYLES, 'outlined');
+                                                  CAPTION_STYLES, 'by_shot');
   const highlightStyle = pickInjected<HighlightStyle>(highlightStyleProp, 'highlightStyle',
                                                       HIGHLIGHT_STYLES, 'color');
   // 这一镜的字幕由**镜头代码自己摆**（代码里有 `<CaptionLayer/>`，Python 侧扫出来注入）。
@@ -845,12 +859,13 @@ export const FilmLayout: React.FC<FilmLayoutProps> = ({
           {children}
         </div>
 
-        {/* 母版这条字幕。两条不画的路：
+        {/* 母版这条字幕。三条不画的路：
             · `caption_style: none` —— 整片（或这一镜）不上字幕；
+            · `caption_style: by_shot` —— 字幕由这一镜的代码自己设计（2026-10-23）；
             · 代码里摆了 `<CaptionLayer/>` —— 绘制权还给镜头代码，母版让位（否则同屏两条）。
             为什么让位这件事要由 Python 侧扫代码来决定：母版在运行期看不到那一镜的代码，
             而「有没有第二条」是**这一段代码的静态事实**。 */}
-        {captionStyle !== 'none' && !captionFromCode && text ? (
+        {!NO_MOTHER_CAPTION.has(captionStyle) && !captionFromCode && text ? (
           <Caption
             text={text}
             textEn={textEn}
@@ -1159,6 +1174,9 @@ export function useCaptionTiming(opts: {
 export interface CaptionTextProps {
   /** 画面上的那行字。不传＝注入里的 `text`（这一镜的整句）。 */
   text?: string;
+  /** 英文那一行（中英双字幕）。不传＝代码没给 `text` 时取注入里的 `textEn`。
+   *  显式给了 `text` 就不自动取——母版 `<Caption>` 自己排英文，避免同屏两遍。 */
+  textEn?: string;
   highlight?: string[];
   words?: WordTiming[];
   /** 高亮词**怎么显示**。不传＝跟着注入的「高亮样式」那一维（`HIGHLIGHT_LOOK`）。
@@ -1196,7 +1214,7 @@ export interface CaptionTextProps {
  * （`<Caption>` → 也是它）在同一档下逐字相同。
  */
 export const CaptionText: React.FC<CaptionTextProps> = ({
-  text, highlight, words, emphasis: emphasisProp, karaoke: karaokeProp,
+  text, textEn, highlight, words, emphasis: emphasisProp, karaoke: karaokeProp,
   hl: hlProp, accent: accentProp, cap: capProp, fitWidth, fontSize: sizeProp,
   sizeScale: sizeScaleProp, outline,
   captionStyle: captionStyleProp, highlightStyle: highlightStyleProp,
@@ -1206,7 +1224,7 @@ export const CaptionText: React.FC<CaptionTextProps> = ({
   const t = useCaptionTiming({ text, highlight, words });
   // 字幕样式先定：白字黑边这一档的字色本来就是统一的，下面的高亮是否生效要参考它。
   const capStyle = pickInjected<CaptionStyle>(captionStyleProp, 'captionStyle', CAPTION_STYLES,
-                                              'outlined');
+                                              'by_shot');
   // 两维都不给 prop 时跟着**注入**那一档走：镜头代码把字摆进画面时，「高亮怎么显示」
   // 本来就是整片（或这一镜）的一个观感决定，不该由每一份现写的代码各答一次。
   // 缺省是 `plain`（2026-10-20：用户点名「字幕默认黑边白字」，此前缺省 color 会在
@@ -1222,6 +1240,12 @@ export const CaptionText: React.FC<CaptionTextProps> = ({
   const karaoke = karaokeProp ?? hlLook.karaoke;
   const style = resolveFilmStyle(getInputProps());
   const look = captionLook(style, style.bg || TOKENS.bg);
+  // 中英双行：镜头代码自己摆字幕时母版那条会让位（`captionFromCode`），英文行
+  // 只有这里能画。代码没传 `text` 就取注入里的那一份；代码传了自己的字，就只在
+  // 显式给了 `textEn` 时画——母版 `<Caption>` 自己排英文，不会走这条自动路径。
+  const enText = String((textEn ?? (text === undefined
+    ? (getInputProps() as { textEn?: string }).textEn
+    : '')) || '').trim();
   const hlColor = hlProp ?? look.hl;
   // 用户在「文字库」钉过的强调色**排在最前**：它在 `captionLook` 里已经盖过色板，
   // 这里再排到 `accent` 那一栏之前——否则照推荐写法（`accent={palette.accent}`）写的
@@ -1286,23 +1310,52 @@ export const CaptionText: React.FC<CaptionTextProps> = ({
       setShift({ x: Math.round(dx * 10) / 10, y: Math.round(dy * 10) / 10 });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [width, height, frame, text, fontSize, shift.x, shift.y]);
+  }, [width, height, frame, text, enText, fontSize, shift.x, shift.y]);
+
+  const wordStyle = {
+    display: 'inline-block',
+    maxWidth: '100%',
+    // 中文长句必须真的在盒子里折行：只靠 CJK 的默认断行，一旦外层或高亮片段
+    // 带了 `nowrap`，整句会排成一条比画面还宽的单行，安全网只能把它平移进画，
+    // 两端仍会被切掉（2026-10-20 真机字幕左右各缺一截）。
+    whiteSpace: 'normal' as const,
+    wordBreak: 'break-word' as const,
+    overflowWrap: 'anywhere' as const,
+  };
+  // 英文那一行与中文同号、同色、同一圈描边（与母版 `<Caption>` 的排法一致）；
+  // 次序跟 `caption.order` 走（缺省英文在上）。两行一起被上面的安全网量到。
+  const enGap = Math.round(fontSize * 0.14);
+  const enFirst = (style.captionOrder ?? 'en-zh') === 'en-zh';
+  const enBlock = enText ? (
+    <div
+      style={{
+        marginTop: enFirst ? 0 : enGap,
+        marginBottom: enFirst ? enGap : 0,
+        fontSize,
+        fontWeight: ringColor ? capLook.weight : undefined,
+        lineHeight: 1.22,
+        letterSpacing: 0.2,
+        color: textColor,
+        textAlign: 'center',
+        overflowWrap: 'anywhere',
+        textShadow: shadow,
+      }}
+    >
+      {enText}
+    </div>
+  ) : null;
 
   return (
     <span
       ref={boxRef}
       style={{
-        display: 'inline-block',
-        maxWidth: '100%',
-        // 中文长句必须真的在盒子里折行：只靠 CJK 的默认断行，一旦外层或高亮片段
-        // 带了 `nowrap`，整句会排成一条比画面还宽的单行，安全网只能把它平移进画，
-        // 两端仍会被切掉（2026-10-20 真机字幕左右各缺一截）。
-        whiteSpace: 'normal',
-        wordBreak: 'break-word',
-        overflowWrap: 'anywhere',
+        ...wordStyle,
+        textAlign: enText ? 'center' : undefined,
         transform: shift.x || shift.y ? `translate(${shift.x}px, ${shift.y}px)` : undefined,
       }}
     >
+      {enText && enFirst ? enBlock : null}
+      <span style={wordStyle}>
       {t.pieces.map(({ p, start }, i) => {
         const isHl = t.highlight.some((h) => h && h === p);
         const on = isHl && t.reached(start);
@@ -1345,6 +1398,8 @@ export const CaptionText: React.FC<CaptionTextProps> = ({
           </span>
         );
       })}
+      </span>
+      {enText && !enFirst ? enBlock : null}
     </span>
   );
 };
@@ -1403,7 +1458,7 @@ export const CaptionFrame: React.FC<CaptionFrameProps> = ({
   const geo = FILM_GEOMETRY[aspect];
   const cap = geo.caption;
   const capStyle = pickInjected<CaptionStyle>(captionStyle, 'captionStyle', CAPTION_STYLES,
-                                              'outlined');
+                                              'by_shot');
   // 字幕带高度：按这一档的字号上限算两行（与 `<CaptionText/>` 的「两行不超过画面高
   // 20%」同一条线），再加内衬。写手不必估「两行有多高」——这是它一直在估错的那个数。
   // 字号要乘上这一档的 `size`：`on_picture` 已经缩到 0.66，带子若仍按满字号算，
@@ -1416,8 +1471,9 @@ export const CaptionFrame: React.FC<CaptionFrameProps> = ({
   ));
   const gapPx = Math.max(0, gap ?? Math.round(height * 0.015));
   const insetPx = Math.max(0, inset ?? cap.side);
-  // 「不上字幕」这一档不割地：带子不画，画面就用整帧（分带只在真有字要站的时候才有意义）。
-  const showCaption = caption && capStyle !== 'none';
+  // 「不上字幕」与「字幕交给代码自己画」这两档都不割地：带子不画，画面就用整帧
+  // （分带只在真有母版字幕要站的时候才有意义）。
+  const showCaption = caption && !NO_MOTHER_CAPTION.has(capStyle);
   // 带子 + 空隙不能吃掉整帧：留至少三分之一给画面。
   const carve = showCaption ? Math.min(bandH + gapPx, Math.round(height * 0.66)) : 0;
   const art: ArtBox = { x: 0, y: 0, w: width, h: Math.max(1, height - carve), aspect };
@@ -1453,6 +1509,8 @@ export const CaptionFrame: React.FC<CaptionFrameProps> = ({
 export interface CaptionLayerProps {
   /** 不传＝注入里的那一份（这一镜的整句）。 */
   text?: string;
+  /** 英文那一行。不传＝`text` 也没传时取注入里的 `textEn`（中英双行）。 */
+  textEn?: string;
   highlight?: string[];
   words?: WordTiming[];
   /** 字幕样式那一维。不传＝注入的那一档。**`none` 不画**（见下面的自守）。 */
@@ -1488,7 +1546,7 @@ export interface CaptionLayerProps {
  * 直接打回，免得这段代码静悄悄地不生效。
  */
 export const CaptionLayer: React.FC<CaptionLayerProps> = ({
-  text, highlight, words, captionStyle: captionStyleProp,
+  text, textEn, highlight, words, captionStyle: captionStyleProp,
   highlightStyle: highlightStyleProp, tone: toneProp, hl: hlProp, accent: accentProp,
   aspect: aspectProp, bottom: bottomProp, opacity,
 }) => {
@@ -1497,12 +1555,16 @@ export const CaptionLayer: React.FC<CaptionLayerProps> = ({
   const aspect = injectedAspect(aspectProp);
   const geo = FILM_GEOMETRY[aspect];
   const captionStyle = pickInjected<CaptionStyle>(captionStyleProp, 'captionStyle',
-                                                  CAPTION_STYLES, 'outlined');
+                                                  CAPTION_STYLES, 'by_shot');
   const highlightStyle = pickInjected<HighlightStyle>(highlightStyleProp, 'highlightStyle',
                                                       HIGHLIGHT_STYLES, 'color');
   const style = resolveFilmStyle(getInputProps());
   const look = captionLook(style, style.bg || TOKENS.bg);
   const t = useCaptionTiming({ text, highlight, words });
+  // 英文行与 `<CaptionText/>` 同一口径：代码没写自己的字，就取注入的那一份。
+  const resolvedTextEn = String((textEn ?? (text === undefined
+    ? (getInputProps() as { textEn?: string }).textEn
+    : '')) || '').trim();
 
   // 一次一条，不逐帧刷屏：渲染服务的浏览器日志每条都要过一遍 onBrowserLog。
   React.useEffect(() => {
@@ -1517,6 +1579,7 @@ export const CaptionLayer: React.FC<CaptionLayerProps> = ({
   return (
     <Caption
       text={t.text}
+      textEn={resolvedTextEn}
       highlight={t.highlight}
       words={t.words}
       look={CAPTION_LOOK[captionStyle]}

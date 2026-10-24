@@ -130,6 +130,10 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
             raise ValueError(
                 "render_motion_code：没有 spec 参数，Store 里也没有 plan_motion 产物——"
                 "先调 plan_motion 出代码分镜，或把 spec 直接传进来")
+        # 2026-10-24：这里原来调 `refresh_style_template`（按库里登记刷新模板槽位）。
+        # 风格包/模板通道整条删除时那个函数一起删了，这一行却留着——
+        # 结果**渲染一点就炸**：`cannot import name 'refresh_style_template'`。
+        # 现在没有模板，也就没有槽位可刷新，整段去掉。
         # 顶层开关并进来再过一次校验——与 plan_motion 入库前调的是同一个 validate_code_spec：
         # 越界的值不许走到烧像素。
         # 质检档：spec 没写就按产品缺省（MOTION_QC，缺省 preview——渲后像素闸只提醒）。
@@ -138,11 +142,20 @@ class RenderCodeMotionVideoNode(MotionRenderBase):
         # 旧计划**里的代码不会重跑那一步。这里再修一次（幂等），免得用户点确认之后
         # 才在成片里看到两条叠在一起的字。
         raw, _dup_caption_notes = cspec.autofix_duplicate_caption(raw)
+        # 叠化 × 逐镜烧进画面的字幕 = 两条字叠在一起（2026-10-22 真机）。同一份
+        # 分镜期兜底在这里再跑一次：旧 checkpoint 里的 spec 还是 `dissolve`。
+        raw, _cap_trans_notes = cspec.autofix_caption_transition(raw)
         # 整屏 `<feTurbulence>` 颗粒的渲染口兜底：plan_motion 入库前已经换过，但旧
         # checkpoint 里的代码不会重跑那一步。幂等，没这种写法就一个字节都不动。
         raw, _grain_notes = cspec.autofix_film_grain(raw)
-        spec, errors = cspec.validate_code_spec(
-            cspec.overlay_knobs(cspec.with_default_qc(raw), inputs))
+        raw = cspec.overlay_knobs(cspec.with_default_qc(raw), inputs)
+        # 字幕缺省（白字黑边 / 整条同色）也在这里再收一次：模型常常在出片这一步
+        # 把用户原话里的「无描边」又抄一遍（`caption_style: on_picture`）当顶层开关
+        # 传进来——覆盖回来就把分镜期收回的白字黑边又冲掉了。用户点名过（「不要黑边」
+        # 「要关键词换色」）时这一档一个字节都不动。
+        raw, _cap_default_notes = cspec.autofix_caption_default(
+            raw, user_request=getattr(state, "user_request", "") or "")
+        spec, errors = cspec.validate_code_spec(raw)
         # 手写 spec 可能只带 `brief`（2026-10-18：code 可省）：在烧像素之前补写，
         # 与 plan_motion 走的是同一个写手。已经带 code 的镜一个字节都不动。
         if not cspec.DEMOS_ENABLED and any(

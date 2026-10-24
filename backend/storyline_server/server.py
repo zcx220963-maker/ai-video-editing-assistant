@@ -30,7 +30,6 @@ from agent_framework.orchestration import (
     topological_order,
 )
 from agent_framework.storage import Storage, build_storage, to_ref
-from agent_framework import style_templates as style_tpl
 
 from .motion import caption_preview as cpreview
 from .motion import code_spec as cspec
@@ -160,16 +159,6 @@ class StorylineServer:
             if hung or stale:
                 print(f"[storyline] 启动对账：悬挂渲染任务置 failed {hung} 条，"
                       f"过期工作区文件回收 {stale} 个")
-            # 模板库：种子只补缺；已发布模板推给渲染容器（失败只打印，用到时补推）。
-            try:
-                added = await style_tpl.seed_system_templates(self.storage)
-                pushed = await style_tpl.sync_validated(self.storage)
-                if added or pushed.get("pushed") or pushed.get("failed"):
-                    print(f"[storyline] 模板库：新增种子 {added} 条，推送 "
-                          f"{pushed.get('pushed')} 条"
-                          + (f"，失败 {pushed['failed']}" if pushed.get("failed") else ""))
-            except Exception as exc:  # noqa: BLE001 - 模板库同步不该拦服务启动
-                print(f"[storyline] 模板库同步失败（沿用库里已有内容）：{exc}")
             self.renders.start_watchdog()
             stall = self.settings.caps.render_stall_sec
             print("[storyline] 渲染停滞看门狗："
@@ -214,7 +203,7 @@ class StorylineServer:
     def _register_one(self, node) -> None:
         server = self
 
-        async def handler(ctx: Context, **kwargs: Any) -> str:
+        async def _body(ctx: Context, **kwargs: Any) -> str:
             args = {k: v for k, v in kwargs.items() if v is not None}
             sid = DEFAULT_SESSION
             try:  # 请求拦截①：从传输层找回会话身份
@@ -276,6 +265,19 @@ class StorylineServer:
                 return await server._invoke_long(node, state, args, wait_sec)
             result = await server.interceptor.invoke(node.name, state, **args)
             return tool_json(result)
+
+        # 2026-10-24：**工具错误必须落日志**。
+        # 原先错误只回给模型、服务端一行不写：真机 run `3cddbe30dbef` 写手写完 12 镜
+        # （约 0.5 元）之后 plan_motion 抛错，模型用同样参数重试 6 次，日志里一片空白，
+        # 只能反过来问用户「界面上那条红字是什么」。这一行把它变成可查的事实。
+        async def handler(ctx: Context, **kwargs: Any) -> str:
+            try:
+                return await _body(ctx, **kwargs)
+            except Exception as exc:      # noqa: BLE001 - 记完照原样抛给模型
+                detail = str(exc).replace("\n", " ⏎ ")
+                print(f"[tool-error] {node.name}: {type(exc).__name__}: {detail[:2400]}",
+                      flush=True)
+                raise
 
         # 让 FastMCP 按节点契约（而非 Python 签名）生成 inputSchema
         handler.__signature__ = self._signature_for(node)

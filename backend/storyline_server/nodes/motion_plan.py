@@ -23,10 +23,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from agent_framework import style_authoring
 from agent_framework.orchestration import NodeState, _safe
-from agent_framework.skill import _parse_frontmatter, _parse_manifest
-from agent_framework.style_templates import as_pack_template, ensure_remote, visible
+from agent_framework.skill import _parse_frontmatter, derive_display
 from agent_framework.retrieval import (UNVERIFIED_MARKS, cite_fields, claims_verified,
                                        ledger, matches_ledger)
 
@@ -37,6 +35,7 @@ from ..motion import code_render as crender
 from ..motion import code_spec as cspec
 from ..motion import design_review
 from ..motion import remotion_client as rc
+from ..motion import recipe_index
 from ..motion import shot_writer
 from .core_nodes import StoryNode, _flag_on, _obj, _resolve_target_duration
 
@@ -209,75 +208,240 @@ def _try_rescue_json(text: str) -> Any:
 #: 风格包正文进 spec 的上限。它是给写手看的说明书，不是分镜本身；
 #: 超过这个长度只截断、不报错——风格包写得啰嗦不该让整份分镜交不上。
 MAX_STYLE_BODY_CHARS = 12000
+#: 多份技能合并时，**每一份**最多贡献多少字（2026-10-24）。
+#: 十份 skill 的正文合计八万多字，全量塞进写手 prompt 会把它淹掉——每份只给开头
+#: 这一段（够看清它主张什么画法），要更细的做法看它自己的 `references/`。
+SKILL_BUNDLE_PER_MAX = 6000
+#: 动态下限：挂 10 份时每份仍至少给这么多。
+SKILL_BUNDLE_PER_MIN = 1200
+#: 合并的上限份数。再多就只是噪音。
+SKILL_BUNDLE_MAX_SKILLS = 10
 
 
-async def _bind_slots(storage: Any, template: dict[str, Any],
-                      overrides: Any, notes: list[str]) -> None:
-    """把 `style_overrides` 解成槽位上的 ``bound`` 记录（组件 → 替换件模块）。
+def _clean_phrase(text: Any) -> str:
+    """把一句话压成「只留汉字字母数字」的形态，用来做子串匹配。"""
+    return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]+", "", str(text or ""))
 
-    只认**已登记**的替换件（模板 `manifest.variants` 里的 name/module/label）；
-    没登记的自由描述不在这里生成——那要先调 ``/variants`` 换件，运行时按默认
-    组件画并在回执里说明。这样写手拿到的永远是一条能 import 的路径。
+
+#: 用户在这句话里明确表态「不要风格包」——自动挑到这就整段让路。
+#: 宣传片、能力混搭片必须能说这句话，否则「剪影」「手绘」这些词一定会误挂一套上去。
+_STYLE_OPT_OUT = ("风格留自动", "风格自动", "不套风格", "不挂风格", "不要风格包",
+                  "不套模板", "不挂模板", "不用风格包", "不要套模板")
+
+
+def _bigrams(text: Any) -> set[str]:
+    s = _clean_phrase(text)
+    if len(s) < 2:
+        return {s} if s else set()
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def _identity_phrases(row: Mapping[str, Any]) -> list[str]:
+    """这套风格「自称」的那几个词：中文名 + `auto_select` + 简介短句 + 能力名。
+
+    全部来自文件本身，不需要人写——用户导入新技能时零维护：
+
+    * `display`（缺了就从正文一级标题派生，见 `skill.derive_display`）；
+    * `style_manifest.auto_select`（`auto_select` 这个字段以前是死的，没有任何代码读它，
+      它本来就是为这件事写的）；
+    * 简介里 4~12 字的中文片段；
+    * **附件里的中文目录名 / 不重复的文件名**（`skill.capability_phrases`）——
+      社区技能几乎都是「一种能力一个目录」，这些名字就是它的能力清单。
+
+    为什么不用 `##` 小标题：实测七份里小标题几乎全是流程（「第 0 步：检查环境」
+    「工作目录」「遇到这些情况」），当触发词只会把匹配搞脏。
     """
-    slots = template.get("slots")
-    if not isinstance(slots, list) or not isinstance(overrides, Mapping):
-        return
-    for comp, want in overrides.items():
-        comp = str(comp or "").strip()
-        slot = next((s for s in slots
-                     if isinstance(s, dict) and str(s.get("component") or "") == comp),
-                    None)
-        if slot is None:
-            notes.append(f"风格包没有槽位「{comp}」，忽略这条替换")
-            continue
-        if isinstance(want, Mapping):
-            want = want.get("variant") or want.get("name") or want.get("label") or ""
-        want = str(want or "").strip()
-        if not want or want in (comp, "default"):
-            # 模板可能把最新替换件标成默认（换完即用）；这里显式回退到自带组件。
-            slot.pop("bound", None)
-            continue
-        options = [v for v in (slot.get("variants") or []) if isinstance(v, Mapping)]
-        hit = next((v for v in options
-                    if want in (str(v.get("name") or ""), str(v.get("module") or ""),
-                                str(v.get("label") or ""))), None)
-        if hit is None:
-            have = "、".join(f"「{v.get('label') or v.get('name')}」" for v in options[:6])
-            notes.append(f"「{comp}」没有替换件「{want}」"
-                         + (f"（现有：{have}）" if have else
-                            "；先调换件接口给这个槽位做一件")
-                         + "，按默认组件画")
-            continue
-        vname = str(hit.get("name") or "")
-        try:
-            ok, why = await ensure_remote(storage, vname)
-        except Exception as exc:  # noqa: BLE001 - 存储/渲染抖动只降级
-            ok, why = False, str(exc)[:120]
-        if not ok:
-            notes.append(f"替换件「{vname}」暂不可用（{why}），「{comp}」按默认组件画")
-            continue
-        slot["bound"] = {
-            "name": vname,
-            "module": str(hit.get("module") or ""),
-            "component": comp,
-            "label": str(hit.get("label") or ""),
-            "contract": [str(p) for p in (hit.get("contract") or []) if str(p).strip()],
-            # 替换件可能给联合类型加了取值（更多时代/场景）；写手要用它驱动逐镜变化。
-            "contract_text": str(hit.get("contract_text") or ""),
-            "hash": str(hit.get("hash") or ""),
-        }
-        notes.append(f"槽位「{comp}」换成替换件「{hit.get('label') or vname}」")
+    from agent_framework.skill import capability_phrases, derive_display
+
+    fm = row.get("frontmatter") or {}
+    out: list[str] = []
+    display = _clean_phrase(derive_display(fm, str(row.get("body") or ""),
+                                           str(row.get("name") or "")))
+    if len(display) >= 2:
+        out.append(display)
+    raw = fm.get("auto_select")
+    items = raw if isinstance(raw, (list, tuple)) else ([raw] if raw else [])
+    for item in items:
+        p = _clean_phrase(item)
+        if 2 <= len(p) <= 12:
+            out.append(p)
+    desc = str(fm.get("description") or "")
+    for chunk in re.split(r"[^\u4e00-\u9fff]+", desc):
+        if 4 <= len(chunk) <= 12:
+            out.append(chunk)
+    for p in capability_phrases(fm, str(row.get("body") or ""),
+                                row.get("files") or [], limit=10):
+        out.append(_clean_phrase(p))
+    seen: list[str] = []
+    for p in out:
+        # 上限从 12 放宽到 40：导入的 skill 大量是英文名（`dashi-animationstyle`
+        # 18 个字符、`huashu-art-motion` 15 个），旧的 12 字上限会把它们整条过滤掉，
+        # 结果是「点名字永远挂不上」——2026-10-24 实测七个导入包里四个中招。
+        # `_phrase_hit` 本来就只认 ≥4 字的公共片段，长名字不会变松。
+        if 2 <= len(p) <= 40 and p not in seen:
+            seen.append(p)
+    return seen
+
+def _phrase_hit(phrase: str, req: str) -> str:
+    """短语里**最长的那一段**出现在请求里，就回那一段；没有回空串。
+
+    为什么不要求整句命中：风格包的 display 是「平涂剪影四层景」，用户嘴里说的是
+    「纯平涂剪影」——整句永远对不上，而「平涂剪影」这 4 个字是强信号。反过来，
+    只按 2 字重叠又太松（「动画」「设计」谁都撞）。所以取「≥4 字的最长公共片段」：
+    够长才算数，且报出来的那一段能直接写进回执给用户看。
+    """
+    L = len(phrase)
+    floor = 3 if L == 3 else 4
+    for n in range(L, floor - 1, -1):
+        for i in range(L - n + 1):
+            sub = phrase[i:i + n]
+            if sub in req:
+                return sub
+    return ""
 
 
-async def _attach_style_pack(storage: Any, raw: Mapping[str, Any], name: str,
-                             user_id: str) -> tuple[dict[str, Any], str]:
-    """按名字取风格包，注入 ``spec.style_pack`` 并补齐视觉缺省。
+async def _auto_pick_own_skill(storage: Any, user_id: str,
+                               request: str) -> tuple[str, str]:
+    """用户没点名风格时，看他自己的话是不是正好指向**他自己导入**的某个技能。
 
-    三条纪律：
-    * **风格包是数据，不是流程**：这里只读写 manifest/正文，不执行任何用户代码。
-    * **只读本人或系统内置**：别人的包一律当不存在（回执里也不泄露它的存在）。
-    * **失败只降级**：不存在 / 不是 style / manifest 坏了 / 无权限，都回一句说明继续，
-      不让一份写坏了的风格包把整次分镜拦死（「堵死比白烧更坏」）。
+    返回 ``(技能名, 给人看的一句话)``。没命中回 ``("", "")``；命中多份回
+    ``("", 说明)``——那时候**不替他选**，但把候选说出来，让他点一下。
+
+    ## 用户明确说了「不挂风格」就一律不猜
+
+    宣传片那类片子要在**一部片里换五种视觉语言**，提示词里会写「风格留自动、不要挂任何
+    风格包」。那种话里必然出现「剪影」「手绘」「界面」这些词，按下面的匹配逻辑一定会
+    误挂一套上去——把整片拉成那一种。所以先认这句话，命中就整段让路。
+
+    ## 为什么只认「本人导入的」
+
+    2026-10-19 删掉过一版「按特征词自动套风格包」，理由是「那等于把视觉规则从对话
+    搬回库里」。那个批评对**系统内置包**成立：库里那几套是产品带的，用户没要。
+    但用户自己拖进来的技能是另一件事——他花了力气装进来，就是想让片子按那个画。
+    所以这里的边界是 `owner_user_id == user_id`：系统包一个都不碰。
+
+    ## 为什么并列时不猜
+
+    并列第一说明这段话同时像两套（他库里确实有两套剪影）。这时候挂哪一个都是赌，
+    而赌错的代价是整片按错的形式渲完。所以回一句「都对得上，你指一下」——
+    把一次猜测换成一次点击，比默默选错便宜得多。
+    """
+    plain = str(request or "")
+    if any(k in plain for k in _STYLE_OPT_OUT):
+        return "", ""
+    req = _clean_phrase(request)
+    if len(req) < 4:
+        return "", ""
+    try:
+        rows = await storage.skills.list(user_id)
+    except Exception:      # noqa: BLE001 - 读不到技能库就当没有，不拦分镜
+        return "", ""
+    scored: list[tuple[int, str, str, list[str], str]] = []
+    for row in rows:
+        if str(row.get("owner_user_id") or "") != str(user_id or ""):
+            continue                      # 只认本人导入的，系统内置包一律不碰
+        fm = row.get("frontmatter") or {}
+        hits = [h for h in (_phrase_hit(p, req) for p in _identity_phrases(row)) if h]
+        # 机器名单独算一条：必须**整段**出现在请求里。
+        # 不能交给 `_phrase_hit`——它认任意 ≥4 字片段，`motion_explainer_skill`
+        # 里的 "skill" 会让「参考 nope-skill-xyz」误挂到科普片上（2026-10-24 实测）。
+        name_p = _clean_phrase(row.get("name") or "")
+        if len(name_p) >= 4 and name_p in req and name_p not in hits:
+            hits.append(name_p)
+        if not hits:
+            continue
+        longest = max(len(h) for h in hits)
+        overlap = len(_bigrams(req) & _bigrams(str(row.get("body") or "")[:800]))
+        display = str(fm.get("display") or "") or derive_display(
+            fm, str(row.get("body") or ""), str(row.get("name") or ""))
+        scored.append((longest * 3 + len(hits) * 2 + overlap,
+                       str(row.get("name") or ""), display,
+                       sorted(set(hits), key=len, reverse=True)[:3],
+                       str(row.get("updated_at") or "")))
+    if not scored:
+        return "", ""
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    top = scored[0]
+    rivals = [s for s in scored[1:] if s[0] == top[0]]
+    if rivals:
+        names = "、".join(f"《{s[2]}》" for s in [top, *rivals[:2]])
+        return "", (f"你这段话同时像 {names} 这几套，没替你选——"
+                    "把风格指一下（或从模板库里挑一套）我就按它画")
+    _, name, display, hits, _ = top
+    return name, (f"你这段话里的「{'、'.join(hits)}」对上了你自己导入的《{display}》，"
+                  f"这一片按它的画面契约画（不想这样就把风格改成「自动」）")
+
+
+async def _auto_pick_own_skills(storage: Any, user_id: str,
+                                request: str) -> tuple[list[str], str]:
+    """把用户原话里**所有**对得上的、他自己导入的技能名都取回来（按分排序）。
+
+    与 `_auto_pick_own_skill`（只取唯一命中）的区别：那条路用在「只能挂一份」的
+    旧口径上；2026-10-24 起支持一份片子挂多份技能，所以这里回列表。
+
+    仍然不猜：一份都没命中回 `([], "")`；命中的**全部**按分数从高到低返回，
+    由调用方按预算裁剪——不再因为「有两套都对得上」就一份都不挂。
+    """
+    plain = str(request or "")
+    if any(k in plain for k in _STYLE_OPT_OUT):
+        return [], ""
+    req = _clean_phrase(request)
+    if len(req) < 4:
+        return [], ""
+    try:
+        rows = await storage.skills.list(user_id)
+    except Exception:      # noqa: BLE001 - 读不到技能库就当没有，不拦分镜
+        return [], ""
+    scored: list[tuple[int, str]] = []
+    # **显式点名优先**（2026-10-24）：原话里出现了某份技能的机器名（整段命中），
+    # 就只挂被点名的那几份，不再做模糊匹配。
+    #
+    # 为什么必须这样：模糊匹配会拿 description 里的 4~12 字中文片段去撞，v8 提示词
+    # 里写了「十二个机制」，就把 `system-diagram-animation` 也拉了进来——用户只点了
+    # 两份，实际挂了第三份，那一份的正文还会覆盖掉前两份的画法。
+    explicit: list[str] = []
+    for row in rows:
+        if str(row.get("owner_user_id") or "") != str(user_id or ""):
+            continue
+        name_p = _clean_phrase(row.get("name") or "")
+        if len(name_p) >= 4 and name_p in req:
+            explicit.append(str(row.get("name") or ""))
+    if explicit:
+        return sorted(set(explicit)), f"你点名了 {len(set(explicit))} 份技能"
+
+    for row in rows:
+        if str(row.get("owner_user_id") or "") != str(user_id or ""):
+            continue                      # 只认本人导入的，系统内置包一律不碰
+        fm = row.get("frontmatter") or {}
+        hits = [h for h in (_phrase_hit(p, req) for p in _identity_phrases(row)) if h]
+        name_p = _clean_phrase(row.get("name") or "")
+        if len(name_p) >= 4 and name_p in req and name_p not in hits:
+            hits.append(name_p)
+        if not hits:
+            continue
+        longest = max(len(h) for h in hits)
+        overlap = len(_bigrams(req) & _bigrams(str(row.get("body") or "")[:800]))
+        scored.append((longest * 3 + len(hits) * 2 + overlap,
+                       str(row.get("name") or "")))
+    if not scored:
+        return [], ""
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    names = [n for _, n in scored[:SKILL_BUNDLE_MAX_SKILLS]]
+    return names, f"这段话对上了你导入的 {len(names)} 份技能"
+
+
+async def _attach_skill_contract(storage: Any, raw: Mapping[str, Any], name: str,
+                                  user_id: str) -> tuple[dict[str, Any], str]:
+    """按名字取**用户导入的 skill**，注入 ``spec["skill_contract"]``。→ (新 spec, 说明)
+
+    2026-10-24：这里原来叫 `_attach_style_pack`，同一个载体同时服务「风格包」与
+    「导入的 skill」。风格包通道整条删除之后只剩后者，所以：
+
+    * **不再读 `style_manifest`**（配色/构图/模板/槽位那些键已经不产出了）
+    * **不再找模板、不再绑槽位**（模板通道已删）
+    * **`kind=style` 直接拒绝**——项目里不允许再有风格包这种东西
+
+    三条纪律照旧：只读本人或系统内置；失败只降级不拦；别人的按不存在处理。
     """
     fm: Mapping[str, Any] = {}
     body = ""
@@ -285,249 +449,110 @@ async def _attach_style_pack(storage: Any, raw: Mapping[str, Any], name: str,
     row: Mapping[str, Any] | None = None
     try:
         row = await storage.skills.get(name)
-    except Exception:      # noqa: BLE001 - 存储不可达时走磁盘种子，不在这里判死
+    except Exception:      # noqa: BLE001 - 存储不可达时走磁盘种子
         row = None
     if row:
         fm = row.get("frontmatter") or {}
         body = str(row.get("body") or "")
         owner = row.get("owner_user_id")
     else:
-        # 磁盘兜底：editor 可能比 app 先起（系统种子还没同步进 PG），或离线直调。
-        # 运行时仍以 PG 为准——这里只是让「同一个镜像里的种子」立刻可用。
+        # 磁盘兜底：editor 可能比 app 先起（系统种子还没同步进 PG）。
         seed = (Path(__file__).resolve().parents[2]
                 / "examples" / "skills" / name / "SKILL.md")
         if not seed.is_file():
-            return dict(raw), f"风格包「{name}」不存在，按默认视觉继续"
+            return dict(raw), f"技能「{name}」不存在，按默认视觉继续"
         try:
             meta, body = _parse_frontmatter(seed.read_text(encoding="utf-8"))
         except OSError:
-            return dict(raw), f"风格包「{name}」读不出来，按默认视觉继续"
+            return dict(raw), f"技能「{name}」读不出来，按默认视觉继续"
         fm, owner = meta, None
     kind = str(fm.get("kind") or "workflow").strip().lower()
-    if kind != "style":
-        return dict(raw), f"「{name}」不是风格包（kind={kind}），按默认视觉继续"
+    if kind == "style":
+        return dict(raw), f"「{name}」是风格包，这条通道已删除，按默认视觉继续"
     if owner is not None and owner != user_id:
-        # 与素材同一口径：别人的东西按不存在处理，不在回执里确认它存在。
-        return dict(raw), f"风格包「{name}」不可用，按默认视觉继续"
-    manifest = _parse_manifest(fm.get("style_manifest"))
-    if not manifest:
-        return dict(raw), f"风格包「{name}」的 manifest 读不出来，按默认视觉继续"
+        return dict(raw), f"技能「{name}」不可用，按默认视觉继续"
     display = str(fm.get("display") or name)
     spec = dict(raw)
-    spec["style_pack"] = {
+    spec["skill_contract"] = {
         "name": name,
         "display": display,
         "body": body[:MAX_STYLE_BODY_CHARS],
-        "manifest": manifest,
+        #: 这一片挂了哪几份技能——写手的「可读参考」清单按它筛。
+        "parts": [name],
     }
-    # 模板是**可执行的那一层**：风格包只写了名字，真正的 import 路径、组件清单与
-    # 源码指纹从模板库取。取不到 / 没推成功就**不注入**——写手会按 manifest 自己画，
-    # 而不是 import 一个注定打包失败的模块（那会白烧一整镜）。系统内置模板没有源码，
-    # `ensure_remote` 直接放行（镜像里已经烤好）。
-    template_name = str(manifest.get("template") or "").strip()
-    note = f"已注入风格包《{display}》（{name}）"
-    if template_name:
-        try:
-            trow = await storage.style_templates.get(template_name)
-        except Exception:      # noqa: BLE001 - 存储抖动不该拦分镜
-            trow = None
-        if trow is None:
-            note += f"；模板「{template_name}」未在库里登记，按正文自行画"
-        elif not visible(trow, user_id):
-            note += f"；模板「{template_name}」不可用，按正文自行画"
-        else:
-            ok, why = await ensure_remote(storage, template_name)
-            if ok:
-                spec["style_pack"]["template"] = as_pack_template(trow)
-            else:
-                note += f"；模板「{template_name}」暂不可用（{why}），按正文自行画"
-    # 槽位绑定：`style_overrides` 把某个组件换成该槽位已登记的替换件；不传就用
-    # 模板自己的组件（零参数可渲）。绑定失败只降级成默认组件并写回执，不拦分镜。
-    pack_tmpl = spec["style_pack"].get("template")
-    bound_notes: list[str] = []
-    if isinstance(pack_tmpl, Mapping):
-        await _bind_slots(storage, pack_tmpl, raw.get("style_overrides"),
-                          bound_notes)
-    if bound_notes:
-        note += "".join(f"；{n}" for n in bound_notes)
-    # 缺省补齐：分镜/卡面显式写了的优先，风格包只填空格。
-    cap = manifest.get("caption") if isinstance(manifest.get("caption"), Mapping) else {}
-    if not spec.get("caption_style"):
-        declared = str(manifest.get("caption_style") or "").strip()
-        if declared in cspec.CAPTION_STYLES:
-            spec["caption_style"] = declared
-        elif str(cap.get("look") or "") == "overlay":
-            # 贴画面的一档里，「白字黑边」是用户点名要的（2026-10-20）；不要落到
-            # 无描边的 on_picture——深底上会糊成一片。
-            spec["caption_style"] = "outlined"
-    if not spec.get("highlight_style"):
-        declared = str(manifest.get("highlight_style") or "").strip().lower()
-        if declared in cspec.HIGHLIGHT_STYLES:
-            spec["highlight_style"] = declared
-    if not spec.get("recurring_prop") and manifest.get("recurring_prop"):
-        spec["recurring_prop"] = str(manifest["recurring_prop"])
-    # 片壳（2026-10-20）：风格包可以指定整片外框（数据驱动，后端不按风格名写分支）。
-    # 分镜显式写了的优先；manifest 里没写或写了不认识的名字就当没选壳，不拦分镜。
-    if not spec.get("shell"):
-        declared = str(manifest.get("shell") or "").strip().lower()
-        if declared in cspec.SHELLS:
-            spec["shell"] = declared
-            if not spec.get("shell_label") and manifest.get("shell_label"):
-                spec["shell_label"] = str(manifest["shell_label"])
-    # 整片底色与质感（2026-10-21）：风格包说得出「这一套是深墨蓝、带胶片颗粒」，
-    # 却要模型在每份分镜里再抄一遍，抄漏一次画面就回到缺省的米色纸。这里按名字
-    # 补空格——分镜显式写了的优先；认不出的名字不填，交给下游契约层去说。
-    if not spec.get("palette"):
-        declared = cspec.norm_palette(manifest.get("palette_name"))
-        if declared:
-            spec["palette"] = declared
-    if not spec.get("texture"):
-        declared = str(manifest.get("texture") or "").strip().lower()
-        if declared in cspec.TEXTURES:
-            spec["texture"] = declared
-    # 满幅（2026-10-21）：深色底 + 非满幅 = 画面被夹在中间一条带子里，**四边一圈黑**，
-    # 字幕站在带子外面的底色上——用户在成片上看到的就是「字幕和画面分家」，像嵌了一张
-    # 图，不像一支片子；而镜头代码多半按整帧坐标画，被夹进去之后构图还会被裁歪。
-    # 风格包能说「这一套是满幅的」，就不该让五十份分镜各抄一遍（抄漏一镜，那一镜
-    # 立刻变回黑边）。只补**没申报**的镜：分镜显式写了 `bleed`（哪怕是 false）就听它的。
-    if manifest.get("bleed") is True:
-        # 满幅镜要同时有底色（闸⑲ 的第③条，也是闸④ 判空的基准色）。风格包的
-        # `palette.page` 就是这一套的底色；分镜自己写了 `bg` 的不动。
-        page = ""
-        mpal = manifest.get("palette") if isinstance(manifest.get("palette"), Mapping) else {}
-        if isinstance(mpal, Mapping):
-            page = str(mpal.get("page") or "").strip().lower()
-        for s in (spec.get("shots") or []):
-            if not isinstance(s, dict):
-                continue
-            if not isinstance(s.get("bleed"), bool):
-                s["bleed"] = True
-            if page and not str(s.get("bg") or "").strip():
-                s["bg"] = page
-    # 贯穿主体也可以由风格包给定：它的构图/人物参数本来就是按同一副骨架写死的，
-    # 分镜再手写一遍容易漏（真机 37 镜的 spec 里根本没有 `protagonist`，于是每镜
-    # 各画一个人）。分镜显式写了的优先，风格包只填空格。
-    if isinstance(manifest.get("protagonist"), Mapping):
-        # 分镜自己写了的键优先，风格包只补空格：真机里模型写了 look/wardrobe，
-        # 但没写 `component`，于是模板 import 检查不知道主角该由哪件组件渲染，
-        # 画面里人又被手画了一遍（2026-10-20）。补齐 component 后这项检查才有落点。
-        merged = dict(manifest["protagonist"])
-        if isinstance(spec.get("protagonist"), Mapping):
-            merged.update(spec["protagonist"])
-        spec["protagonist"] = merged
-    if not spec.get("style") and display:
-        spec["style"] = display
-    if not spec.get("style_grammar") and manifest.get("recurring_pose"):
-        spec["style_grammar"] = str(manifest["recurring_pose"])
-    if manifest.get("template"):
-        spec["style_template"] = str(manifest["template"])
+    return spec, f"已把导入的技能《{display}》作为这一片的画面契约（{name}）"
+
+
+async def _attach_skill_contracts(storage: Any, raw: Mapping[str, Any],
+                                  names: Sequence[str],
+                                  user_id: str) -> tuple[dict[str, Any], str]:
+    """把**多份**导入的技能合并成一个画面契约（`spec["skill_contract"]`）。
+
+    为什么合并而不是列表：`code_spec` / `shot_writer` / `art_director` /
+    `design_review` 四处都只认「一个契约」，改成列表要动四个模块和它们的校验。
+    合并成一个载体，形状不变、下游零改动，而写手看到的是分节的多份正文。
+
+    **预算**：每份最多 :data:`SKILL_BUNDLE_PER_MAX` 字，合计不超过
+    :data:`MAX_STYLE_BODY_CHARS`。十份 skill 的正文合计八万多字，全量注入会把它淹掉。
+
+    只挂一份时退回单份形状（`name`/`display` 就是它自己的），回执也一样——
+    这样「只点一个」的老行为逐字不变。
+    """
+    wanted = [str(n).strip() for n in (names or []) if str(n).strip()]
+    if not wanted:
+        return dict(raw), ""
+
+    got: list[tuple[str, str, str]] = []       # (name, display, sliced body)
+    skipped: list[str] = []
+    budget = MAX_STYLE_BODY_CHARS
+    for name in wanted[:SKILL_BUNDLE_MAX_SKILLS]:
+        spec_one, note = await _attach_skill_contract(storage, raw, name, user_id)
+        contract = spec_one.get("skill_contract")
+        if not isinstance(contract, Mapping):
+            skipped.append(name)
+            continue
+        body = str(contract.get("body") or "")
+        # 每份给多少：总预算 ÷ 份数，夹在 [MIN, MAX] 之间。
+        # 固定 1600 时，只挂 2 份也各给 1600——huashu 的 11162 字只看到 14%。
+        per = max(SKILL_BUNDLE_PER_MIN,
+                  min(SKILL_BUNDLE_PER_MAX,
+                      MAX_STYLE_BODY_CHARS // max(1, len(wanted))))
+        keep = min(per, budget)
+        if keep <= 0:
+            skipped.append(name)
+            continue
+        got.append((str(contract.get("name") or name),
+                    str(contract.get("display") or name),
+                    body[:keep]))
+        budget -= min(len(body), keep)
+
+    if not got:
+        return dict(raw), ("这些技能都没挂上（" + "、".join(skipped) + "），按默认视觉继续"
+                           if skipped else "")
+    if len(got) == 1:
+        name, display, body = got[0]
+        spec = dict(raw)
+        spec["skill_contract"] = {"name": name, "display": display, "body": body}
+        return spec, f"已把导入的技能《{display}》作为这一片的画面契约（{name}）"
+
+    parts = [f"### {display}（{name}）\n{body}".rstrip()
+             for name, display, body in got]
+    spec = dict(raw)
+    spec["skill_contract"] = {
+        "name": "skill_bundle",
+        "display": "、".join(d for _, d, _ in got),
+        "body": "\n\n".join(parts),
+        "parts": [n for n, _, _ in got],
+    }
+    note = (f"已挂上 {len(got)} 份技能：" + "、".join(f"《{d}》" for _, d, _ in got)
+            + f"（每份取正文前 {SKILL_BUNDLE_PER_MAX} 字）")
+    if skipped:
+        note += "；没挂上：" + "、".join(skipped)
     return spec, note
 
-
-#: 自动补件是「整片落地检查」——同一时刻只让一份分镜改模板，避免两个
-#: plan_motion 并发写 `manifest.variants`（app 侧换件有 `_deposit_lock`，
-#: 编辑器进程是另一个进程，只能各自兜住自己的并发）。
-_AUTO_FIT_LOCK = asyncio.Lock()
-
-
-def _storyboard_digest(spec: Mapping[str, Any]) -> str:
-    """分镜 → 落地检查器看的几行：每镜要画什么，比整份 spec 小得多。"""
-    lines: list[str] = []
-    for s in (spec.get("shots") or []):
-        if not isinstance(s, Mapping):
-            continue
-        text = str(s.get("text") or "").strip()
-        brief = str(s.get("brief") or "").strip()
-        if not (text or brief):
-            continue
-        line = f"- 镜{s.get('id') or '?'}：{brief[:400]}"
-        if text:
-            line += f"｜字幕：{text[:80]}"
-        lines.append(line)
-    return "\n".join(lines)
-
-
-async def _auto_fit_template(
-        storage: Any, spec: Mapping[str, Any], user_id: str, *,
-        user_request: str = "", conversation_id: str = "") -> tuple[str, bool]:
-    """分镜要画的内容模板还画不了时，自动给对应槽位补一件。
-
-    用户不该先学会「换件面板」：他在对话框里说完整片，逐镜 `brief` 与
-    这一轮的原话已经写清「洞穴、客厅、地铁」「篝火、电视、手机」。这里让
-    模型对着槽位清单判断现有取值够不够；不够就按换件同一套闸补一件，
-    只补缺、不重写整份模板。
-
-    返回 ``(回执, 是否有零件补成功)``。任何一步失败都只写回执，
-    **不拦分镜**——自动补件是省事，不是出片的前提。
-    """
-    pack = spec.get("style_pack")
-    if not isinstance(pack, Mapping):
-        return "", False
-    manifest = pack.get("manifest") if isinstance(pack.get("manifest"), Mapping) else {}
-    record = pack.get("template") if isinstance(pack.get("template"), Mapping) else {}
-    base = str(manifest.get("template") or record.get("name") or "").strip()
-    slots = record.get("slots")
-    if not base or not isinstance(slots, list) or not slots:
-        return "", False
-    storyboard = _storyboard_digest(spec)
-    request = (str(user_request or "").strip()
-               + ("\n\n" if user_request and storyboard else "") + storyboard).strip()
-    if not request:
-        return "", False
-    try:
-        row = await storage.style_templates.get(base)
-    except Exception:  # noqa: BLE001 - 存储抖动只代表这次不补件
-        return "", False
-    if not isinstance(row, Mapping) or row.get("owner_user_id") is None:
-        # 系统内置模板是共享行，不能往里登记用户替换件。
-        return "", False
-    try:
-        from agent_framework.llm_openai import get_default_llm
-        llm = get_default_llm()
-    except Exception:  # noqa: BLE001 - 没配模型就按现有取值画
-        return "模板落地检查：没有可用的模型配置，按现有取值画", False
-    # 这是剪辑服务端（另一个进程），身份 contextvar 不过 HTTP：不显式绑，
-    # `resolve_api_key` 拿到的用户是空串，模型键永远解析不出来。与 shot_writer /
-    # selfcheck 同一条纪律。
-    from agent_framework.identity import use_identity
-    done: list[str] = []
-    failed: list[str] = []
-    try:
-        with use_identity(user_id, conversation_id):
-            edits = await style_authoring.fit_storyboard(
-                llm, base_row=row, slots=slots, storyboard=request,
-                identity_user=user_id, conversation_id=conversation_id)
-            if not edits:
-                return "", False
-            async with _AUTO_FIT_LOCK:
-                for edit in edits[:4]:
-                    comp = str(edit.get("component") or "").strip()
-                    if not comp:
-                        continue
-                    target = str(edit.get("spec") or edit.get("label") or request)
-                    try:
-                        item = await style_authoring.author_variant(
-                            storage, base_name=base, component=comp,
-                            target=target[:600], user_id=user_id, llm=llm,
-                            identity_user=user_id,
-                            conversation_id=conversation_id, intent=edit)
-                    except Exception as exc:  # noqa: BLE001 - 一件失败不拖垮整片
-                        failed.append(f"{comp}：{str(exc)[:80]}")
-                        continue
-                    done.append(f"{comp}「{item.get('label') or item.get('name')}」")
-    except Exception as exc:  # noqa: BLE001 - 检查失败不代表有缺口
-        return ("模板落地检查没跑完（" + str(exc)[:80] + "），按现有取值画"
-                if not done else ""), bool(done)
-    note = ""
-    if done:
-        note = ("模板缺的内容已自动补件：" + "、".join(done)
-                + "。这一片会直接用补好的零件画；不用再去换件面板。")
-    if failed:
-        note += ("；" if note else "") + ("自动补件没成功：" + "；".join(failed[:4])
-                                        + "（这几样按模板现有取值画）")
-    return note, bool(done)
-
-
+#: 渲染环境自检的进程内缓存：`{"c": (时间戳, 说明)}`。
+#: 2026-10-24 补回：删风格包那一段时被连带删掉了（原来紧贴在 `_preflight_note` 上面），
+#: 结果是每次 plan_motion 都炸 `name '_PREFLIGHT_CACHE' is not defined`。
 _PREFLIGHT_CACHE: dict[str, tuple[float, str]] = {}
 _PREFLIGHT_TTL_SEC = 600.0
 
@@ -570,6 +595,42 @@ class PlanMotionNode(StoryNode):
         "零素材出片的第一站：交一份**分镜**，校验、归一并存成本会话的 motion_spec，"
         "同时回一份「将要渲成什么样」的账（镜头数、总字数、按字数估的秒数区间、"
         "与目标时长的偏差提醒、每镜交出的字段清单）。本节点**不渲染、不烧像素**。"
+        # ─── 第一道门：需求文档（2026-10-23）────────────────────────────────
+        # 真机 run（15:0x）：模型把卡面上的中文标签（「关键词换色」「男声·沉稳纪录片
+        # 解说」）当机器名传进来，四次报错、整次分镜作废，一次重跑烧 407 秒。
+        # 根因是「理解需求」与「填 30 个字段」挤在同一次调用里。所以在调本工具
+        # **之前**，先用一段文字把需求写下来，停下等用户确认——用户改一段话，
+        # 比改 12 镜的代码便宜两个数量级。
+        "**调用本工具之前，先用一段文字输出一份《需求文档》并停下来等用户确认。**"
+        "用户确认或修改之后，才调本工具。**不要在同一条回复里既给文档又调本工具**——"
+        "那样文档等于没写，用户没有机会在花掉写码时间之前改它。"
+        "文档写六节，每节一两句："
+        "① 主题与一句话主线；② 受众与语气（给谁看、多正式）；"
+        "③ 时长与节奏；④ 必须出现的具体事实（带数字，注明数据期）；"
+        "⑤ 视觉方向（要什么、不要什么）；⑥ 禁区（用户明确不要的）。\n"
+        # 2026-10-24 真机：用户给了「151 分钟」，模型联网查到 162 之后**静默替换**，
+        # 用户看到的字幕已经变了而没人告诉他。口径该不该更新是用户的事，
+        # 不是模型替他决定的——所以：照抄 + 只提示、不改数。
+        "**用户已经给了具体数字，就照抄，不要联网替换成别的口径。**"
+        "如果你查到更新的数据或不同口径，**只在回执里说一句**"
+        "（例如「你给的 151 分钟是 2024 年报告口径，2025 年报告为 156 分钟」），"
+        "让用户自己决定改不改；**不要擅自把数字换掉**——改了又不说明，是最坏的一种。\n"
+        "**文档不许承诺下面这份能力边界之外的任何东西**——承诺了做不到的，"
+        "比不写文档更糟（用户会以为被骗）：\n"
+        f"· 画面全部是**代码逐帧画**出来的（React/TSX + SVG / `<canvas>` / roughjs / "
+        "katex / three.js），没有实拍、没有真人、没有照片，人物也做不出表情；\n"
+        f"· 转场只由**拼接层**提供（{'、'.join(cspec.TRANSITION_STYLES)}），"
+        "镜头代码里没有转场可写；\n"
+        f"· 模板通道已关闭（2026-10-23）：没有预置组件可套，每一镜的画法由写手自己画，"
+        "所以「每镜长得一样」不靠代码保证，靠风格不变量与全片画法账；\n"
+        f"· 画幅 {'、'.join(cspec.ASPECTS)}、帧率 {cspec.FPS_CHOICES}、"
+        f"质感 {'、'.join(cspec.TEXTURES)}、色板 {'、'.join(cspec.PALETTE_CHOICES)}、"
+        f"字幕样式 {'、'.join(cspec.CAPTION_STYLES)}、高亮样式 "
+        f"{'、'.join(cspec.HIGHLIGHT_STYLES)}、音色 6 个（男声/女声，无方言）；\n"
+        "· 时长由**旁白字数**决定：要卡准目标秒数，先算字数再定镜数，别指望后面裁。\n"
+        "如果用户的原话越过了这条边界（「要实拍感」「要 3D 电影镜头」），"
+        "在文档里如实写成「这个做不到，替代方案是…」，不要默默降级、也不要原样承诺。\n"
+        # ────────────────────────────────────────────────────────────────────
         "每镜最少交三样：一句 `text`（字幕文案）、一个 `highlight`（必须是文案子串）、"
         "一句 `brief`（这一镜画什么、怎么构图、字幕排在构图的哪一处、怎么分几拍动）——"
         "**`code` 可省**：不写就由系统按 brief、整片 style 与这一镜文案**单独写**这一镜的"
@@ -729,7 +790,7 @@ class PlanMotionNode(StoryNode):
         # 取材轮排在**一切校验之前**：它根本不是一份分镜（没有 code、没有 aspect），
         # 放进 validate_code_spec 只会得到一屏「code 为空」的清单。判定只看一件事——
         # 这一轮有没有交 code（见 cspec.forage_scan）。
-        # 风格包：按名字从 PG 取（磁盘种子兜底），把 manifest + 正文注入 spec.style_pack。
+        # 导入的技能：按名字从 PG 取（磁盘种子兜底），把正文注入 spec.skill_contract。
         # 排在 expand/复用之前——复用要比对风格包名，补缺省也要在契约校验之前完成。
         # 取不到、不是 style、不属于本人，都只写一句回执继续，不拦分镜。
         style_skill = str(inputs.get("style_skill")
@@ -745,10 +806,31 @@ class PlanMotionNode(StoryNode):
         # 「风格：自动」= 空串：**不套任何风格包、不套模板**。用户没点名风格时，
         # 画面只由对话框里那段话决定（`user_request` 原样进每一镜的提示词）。
         # 从前这里会按特征词自动套一份风格包，那等于把视觉规则从对话搬回库里——
-        # 用户要的是「我写成什么样，就画成什么样」，所以这一层不做了。
+        # 用户要的是「我写成什么样，就画成什么样」，所以那一层删了。
+        #
+        # 2026-10-23 补回来一版，口径收紧到三条（`_auto_pick_own_skill`）：
+        #   ① 只在**用户自己导入的**技能里找——系统内置包一个都不碰，所以不会
+        #      「不管你说什么都给你套上库里那几套」；
+        #   ② 只在**唯一命中**且命中词落在「中文名 / auto_select」上时才挂——不猜；
+        #   ③ 挂上了要**写在回执里**，用户看得见是哪一句把他带过去的。
+        # 这跟被删掉那版的区别是「谁的话说了算」：那版是库里的规则赢，这版仍然是
+        # 用户那句话赢，只是把他自己带进来的那份说明书认了出来。
+        # 2026-10-24：从「只挂唯一命中」改成「挂所有对得上的」——用户要一份片子用
+        # 多份技能。**代码里不写任何具体技能名**：谁被挂上完全由用户那句话里出现了
+        # 哪些名字决定，预算只按字数裁（`SKILL_BUNDLE_PER_MAX` / `MAX_STYLE_BODY_CHARS`）。
+        picked_names: list[str] = []
         if style_skill:
-            raw, attached_note = await _attach_style_pack(
-                self.storage, raw, style_skill, state.user_id)
+            picked_names = [style_skill]
+        else:
+            picked_names, auto_note = await _auto_pick_own_skills(
+                self.storage, state.user_id,
+                getattr(state, "user_request", "") or "")
+            if auto_note:
+                # 「对上了几份」也要落地：用户得知道是哪一句话把技能带进来的。
+                state.summary.notes.append(auto_note)
+        if picked_names:
+            raw, attached_note = await _attach_skill_contracts(
+                self.storage, raw, picked_names, state.user_id)
             style_note = "；".join(n for n in (style_note, attached_note) if n)
             if style_note:
                 state.summary.notes.append(style_note)
@@ -817,28 +899,29 @@ class PlanMotionNode(StoryNode):
                 " shots_patch 只交那几镜）：\n"
                 + "\n".join(f"  · {e}" for e in errors[:12])
                 + (f"\n  · …另有 {len(errors) - 12} 条同类错误" if len(errors) > 12 else ""))
+        # **时长先判（2026-10-23）**：写手是分钟级开销，等它写完才说「太长」= 白烧一轮。
+        # 真机 run（15:0x）：407 秒写完 12 镜，然后才发现估算 94~146 秒、目标 60 秒。
+        # 判据是纯算术（文案字数 ÷ 语速），一分钱不花，所以**必须排在写手之前**。
+        #
+        # 阈值取 1.35（下面入库前那一道是 1.6）：1.6 让「94 vs 96」正好漏过去——
+        # 差 2 秒不拦，等于这一道形同虚设。1.35 与 `check_target` 的提醒线同值。
+        _early_target = _resolve_target_duration(state, inputs, None)
+        if _early_target is None and raw.get("target_duration_sec"):
+            _early_target = max(3.0, float(raw["target_duration_sec"]))
+        if _early_target:
+            spec, _fit_notes = cspec.fit_duration(spec, _early_target)
+            _early_blocked = cspec.duration_block(spec, _early_target, long_factor=1.35)
+            if _early_blocked:
+                raise ValueError(
+                    _early_blocked
+                    + " 改完重调本工具——**分镜没有入库，也还没开始写代码**，"
+                      "所以这一次不算白跑；别等写完 12 镜再说。")
         # 贯穿人物没写 `protagonist`：只报不拦。写码马上要开始，这句排在写手之前，
         # 模型看到回执还来得及补交顶层这一栏（主角约定进复用键，补了会整片重写）。
         if not spec.get("protagonist"):
             note = missing_protagonist_note(spec)
             if note:
                 state.summary.notes.append(note)
-        # 自动落地检查（2026-10-19）：用户只在对话框说片子，不该先学换件面板。
-        # 分镜里明确要的「洞穴/客厅/地铁」「篝火/电视/手机」若模板现在画不了，
-        # 先按换件同一套闸补一件，再重新解析槽位——后面的写手直接用新件。
-        # 排在校验之后：字段都不成立的分镜不值得花补件的钱；失败只写回执不拦。
-        if style_skill:
-            fit_note, refit = await _auto_fit_template(
-                self.storage, spec, state.user_id,
-                user_request=getattr(state, "user_request", "") or "",
-                conversation_id=getattr(state, "conversation_id", "") or "")
-            if fit_note:
-                state.summary.notes.append(fit_note)
-            if refit:
-                spec, rebind_note = await _attach_style_pack(
-                    self.storage, spec, style_skill, state.user_id)
-                if rebind_note and rebind_note != style_note:
-                    state.summary.notes.append(rebind_note)
         # 环境自检（2026-10-19）：在**开始花钱写码之前**确认渲染容器还活着。
         # 教程里那句「环境摩擦可能比模型能力更致命」在真机上是成立的：chromium 起不来
         # 时写手照样会把二十几镜写完，等第一镜真渲才发现——那才是真正的白烧。
@@ -855,20 +938,19 @@ class PlanMotionNode(StoryNode):
         # 已经带了 `code` 的镜（局部改、或模型自己写的）一个字节都不动。
         writer_notes: list[str] = []
         writer_cost = 0.0
-        # 风格包**显式要求**用模板时，模型自己交的代码也过一次「模板 import」这把尺
-        # （2026-10-19）。默认不要求：画面由写手自己画，模板只是可参考的现成画法。
-        # 写手那条路会退回重写；这里只记账不重写、不拦：分镜已经成型，回执说清楚就够了。
-        pack_tpl = ((spec.get("style_pack") or {}).get("template")
-                    if isinstance(spec.get("style_pack"), Mapping) else None)
-        if isinstance(pack_tpl, Mapping):
-            for s in spec.get("shots") or []:
-                if not isinstance(s, Mapping) or not str(s.get("code") or "").strip():
-                    continue
-                miss = shot_writer.template_import_missing(
-                    spec, str(s.get("code") or ""))
-                if miss:
-                    writer_notes.append(f"{s.get('id') or '?'}：{miss}")
-        if not cspec.DEMOS_ENABLED:
+        # 2026-10-24：**全片都带 code 时，这三步一个都不该跑。**
+        # 导演与写手的 `todo` 都按「没有 code 的镜」筛，空表就直接返回；而
+        # `recipe_index.assign()` 不筛，它会照跑一次、把配方卡写进
+        # `film_ledger.recipes`——但那一份只有写手的 `_shot_block` 会读，
+        # 写手没跑就等于白花一次调用（真机 2026-10-24：12 镜全带 code，
+        # 分配照样跑了）。
+        needs_code = any(not str(s.get("code") or "").strip()
+                         for s in (spec.get("shots") or []) if isinstance(s, Mapping))
+        if not needs_code:
+            state.summary.notes.append(
+                "全片每一镜都已带 code，跳过美术导演 / 配方卡分配 / 逐镜写手"
+                "（这三步只服务「只有 brief 的镜」）。")
+        if not cspec.DEMOS_ENABLED and needs_code:
             # 美术导演（2026-10-18）：一次纯文本调用，把整片风格拆成可执行做法，
             # 并把每一镜的 brief 补成「画什么物件、在哪、多大、光从哪来、字排哪」。
             # 排在写手之前——真机上「不像像素赛博朋克」的 14 镜，根因是 brief 太抽象，
@@ -877,6 +959,22 @@ class PlanMotionNode(StoryNode):
                 spec, user_id=state.user_id or "",
                 conversation_id=state.conversation_id or "",
                 user_request=getattr(state, "user_request", "") or "")
+            # 配方卡分配（2026-10-23）：`shots/` 下 136 篇做法文档被 SKILL.md 的
+            # `exclude: demos/, shots/` 排除掉了，写手只看得到正文的**原则**、看不到
+            # **手法**（实测后果：s01/s09 被闸⑭ 数出 0 个变化段，整镜是一张静帧）。
+            # 一次调用把配方卡分到各镜，写手照着它的节拍与参数拍。
+            # **排在导演之后**：导演补过的 brief 更具体，分配更准。
+            # 分配失败不影响写手——那只是退回「只有原则没有手法」的老路。
+            rec = await recipe_index.assign(
+                spec, storage=self.storage, user_id=state.user_id or "",
+                conversation_id=state.conversation_id or "")
+            if rec["assigned"]:
+                directed["notes"].append(
+                    f"配方卡：{len(rec['assigned'])} 镜配到了具体手法"
+                    f"（从 {len(recipe_index.names())} 篇做法文档里挑的），"
+                    "已随这一镜的 prompt 交给写手。")
+            elif rec["note"]:
+                directed["notes"].append(f"配方卡：{rec['note']}")
             wrote = await shot_writer.write_shot_code(
                 spec, user_id=state.user_id or "",
                 conversation_id=state.conversation_id or "",
@@ -886,53 +984,45 @@ class PlanMotionNode(StoryNode):
             # 「未判/补了美术方向」就永远到不了回执（2026-10-19 修）。
             writer_notes = list(directed["notes"]) + list(wrote["notes"])
             writer_cost = (float(directed["cost_yuan"] or 0.0)
-                           + float(wrote["cost_yuan"] or 0.0))
+                           + float(wrote["cost_yuan"] or 0.0)
+                           + float(rec["cost_yuan"] or 0.0))
             if reused_ids:
                 head = "、".join(reused_ids[:8]) + ("…" if len(reused_ids) > 8 else "")
                 writer_notes.append(
                     f"复用：{len(reused_ids)} 镜（{head}）的 brief 与本会话上一版逐字相同，"
                     "直接沿用了已写好的代码——没有重写、也没有重渲草稿。"
                     "要重画其中某一镜，用 shots_patch 只交那一镜的新 brief。")
+            # **先存草稿再判失败**（2026-10-24 修）：原来这一句在「有几镜没写成」的
+            # raise 之后，于是**失败的那一轮草稿被丢掉**——重试时 12 镜全重写，
+            # 写手那 0.5 元白烧一遍。真机 run `3cddbe30dbef`：s02/s03 三试不过，
+            # 整份打回，下一轮又从 s01 开始写。
+            # 存了之后 `reuse_coded` 会命中已写成的 10 镜，只重写缺的那两镜。
+            _remember_draft(state.session_id, spec)
             if wrote["unwritten"]:
                 raise ValueError(
                     "逐镜写代码时有几镜没写成，分镜没有入库（"
                     + "、".join(wrote["unwritten"]) + "）：\n"
                     + "\n".join(f"  · {n}" for n in writer_notes[:12])
-                    + "\n把这几镜的 brief 写得更具体（画什么、怎么构图、怎么动），"
-                    "或者自己直接交这一镜的 code，再调一次本工具。其余镜不必重交——"
-                    "用 shots_patch 只交这几镜。")
+                    + "\n**已写成的镜已经存进草稿**，重调本工具时它们会直接复用、"
+                    "不会再花一次写手的钱。把没写成的这几镜的 brief 写得更具体"
+                    "（画什么、怎么构图、怎么动），或者直接交这一镜的 code。")
             # 草稿换成**带代码**的这一版：下一次 shots_patch 只改动过的那几镜，其余镜
             # 的代码直接复用，不会整片重写（那会把写手的钱再花一遍）。
             _remember_draft(state.session_id, spec)
-        # 模板文字槽位的内容不能靠缺省值：缺省值是参考片那一镜的原文。真机
-        # 2026-10-19 菊花镜：`<StyleCaption>` 没传 `text`，预览左上角显示的是参考片
-        # 台词「到山西，下雪了。新靴，还是没舍得穿。」。这里只点名、不拦——分镜已经
-        # 成型，用户可以接受；但缺的是哪一镜、哪个组件、哪个 prop 必须说清楚。
-        if isinstance(pack_tpl, Mapping):
-            slots = cspec.style_template_slots(spec)
-            for s in spec.get("shots") or []:
-                if not isinstance(s, Mapping):
-                    continue
-                code = str(s.get("code") or "")
-                if not code.strip():
-                    continue
-                sid = str(s.get("id") or "?")
-                for comp, prop, text_kind in cspec.missing_template_content_props(
-                        code, slots):
-                    role = {"caption": "主字幕", "inscription": "日期铭文"}.get(
-                        text_kind, "文字")
-                    writer_notes.append(
-                        f"{sid}：模板的{role}组件 `{comp}` 没传 `{prop}`——"
-                        "模板的缺省值是参考片那一镜的原文，不传就会把参考片的字带上屏。"
-                        f"要改就用 shots_patch 只交这一镜，给 `{comp}` 显式传 "
-                        f"`{prop}={{这一镜自己的文字}}`。")
-                style = str(s.get("caption_style")
-                            or spec.get("caption_style") or "")
-                if style == "none" and cspec.template_caption_in_code(code, slots):
-                    writer_notes.append(
-                        f"{sid}：申报了 caption_style=\"none\"（不上字幕），代码里却"
-                        "渲染着模板的主字幕组件——它不读这个开关，字仍会上屏。"
-                        "要么把这一镜的字幕样式改回要画的那一档，要么别渲染那个组件。")
+            # 闸⑯ 的回写环（2026-10-23）：申报了 three/katex/rough/canvas 却写成手写
+            # SVG 的镜，带着「必须真用上」这条意见重写。**排在预览之前**——它不烧像素、
+            # 只判代码字节，是最便宜的一环；等到预览之后才发现就白渲了一轮静帧。
+            chan = await self._channel_loop(state, spec)
+            if chan["rewritten"]:
+                writer_notes.append(
+                    f"画法通道：{'、'.join(sorted(chan['rewritten']))} 申报了高级通道，"
+                    f"代码里却只有手写 SVG，已按「申报必须有证据」重写"
+                    f"（{len(chan['rounds'])} 轮）。")
+            if chan["skipped"]:
+                writer_notes.append(
+                    f"画法通道：{'、'.join(sorted(set(chan['skipped'])))} 重写没成，"
+                    "保留上一版——这几镜的申报与实现仍不一致，出片前最好手工看一眼。")
+            writer_cost += float(chan["cost_yuan"] or 0.0)
         # 目标时长：本次入参 > 会话 flags > spec 里写的那一份（模型常在取材轮带上、
         # 写码轮漏掉——真机 run 79dcdc0ec0a8 就是写码轮 target=None，时长闸被推迟到确认之后）。
         target = _resolve_target_duration(state, inputs, None)
@@ -964,8 +1054,12 @@ class PlanMotionNode(StoryNode):
         # 用户自己钉的那一档不在这里，只有模型顺手写的 `on_picture`（无描边）被换掉。
         spec, cap_default_notes = cspec.autofix_caption_default(
             spec, user_request=getattr(state, "user_request", "") or "")
+        # 叠化 + 逐镜烧进画面的字幕 = 两行字叠在一起（2026-10-22 真机）。只把
+        # 「两侧都有字幕」的接缝改硬接；其余接缝照用户选的那一档。排在补字幕之后：
+        # 这一步要知道哪几镜真的有字。
+        spec, cap_trans_notes = cspec.autofix_caption_transition(spec)
         caption_notes = (list(caption_notes) + list(dup_notes) + list(grain_notes)
-                         + list(cap_default_notes))
+                         + list(cap_default_notes) + list(cap_trans_notes))
         # 闸① 提前到入库前：原先 lint 只在渲染口里跑，一镜代码写错要等前面几镜都烧完、
         # 渲到它才现形，然后整份重写重提。这里所有镜并行过一遍（不烧像素，每镜几百毫秒）。
         # **这一道照旧拦**：它不是判据，是"这段字节编译不编译得过"——一份过不了闸① 的
@@ -1000,14 +1094,13 @@ class PlanMotionNode(StoryNode):
         if env_note:
             # 放在最前面：模型读回执是从上往下读的，环境问题排在账目后面就会被跳过。
             payload = {"env_warning": env_note, **payload}
-        # 风格包只报名字与模板：正文是给写手/导演的，不必再回一遍主对话上下文。
-        pack = spec.get("style_pack") if isinstance(spec.get("style_pack"), Mapping) else {}
-        if pack:
-            manifest = pack.get("manifest") if isinstance(pack.get("manifest"), Mapping) else {}
-            payload["style_pack"] = {
-                "name": str(pack.get("name") or ""),
-                "display": str(pack.get("display") or ""),
-                "template": str(manifest.get("template") or ""),
+        # 导入的技能只报名字：正文是给写手/导演的，不必再回一遍主对话上下文。
+        contract = (spec.get("skill_contract")
+                    if isinstance(spec.get("skill_contract"), Mapping) else {})
+        if contract:
+            payload["skill_contract"] = {
+                "name": str(contract.get("name") or ""),
+                "display": str(contract.get("display") or ""),
             }
         if style_note:
             payload["style_note"] = style_note
@@ -1089,8 +1182,9 @@ class PlanMotionNode(StoryNode):
                     "**不影响入库，可直接出片。**要改就用 shots_patch 只交这几镜："
                     "把撞上的那块字或图挪开，画面最底下那一条留给字幕；"
                     "确属刻意的叠压可以不改。")
-            # 视觉评审（M2）：一次带图调用同时判「这一帧作为一张画够不够好」与
-            # 「像不像整片那句风格」，红镜带着评审意见重写一遍，只重渲改过的镜。
+            # 视觉闭环：一次带图调用同时判「这一帧作为一张画够不够好」与「像不像
+            # 整片要的那套风格」，红镜带着评审意见和它自己那张静帧重写，只重渲改过的
+            # 镜，**再看一轮**（`_visual_loop`，最多 `review_rounds` 轮）。
             # **只报不拦**——评审红绝不打回分镜。
             #
             # 2026-10-18 把原来的 `selfcheck.style_review` 并进这里：同一张静帧分两次问，
@@ -1098,53 +1192,40 @@ class PlanMotionNode(StoryNode):
             # 主对话，主对话再走一整轮 plan_motion（全片重写码、重渲、重评）。
             if files and design_review.review_enabled(spec):
                 art = spec.get("art") if isinstance(spec.get("art"), Mapping) else {}
-                visual = await design_review.review_stills(
-                    shots=spec["shots"], stills=files, art=art,
-                    prop=str(spec.get("recurring_prop") or ""),
-                    style=str(spec.get("style") or ""),
-                    grammar=str(spec.get("style_grammar") or ""),
-                    style_pack=spec.get("style_pack"),
-                    user_id=state.user_id or "", conversation_id=state.conversation_id or "")
-                spent = float(visual["cost_yuan"])
-                # `files` 是评审看过的那批静帧：把每镜自己那张图一并交给写手，
-                # 让它改的是真渲出来的画面，而不是文字描述在它脑子里的投影。
-                rewritten = await design_review.rewrite_failed(
-                    spec=spec, failed=visual["failed"], stills=files,
-                    user_id=state.user_id or "", conversation_id=state.conversation_id or "",
-                    user_request=getattr(state, "user_request", "") or "")
-                spent += float(rewritten["cost_yuan"])
-                fixed = [sid for sid, r in rewritten["rewritten"].items() if r.get("ok")]
-                after: dict[str, Any] = {}
-                if fixed:
-                    refs2, notes2, _layouts2, files2, bad2 = await self._publish_previews(
-                        state, spec, only=set(fixed))
-                    files.update(files2)
-                    notes.extend(notes2)
-                    if bad2:
-                        # 评审重写后仍编译不过：与前面那一轮同一个出口，卡上要能看到。
-                        failures.update(bad2)
-                        payload["preview_failures"] = {
-                            sid: str(f.get("kind") or "transient")
-                            for sid, f in failures.items()}
-                    payload["preview_frames"] = _remember_previews(
-                        state.session_id, state.artifact_id or "_default",
-                        refs2, spec)
-                    payload["preview_notes"] = notes[:12]
-                    # 重写后的镜再看一眼（只花这几镜的钱）。仍红的照交，由模型决定
-                    # 出片前要不要用 shots_patch 再改——不在这里做第二轮自动重写。
-                    after = await design_review.review_stills(
-                        shots=spec["shots"], stills=files2, art=art,
-                        prop=str(spec.get("recurring_prop") or ""),
-                        style=str(spec.get("style") or ""),
-                        grammar=str(spec.get("style_grammar") or ""),
-                        style_pack=spec.get("style_pack"),
-                        user_id=state.user_id or "",
-                        conversation_id=state.conversation_id or "")
-                    spent += float(after["cost_yuan"])
+                loop = await self._visual_loop(
+                    state, spec, refs=refs, files=files, notes=notes,
+                    failures=failures, art=art)
+                spent = float(loop["cost_yuan"])
+                visual = loop["first"]
+                # 评审那一轮可能**升级了申报**（`_bump_channel_by_review`：评审说「该有
+                # 体积」，于是把这一镜从 vector 升成 three）。升级之后如果代码还是 SVG，
+                # 闸⑯ 就会报「申报无证据」——再跑一次回写环，让升级真的落到代码上。
+                # 只跑 1 轮：这一趟是收尾，不是新一轮迭代。
+                chan2 = await self._channel_loop(state, spec, rounds=1)
+                if chan2["rewritten"]:
+                    notes.append(
+                        f"通道升级后重写：{'、'.join(sorted(chan2['rewritten']))}"
+                        "（评审说画面该有体积/该是公式，申报已升级，代码已按新通道重画）。")
+                if chan2["skipped"]:
+                    notes.append(
+                        f"通道升级后仍没写成：{'、'.join(sorted(set(chan2['skipped'])))}"
+                        "——这几镜的申报比代码高，出片前请手工看一眼。")
+                spent += float(chan2["cost_yuan"] or 0.0)
+                fixed_all = sorted(sid for sid, r in loop["rewritten"].items()
+                                   if r.get("ok"))
+                payload["preview_frames"] = _remember_previews(
+                    state.session_id, state.artifact_id or "_default", refs, spec)
+                payload["preview_notes"] = notes[:12]
+                if failures:
+                    payload["preview_failures"] = {
+                        sid: str(f.get("kind") or "transient")
+                        for sid, f in failures.items()}
+                if fixed_all:
                     # plan_table 里 code_chars 是重写前算的；改过的镜要刷新，否则
                     # 卡面上的字节数还指着上一版。
                     payload["plan_table"] = plan_payload(
                         spec, target=target, gate=gate)["plan_table"]
+                last = loop["last"] if len(loop["rounds"]) > 1 else {}
                 payload["visual_review"] = {
                     # 补丁轮只复查改动过的镜（省掉全片重渲重评）；整份重交是全片。
                     "scope": "changed" if only else "all",
@@ -1152,15 +1233,24 @@ class PlanMotionNode(StoryNode):
                     "passed": visual["passed"][:24],
                     "failed": visual["failed"][:16],
                     "unjudged": visual["unjudged"][:24],
-                    "rewritten": rewritten["rewritten"],
-                    "skipped": rewritten["skipped"],
-                    "after": ({"passed": after.get("passed", []),
-                               "failed": after.get("failed", [])[:16],
-                               "unjudged": after.get("unjudged", [])}
-                              if after else {}),
+                    "rewritten": loop["rewritten"],
+                    "skipped": loop["skipped"],
+                    # 每一轮各看了几镜、改了哪几镜、哪几镜是同一处意见停了手。
+                    "rounds": [{
+                        "round": row["round"],
+                        "checked": row["checked"],
+                        "passed": row["passed"][:24],
+                        "failed": [str(f.get("shot")) for f in row["failed"]][:16],
+                        "fixed": row.get("fixed", []),
+                        "stale": row.get("stale", []),
+                        "cost_yuan": row["cost_yuan"],
+                    } for row in loop["rounds"]],
+                    "after": ({"passed": last.get("passed", []),
+                               "failed": last.get("failed", [])[:16],
+                               "unjudged": last.get("unjudged", [])}
+                              if last else {}),
                 }
                 if visual["failed"]:
-                    left = [str(f.get("shot")) for f in after.get("failed", []) if f.get("shot")]
                     # 头一句必须是「已入库、可出片」：真机 run 901597a97570 里模型先读到
                     # 33 镜「仍红」，再把 37 镜的 brief 整份重交了一遍（9217 补全 token，
                     # 约 21 分钟），画面并没有变好——红的是写码层与评审口径，不是 brief
@@ -1168,13 +1258,19 @@ class PlanMotionNode(StoryNode):
                     lines = ["**分镜已入库，可以直接出片；这一轮不需要再交 plan_motion。**"]
                     lines.append(f"带图看了 {visual['checked']} 镜，{len(visual['failed'])} 镜"
                                  "按五条评审没通过（画面作为一张画还不成立）。")
-                    if fixed:
-                        lines.append(f"已自动按评审意见重写并重渲：{'、'.join(sorted(fixed))}；"
-                                     "重写后的结果见 visual_review.after。")
-                    if left:
-                        lines.append(f"重写后仍红：{'、'.join(left)}——照交，**不影响入库**。")
-                    if rewritten["skipped"]:
-                        lines.append(f"没改成的镜：{'、'.join(rewritten['skipped'])}"
+                    if fixed_all:
+                        lines.append(f"已自动按评审意见重写并重渲（共 {len(loop['rounds'])} 轮"
+                                     f"看片）：{'、'.join(fixed_all)}；"
+                                     "改后的结果见 visual_review.after。")
+                    if loop["still_red"]:
+                        lines.append(f"仍在红：{'、'.join(loop['still_red'])}——照交，"
+                                     "**不影响入库**。")
+                    if loop["stale"]:
+                        lines.append(f"同一句意见改过一次还是同一句，已停手："
+                                     f"{'、'.join(sorted(set(loop['stale'])))}"
+                                     "（再改一轮只是同一个来回）。")
+                    if loop["skipped"]:
+                        lines.append(f"没改成的镜：{'、'.join(loop['skipped'])}"
                                      "（重写没写成，已保留上一版能跑的代码）。")
                     lines.append("**不要再整份重交分镜**：整份重交＝逐镜重写代码、重渲静帧、"
                                  "重评一轮，红镜不会因为 brief 换一种说法就变好。"
@@ -1218,6 +1314,206 @@ class PlanMotionNode(StoryNode):
             except Exception as exc:  # noqa: BLE001 - 缺一张预览不拦
                 notes.append(f"{sid}：预览图没发布（{type(exc).__name__}）")
         return refs, notes, layouts, files, failures
+
+    async def _channel_loop(self, state: NodeState, spec: dict[str, Any],
+                            *, rounds: int = 2) -> dict[str, Any]:
+        """闸⑯ 的回写环：申报了画法通道却没真用上，就让写手带着这条意见重写那几镜。
+
+        为什么要有它（2026-10-23）：`whole_film_gate_results` 的出口**一个都不抛**
+        （那是「闸变工具」的设计），所以闸⑯ 判出「申报 three 而代码里是 vector」
+        也只是回执里的一句话——12 镜全写成手写 SVG，分镜照样入库。
+
+        而实测表明这**不是能力问题**：同一份 s07 brief（真 3D 心脏），用 three 写出来
+        是「有体积、有光照、有接触阴影」的画面，手写 SVG 只是「扁平色块 + 一个白点」。
+        写手不写 three，是因为「不写」没有后果。
+
+        **这一环不烧像素**：判据只看代码字节（`shot_used_channels`），一次重写就是一次
+        纯文本调用，比视觉评审便宜一个量级。所以排在预览之前——最便宜的那一环先做。
+
+        → ``{rewritten, skipped, cost_yuan, rounds}``。只报不抛。
+        """
+        out: dict[str, Any] = {"rewritten": {}, "skipped": [], "cost_yuan": 0.0,
+                               "rounds": []}
+        for round_no in range(1, max(1, rounds) + 1):
+            rows = [s for s in (spec.get("shots") or []) if isinstance(s, dict)]
+            errs, _w, _u = cspec.whole_film_gate_results(rows)
+            bad: dict[str, tuple[str, str]] = {}
+            for e in errs:
+                m = re.search(r"闸⑯ 主体具名：(s\w+)：申报 subject_channel=(\w+)，"
+                              r"而这一镜代码里用的是([\w、]+)", e)
+                if m:
+                    bad[m.group(1)] = (m.group(2), m.group(3))
+            if not bad:
+                break
+            by_id = {str(s.get("id")): s for s in rows}
+            sem = asyncio.Semaphore(4)
+
+            async def one(sid: str, declared: str, actual: str):
+                shot = by_id.get(sid)
+                if not shot:
+                    return sid, None
+                critique = (
+                    f"这一镜申报的 `subject_channel` 是 `{declared}`，但代码里一条 "
+                    f"{declared} 的 API 都没用上（实际只用了 {actual}）。\n"
+                    f"**这一版必须真的用 {declared} 画主体。**骨架就在这份 prompt 的"
+                    f"「另外四条画法通道：能抄的骨架」那一段，照它写："
+                    + _CHANNEL_HINT.get(declared, "") + "\n"
+                    f"注意：`subject_channel` 是分镜字段，你改不了它（这一趟只回代码）。"
+                    f"所以「把申报改成 {actual}」不是出路——**必须让代码里真的出现 "
+                    f"{declared}**：import 了还得在代码体里真用上，只 import 一行不算。\n"
+                    f"画面主体就是这一镜的 `subject`；用它该有的体积、光照、材质去画，"
+                    f"不要退回到「一圈描边 + 一块平涂」。")
+                async with sem:
+                    got = await shot_writer.rewrite_shot_code(
+                        shot, critique=critique, spec=spec,
+                        user_id=state.user_id or "",
+                        conversation_id=state.conversation_id or "",
+                        user_request=getattr(state, "user_request", "") or "")
+                return sid, got
+
+            results = await asyncio.gather(
+                *(one(sid, d, a) for sid, (d, a) in bad.items()))
+            row: dict[str, Any] = {"round": round_no, "targets": sorted(bad),
+                                   "ok": [], "failed": [], "cost_yuan": 0.0}
+            for sid, r in results:
+                if not r:
+                    out["skipped"].append(sid)
+                    continue
+                row["cost_yuan"] += float(r.get("cost_yuan") or 0.0)
+                if r.get("ok"):
+                    row["ok"].append(sid)
+                    out["rewritten"][sid] = str(r.get("note") or "")
+                else:
+                    row["failed"].append(sid)
+                    if sid not in out["skipped"]:
+                        out["skipped"].append(sid)
+            out["cost_yuan"] += row["cost_yuan"]
+            out["rounds"].append(row)
+            if not row["ok"]:
+                break
+        return out
+
+    async def _visual_loop(self, state: NodeState, spec: dict[str, Any], *,
+                           refs: dict[str, str], files: dict[str, Any],
+                           notes: list[str],
+                           failures: dict[str, dict[str, str]],
+                           art: Mapping[str, Any]) -> dict[str, Any]:
+        """渲完静帧之后：看 → 按意见改 → 重渲那几镜 → **再看**，最多 `review_rounds` 轮。
+
+        为什么要有第二眼：`rewrite_shot_code` 只保证「改出来的代码过闸①」，不保证
+        「画面变好了」——2026-10-18 真机上 34 镜按文字意见重写、重评仍有 26 镜红；
+        个别镜还会越改越差。只有把改后的图再看一眼，才知道这一轮是不是白改。
+
+        反过来，同一句意见上一轮已经照着改过、重渲之后评审还是同一句：那是写手
+        理解不了这条意见（或这条意见在要求一件代码画不出的东西），再改一轮只是
+        同一个来回。这种情况停手，把镜号如实写进回执。
+
+        只报不拦，也不抛。原地更新 ``refs`` / ``files`` / ``notes`` / ``failures``
+        （调用方还要拿它们写回执与卡面），返回每一轮的账。
+        """
+        cap = design_review.review_rounds(spec)
+        out: dict[str, Any] = {
+            "rounds": [], "rewritten": {}, "skipped": [], "first": {}, "last": {},
+            "reviewed": [], "cost_yuan": 0.0, "stale": [], "still_red": []}
+        todo = dict(files)
+        prev_fix: dict[str, str] = {}
+        stale: set[str] = set()
+        left = design_review.MAX_REWRITES
+        for round_no in range(1, cap + 1):
+            if not todo:
+                break
+            review = await design_review.review_stills(
+                shots=spec["shots"], stills=todo, art=art,
+                prop=str(spec.get("recurring_prop") or ""),
+                style=str(spec.get("style") or ""),
+                grammar=str(spec.get("style_grammar") or ""),
+                skill_contract=spec.get("skill_contract"),
+                user_id=state.user_id or "", conversation_id=state.conversation_id or "")
+            out["cost_yuan"] += float(review["cost_yuan"])
+            if not out["first"]:
+                out["first"] = review
+                out["reviewed"] = sorted(str(sid) for sid in todo)
+            out["last"] = review
+            row: dict[str, Any] = {
+                "round": round_no, "checked": review["checked"],
+                "passed": review["passed"],
+                "failed": [f for f in review["failed"]
+                           if str(f.get("shot")) in todo],
+                "unjudged": review["unjudged"], "cost_yuan": review["cost_yuan"]}
+            out["rounds"].append(row)
+            fresh = []
+            for item in row["failed"]:
+                sid = str(item.get("shot"))
+                if design_review.same_fix(prev_fix.get(sid), item.get("fix")):
+                    if sid not in stale:
+                        stale.add(sid)
+                        out["stale"].append(sid)
+                    continue
+                fresh.append(item)
+            if stale:
+                row["stale"] = sorted(stale)
+            if not fresh:
+                break
+            # 评审说「该有体积 / 该是公式 / 该是手绘」时，把这一镜的申报升上去
+            # （只升不降）。**必须排在 `_feed_review_lessons` 与 `rewrite_failed` 之前**：
+            # 升级要往 `fix` 里追加「这一镜现在是 three，必须真用上」，而 `fix` 就是
+            # 交给写手的那段批评——晚一步，写手只会照原来的意见再修一遍 SVG。
+            bumped = _bump_channel_by_review(spec, fresh)
+            if bumped:
+                row["channels_bumped"] = bumped
+            # 评审说「太空 / 只有主体 / 没有背景」时补一份构图骨架（2026-10-24）。
+            # 排在 `rewrite_failed` 之前，理由同上：它要往 `fix` 里追加解释，
+            # 而 `fix` 就是交给写手的那段批评。
+            patched = _bump_density_by_review(spec, fresh)
+            if patched:
+                row["density_patched"] = patched
+            # 评审的教训要跨镜：逐镜意见说的是「这一类画法」的病，不是这一镜的病。
+            # 写进全片账之后，**这一轮重写的每一镜**都会在自己的 prompt 里读到它
+            # （`shot_writer._ledger_block` 的 fixes 那一段）。2026-10-23 之前只重写
+            # 被点名的镜，其余镜一条教训都收不到，下一轮换一种说法再犯一遍。
+            if _feed_review_lessons(spec, fresh):
+                row["lessons_fed"] = True
+            got = await design_review.rewrite_failed(
+                spec=spec, failed=fresh, stills=todo,
+                user_id=state.user_id or "", conversation_id=state.conversation_id or "",
+                user_request=getattr(state, "user_request", "") or "",
+                limit=(None if left is None else max(0, left)))
+            out["cost_yuan"] += float(got["cost_yuan"])
+            row["rewritten"] = dict(got["rewritten"])
+            row["skipped"] = list(got["skipped"])
+            out["rewritten"].update(got["rewritten"])
+            for sid in got["skipped"]:
+                if sid not in out["skipped"]:
+                    out["skipped"].append(sid)
+            if left is not None:
+                left = max(0, left - len(got["rewritten"]))
+            fixed = sorted(sid for sid, r in got["rewritten"].items() if r.get("ok"))
+            row["fixed"] = fixed
+            if not fixed:
+                break
+            refs2, notes2, _layouts2, files2, bad2 = await self._publish_previews(
+                state, spec, only=set(fixed))
+            refs.update(refs2)
+            files.update(files2)
+            notes.extend(notes2)
+            if bad2:
+                # 重写后仍编译不过：与前面那一轮同一个出口，卡上要能看到。
+                failures.update(bad2)
+            todo = dict(files2)
+            prev_fix = {str(f.get("shot")): str(f.get("fix") or "")
+                        for f in row["failed"]}
+        # 「仍红」= 最后一次看片还红、且之后没有再改过的镜。轮数用完时最后一轮
+        # 改过但没再看的那几镜不算红——我们不知道它现在长什么样，不该替它下结论。
+        tail_fixed = set(out["rounds"][-1].get("fixed") or []) if out["rounds"] else set()
+        out["still_red"] = sorted({str(f.get("shot"))
+                                   for f in (out["last"].get("failed") or [])}
+                                  - tail_fixed)
+        # 「没改成」按**最后一次**的结论算：第一轮没改成、第二轮改成了的镜不该留在
+        # 这一栏（回执里说它「没改成」会让人以为那一版还是旧的）。
+        done = {sid for sid, r in out["rewritten"].items() if r.get("ok")}
+        out["skipped"] = sorted({sid for sid in out["skipped"] if sid not in done})
+        out["cost_yuan"] = round(out["cost_yuan"], 4)
+        return out
 
     async def _repair_broken_shots(self, state: NodeState, spec: dict[str, Any],
                                    failures: Mapping[str, Mapping[str, str]],
@@ -1294,6 +1590,233 @@ def _remember_draft(session_id: str, raw: Mapping[str, Any]) -> None:
     _DRAFTS[session_id] = dict(raw)
     while len(_DRAFTS) > _DRAFTS_MAX:
         _DRAFTS.pop(next(iter(_DRAFTS)))
+
+
+#: 闸⑯ 回写环里，按通道给写手的一句「怎么真用上」。骨架在
+#: `shot_writer._channel_samples_block()` 里（每镜 prompt 都带），这里只是点名。
+_CHANNEL_HINT: dict[str, str] = {
+    "three": "`import { ThreeCanvas } from '@remotion/three'`，里面用 `<mesh>` + "
+             "`<sphereGeometry>/<boxGeometry>/<coneGeometry>/<cylinderGeometry>` + "
+             "`<meshStandardMaterial>`（要 roughness/metalness，**别用 meshBasicMaterial**"
+             "——那等于没开灯）；再配一盏 `directionalLight`（主光）和一盏 `pointLight`"
+             "（边光），底部加一块水平暗面接阴影。",
+    "katex": "`import katex from 'katex'` 与 `import 'katex/dist/katex.min.css'`（**css 不能少**，"
+             "否则字形崩成豆腐块），`katex.renderToString(tex, {displayMode:true, "
+             "throwOnError:false})` 配 `dangerouslySetInnerHTML`。",
+    "rough": "`import rough from 'roughjs'`，`rough.canvas(canvasRef.current)` 之后调 "
+             "`rc.circle/rc.path/rc.rectangle`；手绘感主要来自 `fillStyle:'hachure'` 的斜纹"
+             "填充，不是把线抖一点。",
+    "canvas": "`<canvas ref={…}>` + `useEffect` 里 `getContext('2d')` 逐帧重画"
+              "（依赖 `[frame]`），适合点阵/粒子这类几百个小元素——**它不会自己动**，每帧都要重画。",
+}
+
+
+#: 评审意见 → 该升到哪条通道。**只认画面里说得出来的物理特征**，不认风格词。
+#:
+#: 为什么要这张表（2026-10-23 晚）：`subject_channel` 是模型在 plan 阶段自己写的申报，
+#: 而「降低申报」比「写 60 行 three」容易太多 —— 把 s07 申报成 `vector`，闸⑯ 立刻放行，
+#: 画面还是扁平。这一环把视觉评审看到的「该有体积」回灌成「改申报」，那个漏洞才堵上。
+#:
+#: 判据故意窄：只有出现「厚度/粗糙度/受光面」这类**只有真 3D 才做得出**的词才升
+#: `three`。写「不够精致」「有点空」这种话不升——那是构图问题，不是通道问题。
+_CHANNEL_UP_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("three", ("体积", "厚度", "立体", "3d", "粗糙度", "受光面",
+               "背光面", "冷边光", "材质", "透视", "遮挡", "实心体")),
+    ("katex", ("公式", "字形", "上下标", "数学符号", "渲染成豆腐块")),
+    ("rough", ("手绘", "铅笔", "斜纹", "hachure", "笔触", "线头", "抖动")),
+    ("canvas", ("点阵", "粒子", "几百个", "大量小元素", "网格里每一个")),
+)
+
+#: **反向排除**：这些词说的是「画漏了 / 没画」，不是「画法不对」。
+#:
+#: 2026-10-23 实测踩到：s12 的评审写「整帧几乎全黑，刻度线、倒数读数、3px 端点都没
+#: 画出来」，靠「实心/接触阴影」这类词被判成「该升 three」——可它的 brief 本来就是
+#: 「黑场 + 一根 2px 刻度线」，用 three 画一根线是荒谬的。**缺失和画法是两种病**：
+#: 前者要补，后者要换笔。命中这里就整条跳过，不升通道。
+_CHANNEL_MISSING_HINTS: tuple[str, ...] = (
+    "没画出来", "没画", "看不到", "缺失", "空白", "几乎全黑", "一片黑",
+    "完全没", "看不见", "只有黑底",
+)
+
+
+def _bump_channel_by_review(spec: dict[str, Any],
+                            failed: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    """评审说「该有体积 / 该是公式 / 该是手绘」时，把那一镜的申报升上去。→ {镜号: 新通道}。
+
+    只升不降：已经是 `three`/`katex`/`rough`/`canvas` 的镜一律不动——它可能是「写了但
+    没写好」，那是重写的事，不是换通道的事。只把 `vector`（或空）往上提。
+
+    升级同时**往 `fix` 里追加一段话**：`rewrite_failed` 拿 `fix` 当批评交给写手，
+    所以「这一镜申报已改为 three，必须真用上」这句话必须跟着这条意见一起过去——
+    否则写手只会照原来的意见再修一遍 SVG。
+
+    改了申报而重写没成，闸⑯ 会在下一轮报「申报无证据」——那是**如实记账**，
+    不是 bug：这一镜的申报确实没兑现，回执里该看得见。
+    """
+    rows = {str(s.get("id")): s for s in (spec.get("shots") or [])
+            if isinstance(s, dict)}
+    bumped: dict[str, str] = {}
+    for item in failed:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("shot") or "")
+        shot = rows.get(sid)
+        if not shot:
+            continue
+        cur = str(shot.get("subject_channel") or "").strip().lower()
+        if cur and cur != "vector":
+            continue          # 已经是高级通道：问题在实现，不在选择
+        text = (str(item.get("why") or "") + " " + str(item.get("fix") or "")).lower()
+        # 「画漏了」不是「画法不对」：命中缺失类词就整条跳过，不升通道。
+        if any(w in text for w in _CHANNEL_MISSING_HINTS):
+            continue
+        for chan, words in _CHANNEL_UP_HINTS:
+            if not any(w.lower() in text for w in words):
+                continue
+            shot["subject_channel"] = chan
+            bumped[sid] = chan
+            item["fix"] = (
+                str(item.get("fix") or "")
+                + f"\n\n【通道升级】这一镜的申报已从 `{cur or '空'}` 升为 `{chan}`："
+                f"评审说的是「{str(item.get('why') or '')[:60]}」——"
+                f"那不是一份手写 SVG 能画出来的。**这一版必须真的用 {chan} 画主体**，"
+                f"骨架就在这份 prompt 的「另外四条画法通道：能抄的骨架」那一段。"
+                + _CHANNEL_HINT.get(chan, ""))
+            break
+    return bumped
+
+
+#: 评审意见里「画面太空」的那一类词。命中就给这一镜补一份构图骨架，然后重写。
+#:
+#: 为什么要有它（2026-10-24）：2026-10-23《一秒》12 镜评审**全不过**，看图确认是
+#: 同一个病——每镜只有「一个主体 + 一块底色」，四角全空。这件事以前**没有任何一层
+#: 负责**：导演被要求「别硬凑实体」，写手被告知「brief 是最高事实」，评审看得出来
+#: 但只能写一段话。所以在这里把它接上：评审说「太空」→ 补构图 → 重写。
+#:
+#: 与 `_CHANNEL_UP_HINTS` 的分工：那一条判「画法选错了」，这一条判「画得不够满」。
+#: 两者可以同时命中（一颗扁平的球既该换通道、也该补背景），互不冲突。
+_DENSITY_HINTS: tuple[str, ...] = (
+    "太空", "空荡", "大片空", "留白太多", "只有主体", "只有一块", "孤零零", "漂在",
+    "没有背景", "缺少背景", "缺背景", "没有层次", "同明度", "无明暗", "无亮区",
+    "看不见", "看不清", "缩成", "稀疏", "没占满", "没铺满", "没有铺满",
+    "太简单", "单薄", "信息量不足", "扁平横条", "像表格行", "只是一团", "只是几片",
+    "没有铺开", "四角",
+    # 色彩（2026-10-24 加）：实测我们的画面饱和度只有 1.6/255（参考片 6.5~81），
+    # 本质是「灰蓝底 + 暖白粉彩」＝黑白片。评审说得出这几种话时一并补配色。
+    "发灰", "灰蒙", "灰蒙蒙", "闷", "寡淡", "没颜色", "没有颜色", "缺色",
+    "单色", "黑白", "像黑白", "饱和度", "不够鲜", "不鲜艳", "灰暗",
+)
+#: 这一镜的 brief 本身就声明了「极简/黑场/剪影」时**不补**——那是设计，不是缺陷。
+#: 踩过：s12 的 brief 是「黑场 + 一根 2px 刻度线」，被当成「太空」补满 HUD 就荒谬了。
+_DENSITY_MINIMAL_HINTS: tuple[str, ...] = (
+    "极简", "黑场", "只留", "留白", "剪影", "单线", "纯字", "只画一根", "只有一根",
+)
+#: 补上去的构图骨架。五段与 `art_director._SYSTEM` 里要求导演写的那一行同构，
+#: 写手那一侧由 `shot_writer._frame_floor_block` 读。
+_DENSITY_PATCH = (
+    "背景：底色（不用纯黑）+ 细网格 + 暗角 + 一层雾/光晕"
+    "｜中景：主体群至少 3 件、最大者占画面高 35~55%"
+    "｜前景：一条刻度尺 + 两个读数 + 一条标注线/括号"
+    "｜配色：底色 #0B1220 + 三个高饱和色相 #FF6B2C / #22D3EE / #FFC93C，"
+    "饱和色块合计占画面 ≥25%（不许只出现在细线与小圆点上）"
+    "｜动：至少 4 个元素在动，两处变化各覆盖画面三分之一以上"
+    "｜运镜：推近 10%，整幅在动"
+)
+
+
+def _bump_density_by_review(spec: dict[str, Any],
+                            failed: Sequence[Mapping[str, Any]]) -> list[str]:
+    """评审说「太空 / 只有主体 / 没有背景」时，给那一镜补一份构图骨架。→ 补了的镜号。
+
+    补的是 `shot["frame_note"]`（不是 brief 的尾巴——brief 有 400 字硬上限，追加会被
+    截掉，而截掉的正好是这段）。`shot_writer._frame_floor_block` 优先读它。
+
+    同时往 `fix` 里追加一句，让写手知道「这一版为什么突然多了一段构图要求」——
+    `rewrite_failed` 拿 `fix` 当批评，不解释的话写手会当成又一次泛泛的「再精致一点」。
+    """
+    rows = {str(s.get("id")): s for s in (spec.get("shots") or [])
+            if isinstance(s, dict)}
+    patched: list[str] = []
+    for item in failed:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("shot") or "")
+        shot = rows.get(sid)
+        if not shot or shot.get("frame_note"):
+            continue              # 已经补过，别在第二轮再叠一层
+        text = (str(item.get("why") or "") + " " + str(item.get("fix") or "")).lower()
+        if not any(w in text for w in _DENSITY_HINTS):
+            continue
+        brief = str(shot.get("brief") or "")
+        # 「画漏了」有两种：一种是真的空，一种是 brief 本来就要极简。后者不补。
+        if any(w in brief for w in _DENSITY_MINIMAL_HINTS):
+            continue
+        # 导演已经为这一镜写过 `【构图】` 时**不覆盖**：那一份是按这一镜的画面写的，
+        # 比下面这段通用的强。只在 `fix` 里点一句「照那段画」。
+        has_frame = "【构图】" in brief
+        if not has_frame:
+            shot["frame_note"] = _DENSITY_PATCH
+            patched.append(sid)
+        item["fix"] = (
+            str(item.get("fix") or "")
+            + "\n\n【构图补丁】评审说这一镜「"
+            + str(item.get("why") or "")[:60]
+            + "」——那不是「再精致一点」能修的，是画面里**根本没有背景层和前景信息**。"
+            + ("这一版已给这一镜补了一份构图骨架（见 prompt 里 `【构图】` 那一段），"
+               if not has_frame else
+               "这一镜的 brief 里已经有 `【构图】` 那一段，")
+            + "**五段都要真的画出来**：背景网格与暗角、主体群、刻度尺与读数、四处以上的动、"
+            "一次整幅运镜。只画主体、四角全空，会原样再被打回。")
+    return patched
+
+
+def _feed_review_lessons(spec: dict[str, Any],
+                         failed: Sequence[Mapping[str, Any]]) -> int:
+    """把视觉评审挑出的问题写进**全片画法账**，让重写时的每一镜都读得到。→ 新增条数。
+
+    为什么要有它：评审是**逐镜**的，但那条意见说的往往是**一类画法**的毛病。
+    2026-10-23《一秒》实跑：评审挑了 3 镜——s07「心脏是扁平卡通剪影，没有厚度、
+    粗糙度、接触阴影」、s11「一片极暗竖点阵，看不出火柴人」、s04「最亮处不唯一」。
+    这三条其实是同一件事（实体没有体积、没有光位、没有接触阴影），s02 的金属腔、
+    s05 的地球、s10 的太阳犯的是同一个错。但系统只重写了这 3 镜，**其余 8 镜一条
+    教训都没收到**，下一轮换一种说法再犯一遍。
+
+    写进去的形状就是 `shot_writer._ledger_block` 读的那一份（`{ids, what, fix}`），
+    它在每镜 prompt 里以「全片复核挑出的问题（改这一镜时一并避开）」出现。
+    所以重写 s02 的时候，写手会看到 s07 那条「没有厚度/接触阴影」的教训。
+
+    条数按 `_ledger_block` 的上限截（8 条）；同一条 `fix` 只留一次（跨轮也不重复）。
+    """
+    led = spec.get("film_ledger")
+    if not isinstance(led, dict):
+        led = {}
+        spec["film_ledger"] = led
+    fixes = led.get("fixes")
+    if not isinstance(fixes, list):
+        fixes = []
+        led["fixes"] = fixes
+    seen = {re.sub(r"\s+", "", str(f.get("fix") or ""))[:60]
+            for f in fixes if isinstance(f, Mapping)}
+    added = 0
+    for item in failed:
+        if not isinstance(item, Mapping):
+            continue
+        fix = str(item.get("fix") or "").strip()
+        if not fix:
+            continue
+        key = re.sub(r"\s+", "", fix)[:60]
+        if key in seen:
+            continue
+        seen.add(key)
+        sid = str(item.get("shot") or "").strip()
+        fixes.append({
+            "ids": [sid] if sid else [],
+            "what": str(item.get("why") or "").strip(),
+            "fix": fix,
+        })
+        added += 1
+    del fixes[8:]
+    return added
 
 
 def _shot_ids(spec: Mapping[str, Any] | None) -> list[str]:
@@ -1403,13 +1926,7 @@ def _style_key(raw: Any) -> tuple[str, ...]:
     p = raw.get("protagonist") if isinstance(raw.get("protagonist"), Mapping) else {}
     protagonist = "|".join(str(p.get(k) or "") for k in
                            ("render", "height", "foot_y", "facing", "stride_sec"))
-    pack = raw.get("style_pack")
-    if not isinstance(pack, Mapping):
-        return ("", "", protagonist)
-    manifest = pack.get("manifest") if isinstance(pack.get("manifest"), Mapping) else {}
-    return (str(pack.get("name") or ""),
-            str(manifest.get("template") or raw.get("style_template") or ""),
-            protagonist)
+    return ("", "", protagonist)
 
 
 #: 风格/分镜里出现这些词、且有好几镜时，认为片子里有一个反复出现的人物。
@@ -1534,8 +2051,12 @@ async def _prelint(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
     「闸① 全过」，而那一趟其实一次都没连上。渲染口确实还会再 lint 一遍（那才是硬闸），
     但入库这一步的回执必须自己说清这一趟量到什么程度，不能拿下游的兜底当自己的读数。
     """
-    def lint(code: str, names: list[str], assets: list[Any]) -> dict[str, Any]:
-        return rc.lint(code, declared_fields=names, assets=assets, timeout=PRELINT_TIMEOUT)
+    def lint(code: str, names: list[str]) -> dict[str, Any]:
+        # 不再传 `assets`：那一栏 2026-10-16 已从契约里删掉，`lint()` 也没有这个形参
+        # ——带着它调用会抛 TypeError，而 `_prelint` 把任何异常都记成「未判」，
+        # 于是闸① 在这条预检路上**从未真正跑过一次**，回执却只写「没连上渲染容器」。
+        # （2026-10-22 三镜自检里 s01/s02/s03 全是 TypeError，渲口仍可用。）
+        return rc.lint(code, declared_fields=names, timeout=PRELINT_TIMEOUT)
     gate = asyncio.Semaphore(PRELINT_CONCURRENCY)
 
     async def one(shot: Mapping[str, Any]) -> tuple[list[str], list[str]]:
@@ -1549,8 +2070,7 @@ async def _prelint(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
                  if f.get("name")]
         async with gate:
             try:
-                got = await asyncio.to_thread(lint, code, names,
-                                              list(shot.get("assets") or []))
+                got = await asyncio.to_thread(lint, code, names)
             except Exception as exc:  # noqa: BLE001 - 预检外呼失败不拦，渲染口兜底
                 return [], [f"{sid}：闸① 未判——预检这一趟没连上渲染容器"
                             f"（{type(exc).__name__}）。**这不是通过**，"

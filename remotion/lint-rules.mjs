@@ -80,6 +80,122 @@ function parseFontFamilies(str) {
  * 是一句谁也看不懂的 bundle 错误。谁想开新包，先装进镜像再来加这一行，
  * 构建层末尾的那条 resolve 检查会替两边盯着。
  */
+/**
+ * 字幕的绘制入口。同一镜只许出现**一种**（判据见 `caption-double`）。
+ *
+ * 2026-10-23 真机 s05 同时写了 `<StyleCaption>` 和 `<CaptionLayer>`：两条的位置都由
+ * 同一张几何表算出来，几乎完全重合，成片上只表现为「字变粗、发虚」——人工看片极容易
+ * 漏过去，但它是真·两条字幕。这条规则就是拦这个。
+ */
+const CAPTION_ENTRIES = new Set([
+  'StyleCaption', 'CaptionLayer', 'CaptionFrame', 'CaptionText',
+]);
+
+/**
+ * 剪影系的风格包模块。`band-over-subject` 只在这些包上生效。
+ *
+ * **为什么按 import 认风格包，而不是全局生效**：这条规则判的是「一条满宽不透明带
+ * 画在了最后，它一定盖在主体上面」。这个形状在剪影系里一定是错（剪影系的主体就是
+ * 那一个纯黑人形，盖住它这一镜就空了），但在别的风格里完全可能是对的——纸片风
+ * 结尾压一层整幅纸色、电影棚压一层暗角，都是正当写法。全局挂上去就会在那些包上
+ * 天天误伤，而误伤的下场比漏判更坏：写手会学会绕，规则就废了。
+ *
+ * 所以判据放在**代码自己的 import** 上：镜头文件里没有 `@dg/lib/style/silhouette*`
+ * 这一行，规则直接让路（`create` 返回空对象，一个节点都不看）。换风格包写片时
+ * 不会拦。 */
+const SILHOUETTE_STYLE_IMPORT = /['"]@dg\/lib\/style\/silhouette[^'"]*['"]/;
+
+/** 取一个 JSX 属性的字面形状。`x={0}` / `x="0"` / `width={W}` 三种都要认；
+ *  表达式取不到值就回 `expr`——判不准的东西按"可能是"处理，但绝不因此报错。 */
+function attrShape(attr) {
+  if (!attr) return { kind: 'missing' };
+  const v = attr.value;
+  if (!v) return { kind: 'bare' };
+  if (v.type === 'Literal' || v.type === 'StringLiteral' || v.type === 'NumericLiteral') {
+    return { kind: 'lit', value: v.value };
+  }
+  if (v.type !== 'JSXExpressionContainer') return { kind: 'other' };
+  const e = v.expression;
+  if (!e) return { kind: 'other' };
+  if (e.type === 'Literal' || e.type === 'StringLiteral' || e.type === 'NumericLiteral') {
+    return { kind: 'lit', value: e.value };
+  }
+  if (e.type === 'Identifier') return { kind: 'ident', name: e.name };
+  if (e.type === 'UnaryExpression' && e.operator === '-'
+      && (e.argument?.type === 'NumericLiteral' || e.argument?.type === 'Literal')) {
+    return { kind: 'lit', value: -Number(e.argument.value) };
+  }
+  return { kind: 'expr' };
+}
+
+const attrOf = (open, name) => (open.attributes || []).find(
+  (a) => a.type === 'JSXAttribute' && a.name && a.name.name === name);
+
+/** 整幅宽的变量名（模板约定 `W` / `width` 就是画幅宽）。 */
+const FULL_WIDTH_IDENTS = new Set(['W', 'width', 'WIDTH', 'videoWidth', 'frameWidth']);
+
+/** 取某个属性值的源码文本（判不了数就看字面写法）。取不到回空串。 */
+function attrText(src, attr) {
+  if (!src || !attr || !attr.value) return '';
+  try {
+    return String(src.getText(attr.value) || '');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 这条满宽带的 `y` 是不是已经落在地面/前景那一档（画面高 70% 以下）。
+ *
+ * **为什么必须排除这一档**：`isFullBleedRect` 只看 x/width/opacity，不看 y。于是
+ * 「最后画一条通栏黑块当地面」——剪影系里最正当的画法之一——会被当成
+ * 「满宽色带盖住主体」报错。2026-10-23 真机就是这么翻车的：12 镜里 6 镜
+ * （s01/s02/s05/s06/s08/s11/s12）全卡在同一条闸上，每镜重写 3 次仍红，
+ * 一次分镜烧掉 326 秒还是没入库。
+ *
+ * 判据用**源码文本**而不是数值：`y={H * 0.84}` / `y={groundY}` / `y={H - H*0.16}`
+ * 这几种写法都算不出来，但都能从字面认出来。只放行「y 明确落在下半部」的那些，
+ * 认不出的照样报——漏判的代价是这一镜可能空，误判的代价是整次分镜作废，
+ * 两者不对等。
+ */
+const GROUND_Y_HINT = /ground|0\.[7-9]\d?|(?:7\d|8\d|9\d)\s*\/\s*100|0\.\d+\s*\*\s*H\s*\+/i;
+
+function looksLikeGroundBand(src, open) {
+  const yText = attrText(src, attrOf(open, 'y'));
+  if (!yText) return false;
+  if (GROUND_Y_HINT.test(yText)) return true;
+  // `y={H - ...}`：减法只有在减数小的时候才落在下半部，认不出就不放行。
+  return false;
+}
+
+/**
+ * 是不是「一条满宽的不透明带」：`<rect>` + `x` 为 0 + `width` 为整幅 + 足够不透明。
+ *
+ * 只认 `<rect>` 是有意的：前景山脊、草丛、栅栏都是 `<path>`，它们压在前面是**对**的
+ * （参考片里草就压住人脚）。真正会把主体整片盖掉的是通栏矩形。
+ */
+function isFullBleedRect(el, src) {
+  if (!el || el.type !== 'JSXElement') return false;
+  const open = el.openingElement;
+  const tag = open.name && open.name.type === 'JSXIdentifier' ? open.name.name : '';
+  if (tag !== 'rect') return false;
+  // 明确声明「我就是前景」的放行（见 SKILL.md 的写法说明）。
+  if (attrOf(open, 'data-front')) return false;
+  // 地面/前景那一档放行：它盖住的是地平线以下，不是主体（见 looksLikeGroundBand）。
+  if (looksLikeGroundBand(src, open)) return false;
+  const x = attrShape(attrOf(open, 'x'));
+  const w = attrShape(attrOf(open, 'width'));
+  const op = attrShape(attrOf(open, 'opacity'));
+  const xZero = x.kind === 'lit' && Number(x.value) === 0;
+  const wFull = (w.kind === 'ident' && FULL_WIDTH_IDENTS.has(w.name))
+    || (w.kind === 'lit'
+        && (String(w.value) === '100%' || Number(w.value) >= 1000));
+  const opaque = op.kind === 'missing' || op.kind === 'bare'
+    || (op.kind === 'lit' && Number(op.value) >= 0.5)
+    || op.kind === 'expr' || op.kind === 'ident';
+  return xZero && wFull && opaque;
+}
+
 export const ALLOWED_IMPORTS = new Set([
   'react',
   'react-dom',
@@ -128,6 +244,35 @@ export const ALLOWED_IMPORTS = new Set([
   'roughjs',
   'katex',
   'katex/dist/katex.min.css',
+  // ---- 2026-10-23：放开的一批「通用能力库」----
+  //
+  // 用户的原话：「我要的是 llm 加 skill 加 remotion 是不是发挥最大能力」。白名单才是
+  // 真正的能力天花板——它比任何闸都更影响能做出什么。这一批的共同点是：
+  //   · **纯函数 / 纯 SVG / 纯 CSS**，不碰 DOM 测量、不碰墙钟、不碰网络；
+  //   · 每一件都解决一类「自己写会写得很拉」的事：路径、比例尺、图标、形状插值、配色。
+  //
+  // 逐个说清为什么收：
+  //   · `d3-shape` / `d3-scale`：折线/面积/饼图路径 + 比例尺。纯函数，输入输出都是数，
+  //     帧驱动天然成立。自己手写贝塞尔曲线与刻度算法，是这条链上最典型的「造轮子造得拉」。
+  //   · `d3-interpolate-path`：两条路径之间平滑过渡（同点数/不同点数都收）。做形变动画
+  //     唯一干净的解法；自己写会在点数不一致时直接崩。
+  //   · `flubber`：两个任意形状之间插值（morph）。与上面那件互补：那个要路径，这个要轮廓。
+  //   · `lucide-react`：1400+ 图标，纯 SVG 组件，可树摇。图标是最不该自己画的东西。
+  //   · `chroma-js`：颜色混合/明度/对比度。配色推导不用手算 RGB。
+  //   · `@remotion/transitions`：官方转场（fade/slide/wipe/ripple/cross-zoom/film-burn）。
+  //     版本与 `remotion` 同号，是这个项目**唯一缺的官方包**。
+  'd3-shape',
+  'd3-scale',
+  'd3-interpolate-path',
+  'flubber',
+  'lucide-react',
+  'chroma-js',
+  '@remotion/transitions',
+  '@remotion/transitions/fade',
+  '@remotion/transitions/slide',
+  '@remotion/transitions/wipe',
+  '@remotion/transitions/flip',
+  '@remotion/transitions/clock-wipe',
   // 母版与 token 走别名
   '@dg/film',
   '@dg/tokens',
@@ -172,6 +317,9 @@ export const ALLOWED_IMPORTS = new Set([
   // 镜头代码只摆实物。它底下的 ThreeCanvas 走 WebGL（容器里是 swangle），
   // 与上面 `three` 三包同属三维通道；名单同样与 `code_spec.py` 同步。
   '@dg/lib/style/cinema-studio',
+  // 超现实写实的能力库（2026-10-22）：光/烟/粒子/水面/辉光/三维世界，
+  // 每一件只回答一个技术问题，场景长什么样归这一镜的文案。名单与 code_spec.py 同步。
+  '@dg/lib/style/surreal',
   // 简笔画零件库（2026-10-17）。**逐件列，与 `@dg/lib/*` 同一口径**：每件是一个
   // 文件级的入口，模型 import 一件就拿到一支能被认出的东西的轮廓（人、机器、厂房、
   // 齿轮、图表…）。它们底下走的是 roughjs 的手绘线，所以这些件的 import 在
@@ -200,8 +348,14 @@ const isRelative = (src) => typeof src === 'string' && (src.startsWith('.') || s
  *  否则一条带路径分隔符的 import 会把 bundler 带到生成目录之外。 */
 export const USER_TEMPLATE_RE = /^@dg\/lib\/style\/generated\/[a-z][a-z0-9-]{1,40}$/;
 
-const isAllowedImport = (src) =>
-  ALLOWED_IMPORTS.has(src) || USER_TEMPLATE_RE.test(String(src || ''));
+const isAllowedImport = (src) => {
+  const s = String(src || '');
+  // `three/` 的子路径与 `three` 是同一个包（`three/examples/jsm/…` 随包发布，不用另装）。
+  // 2026-10-23：surreal 模板因为 import 了 `RoomEnvironment.js` 被拒——白名单按
+  // 精确包名写，就把「同一个包的子路径」判成了「没装的东西」。这不是安全边界，
+  // 是漏了一档粒度。
+  return ALLOWED_IMPORTS.has(s) || s.startsWith('three/') || USER_TEMPLATE_RE.test(s);
+};
 
 /** 字段通道三条规则的共用静态分析。
  *
@@ -349,15 +503,33 @@ function newFieldAnalysis(declared) {
 
     /** 表达式是不是「就是这个字段的那份值」。 */
     valueCarries(mark, fieldName) {
-      const e = mark.valueNode;
-      if (!e) return false;
-      if (e.type === 'Identifier') return bindings.get(e.name) === fieldName;
-      if (e.type === 'MemberExpression' && !e.computed && e.property.type === 'Identifier') {
-        if (isRoot(e.object)) return e.property.name === fieldName;
-        const bound = e.object.type === 'Identifier' ? bindings.get(e.object.name) : null;
-        if (bound) return false;              // fields.a.b 这类：不是表本身，判不出来
-      }
-      return false;
+      // 2026-10-24 改成**递归检查**：只要表达式里读了 `fields.<name>`（或绑到它的变量）
+      // 就算通过。
+      //
+      // 原来是「整个表达式必须就是它」：`Identifier` 或 `fields.x` 才算，其余一律判
+      // 「假指针」。真机 run `3cddbe30dbef` 里 s02/s03 各写 3 次都过不了——
+      // 写手为了让读数显示成「0.2s」，很自然地写 `value={fields.error.toFixed(1)}`
+      // 或 `` value={`${fields.error}s`} ``，像素**确实来自那个字段**，却被判成没读。
+      // 判据的语义是「注入的值有没有真的画到像素上」，不是「表达式长得像不像引用」。
+      //
+      // 仍然拦得住真的假指针：`value={other}` 里 `other` 绑到别的字段 → 一路 false；
+      // `value={0.2}` 字面量 → 没有 `fields.x` 节点 → false。
+      const touches = (node) => {
+        if (!node || typeof node !== 'object') return false;
+        if (Array.isArray(node)) return node.some(touches);
+        if (node.type === 'Identifier') return bindings.get(node.name) === fieldName;
+        if (node.type === 'MemberExpression' && !node.computed
+            && node.property.type === 'Identifier' && isRoot(node.object)) {
+          return node.property.name === fieldName;
+        }
+        for (const key of Object.keys(node)) {
+          if (key === 'parent' || key === 'loc' || key === 'range' || key === 'tokens') continue;
+          const v = node[key];
+          if (v && typeof v === 'object' && touches(v)) return true;
+        }
+        return false;
+      };
+      return touches(mark.valueNode);
     },
 
     finish(context, kind) {
@@ -444,6 +616,152 @@ const fieldRule = (kind, messages) => ({
 
 export const dgPlugin = {
   rules: {
+    // interpolate() 的 outputRange 不能是颜色 —— 2026-10-23 真机 s10 的错。
+    //
+    // s10 写了 `interpolate(skyT, [0, .35, .7, 1], ["#0a1226", "#1a2340", …])`，
+    // 渲染时抛 `Non-numeric strings can only be interpolated using Easing.step1`，
+    // 这一镜的预览静帧直接没出成（payload 里记成 `preview_failures.s10 = "transient"`）。
+    // 代码、语法、导入全对，只有这一个调用在运行时才炸——lint 期拦下来最便宜。
+    //
+    // 颜色渐变得用 `interpolateColors`：接受颜色字符串、逐通道插值、返回 rgba 串。
+    'interpolate-color': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          color:
+            '`interpolate()` 的 outputRange 里出现了颜色 {{sample}}。' +
+            'interpolate 只插数字：颜色字符串会在渲染时抛 ' +
+            '`Non-numeric strings can only be interpolated using Easing.step1`，' +
+            '这一镜直接渲不出来（2026-10-23 真机 s10 就是这样，预览静帧缺失）。' +
+            '颜色渐变改用 `interpolateColors(frame, [输入区间], [颜色们])`，' +
+            '它逐通道插值并返回 rgba 字符串。' +
+            '若确实要「跳色」而不是渐变，给 interpolate 传 `{ easing: Easing.step1 }` ' +
+            '也能跑——但那种场合通常该直接按帧区间取值。',
+        },
+      },
+      create(context) {
+        const isColor = (v) =>
+          typeof v === 'string' &&
+          (/^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(v.trim()) ||
+            /^(?:rgb|rgba|hsl|hsla)\s*\(/i.test(v.trim()));
+        const litValue = (el) => {
+          if (!el) return null;
+          if (el.type === 'Literal' && typeof el.value === 'string') return el.value;
+          if (el.type === 'TemplateLiteral' && el.expressions.length === 0)
+            return el.quasis.map((q) => q.value.cooked ?? q.value.raw).join('');
+          return null;
+        };
+        return {
+          CallExpression(node) {
+            const c = node.callee;
+            const name =
+              (c.type === 'Identifier' && c.name) ||
+              (c.type === 'MemberExpression' && c.property && c.property.name) ||
+              '';
+            if (name !== 'interpolate') return;
+            const out = node.arguments && node.arguments[2];
+            if (!out || out.type !== 'ArrayExpression') return;
+            for (const el of out.elements || []) {
+              const v = litValue(el);
+              if (isColor(v)) {
+                context.report({ node: el, messageId: 'color', data: { sample: v } });
+                return;
+              }
+            }
+          },
+        };
+      },
+    },
+
+    // 同屏两条字幕 —— 2026-10-23 真机 s05 的错。
+    //
+    // 镜头代码里同时摆了 `<StyleCaption>`（模板那条）和 `<CaptionLayer>`（母版那条）。
+    // 两者位置都由 `FILM_GEOMETRY` 的同一个 `caption.bottom` 算，几乎逐像素重合，
+    // 成片上只表现为「字变粗、边缘发虚」——比「两条字错开」更难发现，也更容易被
+    // 当成「渲染质量差」。字幕只许有一个出处，这条在 lint 期就该拦。
+    'caption-double': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          double:
+            '这一镜摆了 {{found}} 种字幕入口（{{names}}）。字幕只许有一个出处：' +
+            '<StyleCaption/>（模板那条）/ <CaptionLayer/>（母版那条）/ ' +
+            '<CaptionText/>（自己排）/ <CaptionFrame/>（画字分带）——四选一。' +
+            '同时画两个就是同屏两条字：位置来自同一张几何表，会叠在一起，' +
+            '成片上只表现为字变粗、发虚，看不出是两条。',
+        },
+      },
+      create(context) {
+        const seen = new Set();
+        return {
+          JSXOpeningElement(node) {
+            const n = node.name;
+            if (n && n.type === 'JSXIdentifier' && CAPTION_ENTRIES.has(n.name)) {
+              seen.add(n.name);
+            }
+          },
+          'Program:exit'() {
+            if (seen.size <= 1) return;
+            context.report({
+              loc: { line: 1, column: 0 },
+              messageId: 'double',
+              data: { found: seen.size, names: [...seen].join(' + ') },
+            });
+          },
+        };
+      },
+    },
+
+    'band-over-subject': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          over:
+            '这一镜最后画的是通栏矩形（x=0、width 为整幅、不透明度 ≥ 0.5）。' +
+            '它排在整个容器的最末，就一定盖在所有已经画好的东西上面——包括主体。' +
+            '真机 s05 就是这样：铁锈红满宽带写在人物之后，成片上「这一镜没有人」，' +
+            '而代码、lint、渲染全都是成功的。' +
+            '三种改法，按这条带到底是什么挑一个：' +
+            '① 它是地面/前景（盖住的只是地平线以下）——把 y 写成闸能认出来的形式：' +
+            '`y={H * 0.84}` 或 `y={groundY}`，闸就不报了；写成 `y={H - H*0.16}` 这类' +
+            '算不出来的表达式仍会报。' +
+            '② 它是块面动效（满宽色带擦入/展开）——挪到主体之前，垫在主体后面动，' +
+            '像素上的变化一样大。' +
+            '③ 它真的该压在主体前面（前景剪影带、暗角）——在 <rect> 上加 `data-front`。' +
+            '**别默认用 ③**：加了它这一镜的主体就真被盖住了，而那正是这条闸要拦的东西。',
+        },
+      },
+      create(context) {
+        // 见 SILHOUETTE_STYLE_IMPORT：不是剪影系就直接让路，别的风格包一个字都不看。
+        const src = context.sourceCode?.text
+          ?? (typeof context.getSourceCode === 'function' ? context.getSourceCode().text : '')
+          ?? '';
+        if (!SILHOUETTE_STYLE_IMPORT.test(src)) return {};
+        const code = context.sourceCode
+          ?? (typeof context.getSourceCode === 'function' ? context.getSourceCode() : null);
+        const reported = new Set();
+        return {
+          JSXElement(node) {
+            const kids = (node.children || []).filter((c) => c.type === 'JSXElement');
+            if (kids.length < 2) return;
+            const flags = kids.map((k) => isFullBleedRect(k, code));
+            // 尾部连续的那一串通栏带
+            let tail = kids.length;
+            while (tail > 0 && flags[tail - 1]) tail -= 1;
+            // 尾部没有带（正常），或者整层全是带（没有主体可盖，也不报）
+            if (tail >= kids.length || tail === 0) return;
+            const first = kids[tail];
+            if (reported.has(first)) return;
+            reported.add(first);
+            context.report({ node: first, messageId: 'over' });
+          },
+        };
+      },
+    },
+
     'only-allowed-imports': {
       meta: {
         type: 'problem',
@@ -691,13 +1009,19 @@ export const dgPlugin = {
       // `assets` 与投递 manifest）随通道一起没了，判据就缩成这一条还留得下对象的话。
       meta: { type: 'problem', schema: [],
               messages: {
-                notFont: 'staticFile("{{arg}}") 指的不是字体。供图通道撤掉后，随镜像铺进这一镜 '
-                  + 'public/ 的只有 `public/fonts/`；画面得由你自己写代码画出来，摆一张图不叫画'
-                  + '（闸⑦「每镜必画」）。要取字体请写 staticFile(\'fonts/….woff2\')。',
+                notFont: 'staticFile("{{arg}}") 指的东西不在 `public/` 里。现在只有两处是随镜真存在的：'
+                  + '`public/fonts/`（字体）与 `public/assets/`（脚本产出的图）。其余画面得由你'
+                  + '自己写代码画出来，摆一张不存在的图不叫画（闸⑦「每镜必画」）。'
+                  + '要取字体写 staticFile(\'fonts/….woff2\')；要取脚本产出的图写 '
+                  + 'staticFile(\'assets/xxx.png\')。',
                 nonLiteral: 'staticFile 的实参必须是字符串字面量，变量拼路径让机器核对不了它指的是不是字体。',
               } },
       create(context) {
         const SHIPPED = 'fonts/';
+        // 脚本产出的图（2026-10-23 起的第二条通道）：`run` 把工作区里的 PNG/SVG 推到
+        // `public/assets/`，镜头按这个名字取。只认这四种扩展名——`.html` / `.json`
+        // 之类还是不许，它们不是「画出来的东西」。
+        const ASSET_OK = /^assets\/[a-z0-9][a-z0-9._-]{0,60}\.(png|jpe?g|webp|svg)$/;
         return {
           CallExpression(node) {
             if (node.callee.type !== 'Identifier' || node.callee.name !== 'staticFile') return;
@@ -706,7 +1030,7 @@ export const dgPlugin = {
               context.report({ node, messageId: 'nonLiteral' });
               return;
             }
-            if (!arg.value.startsWith(SHIPPED)) {
+            if (!arg.value.startsWith(SHIPPED) && !ASSET_OK.test(arg.value)) {
               context.report({ node, messageId: 'notFont', data: { arg: arg.value } });
             }
           },

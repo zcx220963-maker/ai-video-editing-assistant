@@ -103,9 +103,18 @@ services:
       MOTION_PREVIEW_PARALLEL: ${MOTION_PREVIEW_PARALLEL:-6}
       # 预览静帧缩放：0.75 的 1440×810 够看构图，像素少 44%。
       MOTION_PREVIEW_SCALE: ${MOTION_PREVIEW_SCALE:-0.75}
-      # 逐镜带图评审：缺省关；要抽检就开 1 并把 RATE 设成 0.34（每三镜看一镜）。
-      MOTION_VISUAL_REVIEW: ${MOTION_VISUAL_REVIEW:-0}
-      MOTION_VISUAL_REVIEW_RATE: ${MOTION_VISUAL_REVIEW_RATE:-0.34}
+      # 逐镜带图评审：缺省开（看片是默认形态的一根柱子——画面全靠写手现写）。
+      # RATE 是抽样：1.0＝每镜都看；不想付就设 0。
+      #
+      # **2026-10-23 从 0.34 提到 1.0。** 0.34 是「每三镜看一镜」，那条片的实跑账是：
+      # 12 镜只看了 4 镜（s01/s04/s07/s11），**其中 3 镜没过 —— 失败率 75%**。
+      # 抽样率 34% 遇上 75% 的失败率，等于「八成有问题的片子里只改了四分之一」：
+      # 没被抽到的 8 镜从头到尾没人看过一眼。抽样省的是评审费，赔的是整片。
+      # 代价：评审成本 ×3（每镜一次带图调用）。要省就把 RATE 调回去，别默认省。
+      MOTION_VISUAL_REVIEW: ${MOTION_VISUAL_REVIEW:-1}
+      MOTION_VISUAL_REVIEW_RATE: ${MOTION_VISUAL_REVIEW_RATE:-1.0}
+      # 看片闭环的轮数：1＝看一轮改一轮；2＝改完再看一眼，确认改对了没有。
+      MOTION_VISUAL_ROUNDS: ${MOTION_VISUAL_ROUNDS:-2}
       # 计划阶段的并发与重写预算（说明见 .env.example 末段）。
       # 评审已并进一次带图调用；重写缺省不封顶，红几镜改几镜。
       MOTION_WRITER_PARALLEL: ${MOTION_WRITER_PARALLEL:-8}
@@ -116,10 +125,9 @@ services:
       # 草稿渲抽检间隔：每 N 镜验一次运动（第一镜必验）；0＝每镜都验。
       # 缺省 4：每镜一验会让渲染容器 20 核打满，预览静帧都排不进去。
       MOTION_WRITER_MOTION_EVERY: ${MOTION_WRITER_MOTION_EVERY:-4}
-      # 模板作者模型：从零写一份满足 props 合约的 TSX 比逐镜写码难得多，弱模型会
-      # 反复把必填 props 写死。留空＝用用户自己的模型；只覆盖「写模板 / 写替换件」
-      # 两次调用，分析与保真评审仍走用户配的视觉模型。
-      MOTION_TEMPLATE_MODEL: ${MOTION_TEMPLATE_MODEL:-}
+      # 模型只有一个来源：页面「设置」里配的那一个。写手 / 美术导演 / 模板作者
+      # 都不再有环境变量覆盖口（2026-10-22 撤掉 `MOTION_WRITER_MODEL` 等三项
+      # ——它们在 `.env` 里被钉死过，页面上换模型对这三条链不生效）。
     volumes:
       - whisper-cache:/root/.cache
       - app-runtime:/app/.runtime
