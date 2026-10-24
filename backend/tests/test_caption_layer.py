@@ -142,10 +142,18 @@ def test_single_render_path(remo: Path | None) -> None:
           "整件 <CaptionLayer/> 复用纸条组件 <Caption/>，没有第二套纸条")
     check("borderRadius" not in layer,
           "整件里没有自己的纸条圆角——纸条只有一份（在 <Caption/> 里）")
-    # 字号只有一处：纸条不给字设 CSS 的 fontSize（给了就是第二处求字号；
+    # 字号只有一处：纸条不给字**另求**一个 CSS 的 fontSize（另求就是两处可能算出两个数；
     # `cap.fontSize` 只用来换算上浮距离，那是几何不是字号本身）。
-    check(re.search(r"\bfontSize\s*:", pill) is None,
-          "纸条不给字设 fontSize：字号归 <CaptionText/> 一处求（纸条给字号＝两处可能算出两个数）")
+    # 2026-10-24：这条原来写「pill 里一个 `fontSize:` 都不许有」，中英双语（2026-10-21）
+    # 之后不再成立——英文那一行也要有字号，而它用的是 `enSize`，**就是 `zhSize` 本身**
+    # （`const enSize = zhSize`），同一个数分给两行，不是第二次求。
+    # 所以判据从「不许出现」收准成「不许另求」：字号只在 pill 里求**一次**
+    # （`zhSize` 那一处），唯一那处 `fontSize:` 只能是 `enSize`。
+    check(re.search(r"\bfontSize\s*:(?!\s*enSize\b)", pill) is None
+          and pill.count("fitCaptionFontSize(") == 1,
+          f"纸条只求一次字号（zhSize），唯一那处 fontSize 只能是 enSize——英文行与中文行"
+          f"共用同一个数：实得 fontSize: {len(re.findall(r'fontSize\\s*:', pill))} 处、"
+          f"求字号 {pill.count('fitCaptionFontSize(')} 次")
     check("fitCaptionFontSize(" in text_c,
           "自动字号在 <CaptionText/> 里（它才是「字」的那一件）")
 
