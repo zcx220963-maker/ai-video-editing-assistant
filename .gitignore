@@ -63,7 +63,10 @@ docs/面试复习全解.md
 docs/项目复习指南.md
 
 # ---- backend 本地开发件(不入库) ----
-backend/tests/
+# 2026-10-24 改：**`backend/tests/` 不再忽略**。147 个测试文件全在本机，
+# 「克隆下来能跑测试」这条就永远不成立——而这正是「项目做完了没有」唯一可验证的定义。
+# 入库的是测试与夹具；下面只挡探针脚本（`_` 开头那几支是一次性取证，不是测试）。
+backend/tests/_*
 backend/docs/
 backend/scripts/
 backend/.smoke/
@@ -140,5 +143,9 @@ openchatcut-src/
 !/remotion/tests/gate13-assets.mjs
 !/remotion/tests/fixtures-gate13.mjs
 !/remotion/tests/shipped-namespace.mjs
+# 2026-10-24：`@react-three/postprocessing` 的入场券。它和白名单里那几条一样，
+# 是「能不能用」的取证，不是一次性探针——换浏览器或换 three 版本都要重跑。
+!/remotion/tests/bloom-probe.mjs
+!/remotion/tests/effects-probe.mjs
 /remotion/src/user-shots/fixture-*.tsx
 /remotion/src/lib/helpers/__tests__/

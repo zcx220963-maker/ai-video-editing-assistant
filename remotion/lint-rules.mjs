@@ -238,6 +238,14 @@ export const ALLOWED_IMPORTS = new Set([
   '@remotion/effects/blur',
   // 画法通道：真三维与手绘斜纹。这两个家族在 package.json + lockfile 里躺着，
   // 且 2026-10-11 那批六支真渲夹具（roughjs / three / KaTeX × 两画幅）就是它们渲出来的
+  // 真三维场景里的**后处理**（2026-10-24 真渲验过，见 `tests/bloom-probe.mjs`）：
+  // `@remotion/effects/glow` 只能挂 `<Img>/<Solid>/<HtmlInCanvas>`，管不到 `<ThreeCanvas>`
+  // 里的东西；three 场景要 bloom 只能走 EffectComposer。
+  // 实测（swangle 软 GL / 1920×1080 / 白球半径 1.05）：
+  //   不挂 21s、挂 50s（150 帧）→ **每帧多 0.19 秒**，比 HtmlInCanvas 的 0.64 秒便宜；
+  //   球外一圈亮度 5.5 → 17.1（i=0.9 / t=0.60 / r=0.45）——亮核边缘仍在，外面一圈柔光；
+  //   i=1.6 那一档把整幅糊成一团（整幅平均 49→70），**别照官方示例的默认值抄**。
+  '@react-three/postprocessing',
   'three',
   '@react-three/fiber',
   '@remotion/three',

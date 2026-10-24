@@ -1148,7 +1148,7 @@ const { width, height } = useVideoConfig();   // 竖屏 1080×1920、横屏 1920
 
 # 镜头代码的 import 名单
 
-lint 白名单 82 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
+lint 白名单 83 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 
 `react`、`react-dom`、`remotion`、`@remotion/paths`、`@remotion/shapes`、
 `@remotion/motion-blur`、`@remotion/layout-utils`、
@@ -1161,6 +1161,7 @@ lint 白名单 82 项（`ALLOWED_IMPORTS`），镜头代码只能引这些：
 `@remotion/transitions`、`@remotion/transitions/fade`、`@remotion/transitions/slide`、
 `@remotion/transitions/wipe`、`@remotion/transitions/flip`、`@remotion/transitions/clock-wipe`、
 `chroma-js`、`d3-scale`、`d3-shape`、`d3-interpolate-path`、`flubber`、`lucide-react`、
+`@react-three/postprocessing`、
 `three`、`@react-three/fiber`、`@remotion/three`、`roughjs`、
 `katex`、`katex/dist/katex.min.css`、
 `@dg/film`、`@dg/tokens`、`@dg/fonts`、`@dg/motion`、`@dg/polish`、`@dg/brand`、

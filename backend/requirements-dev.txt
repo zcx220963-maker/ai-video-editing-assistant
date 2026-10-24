@@ -1,0 +1,14 @@
+# 测试依赖（**不进运行时镜像**）
+#
+# 为什么要单独一份：`requirements.txt` 是「跑服务需要的」，pytest 只在跑测试时需要。
+# 混在一起会让生产镜像多装一个测试框架，也让人分不清哪个包是服务真用的
+# （`test_requirements_hygiene.py` 专门查这类「装了没人 import」的占位依赖）。
+#
+# 用法：
+#     pip install -r requirements.txt -r requirements-dev.txt
+#     python -m pytest tests -q
+#
+# 注意：两个运行镜像（creation-app / creation-editor）**都没装 pytest**，
+# 所以测试只能在宿主机跑。要用容器跑就先装这两份，别指望 `docker exec ... pytest`。
+
+pytest>=8.0

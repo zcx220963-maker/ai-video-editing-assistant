@@ -6144,6 +6144,10 @@ IMPORT_WHITELIST: tuple[str, ...] = (
     "@remotion/effects/blur",
     # 画法通道：手绘斜纹与真三维。这两族在 package.json + lockfile 里躺着，
     # 2026-10-11 那批六支真渲夹具（roughjs / three / KaTeX × 两画幅）就是它们渲的。
+    # 真三维场景里的后处理（2026-10-24 真渲验过）。`@remotion/effects/glow` 只能挂
+    # `<Img>/<Solid>/<HtmlInCanvas>`，**管不到 `<ThreeCanvas>` 里的东西**——three 场景
+    # 要 bloom 只能走 `EffectComposer`。实测每帧多 0.19 秒（比 HtmlInCanvas 的 0.64 便宜）。
+    "@react-three/postprocessing",
     "three", "@react-three/fiber", "@remotion/three", "roughjs",
     "katex", "katex/dist/katex.min.css",
     # 2026-10-24：补齐与闸① 的差集。这 12 项**镜像里早装好了、闸① 也早放行了**，
