@@ -18,6 +18,8 @@ import json
 import re
 from typing import Any
 
+from . import caption
+
 #: 运镜四档轮换。推/拉/横移/微推——同一档连用两镜会看出"卡住"。
 _STORY_ZOOM = ((1.0, 1.10), (1.12, 1.0), (1.0, 1.06), (1.08, 1.02))
 _STORY_PAN = ((0.10, 0.0), (-0.08, 0.0), (0.0, 0.06), (0.0, -0.05))
@@ -55,30 +57,27 @@ def _scene_fingerprint(body: str) -> tuple[int, ...]:
             n(r"linearGradient"), n(r"radialGradient"))
 
 
-def _caption_fit(text: str) -> tuple[float, float]:
-    """按字数给字幕挑字号与基线，保证**不溢出画面下沿**。
+def _caption_fit(text: str) -> float:
+    """按字数给字号（占**短边**的比例）。实现在 `caption.py`。
 
-    叙事片的字幕是整句话（30~45 字），不是 14 字标题。用固定 `size=0.046`（1920 宽
-    → 88px）时，40 个字会排成 3 行、从 y=0.82 一路溢出到画面外——真机第一版就是这样，
-    最下面一行被裁掉一半。
-    这里按"最多 3 行、每行 ≤ 0.88 宽"反推字号，并把基线抬高到能装下 3 行。
+    为什么搬走：字号、位置、"这一镜要不要外层字幕"是同一个关注点，
+    散在两个文件里就会出现"改了字号忘了位置"。这里留一层薄壳，
+    是因为 `film.py` 与测试都按这个名字取。
     """
-    n = len(text or "")
-    if n <= 16:
-        return 0.050, 0.845
-    if n <= 24:
-        return 0.044, 0.835
-    if n <= 34:
-        return 0.038, 0.815
-    return 0.032, 0.795
+    return caption.fit(text)
 
 
 def wrap_story_scene(body: str, scene: dict[str, Any], *, index: int) -> str:
-    """把模型画的场景包成完整一镜：`Camera` 运镜 + 章节号 + 时间标记 + 高亮字幕。
+    """把模型画的场景包成完整一镜：`Camera` 运镜 + 章节号 + 时间标记 + 字幕。
 
-    为什么文字层与运镜由外层统一加，而不是让模型写：
-    十几镜的字幕位置、章节标记、推拉方向必须**一致**——那是"一部片子"的感觉来源。
-    交给模型逐镜决定，必然每镜都不一样。
+    为什么运镜与章节标记由外层统一加，而不是让模型写：
+    十几镜的推拉方向、章节标记位置必须**一致**——那是"一部片子"的感觉来源。
+
+    **但字幕不是**（2026-10-25 改）。字幕分三层：
+      可读性下限（字号/描边/安全区）由 `RichCaption` 保；
+      版式意图（要不要、放哪、多大）由分镜的 `caption` 字段给；
+      `mode="drawn"` 时外层**一个字不加**，字幕由画面写手自己画进画面。
+    判据只有一条：分镜说 drawn 就不加，没说就兜底（见 `caption.py`）。
     """
     inner = body.replace("const Scene", f"const Inner{index + 1:02d}", 1)
     z0, z1 = _STORY_ZOOM[index % len(_STORY_ZOOM)]
@@ -110,10 +109,11 @@ def wrap_story_scene(body: str, scene: dict[str, Any], *, index: int) -> str:
         lines.append(f"      <ChapterMark index={q(chapter)} t={{t}} />")
     if tmark:
         lines.append(f"      <TimeMark text={q(tmark)} t={{t}} />")
-    if text:
-        size, _y = _caption_fit(text)
+    cap = caption.plan(scene)
+    if text and cap["mode"] == "overlay":
         lines.append(f"      <RichCaption text={q(text)} hi={q(hi)} t={{t}}"
-                     f" bottom={{0.07}} size={{{size}}} />")
+                     f" bottom={{{cap['bottom']}}} size={{{cap['size']}}}"
+                     f" align={q(cap['align'])} />")
     lines += ["    </AbsoluteFill>", "  );", "};"]
     return inner + "\n" + "\n".join(lines)
 

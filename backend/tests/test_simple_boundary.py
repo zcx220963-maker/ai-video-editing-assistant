@@ -59,10 +59,14 @@ CORE_LINE_BUDGET = 500
 #:   ⑫ `facts.py`（每个数字能不能说清从哪来）。视觉自检看不出"这个数是编的"，
 #:      而编一个数字是这条链路里最贵的错。**不做闸只做账**：不拦片，报告里如实写。
 #:   ⑬ `scene.GRADE_OPACITY`（整片提亮层）。提示词写"亮度 ≥38/255"、模型稳定做到 27
-#:      ——它对绝对亮度没有直觉，跟"对占画面多少没有直觉"是同一个毛病。补在最后一道
+#:      ——它对绝对亮度没有直觉，跟"对画面占多少没有直觉"是同一个毛病。补在最后一道
 #:      确定性代码里，实测 YAVG 27.0 → 39.9（参考片 41.6）。
+#: 2026-10-25 九次数：加"字幕三层"后 3,615，预算提到 3,700。
+#:   ⑭ `caption.py`（字幕：字号按短边 + 五档位置 + overlay/drawn/none 三模式）。
+#:      修的是三个真毛病：字号按宽度算导致横竖屏差三倍（1280 宽 48.6px vs 参考片 34px）、
+#:      底部 36% 黑条把画面割开、要不要字幕外层说了算。
 #: 下一次再超，得说清买了什么才准提。
-PACKAGE_LINE_BUDGET = 3560
+PACKAGE_LINE_BUDGET = 3700
 
 #: 不许出现在 import 里的东西。
 BANNED = ("code_spec", "storyline_server.nodes", "storage.repositories",
@@ -148,7 +152,7 @@ def main() -> int:
                       ("scene.py", 210), ("review.py", 170), ("export.py", 230),
                       ("morph.py", 110), ("kernel.py", 380), ("qa.py", 310),
                       ("voice.py", 230), ("mix.py", 100), ("ffmpeg.py", 55),
-                      ("facts.py", 135), ("project.py", 160),
+                      ("caption.py", 135), ("facts.py", 135), ("project.py", 160),
                       ("system.py", 1060), ("takes.py", 60), ("deliver.py", 70)):
         p = next((x for x in files if x.name == name), None)
         if p is None:

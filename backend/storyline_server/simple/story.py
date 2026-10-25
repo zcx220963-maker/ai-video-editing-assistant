@@ -23,7 +23,7 @@ import asyncio
 from typing import Any
 
 from ..motion import remotion_client as rc
-from . import kernel, system
+from . import caption, kernel, system
 from .kernel import KernelError
 from .scene import _ensure_motif  # noqa: F401  —— 写手内部用，也对外保持旧名字可用
 
@@ -106,8 +106,12 @@ async def write_scene_story_code(scene: dict[str, Any], *, index: int, total: in
     """
     ask = (f"这是第 {index + 1}/{total} 镜，时长 {seconds:g} 秒。\n"
            f"**这一镜要画的画面**：{str(scene.get('plate') or scene.get('brief') or '').strip()}\n"
-           f"（这一镜的字幕是「{str(scene.get('text') or '').strip()}」——"
-           f"**不要把它画进画面**，字幕由外层统一加。）\n"
+           # 字幕归谁画，由分镜的 `caption.mode` 定（见 caption.py）。drawn 时下面
+           # 那段"不要画字幕"要**当场反过来说**——否则写手照旧不画，外层也不加，
+           # 这一镜就没字了。
+           + (caption.drawn_brief(scene) if caption.plan(scene)["mode"] == "drawn" else
+              f"（这一镜的字幕是「{str(scene.get('text') or '').strip()}」——"
+              f"**不要把它画进画面**，字幕由外层统一加。）\n")
            + (f"**全片贯穿的一件东西**：{motif}。这一镜里它也要出现，"
               f"大小/位置/明暗和别的镜不同（很小的一处也算；"
               f"它是让十几镜连成一部片子的那根线）。\n" if motif and index >= 2 else "")

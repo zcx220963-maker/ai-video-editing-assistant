@@ -18,7 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from storyline_server.simple import film, morph, qa, scene, story, system  # noqa: E402
+from storyline_server.simple import (  # noqa: E402
+    caption as cap_mod, film, morph, qa, scene, story, system)
 
 _CHECKS = 0
 _FAILS = 0
@@ -78,7 +79,7 @@ def main() -> int:
     check(film._looks_complete(wrapped), "包完仍是完整组件")
     check({"Camera", "RichCaption", "ChapterMark", "TimeMark"}
           <= set(system.used_components(wrapped)), "文字层三件 + 运镜都在外层")
-    check("bottom={0.07}" in wrapped, "字幕按底部锚定（长句不会溢出画面下沿）")
+    check("bottom={0.08}" in wrapped, "字幕默认按底部锚定（long 句不会溢出画面下沿）")
     # 提亮层：提示词写"亮度 ≥ 38/255"，模型稳定做到 27——它对绝对亮度没有直觉。
     # 所以在最后一道确定性代码里补，而不是继续往提示词里加数字。
     check(f"opacity: {scene.GRADE_OPACITY}" in wrapped,
@@ -86,6 +87,31 @@ def main() -> int:
     check(wrapped.index("</Camera>") < wrapped.index(f"opacity: {scene.GRADE_OPACITY}")
           < wrapped.index("<RichCaption"),
           "提亮层在画面之上、文字之下（文字不该被一起洗白）")
+
+    print("\n③b 字幕三层：外层保可读性 / 分镜给版式 / drawn 时模型自己画")
+    # 判据只有一条：分镜说 drawn 就不加，没说就兜底。这是"灵活但不屎山"的关键——
+    # 不判断"画得好不好"，也不加闸。
+    drawn = film.wrap_story_scene(inner, {**SCENE, "caption": {"mode": "drawn"}}, index=0)
+    check("<RichCaption" not in drawn,
+          "mode=drawn → 外层一个字不加（字幕由画面写手画进画面）")
+    none = film.wrap_story_scene(inner, {**SCENE, "caption": {"mode": "none"}}, index=0)
+    check("<RichCaption" not in none, "mode=none → 这镜不要字幕（纯画面）")
+    check("<RichCaption" in wrapped, "不写 caption → 默认 overlay（老片子行为不变）")
+    # 位置五档：只变 2~3 档是有意的，位置每镜都变观众跟不住。
+    ups = film.wrap_story_scene(inner, {**SCENE, "caption": {"at": "upper"}}, index=0)
+    check("bottom={0.62}" in ups, f"at=upper → 底边 0.62（{cap_mod.CAPTION_AT['upper']}）")
+    left = film.wrap_story_scene(inner, {**SCENE, "caption": {"at": "left"}}, index=0)
+    check('align="left"' in left, "at=left → 左对齐")
+    # 字号按**短边**：原来按宽度算，同一个 0.038 在 1920/1280/720 上差三倍。
+    check(cap_mod.fit("短句") > cap_mod.fit("这" * 40),
+          "字数越多字号越小（按字数分档）")
+    check(cap_mod.SIZE_MIN >= 0.03,
+          f"字号下限 {cap_mod.SIZE_MIN}（720 短边 = "
+          f"{cap_mod.SIZE_MIN * 720:.0f}px，再小没人看得清）")
+    check("Math.min(width, height)" in system.SYSTEM_TSX,
+          "`RichCaption` 按短边算字号（不是按宽度）")
+    check("WebkitTextStroke" in system.SYSTEM_TSX and "scrim = 0" in system.SYSTEM_TSX,
+          "去掉了底部黑条（scrim 默认 0），改成描边 + 双层阴影")
 
     print("\n④ 高亮词必须是正文子串")
     bad = film.wrap_story_scene(inner, {"text": "换你守在 1379 号站", "hi": "警告"}, index=0)

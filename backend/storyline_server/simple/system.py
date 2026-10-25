@@ -424,14 +424,14 @@ const ChapterMark = ({ index = '', title = '', sub = '', t = 1, start = 0.04,
 
 /** 时间标记：左下角「地球时间 1975 年」。给叙事一条可数的坐标。 */
 const TimeMark = ({ text = '', t = 1, start = 0.1, hue = '#B9C4CF' }: any) => {
-  const { width } = useVideoConfig();
+  const { width, height } = useVideoConfig();
   const p = easeOut(at(t, start, 0.4));
   if (!text) return null;
   return (
     <div style={{
-      position: 'absolute', left: width * 0.045, bottom: width * 0.045,
-      fontFamily: TOKENS.fontStack, fontSize: width * 0.0128, color: hue,
-      letterSpacing: '0.1em', opacity: 0.85 * p,
+      position: 'absolute', left: width * 0.045, bottom: height * 0.032,
+      fontFamily: TOKENS.fontStack, fontSize: Math.min(width, height) * 0.022,
+      color: hue, letterSpacing: '0.1em', opacity: 0.85 * p,
     }}>{text}</div>
   );
 };
@@ -439,26 +439,34 @@ const TimeMark = ({ text = '', t = 1, start = 0.1, hue = '#B9C4CF' }: any) => {
 /** 带高亮的字幕：`text` 里出现 `hi` 的那一段换成 `hiColor`。
  *  参考片每一句都有一个词是暖色的（"一封信"、"警告"）——那一下就是视觉重音。
  *
- *  **底下永远压一条暗带（scrim）**：实测白字压在大太阳上时，textShadow 救不回来，
- *  那一句直接读不清。参考片的字幕永远落在暗部——不是它运气好，是它加了压暗。
- *  `scrim=0` 可以关掉（一般不用）。 */
+ *  **不铺暗带，靠描边 + 双层阴影**（2026-10-25 改）。原来是底部 36% 高的
+ *  `rgba(3,5,9,0.80)` 渐变——它确实保证了可读，但它把画面下三分之一整块压暗，
+ *  看起来像"字幕把画面割开了"。参考片没有这条带子，靠的就是描边与阴影。
+ *  `scrim>0` 仍可显式打开（比如字幕正好压在大太阳上那种极端情况）。 */
 const RichCaption = ({ text = '', hi = '', hiColor = '#E8A33D', t = 1, start = 0.04,
-                       size = 0.052, y = 0.845, bottom = 0, color = '#F2F5F8',
-                       align = 'center', scrim = 1 }: any) => {
-  const { width } = useVideoConfig();
+                       size = 0.047, y = 0.845, bottom = 0.08, color = '#F2F5F8',
+                       align = 'center', scrim = 0, stroke = 1 }: any) => {
+  const { width, height } = useVideoConfig();
+  // 字号按**短边**算：原来按宽度算，同一个 0.038 在 1920 宽是 73px、
+  // 1280 宽是 48.6px、720 竖屏是 27px——观感差三倍。按短边归一化之后，
+  // 横屏与竖屏的字占画面**比例**一致。参考片实测：1280×720、约 34px → 34/720≈0.047。
+  const base = Math.min(width, height);
   const p = easeOut(at(t, start, 0.3));
-  const fs = width * Math.min(0.085, Math.max(0.018, R(size, 0.052)));
+  const fs = base * Math.min(0.075, Math.max(0.026, R(size, 0.047)));
   const cy = R(y, 0.845);
-  const bt = R(bottom, 0);
-  const sc = R(scrim, 1);
+  const bt = R(bottom, 0.08);
+  const sc = R(scrim, 0);
+  const st = R(stroke, 1);
   const src = String(text || '');
   const key = String(hi || '');
   if (!src) return null;
   const parts = key && src.includes(key) ? src.split(key) : null;
   // **`bottom` 优先**：叙事片的字幕是整句话（30~45 字），按 `top` 定位时
   // 3 行会从画面下沿漏出去（真机踩过）。按底部锚定，字多就往上长，永远不会出画。
+  // 2026-10-25：`bottom` 的单位从 `width` 改成 `height`——底边距本来就该按高算，
+  // 按宽算在横屏上会偏出 1.8 倍。
   const pos: any = bt > 0
-    ? { bottom: width * bt }
+    ? { bottom: height * bt }
     : { top: `calc(${cy * 100}% - ${fs * 0.6}px)` };
   return (
     <>
@@ -472,9 +480,17 @@ const RichCaption = ({ text = '', hi = '', hiColor = '#E8A33D', t = 1, start = 0
       <div style={{
         position: 'absolute', left: width * 0.06, width: width * 0.88,
         ...pos, textAlign: align, fontFamily: TOKENS.fontStack,
-        fontWeight: 600, fontSize: fs, lineHeight: 1.38, color, opacity: p,
-        transform: `translateY(${(1 - p) * 16}px)`,
-        textShadow: '0 4px 26px rgba(0,0,0,0.92)',
+        fontWeight: 600, fontSize: fs, lineHeight: 1.34, color, opacity: p,
+        transform: `translateY(${(1 - p) * 14}px)`,
+        // 折行要均衡：长句刚好超一点时会留下孤零零的一两个字（"缝。"单独一行）。
+        // `balance` 让两行长度接近；浏览器不认就忽略，没有副作用。
+        textWrap: 'balance',
+        // **不要黑条，要描边 + 双层阴影**：`scrim` 那条 36% 高的黑渐变会把画面
+        // 下三分之一整块压暗，看起来像"字幕把画面割开了"。参考片没有它，
+        // 靠的就是这一组描边与阴影。压在暗画面上，白字本来就有对比。
+        textShadow: '0 2px 8px rgba(0,0,0,0.95), 0 0 26px rgba(0,0,0,0.80)',
+        WebkitTextStroke: st ? '0.55px rgba(0,0,0,0.55)' : undefined,
+        paintOrder: 'stroke fill',
       }}>
       {parts ? (
         <>
