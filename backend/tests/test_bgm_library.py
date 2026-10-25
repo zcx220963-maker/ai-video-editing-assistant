@@ -277,46 +277,9 @@ def main() -> None:
     check("load_media(material_ids" in both and "**不要**当画面素材" in both,
           "视频 + 歌曲同时在场：两条说明并存，各走各的出口")
 
-    # ---- ⑥ 零素材出片的 bgm 要认 material_id ----
-    print("⑥ 出片节点的 bgm 收附件/曲库的 material_id（obj: 引用照旧）")
-    from agent_framework.ingest import ingest_bytes
-    from agent_framework.orchestration import NodeState
-    from storyline_server.nodes.motion_code_nodes import RenderCodeMotionVideoNode
-    from storyline_server.providers import Providers
-    from storyline_server.settings import Settings
-
-    async def bgm_ref_case() -> tuple[str, str, str, str]:
-        with tempfile.TemporaryDirectory() as td2:
-            st = build_storage("memory", cache_root=Path(td2) / "c",
-                               workspace_root=Path(td2) / "w")
-            await st.start()
-            await st.users.provision("u-mine")
-
-            async def chunks():
-                yield b"ID3" + b"\x00" * 2048
-
-            imp = await ingest_bytes(st, chunks(), filename="倒数.mp3",
-                                     user_id="u-mine", conversation_id=None, origin="bgm")
-            node = RenderCodeMotionVideoNode(Settings(), Providers(), st)
-            mine = NodeState(session_id="s", user_id="u-mine", conversation_id="c-1")
-            got = await node._bgm_ref(mine, imp["material_id"])
-            expect = "obj:" + (await st.materials.get(imp["material_id"]))["object_key"]
-            passed = await node._bgm_ref(mine, "obj:users/u-mine/convs/c/x.mp3")
-            stranger = NodeState(session_id="s", user_id="u-other", conversation_id="")
-            try:
-                await node._bgm_ref(stranger, imp["material_id"])
-                why = "没抛错（别人的 id 也认了）"
-            except ValueError as e:
-                why = str(e)
-            await st.close()
-            return got, expect, passed, why
-
-    got, expect, passed, why = run(bgm_ref_case())
-    check(got == expect, f"曲库 material_id → 该素材自己的 obj: 引用（实得 {got[:70]}）")
-    check(passed == "obj:users/u-mine/convs/c/x.mp3",
-          f"已经是 obj: 引用的原样通过（实得 {passed}）")
-    check("没有这条配乐素材" in why, f"别人的 material_id 按不存在处理（{why}）")
-
+    # 2026-10-25：原第 ⑥ 节「出片节点的 bgm 收附件/曲库的 material_id」删了。
+    # 它测的是 `motion_code_nodes.RenderCodeMotionVideoNode._bgm_ref`，而那个节点
+    # 连同整个图形科普链一起退役了。曲库本身的判据在 ①~⑤ 节，一节没少。
     srv._gd_music_get, srv._gd_download = real_music_get, real_download
 
     print(f"\n通过 {_checks - _fails}/{_checks}" + ("" if _fails == 0 else f"，失败 {_fails}"))

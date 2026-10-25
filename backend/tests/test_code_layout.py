@@ -268,9 +268,8 @@ def main() -> int:
           f"模型侧白名单收得下这两个键（缺 {sorted(miss)} 就是假告警：账上有、模型看不见）")
     client = (BACKEND / "storyline_server" / "motion" / "remotion_client.py").read_text(encoding="utf-8")
     check("layout_used" in client, "client 的响应契约里点名 layout_used（漏字段=静默 missing）")
-    nodes = (BACKEND / "storyline_server" / "nodes" / "motion_code_nodes.py").read_text(encoding="utf-8")
-    check("describe_layout" in nodes and "layout_scanned" in nodes and "verified" in nodes,
-          "节点层用同一份措辞，且把「几镜真扫过」写进证据")
+    # 2026-10-25：原「节点层用同一份措辞」那条删了——它读 `nodes/motion_code_nodes.py`，
+    # 而那个节点随图形科普链一起退役了。措辞的单源性仍由 `remotion_client` 那一侧守着。
 
     print(f"\n{_checks - _fails}/{_checks} 通过")
     return 0 if _fails == 0 else 1

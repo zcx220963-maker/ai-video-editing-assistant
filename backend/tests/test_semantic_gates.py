@@ -614,11 +614,9 @@ def main() -> int:
           "㉑ 闸前的四个判据挂在整片判据那一个出口上，上限与容差各声明一次")
     check("MOTION_ANCHOR" not in tsx,
           "容差与上限都不在 TS 那一侧：母版只回「哪几帧动过」，判它够不够近的是 Python")
-    nodes_src = (_HERE.parents[1] / "storyline_server" / "nodes" / "motion_code_nodes.py"
-                 ).read_text("utf-8")
-    check("MOTION_ANCHOR_TOLERANCE_DIV" in nodes_src
-          and "cspec.MOTION_ANCHOR_TOLERANCE_DIV" in nodes_src,
-          "回执里印出来的容差也引同一个常量（不在这里抄第二个 k）")
+    # 2026-10-25：原「回执里印出来的容差也引同一个常量」两条删了——它读的是
+    # `nodes/motion_code_nodes.py` 的源码，而那个节点随图形科普链一起退役了。
+    # 常量本身仍只有一处声明（上面第 ㉑ 条守着）。
     check(src_render.count("fps=fps") >= 2,
           "渲染层两次调用都**把 fps 递给判据**、不自己折成帧数（k 的定义只在一处）")
     shot_sc = cs.spec_schema()["properties"]["shots"]["items"]
@@ -633,14 +631,9 @@ def main() -> int:
           "anchors 的上下限与 Python 判据同源（minItems 1 / maxItems 引用同一个常量）")
     check("MOTION_ANCHOR_FORMS" in inspect.getsource(cs.check_motion_anchors),
           "闸前的白名单引用同一个常量，不在判据里另写一份「三种写法」")
-    check("motion_anchor_unjudged" in nodes_src and "motion_anchor_warnings" in nodes_src
-          and "motion_unjudged" in nodes_src,
-          "回执上 ㉑ 的两个出口**另起两栏**，不并进 ⑭ 那两栏：一镜可能「动效密度过了」"
-          "而「锚定未判」，并栏就是把前者当后者")
-    # 「申报了锚的镜」必须读 spec 里那一栏：账里的 `r["motion"]` 是 ⑭ 从像素上数出来的
-    # 读数（每一镜都有一份），拿它当申报，这一行就会把「这一镜有动效」说成「这一镜申报了锚」。
-    check('for s in spec["shots"] if s.get("motion")' in nodes_src,
-          "回执里「几镜申报了锚」数的是 spec 的申报栏，不是 ⑭ 的读数栏")
+    # 2026-10-25：原「回执上 ㉑ 的两个出口另起两栏」「几镜申报了锚数的是 spec 申报栏」
+    # 两条删了——它们读 `nodes/motion_code_nodes.py` 的源码，而那个节点随图形科普链
+    # 一起退役。判据本体（`check_motion_anchors`）仍在上面几条上被守着。
 
     print("\n未验证清单（跳过 ≠ 通过）：")
     print("  · 真像素那一格：⑲-a 的几何读数与 ⑳(c) 的画面指纹都要靠真渲一镜才量得出来，"

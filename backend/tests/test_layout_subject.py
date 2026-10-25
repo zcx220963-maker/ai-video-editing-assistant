@@ -320,29 +320,11 @@ def main() -> int:
           and cs.style_facts([_shot(1, ch="vector", card_id="")])["card_families"]["s01"] == "",
           "没选卡的镜记空串——「没选卡」与「选了某族」在账上是两件事")
 
-    from storyline_server.nodes import motion_plan as mp        # 只在这里 import：
-    from agent_framework.plan import support as plan_support    # 离线直调不带起别的链
-    spec6, errs6 = cs.validate_code_spec(_film(_mixed6()))
-    assert errs6 == [], f"夹具本身没过契约：{errs6}"
-    payload = mp.plan_payload(spec6)
-    row0 = payload["plan_table"][0]
-    for key in ("subject", "subject_channel", "family"):
-        check(key in row0 and key in payload["plan_table"][-1],
-              f"计划卡逐镜账上有这一栏：{key}（卡面上直接看得见「这一镜画的是什么」「哪一族」）")
-    # DEMOS_ENABLED=False 时 `card` 那一栏在归一时被当没写（见 `code_spec` 里那个开关的
-    # 注释），所以族是空串；通道仍按代码字节认出来。两件事分别钉，避免把「开关关着」
-    # 误读成「账算错了」。
-    check((row0["family"] == "" if not cs.DEMOS_ENABLED else row0["family"] == "opening")
-          and row0["subject_channel"] == "rough",
-          f"卡面上的值与 style_facts 同一份：{row0['family']!r}/{row0['subject_channel']}")
-    check(payload["style_warnings"] == [] or isinstance(payload["style_warnings"], list),
-          "提醒清单仍是清单（⑯ 自 2026-10-18 起也会出提醒；⑮ 仍只出打回）")
-    # 计划卡那两栏现在由**一个**函数产出（T28 顺手收的：六道整片闸的清单曾经在
-    # 三处各抄一遍，抄漏一处就是「某个面看不见这道闸」）。所以这一条从「源码里有没有
-    # 把这两道加进去」改成钉那个**唯一的清单**——⑮⑯ 在里头，且卡面走的是它。
-    src_plan = (_HERE.parents[1] / "storyline_server" / "nodes" / "motion_plan.py").read_text("utf-8")
-    check("cspec.whole_film_gate_results(" in src_plan,
-          "计划卡的两栏走那一个唯一的三态出口（提醒/未判分家，见 §6-T28）")
+    # 2026-10-25：原「计划卡逐镜账上有 subject/subject_channel/family 三栏」那一节删了。
+    # 它走 `motion_plan.plan_payload(spec)` 造计划卡，而 `motion_plan`（`plan_motion` 节点）
+    # 随图形科普链一起退役。计划卡这条路已经不是产品面了——简洁线的分镜卡走
+    # `film.plan()` 的 `sources` / `scenes`，见 `test_story_mode`。
+    # 卡面与 `style_facts` 同源这条纪律本身仍成立，判据在 `cs.style_facts` 那几条上。
     _gate_names = {g.__name__ for g in cs.WHOLE_FILM_GATES}
     # ⑮（版式族）只在用 demo 时才有意义：`DEMOS_ENABLED = False` 时它整条不进
     # 整片判据（见 `code_spec._DEMO_GATES` 的注释）。本文件不再假设它一定在清单里，
@@ -358,6 +340,7 @@ def main() -> int:
           and callable(cs.check_subject_named) and callable(cs.check_ink_contrast),
           f"2026-10-23 晚：⑯ 加回整片判据（只拦「申报通道无证据」），⑩ 仍撤出"
           f"（当前清单 {sorted(_gate_names)}），两个函数都还在")
+    from agent_framework.plan import support as plan_support   # 模型侧词表（活模块）
     for name in ("subject", "subject_channel", "family"):
         check(name in plan_support.OUTPUT_FIELD_NAMES,
               f"文案词表收了 {name}——技能正文教了模型写它，不收就是假告警")

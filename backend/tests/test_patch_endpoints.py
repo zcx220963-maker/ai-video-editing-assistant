@@ -44,7 +44,6 @@ from agent_framework.session import SessionManager
 from agent_framework.storage import build_storage
 from agent_framework.tool import Tool, ToolError, ToolRegistry
 from storyline_server.nodes.core_nodes import PatchVideoNode
-from storyline_server.nodes.motion_code_nodes import PatchCodeMotionVideoNode
 
 _checks = 0
 _fails = 0
@@ -112,8 +111,14 @@ class _FailPatch(_StubPatch):
 
 
 def _names() -> tuple[str, str]:
-    """(图形链, 口播链) 的真实局部改节点名——单源，不在这儿重打一遍。"""
-    return PatchCodeMotionVideoNode.name, PatchVideoNode.name
+    """真实局部改节点名——单源，不在这儿重打一遍。
+
+    2026-10-25：图形科普链的 `patch_motion_code` 节点随那条链退役了
+    （`nodes/motion_code_nodes.py` 已删），但**前端那条 `/motion/patch` 路由还在**——
+    它派发时按节点名找工具，所以这里仍要一个名字。用字面量而不是 import 已删模块：
+    这两条用例测的是"路由能不能把参数派发到节点、错误怎么透出"，不是节点实现。
+    """
+    return "patch_motion_code", PatchVideoNode.name
 
 
 def _build(storage, registry):

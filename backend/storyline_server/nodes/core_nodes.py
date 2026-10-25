@@ -4125,17 +4125,17 @@ REAL_NODE_CLASSES = [
 def build_real_registry(settings: Settings, providers: Providers, storage: Storage,
                         allowed: list[str] | None = None) -> NodeRegistry:
     """实例化真实节点；allowed 为 TOML available_nodes 白名单。"""
-    # 网页出片、图形科普片的分镜与出片通道延迟到这里导入：它们的模块反过来引本模块的
-    # StoryNode/_obj/_JobProgress，模块级互相导入会因加载顺序炸掉其中一边。
-    # motion_nodes.py 里的两个基类**不注册**（那个文件没有工具，只有流程）。
-    from .motion_code_nodes import (PatchCodeMotionVideoNode,
-                                    RenderCodeMotionVideoNode)
-    from .motion_plan import PlanMotionNode
+    # 网页出片节点延迟到这里导入：它的模块反过来引本模块的 StoryNode/_obj/_JobProgress，
+    # 模块级互相导入会因加载顺序炸掉其中一边。
+    #
+    # 2026-10-25：`plan_motion` / `render_motion_code` / `patch_motion_code` 三个节点
+    # **连同它们那一万行的图形科普链一起删了**（`motion/` 下 11 个模块 + `nodes/` 下 3 个）。
+    # 之前只是把它们从白名单里摘掉——那时文件还在、注册表还 import 它们，
+    # 于是"关掉"只是"模型看不见"，代码一天不删就得跟着每个改动一起维护。
+    # 要找回某一版：`git show 71616c7:backend/storyline_server/motion/shot_writer.py`。
     from .web_nodes import RenderWebNode
     reg = NodeRegistry()
-    name_to_cls = {cls.name: cls
-                   for cls in [*REAL_NODE_CLASSES, RenderWebNode, PlanMotionNode,
-                               RenderCodeMotionVideoNode, PatchCodeMotionVideoNode]}
+    name_to_cls = {cls.name: cls for cls in [*REAL_NODE_CLASSES, RenderWebNode]}
     for nm in (allowed or list(name_to_cls)):
         cls = name_to_cls.get(nm)
         if cls is not None:

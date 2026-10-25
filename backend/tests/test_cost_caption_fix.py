@@ -39,7 +39,6 @@ from agent_framework.render_gate import motion_summary               # noqa: E40
 from agent_framework.run_state import RunState                       # noqa: E402
 from storyline_server.motion import code_render as cr                # noqa: E402
 from storyline_server.motion import code_spec as cs                  # noqa: E402
-from storyline_server.nodes import motion_plan as mp                 # noqa: E402
 
 _fails = 0
 _checks = 0
@@ -348,17 +347,12 @@ def case_family() -> None:
 
 
 def case_replace() -> None:
-    print("④ 整份替换：少了哪几镜、断了哪几号要说出来")
-    prev = {"shots": [{"id": f"s{i:02d}"} for i in range(1, 7)]}
-    now = {"shots": [{"id": f"s{i:02d}"} for i in range(7, 21)]}
-    notes = mp.shot_diff_notes(prev, now)
-    check(any("整份替换" in n and "6 镜 → 本次 14 镜" in n and "s01" in n and "s06" in n
-              for n in notes), f"真机那个形状（s01–s06 → s07–s20）：点名少了 6 镜 {notes[:1]}")
-    check(any("镜号不连续" in n and "s01" in n for n in notes), "不从 s01 起：点名断号")
-    check(mp.shot_diff_notes(None, {"shots": [{"id": "s01"}, {"id": "s02"}]}) == [],
-          "第一次交、镜号连续：一声不响")
-    check(mp.shot_diff_notes(now, {"shots": now["shots"] + [{"id": "s21"}]})[0].startswith("镜号"),
-          "只增不减：不报「整份替换」（增镜是正常操作）")
+    print("④ 整份替换：判据已随图形科普链退役（2026-10-25）")
+    # 原判据是 `motion_plan.shot_diff_notes`：整份重交时点名「少了哪几镜、断了哪几号」。
+    # `motion_plan` 连同 `plan_motion` 节点一起删了，这条判据没有对象了。
+    # 要找回那份实现与它的四条断言：`git show 71616c7:backend/tests/test_cost_caption_fix.py`
+    check(not hasattr(cs, "shot_diff_notes"),
+          "`shot_diff_notes` 不在 code_spec 里（它属于已删的分镜节点，不该被挪进来）")
 
 
 def case_style() -> None:
