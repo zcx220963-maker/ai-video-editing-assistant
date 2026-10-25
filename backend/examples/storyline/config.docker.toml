@@ -27,12 +27,13 @@ available_nodes = [
     "script_template_rec", "generate_script", "generate_ai_transition",
     "transition_rec", "text_rec", "generate_voiceover", "select_BGM",
     "plan_timeline", "plan_timeline_pro", "plan_timeline_ai_transition",
-    "render_video", "render_web", "plan_motion",
-    # 零素材图形科普片的出片通道：画面由模型逐镜交 React/TSX 代码、渲染容器逐帧渲。
-    "render_motion_code",
+    "render_video", "render_web",
     # 局部改：只对已出片的某一版重烧受影响的镜/窗口，不重做整片。
     # 白名单少一行就等于「那一版改不动」：工具列不出来，前端选区改的派发直接失败。
-    "patch_motion_code", "patch_video",
+    "patch_video",
+    # 2026-10-25：`plan_motion` / `render_motion_code` / `patch_motion_code` 三个**摘了**。
+    # 理由见 config.toml 同一处：那条 1.9 万行的图形科普链已被简洁线替掉，
+    # 「模型能看见谁」由这张表决定，摘一行立刻生效。**两份必须同步改**。
     # 素材供给那三个工具（`search_illustration` / `select_illustration` / `imagegen`）
     # 2026-10-16 摘了：图形片的画面只有一路——模型逐镜写代码画（闸⑦「每镜必画」）。
     # **这份白名单与 config.toml 那份必须逐项相同**——这一份才是真机上 editor 容器读的

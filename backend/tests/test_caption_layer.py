@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """字幕元件化：母版那套字幕能力还给镜头代码之后，守四件事。
 
 用户的疑问原话是「字幕为什么非要和视频分开？不能和视频交互在一起吗」。查下来是一处真缺陷：
@@ -70,7 +70,7 @@ def _remotion_dir() -> Path | None:
 
 def _skill_md() -> Path:
     return (Path(__file__).resolve().parents[1]
-            / "examples/skills/motion_explainer/SKILL.md")
+            / "examples/retired/motion_explainer/SKILL.md")
 
 
 #: 三件元件的名字（新导出）。改这里的名字等于换 API，别只改一处。

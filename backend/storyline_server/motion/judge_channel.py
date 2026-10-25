@@ -101,14 +101,18 @@ def _judge_module() -> Any:
 # ---------------------------------------------------------------------------
 
 def _skill_dir() -> Path:
-    """技能目录。仓库里是 ``backend/examples/skills/motion_explainer``，
-    容器里 backend 就是 ``/app``（``code_spec._SKILL_DIR`` 同一套落位判断）。"""
+    """技能目录。仓库里是 ``backend/examples/retired/motion_explainer``，
+    容器里 backend 就是 ``/app``（``code_spec._SKILL_DIR`` 同一套落位判断）。
+
+    2026-10-25 从 ``skills/`` 移到 ``retired/``：那条链退役后它不该再出现在
+    模型可选的技能列表里（否则模型会照着正文调已摘白名单的节点）。判据面照旧读它。
+    """
     here = Path(__file__).resolve()
     for base in (here.parents[2], here.parents[3] / "backend"):
-        cand = base / "examples" / "skills" / "motion_explainer"
+        cand = base / "examples" / "retired" / "motion_explainer"
         if cand.is_dir():
             return cand
-    return here.parents[2] / "examples" / "skills" / "motion_explainer"
+    return here.parents[2] / "examples" / "retired" / "motion_explainer"
 
 
 def _read_doc(name: str) -> str:

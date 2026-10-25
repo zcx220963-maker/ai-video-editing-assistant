@@ -519,7 +519,12 @@ async def main() -> int:
                    "render_status", "update_memory", "read_memory", "spawn_subagent",
                    "read_file", "write_file", "edit_file", "grep",
                    "read_inbox", "send_message",
-                   "create_cron_job", "delete_cron_job", "list_cron_jobs"}
+                   "create_cron_job", "delete_cron_job", "list_cron_jobs",
+                   # 2026-10-25：简洁视频线的四个原生工具。它们不进 DAG，但模型能在
+                   # 技能正文里看到、也会真的去调——不列进来，新技能正文里**正确**的
+                   # 工具名就会被误报成「臆造工具」（这条用例上面刚说过那个道理）。
+                   "make_short_video", "reshoot_shot", "render_short_film",
+                   "list_short_films"}
     known = node_names | local_names | _module_defined(m_code, m_client)
     submit_schema = {"type": "object", "properties": {
         "plans": {"type": "array", "items": {"type": "object", "properties": {
@@ -535,22 +540,38 @@ async def main() -> int:
         node_param_keys=node_keys | enum_vals,
         node_props=node_props,
         tools=[node_tools, [_Schema(submit_schema)]])
+    # 原生工具的入参名也是「合法字段」：新技能正文里写着 `film_id` / `mp4_url` /
+    # `note` 这些，而它们既不是 DAG 节点参数、也不在 submit 的 schema 里。
+    # 生产侧不会漏（`vocab.param_keys()` 是把**注册表里所有工具**的入参合起来），
+    # 这里手工列一份，否则这条用例会拿真机上不存在的假告警来定罪。
+    # **改这几个工具的入参时要同步这张表**（`test_short_video` 会钉住入参名）。
+    fields |= {"prompt", "seconds", "aspect", "render", "film_id", "shot", "note",
+               "stills", "mp4_url", "coverage", "audit", "shots", "calls",
+               "verdict", "vivid", "content", "hint"}
     # D-红先：把 node_props 抽掉（= 真机修好之前那份来源），判据必须**红**并且精确点名
     # 那一批嵌套字段——一支从不红的判据没有资格说「对齐了」。
     thin = cons.skill_field_names(
         node_param_keys=node_keys | enum_vals,
         tools=[node_tools, [_Schema(submit_schema)]])
 
+    # 2026-10-25：图形科普链退役，`motion_explainer` 的正文移到 `examples/retired/`。
+    # 于是「模型能选到的技能」只剩 `examples/skills/` 下那几份——这一栏只扫它们。
+    # 退役那份正文仍然要用：它是复现「真机那条假告警」的唯一样本（thin_bad 那一条），
+    # 所以下面单独把它读进来，但不参与「技能点名了不存在的工具」这条检查。
     bodies: dict[str, str] = {}
     for md in sorted((Path(__file__).resolve().parents[1]
                       / "examples" / "skills").glob("*/SKILL.md")):
         meta, body = _parse_frontmatter(md.read_text(encoding="utf-8"))
         bodies[meta.get("name") or md.parent.name] = body
-    check(any(n == "motion_explainer_skill" for n in bodies),
-          f"示例技能都读到了（{len(bodies)} 份）")
+    check(any(n == "short_video_skill" for n in bodies),
+          f"示例技能都读到了（{len(bodies)} 份：{sorted(bodies)}）")
     bad = cons.unknown_tools_in_skills(bodies, known, param_keys=fields)
     check(not bad, f"技能正文点名的工具/取值/字段都在真实来源里（误报：{bad}）")
-    thin_bad = cons.unknown_tools_in_skills(bodies, known, param_keys=thin)
+    _retired = (Path(__file__).resolve().parents[1] / "examples" / "retired"
+                / "motion_explainer" / "SKILL.md")
+    thin_bad = cons.unknown_tools_in_skills(
+        {"motion_explainer_skill": _retired.read_text(encoding="utf-8")},
+        known, param_keys=thin)
     check(any("recurring_prop" in b or "highlight_color" in b for b in thin_bad),
           f"抽掉 node_props 就复现真机那条假告警（实得 {thin_bad}）")
     still = cons.unknown_tools_in_skills(
@@ -686,24 +707,51 @@ async def main() -> int:
               for o in c["options"] for d in [o["display"]]),
           "卡面文字是标签而不是取值本身（不会把 portrait 当文字显示）")
 
-    # 服务端兜底：这张卡离不开图形科普那份技能，而模型交上来的 hint 就是空的
-    class _MotionSkill:
-        name = "motion_explainer_skill"
-        display = "图文科普片（零素材出片）"
+    # 服务端兜底：零素材那条链现在是一个**原生工具**（`make_short_video`，一次调用
+    # 跑完整条链，没有 DAG 形状），模型交上来的 hint 就是空的。
+    # 2026-10-25 之前这里用的是 `plan_motion`（DAG 节点）；那条链退役后换成它，
+    # 顺带钉住两件事：① 声明了 `plan_node = True` 的原生工具**能上计划卡**
+    # （`vocab.whitelist()` 的第二类）；② 它照样按 `_IMPLICIT_SKILLS` 预注入技能。
+    class _ShortVideoTool(Tool):
+        plan_node = True
+
+        @property
+        def name(self) -> str:
+            return "make_short_video"
+
+        @property
+        def description(self) -> str:
+            return "一句话出片"
+
+        @property
+        def parameters(self) -> dict[str, Any]:
+            return {"type": "object",
+                    "properties": {"prompt": {"type": "string"},
+                                   "seconds": {"type": "number"}},
+                    "required": ["prompt"]}
+
+        async def execute(self, **kw: Any) -> str:
+            return "{}"
+
+    reg.register(_ShortVideoTool())
+
+    class _ShortVideoSkill:
+        name = "short_video_skill"
+        display = "图形科普短片（零素材出片）"
         available = True
 
     async def _installed():
-        return {"motion_explainer_skill": _MotionSkill()}
+        return {"short_video_skill": _ShortVideoSkill()}
 
     bare_plan = {"plans": [{"plan_id": "p1", "label": "零素材科普片", "goal": "一句话出片",
-                            "steps": [{"seq": 1, "node": PlanMotionNode.name,
-                                       "why": "先出分镜", "expectation": "每镜一句文案"}]}]}
+                            "steps": [{"seq": 1, "node": "make_short_video",
+                                       "why": "一句话出片", "expectation": "回一条链接"}]}]}
     filled, _ = await PlanValidator(vocab, skills=_installed).validate(bare_plan)
-    check(filled[0]["steps"][0]["skills_hint"] == ["motion_explainer_skill"],
-          f"卡上没写 skills_hint：校验器按节点把这份技能补进卡面"
-          f"（{filled[0]['steps'][0]['skills_hint']}）")
-    no_lib, _ = await validator.validate(bare_plan)      # validator 没接技能库
-    check(no_lib[0]["steps"][0]["skills_hint"] == [],
+    check(filled and filled[0]["steps"][0]["skills_hint"] == ["short_video_skill"],
+          f"卡上没写 skills_hint：校验器按工具把这份技能补进卡面"
+          f"（{filled[0]['steps'][0]['skills_hint'] if filled else '整份被打回'}）")
+    no_lib, _ = await PlanValidator(vocab, skills=None).validate(bare_plan)
+    check(no_lib and no_lib[0]["steps"][0]["skills_hint"] == [],
           "技能库没接/这份没装时不补——卡上不能挂一个点开是空的技能")
 
     async def _card_with_display(key: str, text: str) -> list[dict[str, Any]]:

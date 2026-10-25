@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """代码镜契约与缓存键（新链 P2-b）。
 
 这条文件只管两件事，各自钉一组「漂了看不出来」的错：
@@ -58,10 +58,10 @@ def skill_md() -> Path:
 
     写法纪律与整片开关的「怎么选」都只写在这一份里（schema 的散文送不到模型那里，
     见 ⑦ 节），所以它漏一条就等于那条纪律不存在。本机在
-    ``backend/examples/skills/motion_explainer/SKILL.md``，app 镜像里是
+    ``backend/examples/retired/motion_explainer/SKILL.md``，app 镜像里是
     ``/app/examples/skills/…``。两处都没有就抛——「读不到就算过」会把这条闸变成空挂。
     """
-    rel = Path("examples") / "skills" / "motion_explainer" / "SKILL.md"
+    rel = Path("examples") / "retired" / "motion_explainer" / "SKILL.md"
     for cand in (Path("/app") / rel, Path(__file__).resolve().parents[1] / rel):
         if cand.is_file():
             return cand
@@ -1139,41 +1139,16 @@ def main() -> int:
     _, v_ok = cs.validate_code_spec(_spec(shots=_shots(["rough", "vector", "katex"] * 2)))
     check(v_ok == [], f"混合通道的六镜片过整份契约（实际 {v_ok}）")
 
-    # —— ⑲ 闸⑲：风格配额。满幅是**结构**判据（打回），质感与底色是**程度**判据（提醒）
-    #    —— 后半句与闸⑨「宁可漏报，不许误报」同一条纪律。
-    #    2026-10-17 删掉了原来的第一条「色板种数 ≥ ceil(n/4)」：它与这一道其余三条
-    #    方向相反（它逼「别二十镜一个色」，而用户在真机上要的正是**整片一个底色**），
-    #    换它的是 spec 顶层那个 `palette` 字段。下面三条断言钉的就是「它真的走了」。
-    base = ["rough", "vector", "katex"] * 2
-    g_errs, g_warns, g_undet = cs.check_style_variety(_shots(base))
-    check(g_errs == [], f"6 镜 4 套色板 + 2 镜满幅 → 绿（实际 {g_errs}）")
-    check(len(g_warns) == 1 and "质感" in g_warns[0],
-          f"质感一档都没显式申报 → 只有提醒、不打回：{[w[:30] for w in g_warns]}")
-    g_errs, g_warns, _ = cs.check_style_variety(_shots(base, bg=False))
-    check(len(g_warns) == 2 and any("底色" in w for w in g_warns),
-          f"满幅镜不给 `bg` → 多一条底色提醒：{[w[:30] for w in g_warns]}")
-    g_errs, _, _ = cs.check_style_variety(_shots(base, palettes=("warm-cream",)))
-    check(g_errs == [],
-          f"6 镜只绑一套色板 → **不再打回**（这一档删了：它逼的正是用户要消除的东西）。"
-          f"整片一个底色现在是 spec 顶层那个字段说了算（实际 {g_errs[:1]}）")
-    check("VARIETY_PALETTE_DIV" not in dir(cs),
-          "那一条判据的常数也一起删了——留着一个没人读的常数，下一个人会以为它还有用")
-    g_errs, _, _ = cs.check_style_variety(_shots(base, bleed=()))
-    check(any("只有 0 镜满幅" in e and "像 PPT" in e for e in g_errs),
-          f"0 镜满幅 → 打回，且文本说清这正是「像 PPT」的结构原因（实际 {g_errs[:1]}）")
-    g_errs, g_warns, g_undet = cs.check_style_variety(_shots(base, palettes=()))
-    check(g_errs == [] and g_undet == [],
-          f"一镜都认不出色板 → 三条判据一条都不响（色板已经不是这一道的判据了，"
-          f"所以连「未判」也不该有——多一条就是在报一个没人问的问题）：{g_undet[:1]}")
-    _five = cs.check_style_variety(_shots(base[:5]))
-    check(_five == ([], [], []),
-          f"5 镜不判：镜数没到 {cs.VARIETY_MIN_SHOTS}，三镜片用三套色板是常态不是纪律"
-          f"（{_five}）")
-    _spec19, v_errs19 = cs.validate_code_spec(_spec(shots=_shots(base, bleed=())))
-    _w19 = cs.whole_film_gate_results(_spec19["shots"])[1]
-    check(not any("闸⑲ 风格配额" in e for e in v_errs19)
-          and not any("闸⑲" in w for w in _w19),
-          f"2026-10-23：闸⑲ 已撤出整片判据——契约入口不打回，出口也不再报（{_w19[:1]}）")
+    # —— ⑲ 闸⑲ 风格配额：**2026-10-24 整道删除**（先 10-23 撤出整片判据，
+    #    再连函数与四个常数一起删）。这里只守一件事：钩子真的走了，别留个没人读的常数
+    #    让下一个人以为它还有用。判据原文归档 docs/已删的闸-2026-10-24.md。
+    check(not hasattr(cs, "check_style_variety")
+          and "VARIETY_PALETTE_DIV" not in dir(cs)
+          and "VARIETY_MIN_SHOTS" not in dir(cs)
+          and "VARIETY_MIN_TEXTURES" not in dir(cs)
+          and "VARIETY_BLEED_DIV" not in dir(cs)
+          and "VARIETY_BG_SHARE" not in dir(cs),
+          "闸⑲ 的函数与它的五个常数一起删了——留一个没人读的常数会误导下一个人")
     # —— 整片色板（2026-10-17）：一个字段作**默认**，个别镜可覆盖 ——
     #    这一节判的是「整片一个字段能不能真的把底色统一起来」，三件事各一支：
     #    契约收下它、它进缓存键、以及认不出自己色板的镜真的落到它上面。
@@ -1292,22 +1267,16 @@ def main() -> int:
     check(cs.validate_code_spec(_spec(identity="true"))[0].get("identity") is True,
           "字符串 \"true\" 也认——卡面与面板发的值就是字符串（`narration` 同规）")
 
-    # —— ⑳ 闸⑳：原创哨兵（`<original>`）与它的配额。先证它会放，再证它会拦 ——
+    # —— ⑳ 闸⑳ 原创配额：**2026-10-24 删除**（`DEMOS_ENABLED` 关着，它本来就不判）。
+    #    夹具留着：下面 ⑫ 的两条哨兵用例还要用它。
+    base = ["rough", "vector", "katex"] * 2
+
     def _with_originals(k: int) -> list[dict]:
         """六镜片，前 k 镜走原创哨兵，其余照旧派生自 demo。"""
         rows = _shots(base)
         for r in rows[:k]:
             r["derived_from"] = [cs.ORIGINAL_SENTINEL]
         return rows
-
-    check(cs.check_original_share(_with_originals(1)) == ([], []),
-          f"六镜里 1 镜原创 → 绿（{cs.check_original_share(_with_originals(1))}）")
-    errs20, _ = cs.check_original_share(_with_originals(2))
-    check(any("闸⑳ 原创配额" in e and "上限是 1 镜" in e for e in errs20),
-          f"六镜里 2 镜原创 → 打回，且文本说清卡库为什么必须占多数：{errs20[:1]}")
-    check(cs.check_original_share(_with_originals(5)[:5]) == ([], []),
-          f"5 镜不判：镜数没到 {cs.ORIGINAL_MIN_SHOTS}"
-          f"（{cs.check_original_share(_with_originals(5)[:5])}）")
     # 同一段长代码，先证红（声明派生自 ListStackPress → 骨架不像 → 打回），
     # 再证绿（只把声明换成哨兵 → 不再响）。这一对才验到「哨兵镜跳过骨架比对」本身。
     _long = CH_CODE["rough"] + "\n" + ("const a = 1;\n" * 40)

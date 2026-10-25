@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """shots/INDEX.md 不许退化（2026-10-14 真机那次 failed 的回归）。
 
 **这份索引不是文档，是选卡的唯一判据。** SKILL.md:56/65 对模型说得很硬：
@@ -44,7 +44,7 @@ from storyline_server.motion import code_spec as cs  # noqa: E402
 
 FAIL: list[str] = []
 
-SKILL = Path(__file__).resolve().parents[1] / "examples/skills/motion_explainer"
+SKILL = Path(__file__).resolve().parents[1] / "examples/retired/motion_explainer"
 INDEX = SKILL / "shots/INDEX.md"
 SHOTS = SKILL / "shots"
 

@@ -1,0 +1,3056 @@
+{
+  "note": "草案：由 tools/scan_system.py 从 demos/ 扫出，未经人工筛选。最终清单应收到 27~40 个，覆盖七类。",
+  "count": 165,
+  "items": [
+    {
+      "name": "Basic3DScene",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/basic-3d-scene/Basic3DScene.tsx",
+      "summary": "basic-3d-scene — impress.js 式空间步进（第二轮重设计） 手法不变：卡片散布在 3D 空间（各有 x·y·z + 旋转 + 缩放），相机取每站姿态之逆依次",
+      "props": [],
+      "imports": [],
+      "lines": 250,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CrashImpactReal",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/crash-zoom-punch/CrashImpactReal.tsx",
+      "summary": "crash-impact 急推撞停（第二轮重设计）——同 crash-zoom 的急推，到位瞬间不回弹而是撞停震屏： 高频抖 + 指数衰减 6f，然后真静止",
+      "props": [],
+      "imports": [],
+      "lines": 305,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CrashZoomReal",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/crash-zoom-punch/CrashZoomReal.tsx",
+      "summary": "crash-zoom 急推（回弹款，第二轮重设计）——真实 projects 页全景一拍砸到 card4 特写",
+      "props": [],
+      "imports": [],
+      "lines": 246,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CursorFlyover",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/cursor-flyover/CursorFlyover.tsx",
+      "summary": "cursor-flyover — 光标导游的四站巡览（第二轮重设计） 手法不变：整页俯瞰 → 相机依次飞到四个功能区特写，光标同步到位指点、点击并留下涟漪，界面即时响应",
+      "props": [],
+      "imports": [],
+      "lines": 390,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "MultiplaneReal",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/depth-layer-moves/MultiplaneReal.tsx",
+      "summary": "multiplane parallax（第二轮重设计）——真实页面拆 3 层深度横移：同一条 drive 位移乘各层系数 （远 0.35x / 中 0.7x / 近 1.4x），速",
+      "props": [],
+      "imports": [],
+      "lines": 138,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "GrazeFaceTour",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/graze-face-tour/GrazeFaceTour.tsx",
+      "summary": "graze-face-tour v3 —— 源片 clickup-30.mp4 约 28.5–33s： 相机大倾角贴着 UI 表面游走特写，三段接力：侧栏树 → 顶部 tab 条 ",
+      "props": [],
+      "imports": [],
+      "lines": 542,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "OverheadTabletopDrop",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/overhead-camera-moves/OverheadTabletopDrop.tsx",
+      "summary": "overhead-tabletop-drop｜上帝视角桌面滑降（第二轮重设计） 手法不变：三张页面卡平躺成桌面卡阵，相机俯拍横滑巡视（只动 translateX，角度锁死）， 滑过",
+      "props": [],
+      "imports": [],
+      "lines": 315,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TiltReveal",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/overhead-camera-moves/TiltReveal.tsx",
+      "summary": "tilt-reveal｜俯仰揭示（第二轮重设计） 手法不变：整页 rotateX 平躺、开场只见上缘一条透视窄带，机位\"抬头\"回正，内容一排排涌入视野",
+      "props": [],
+      "imports": [],
+      "lines": 299,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "DroneDiveLanding",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/space-camera-moves/DroneDiveLanding.tsx",
+      "summary": "",
+      "props": [],
+      "imports": [],
+      "lines": 173,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ExplodedView",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/space-camera-moves/ExplodedView.tsx",
+      "summary": "exploded-view｜爆炸分解（第二轮重设计） 手法不变：整页带 3D 倾斜，构件沿 Z 轴错峰炸开、悬停一拍让层间视差读出深度，再逆序合体落锤收口",
+      "props": [],
+      "imports": [],
+      "lines": 348,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "SteepTiltGlide",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/steep-tilt-glide/SteepTiltGlide.tsx",
+      "summary": "steep-tilt-glide v5（批次 14 #2）",
+      "props": [],
+      "imports": [],
+      "lines": 366,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BulletTimeFreezeOrbit",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/tension-camera-moves/BulletTimeFreezeOrbit.tsx",
+      "summary": "子弹时间冻结环绕（bullet-time-freeze-orbit）——The Matrix bullet time：时间停住，相机却在动",
+      "props": [],
+      "imports": [],
+      "lines": 279,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "PullBackIsolation",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/tension-camera-moves/PullBackIsolation.tsx",
+      "summary": "拉远孤立收束（pull-back-isolation）——pull-back shot",
+      "props": [],
+      "imports": [],
+      "lines": 184,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "Terminal3D",
+      "category": "camera",
+      "category_cn": "镜头运动",
+      "file": "camera/terminal-3d/Terminal3D.tsx",
+      "summary": "terminal-3d —— 三个终端窗散布 3D 空间，相机窗间飞行（途中拉远），每到一窗打字机敲命令、结果逐行吐出",
+      "props": [],
+      "imports": [],
+      "lines": 390,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BeforeAfterSliderScrub",
+      "category": "data",
+      "category_cn": "数据与图表",
+      "file": "data/before-after-slider-scrub/BeforeAfterSliderScrub.tsx",
+      "summary": "before-after-slider-scrub —— 前后对比拉杆 FakeDashboard 两版叠放：before = 低对比灰蒙版（\"处理前\"），after = 正常清晰",
+      "props": [],
+      "imports": [],
+      "lines": 155,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "AxisRescaleShockV2",
+      "category": "data",
+      "category_cn": "数据与图表",
+      "file": "data/chart-live-moves/AxisRescaleShockV2.tsx",
+      "summary": "axis-rescale-shock-v2 —— 轴爆表重标：折线正常爬升，新值顶破图表上沿冲进标题区， 停半拍，y 轴\"哗\"地重标（旧刻度飞出 / 新刻度滑入 / 网格加密 / ",
+      "props": [],
+      "imports": [],
+      "lines": 303,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "OscilloscopeStreamV2",
+      "category": "data",
+      "category_cn": "数据与图表",
+      "file": "data/chart-live-moves/OscilloscopeStreamV2.tsx",
+      "summary": "oscilloscope-stream-v2 —— 示波流线：曲线写入点钉在右侧上下起伏，旧数据向左流出画",
+      "props": [],
+      "imports": [],
+      "lines": 290,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "UnitDotSwarmRegroupV2",
+      "category": "data",
+      "category_cn": "数据与图表",
+      "file": "data/chart-live-moves/UnitDotSwarmRegroupV2.tsx",
+      "summary": "unit-dot-swarm-regroup-v2 —— 单位点阵重组：320 个点（每点 ≈ 40 次渲染）三幕迁徙—— 散布 → 按片型聚成三簇 → 列队成柱 → 拼成大数字「",
+      "props": [],
+      "imports": [],
+      "lines": 278,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "NeedleSweepSelftest",
+      "category": "data",
+      "category_cn": "数据与图表",
+      "file": "data/gauge-readout-moves/NeedleSweepSelftest.tsx",
+      "summary": "needle-sweep-selftest —— 满弧扫针自检 卡片内三个并排 270° 表盘",
+      "props": [],
+      "imports": [],
+      "lines": 307,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TapeScrollFixedPointer",
+      "category": "data",
+      "category_cn": "数据与图表",
+      "file": "data/gauge-readout-moves/TapeScrollFixedPointer.tsx",
+      "summary": "tape-scroll-fixed-pointer —— 滚带定针（世界动、针不动：数值大小 = 看得见的位移距离） 第二轮重设计（瓷白精密仪器 · 航电速度带语法）： - loo",
+      "props": [],
+      "imports": [],
+      "lines": 215,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BrakeReticleLock",
+      "category": "data",
+      "category_cn": "数据与图表",
+      "file": "data/scroll-brake-moves/BrakeReticleLock.tsx",
+      "summary": "组合：长卷急刹 × 准星咬合（brake-reticle-lock） changelog 长列表从下往上高速掠过（加速冲刺→9f 猛减速带 30px 超调回弹）， 急刹帧（BRAK",
+      "props": [],
+      "imports": [],
+      "lines": 299,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ChangelogScrollBrake",
+      "category": "data",
+      "category_cn": "数据与图表",
+      "file": "data/scroll-brake-moves/ChangelogScrollBrake.tsx",
+      "summary": "changelog-scroll-brake —— Changelog 长卷急刹 ~34 行条目（行高错落）从下往上高速掠过（快起步 + 指数式长尾减速）， 高速段叠纵向运动模糊（",
+      "props": [],
+      "imports": [],
+      "lines": 232,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TimelineTravel",
+      "category": "data",
+      "category_cn": "数据与图表",
+      "file": "data/timeline-travel/TimelineTravel.tsx",
+      "summary": "timeline-travel —— 时间轴横移（《反恐王国》式） 镜头沿水平刻度轴加速横移，v1.0/v2.0/v3.0/Today 四个刻度依次掠过， 每过刻度对应卡片从刻度线",
+      "props": [],
+      "imports": [],
+      "lines": 290,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "AssembleThenTypeFlyin",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/assemble-then-type-flyin/AssembleThenTypeFlyin.tsx",
+      "summary": "assemble-then-type-flyin — 先骨架后文字：页面\"自己长出来\" 第二轮重设计（石墨暗场 · 胶片金 · 发布页）： - look = graphite（近单",
+      "props": [],
+      "imports": [],
+      "lines": 273,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "AuroraBloomBgFlip",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/aurora-bloom-bg-flip/AuroraBloomBgFlip.tsx",
+      "summary": "aurora-bloom-bg-flip — Aurora Bloom 极光升腾底色反转（motion-lab 定稿转原生 Remotion） 浅灰底从底部升起紫橙柔焦 blob，",
+      "props": [],
+      "imports": [],
+      "lines": 167,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BrandFrameSnap",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/brand-frame-snap/BrandFrameSnap.tsx",
+      "summary": "brand-frame-snap —— figma-devmode 0:28–0:32 (brand-frame-snap) + 0:43–0:47 (frame-color-fl",
+      "props": [],
+      "imports": [],
+      "lines": 536,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ReticleLockOn",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/fui-hud-moves/ReticleLockOn.tsx",
+      "summary": "reticle-lock-on —— 准星咬合（钢铁侠 HUD / 安德的游戏） FakeDashboard 静置",
+      "props": [],
+      "imports": [],
+      "lines": 164,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "FlylineArc",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/glow-flyline-moves/FlylineArc.tsx",
+      "summary": "flyline-arc —— 飞线连接 暗场版 FakeDashboard A 压暗当底，左上卡→右下卡一条贝塞尔弧线\"打\"过去（22f, out-cubic 生长）， 亮点头部领",
+      "props": [],
+      "imports": [],
+      "lines": 175,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "GlowOrbAmbient",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/glow-flyline-moves/GlowOrbAmbient.tsx",
+      "summary": "glow-orb-ambient｜暗场光斑呼吸——三团大光斑有机漂移，中央卡的边缘随最近的光斑靠近而泛光",
+      "props": [],
+      "imports": [],
+      "lines": 197,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "OrbFlylineRelay",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/glow-flyline-moves/OrbFlylineRelay.tsx",
+      "summary": "orb-flyline-relay｜光斑飞线接力——氛围层（光斑）与事件层（飞线）同帧共振：飞线落点那一帧， 节点背后的光斑一起涨亮一拍，背景给前景\"搭腔\"",
+      "props": [],
+      "imports": [],
+      "lines": 241,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "AttentionBounce",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/icon-performance-moves/AttentionBounce.tsx",
+      "summary": "求关注弹跳（attention-bounce）——macOS Dock 语汇：图标原地连跳讨拍，一次比一次高，镜头被它吸引过去",
+      "props": [],
+      "imports": [],
+      "lines": 279,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "AnimeImpact",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/impact-feedback/AnimeImpact.tsx",
+      "summary": "",
+      "props": [],
+      "imports": [],
+      "lines": 230,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "HitCounter",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/impact-feedback/HitCounter.tsx",
+      "summary": "hit-counter 连招计数：三张功能卡接连砸入槽位，每次命中 = 全局顿帧 2f + 落点伤害数字上浮渐隐 + 右上角 ×N combo 跳字（脉冲 / 倾斜 / 字号逐次加",
+      "props": [],
+      "imports": [],
+      "lines": 345,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "SheenSweepRetry",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/light-play-moves/SheenSweepRetry.tsx",
+      "summary": "sheen-sweep-retry —— 单点扫光（高标准重试）：深墨主角卡上一道斜向高光带缓扫一次，被圆角裁住，无声的加冕",
+      "props": [],
+      "imports": [],
+      "lines": 275,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "SpotlightSweepReveal",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/light-play-moves/SpotlightSweepReveal.tsx",
+      "summary": "spotlight-sweep-reveal —— 聚光扫字：暗场里几乎不可见的标题，被一盏摆动的追光扫亮，光到哪哪亮",
+      "props": [],
+      "imports": [],
+      "lines": 229,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "RadialRipplePhoneChips",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/radial-ripple-phone-chips/RadialRipplePhoneChips.tsx",
+      "summary": "radial-ripple-phone-chips — 同心波纹手机：四层同心圆错相呼吸如水波，中央手机屏内 feed 自动缓滚， 两侧 chip 先后 spring pop 入场",
+      "props": [],
+      "imports": [],
+      "lines": 312,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "RisoMisregistrationHit",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/riso-print-hits/RisoMisregistrationHit.tsx",
+      "summary": "套印错位冲击帧（riso-misregistration-hit）——标题撞停瞬间裂成两份单色\"印版\" （mix-blend-mode: multiply 叠在纸上），像 riso",
+      "props": [],
+      "imports": [],
+      "lines": 222,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ScanBracketSweep",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/scan-bracket-sweep/ScanBracketSweep.tsx",
+      "summary": "scan-bracket-sweep — Scan Bracket 取景括号扫描光带（motion-lab 定稿转原生 Remotion） 文档弹到画面中央，四角落下 L 形取景括",
+      "props": [],
+      "imports": [],
+      "lines": 295,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ScanlineAnnotateFocus",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/scanline-annotate-focus/ScanlineAnnotateFocus.tsx",
+      "summary": "scanline-annotate-focus — 扫描分析取景标注：一条扫描线自上而下匀速掠过一张已存在的品牌官网， 扫过哪个区块的下缘，哪块就被一组取景角标\"收拢对准\"，随后贴",
+      "props": [],
+      "imports": [],
+      "lines": 329,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ScanlineAssembleFlyin",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/scanline-assemble-flyin/ScanlineAssembleFlyin.tsx",
+      "summary": "scanline-assemble-flyin — 扫描装配组件飞入：开场只有一张蓝图画板（网格 + 虚线槽位），一条扫描线自上而下 匀速掠过",
+      "props": [],
+      "imports": [],
+      "lines": 315,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ImpactBurstKit",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/slam-entrance-moves/ImpactBurstKit.tsx",
+      "summary": "落点冲击套件（impact-burst-kit）——主卡从镜头前砸进页面里的空槽位，落点帧同帧起爆 冲击环 + 碎屑迸发 + 震屏",
+      "props": [],
+      "imports": [],
+      "lines": 264,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "KanadaPerspectiveSnap",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/slam-entrance-moves/KanadaPerspectiveSnap.tsx",
+      "summary": "金田透视急停（kanada-perspective-snap）——金田伊功式夸张透视入场：卡片以鱼眼级透视姿态贴着镜头 从左侧甩进画面中心，透视随减速从短焦收敛到长焦，落定瞬间\"啪",
+      "props": [],
+      "imports": [],
+      "lines": 260,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ScoreSlam",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/slam-entrance-moves/ScoreSlam.tsx",
+      "summary": "比分砸落入场（score-slam）——体育转播比分弹窗式 slam：比分卡从镜头前 2.6 倍大小加速砸到屏心， 落点帧同帧起爆三件套（冲击环 + 碎片火花 + 震屏），砸落带一",
+      "props": [],
+      "imports": [],
+      "lines": 263,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CornerSpotlightReveal",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/spotlight-sweep-moves/CornerSpotlightReveal.tsx",
+      "summary": "corner-spotlight-reveal —— 对标 clickup-30.mp4 41.5–44.6s： 黑场上，左上角径向聚光从小到大扩张，把白色 video-shotc",
+      "props": [],
+      "imports": [],
+      "lines": 123,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "GlowWakeSleepPanel",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/spotlight-sweep-moves/GlowWakeSleepPanel.tsx",
+      "summary": "glow-wake-sleep-panel v3 —— 扫光方向改为从左向右（用户裁决）： 聚光灯从左向右\"扫过\"斜置面板",
+      "props": [],
+      "imports": [],
+      "lines": 187,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "SlideSpotlightPan",
+      "category": "effects",
+      "category_cn": "光效与质感",
+      "file": "effects/spotlight-sweep-moves/SlideSpotlightPan.tsx",
+      "summary": "slide-spotlight-pan v2 —— 按用户截图 clickup03 重做： 紫色光线贴着 UI 面板边缘泛光（先绕左上角竖缘、再沿顶边横走）， 聚光头匀速右移，照到",
+      "props": [],
+      "imports": [],
+      "lines": 175,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "AutolayoutGapDial",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/autolayout-gap-dial/AutolayoutGapDial.tsx",
+      "summary": "autolayout-gap-dial —— framer-ai 4.5–5.5s 间距拨盘驱动布局：一个 gap 数值同帧驱动整排导航块的位置、测量线、徽章与读数",
+      "props": [],
+      "imports": [],
+      "lines": 305,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "DiagramCascadeBuild",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/canvas-materialize-moves/DiagramCascadeBuild.tsx",
+      "summary": "diagram-cascade-build —— miro-promo 104–116s prompt 打字 → 结构图逐层级联生成（根 → 2 子 → 4 孙），连线先于节点生长",
+      "props": [],
+      "imports": [],
+      "lines": 350,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "PanelToCanvasMaterialize",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/canvas-materialize-moves/PanelToCanvasMaterialize.tsx",
+      "summary": "panel-to-canvas-materialize —— miro-promo 84–92s 侧面板列表行逐个打勾 → 按钮按下 → 三行沿上抛弧线错峰飞出面板、跨容器变形成画",
+      "props": [],
+      "imports": [],
+      "lines": 352,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ChipGridSingleSelectBlackout",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/chip-grid-single-select-blackout/ChipGridSingleSelectBlackout.tsx",
+      "summary": "chip-grid-single-select-blackout —— Single Select 1 帧灰闪单选反黑 五个选项 chip 3+2 居中排布错峰入场",
+      "props": [],
+      "imports": [],
+      "lines": 218,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CursorCastEnsemble",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/collab-cursor-moves/CursorCastEnsemble.tsx",
+      "summary": "cursor-cast-ensemble —— figma 0:05 (cursor-badge-cast) + miro 全片 cursor-ensemble-ambience ",
+      "props": [],
+      "imports": [],
+      "lines": 297,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "GlassPillDictationTyping",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/glass-pill-dictation-typing/GlassPillDictationTyping.tsx",
+      "summary": "glass-pill-dictation-typing — Glass Pill Dictation 玻璃胶囊听写 一条定宽玻璃胶囊以约 1.25 倍略大浮现、缓落到位",
+      "props": [],
+      "imports": [],
+      "lines": 157,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "HashtagToPillMaterialize",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/hashtag-to-pill-materialize/HashtagToPillMaterialize.tsx",
+      "summary": "hashtag-to-pill-materialize（bear-app 18–21.5s 重做版，按原片密帧逐帧对照） 原片实测节奏（25fps 逐帧）： 1) 白底居中打字 \"",
+      "props": [],
+      "imports": [],
+      "lines": 218,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "PickerCarouselFeatureCycle",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/picker-carousel-feature-cycle/PickerCarouselFeatureCycle.tsx",
+      "summary": "picker-carousel-feature-cycle — Picker Carousel 功能名吸附轮播（motion-lab 定稿转原生 Remotion） 移动端风竖向选",
+      "props": [],
+      "imports": [],
+      "lines": 202,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "SegmentedThumbHero",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/segmented-thumb-hero/SegmentedThumbHero.tsx",
+      "summary": "segmented-thumb-hero —— 分段控件 thumb 位移当叙事主角拍特写 源：perplexity-promo 2.3–5s",
+      "props": [],
+      "imports": [],
+      "lines": 265,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "PaletteThemeRipple",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/theme-switch-moves/PaletteThemeRipple.tsx",
+      "summary": "组合：命令面板 × 深浅涟漪（palette-theme-ripple）——第二轮重设计：video-shotcraft 样片画廊 · 关灯 设计决定： - 主体：满屏的 vide",
+      "props": [],
+      "imports": [],
+      "lines": 457,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ThemeSweepToggle",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/theme-switch-moves/ThemeSweepToggle.tsx",
+      "summary": "theme-sweep-toggle —— 深浅模式扫场（第二轮重设计：video-shotcraft 发布周排期 · 昼 → 夜） 设计决定： - 主体：video-shotcr",
+      "props": [],
+      "imports": [],
+      "lines": 446,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TypeAndFilter",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/type-and-filter/TypeAndFilter.tsx",
+      "summary": "type-and-filter —— 真实 UI 上打字搜索、网格自己收敛成一张卡、点击穿透进详情页 功能演示的\"操作叙事\"段：让观众\"跟着做一遍\"",
+      "props": [],
+      "imports": [],
+      "lines": 249,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "VoiceWaveformLive",
+      "category": "interaction",
+      "category_cn": "交互演示",
+      "file": "interaction/voice-waveform-live/VoiceWaveformLive.tsx",
+      "summary": "voice-waveform-live —— 录音胶囊实时声纹（第二轮重设计：video-shotcraft 语音口述分镜 · 午后暖光） 设计决定： - look = sand（",
+      "props": [],
+      "imports": [],
+      "lines": 278,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CraneRiseReveal",
+      "category": "opening",
+      "category_cn": "开场",
+      "file": "opening/crane-rise-reveal/CraneRiseReveal.tsx",
+      "summary": "升降臂拉升揭示（crane-rise-reveal）——crane shot：焦点 → 全局",
+      "props": [],
+      "imports": [],
+      "lines": 332,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "DatavizLandscapeOpen",
+      "category": "opening",
+      "category_cn": "开场",
+      "file": "opening/dataviz-landscape-open/DatavizLandscapeOpen.tsx",
+      "summary": "DatavizLandscapeOpen — 暗场支流线束地景开场 配方卡: references/shots/opening/dataviz-landscape-open.md ",
+      "props": [],
+      "imports": [],
+      "lines": 358,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "Fracture",
+      "category": "opening",
+      "category_cn": "开场",
+      "file": "opening/fracture/Fracture.tsx",
+      "summary": "fracture — Fracture Reassemble 碎片聚合（motion-lab 定稿转原生 Remotion） 5×5 瓦片从 3D 空间随机碎片态（±大位移 + 三",
+      "props": [],
+      "imports": [],
+      "lines": 201,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "IconFieldColorize",
+      "category": "opening",
+      "category_cn": "开场",
+      "file": "opening/icon-field-colorize/IconFieldColorize.tsx",
+      "summary": "icon-field-colorize —— 灰阶图标原野错峰浮现铺满全屏，停一拍后多道品牌色横带波纹极快向下扫翻全场， 终态多色横带",
+      "props": [],
+      "imports": [],
+      "lines": 200,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "LetterspaceMaterialize",
+      "category": "opening",
+      "category_cn": "开场",
+      "file": "opening/letterspace-materialize/LetterspaceMaterialize.tsx",
+      "summary": "letterspace-materialize v3 —— 按批次 11 用户意见修正（截图 superhuman，4 张）： ① 字形比例改宽：v2 竖长（60x100），对照终",
+      "props": [],
+      "imports": [],
+      "lines": 208,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "MagicianCardFlourish",
+      "category": "opening",
+      "category_cn": "开场",
+      "file": "opening/magician-card-flourish/MagicianCardFlourish.tsx",
+      "summary": "magician-card-flourish —— 魔术师甩牌：蓝色星芒闪现，卡片从光里被\"变\"出来， 极速自旋弧线飞向镜头，到位瞬间硬定格，定格后一次 sheen 扫光",
+      "props": [],
+      "imports": [],
+      "lines": 341,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "OrbitRingTitleOpen",
+      "category": "opening",
+      "category_cn": "开场",
+      "file": "opening/orbit-ring-title-open/OrbitRingTitleOpen.tsx",
+      "summary": "1 荧光笔扫读",
+      "props": [],
+      "imports": [],
+      "lines": 389,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "SpotlightHeroCard",
+      "category": "opening",
+      "category_cn": "开场",
+      "file": "opening/spotlight-hero-card/SpotlightHeroCard.tsx",
+      "summary": "spotlight-hero-card —— 聚光灯扫过页面锁定一张卡 → 斜侧推进 → 卡片弹起悬浮 → 轮廓光束两圈 → 贴回原位",
+      "props": [],
+      "imports": [],
+      "lines": 293,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "StrokeSegmentBuild",
+      "category": "opening",
+      "category_cn": "开场",
+      "file": "opening/stroke-segment-build/StrokeSegmentBuild.tsx",
+      "summary": "stroke-segment-build —— 断笔成字（《异形》式）：标题拆成十几段互不相连的笔画，乱序逐段点亮， 前 70% 读不出字，最后几段\"钥匙段\"落位的瞬间意义\"啪\"地",
+      "props": [],
+      "imports": [],
+      "lines": 183,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TextAsMask",
+      "category": "opening",
+      "category_cn": "开场",
+      "file": "opening/text-as-mask/TextAsMask.tsx",
+      "summary": "文字视频遮罩（text-as-mask）——超粗大标题字内部透出缓慢平移的产品画面，结尾字形放大溢出、 内部画面接管全屏",
+      "props": [],
+      "imports": [],
+      "lines": 245,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "GrainDissolve",
+      "category": "outro",
+      "category_cn": "收尾",
+      "file": "outro/grain-dissolve/GrainDissolve.tsx",
+      "summary": "grain-dissolve — Grain Dissolve → Condense 文字砂化凝聚（motion-lab 定稿转原生 Remotion） 干净的整行字 \"{ vid",
+      "props": [],
+      "imports": [],
+      "lines": 222,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "LogoShrinkWordmarkLockup",
+      "category": "outro",
+      "category_cn": "收尾",
+      "file": "outro/logo-shrink-wordmark-lockup/LogoShrinkWordmarkLockup.tsx",
+      "summary": "logo-shrink-wordmark-lockup — Shrink & Lockup 图标收束落位（motion-lab 定稿转原生 Remotion） 霓虹切口大环 eas",
+      "props": [],
+      "imports": [],
+      "lines": 223,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "NeonTripleMarquee",
+      "category": "outro",
+      "category_cn": "收尾",
+      "file": "outro/neon-triple-marquee/NeonTripleMarquee.tsx",
+      "summary": "neon-triple-marquee —— 三行对向霓虹跑马灯 recap（clickup-30 61–64.5s 的手法） 第二轮重设计（夜里的灯牌墙 · 斜拍 + 湿地面反光",
+      "props": [],
+      "imports": [],
+      "lines": 217,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "OutroGroupPhotoLaunch",
+      "category": "outro",
+      "category_cn": "收尾",
+      "file": "outro/outro-group-photo-launch/OutroGroupPhotoLaunch.tsx",
+      "summary": "outro-group-photo-launch —— 全片元素四方飞来围住字标合影，crane 落机位 + 舞台光 + 金尘做成发布会收场",
+      "props": [],
+      "imports": [],
+      "lines": 343,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "UiStripAwayOutro",
+      "category": "outro",
+      "category_cn": "收尾",
+      "file": "outro/ui-strip-away-outro/UiStripAwayOutro.tsx",
+      "summary": "ui-strip-away-outro —— framer-ai 33–36.5s 满屏\"编辑器\"里光标点击高亮 Publish 按钮 → UI 层层错峰蒸发退场 （每层 fade",
+      "props": [],
+      "imports": [],
+      "lines": 357,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "IconFlipBloomLogo",
+      "category": "outro",
+      "category_cn": "收尾",
+      "file": "outro/ui-to-brand-morph/IconFlipBloomLogo.tsx",
+      "summary": "icon-flip-bloom-logo —— 图标 Y 轴翻转压扁成竖线，绽放成花形 mark + wordmark 扫出 源：perplexity-promo 88–91.5s",
+      "props": [],
+      "imports": [],
+      "lines": 187,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "InputMorphsIntoLogo",
+      "category": "outro",
+      "category_cn": "收尾",
+      "file": "outro/ui-to-brand-morph/InputMorphsIntoLogo.tsx",
+      "summary": "input-morphs-into-logo —— slack-promo 40–41s · B 式 input-morph-assemble 第二轮重设计（「字标构造图」· 瑞士",
+      "props": [],
+      "imports": [],
+      "lines": 333,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "PaparazziFlash",
+      "category": "rhythm",
+      "category_cn": "节奏与切点",
+      "file": "rhythm/beat-cut-moves/PaparazziFlash.tsx",
+      "summary": "paparazzi-flash（B 连闪定格）—— 高光时刻三连白闪，每闪硬切同一画面的不同裁切 （全景 → 奖牌卡 → 数字特写），快门余韵沉降，第三闪停在数字上收束",
+      "props": [],
+      "imports": [],
+      "lines": 274,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BeatStepListThemeCycle",
+      "category": "rhythm",
+      "category_cn": "节奏与切点",
+      "file": "rhythm/beat-step-list-theme-cycle/BeatStepListThemeCycle.tsx",
+      "summary": "beat-step-list-theme-cycle（bear 22.3–24.6s）——三通道节拍器：形容词列表逐拍上移一行、 视口中央固定胶囊\"接住\"新词并换色、整场底色同拍跟",
+      "props": [],
+      "imports": [],
+      "lines": 270,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ComicPanelSplit",
+      "category": "rhythm",
+      "category_cn": "节奏与切点",
+      "file": "rhythm/panel-grid-moves/ComicPanelSplit.tsx",
+      "summary": "comic-panel-split｜漫画分格并列 —— 同一主体，三个机位，咔咔咔三格定格，末格斜边吃屏",
+      "props": [],
+      "imports": [],
+      "lines": 430,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "QuadSplitParallelScenes",
+      "category": "rhythm",
+      "category_cn": "节奏与切点",
+      "file": "rhythm/quad-split-parallel-scenes/QuadSplitParallelScenes.tsx",
+      "summary": "quad-split-parallel-scenes — Quad Split 四宫并行蒙太奇 手法卡：画面硬切 2×2 四宫格，四个象限并行跑各自独立的微场景，关键节拍互相错开 ",
+      "props": [],
+      "imports": [],
+      "lines": 252,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "JumpCutPunchIn",
+      "category": "rhythm",
+      "category_cn": "节奏与切点",
+      "file": "rhythm/rhythm-interrupt-moves/JumpCutPunchIn.tsx",
+      "summary": "三级跳切推近（jump-cut-punch-in）——节奏剪辑｜戈达尔跳切/纪录片 punch-in",
+      "props": [],
+      "imports": [],
+      "lines": 106,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "SakugaTimingShift",
+      "category": "rhythm",
+      "category_cn": "节奏与切点",
+      "file": "rhythm/sakuga-timing-shift/SakugaTimingShift.tsx",
+      "summary": "sakuga-timing-shift —— 一拍三转一拍一（作画打拍切换） 第二轮重设计（动画师的作画纸 · 赛璐珞卡）： - look = paper（暖白纸 · 墨 · 朱红",
+      "props": [],
+      "imports": [],
+      "lines": 288,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "FreezeAnnotateReal",
+      "category": "rhythm",
+      "category_cn": "节奏与切点",
+      "file": "rhythm/speed-ramp-freeze/FreezeAnnotateReal.tsx",
+      "summary": "freeze-annotate 定格标注——真实卡片流运动中瞬间定格，马克笔圈注目标卡 + 箭头点题，解冻继续",
+      "props": [],
+      "imports": [],
+      "lines": 362,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TrailerBumper",
+      "category": "rhythm",
+      "category_cn": "节奏与切点",
+      "file": "rhythm/trailer-grammar-moves/TrailerBumper.tsx",
+      "summary": "trailer-bumper｜前置速剪预告 结构即全部：三连 9f 速剪（A 整页 / B 整页 / A 中列 Top pages 卡 2.2x 怼脸特写）→ 6f 纯黑喘息 → ",
+      "props": [],
+      "imports": [],
+      "lines": 168,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CompareDuel",
+      "category": "science",
+      "category_cn": "科普图解",
+      "file": "science/compare-duel/CompareDuel.tsx",
+      "summary": "compare-duel —— 对比对擂（科普向） 治的是什么：科普片里\"这两样东西有什么区别\"是最高频的句子之一—— 有性 vs 无性、内燃机 vs 电动机、近视 vs 远视、燃",
+      "props": [],
+      "imports": [
+        "@dg/fixtures/Fixtures",
+        "@dg/polish"
+      ],
+      "lines": 248,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CrossSectionReveal",
+      "category": "science",
+      "category_cn": "科普图解",
+      "file": "science/cross-section-reveal/CrossSectionReveal.tsx",
+      "summary": "cross-section-reveal —— 剖面揭示（科普向） 治的是什么：现有 124 张卡全是产品宣传片语汇（镜头/UI 入场/字体/转场）， 讲\"一个东西里面是什么\"时一",
+      "props": [],
+      "imports": [
+        "@dg/fixtures/Fixtures",
+        "@dg/polish"
+      ],
+      "lines": 321,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CurveFunctionTrace",
+      "category": "science",
+      "category_cn": "科普图解",
+      "file": "science/curve-function-trace/CurveFunctionTrace.tsx",
+      "summary": "curve-function-trace —— 函数曲线逐笔绘制（科普向） 治的是什么：科普片里「这个函数长什么样」是最高频的画面之一—— 正弦、抛物线、指数衰减、阻尼振荡",
+      "props": [],
+      "imports": [
+        "@dg/fixtures/Fixtures",
+        "@dg/polish"
+      ],
+      "lines": 255,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ExplodedAssembly",
+      "category": "science",
+      "category_cn": "科普图解",
+      "file": "science/exploded-assembly/ExplodedAssembly.tsx",
+      "summary": "exploded-assembly —— 拆解合体（科普向） 治的是什么：讲\"一个东西由哪些部分组成、各部分在哪\"——原子、细胞、发动机、 心脏——现有 128 张卡里 camer",
+      "props": [],
+      "imports": [
+        "@dg/fixtures/Fixtures",
+        "@dg/polish"
+      ],
+      "lines": 238,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "GrowthMorph",
+      "category": "science",
+      "category_cn": "科普图解",
+      "file": "science/growth-morph/GrowthMorph.tsx",
+      "summary": "growth-morph —— 生长变形（科普向） 治的是什么：讲\"这个东西是怎么一步步长成的\"——完全变态、生命周期、 恒星演化、材料的相变——现有 128 张卡没有一张讲\"形态",
+      "props": [],
+      "imports": [
+        "@dg/fixtures/Fixtures",
+        "@dg/polish"
+      ],
+      "lines": 337,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "MapTerrainBuild",
+      "category": "science",
+      "category_cn": "科普图解",
+      "file": "science/map-terrain-build/MapTerrainBuild.tsx",
+      "summary": "map-terrain-build —— 地图地形（科普向） 治的是什么：讲地理/地质/流域时，模型手上只有 ui-entrance 那 21 张产品片卡， 于是把地形画成了「带圆",
+      "props": [],
+      "imports": [
+        "@dg/fixtures/Fixtures",
+        "@dg/polish"
+      ],
+      "lines": 325,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "MetaphorBridge",
+      "category": "science",
+      "category_cn": "科普图解",
+      "file": "science/metaphor-bridge/MetaphorBridge.tsx",
+      "summary": "metaphor-bridge —— 比喻桥（科普向） 治的是什么：科普片最难的一步是\"让抽象数字变得可感\"",
+      "props": [],
+      "imports": [
+        "@dg/fixtures/Fixtures",
+        "@dg/polish"
+      ],
+      "lines": 399,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ProcessDiagramFlow",
+      "category": "science",
+      "category_cn": "科普图解",
+      "file": "science/process-diagram-flow/ProcessDiagramFlow.tsx",
+      "summary": "process-diagram-flow —— 流程示意（循环型，科普向） 治的是什么：讲\"这个过程怎么走一圈\"时，模型手上只有产品片的转场卡， 于是把流程做成了\"几张卡片依次淡入",
+      "props": [],
+      "imports": [
+        "@dg/fixtures/Fixtures",
+        "@dg/polish"
+      ],
+      "lines": 439,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TimelineEvolution",
+      "category": "science",
+      "category_cn": "科普图解",
+      "file": "science/timeline-evolution/TimelineEvolution.tsx",
+      "summary": "timeline-evolution —— 演化时间轴（真实比例，科普向） 治的是什么：讲\"这件事是怎么一步步变成这样的\"——生命演化、恒星一生、 元素发现史、气候变迁——现有 1",
+      "props": [],
+      "imports": [
+        "@dg/fixtures/Fixtures",
+        "@dg/polish"
+      ],
+      "lines": 256,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BottomPushStackWipe",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/bottom-push-stack-wipe/BottomPushStackWipe.tsx",
+      "summary": "bottom-push-stack-wipe —— slack-promo 22–27s 换章手法不变：新章连底色整屏从底边向上推入，把旧章刚性顶出画外（两层同速同缓动），连推三章",
+      "props": [],
+      "imports": [],
+      "lines": 310,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CardFlipReveal",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/card-flip-reveal/CardFlipReveal.tsx",
+      "summary": "功能卡 3D 翻面揭示（card-flip-reveal）——Apple bento 翻转段",
+      "props": [],
+      "imports": [],
+      "lines": 261,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CardFlockTumble",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/card-flock-tumble/CardFlockTumble.tsx",
+      "summary": "card-flock-tumble —— 三张 UI 页卡从侧棱薄边 3D 翻飞成阶梯站定（一条 Catmull-Rom 样条，全程清晰）， 站定后保持慢转不停，10f 加速吸入中",
+      "props": [],
+      "imports": [],
+      "lines": 459,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CircleMatchIris",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/circle-match-iris/CircleMatchIris.tsx",
+      "summary": "circle-match-iris — 圆心匹配光圈切（match-cut × iris）：光圈从前景一个真圆的圆心炸开， 圈内新景的圆环图表接在同一个圆上——\"这个人的头像\"变成",
+      "props": [],
+      "imports": [],
+      "lines": 294,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "GradientTransition",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/gradient-transition/GradientTransition.tsx",
+      "summary": "gradient-transition — 背景在 linear → radial → conic 三类 CSS 渐变间平滑过渡： 同类型内逐参数插值（角度 / 色标 / 中心 /",
+      "props": [],
+      "imports": [],
+      "lines": 161,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "LineCarryTransition",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/line-carry-transition/LineCarryTransition.tsx",
+      "summary": "line-carry-transition｜线条接力横移转场（Catch Me If You Can 片头式图形接力） 场景 A 的进度条走满 → 末端延伸成长线冲出卡缘 → 镜头",
+      "props": [],
+      "imports": [],
+      "lines": 248,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "MosaicReframe",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/mosaic-reframe/MosaicReframe.tsx",
+      "summary": "mosaic-reframe — 12 张瓦片在三种排版间连续变形：规则网格 → feature mosaic → 对角瀑布串",
+      "props": [],
+      "imports": [],
+      "lines": 359,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BarnDoorSplit",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/page-turn-transitions/BarnDoorSplit.tsx",
+      "summary": "对开门裂幕（barn-door-split-reveal）——旧页从正中裂成两扇门向外加速让位，新页从门缝里迎上来",
+      "props": [],
+      "imports": [],
+      "lines": 227,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "InkBleedReveal",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/print-texture-transitions/InkBleedReveal.tsx",
+      "summary": "墨渗揭示（ink-bleed-reveal）——水墨转场（轨道遮罩法）",
+      "props": [],
+      "imports": [],
+      "lines": 162,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "PortalWipeV2",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/shot-transitions/PortalWipeV2.tsx",
+      "summary": "portal-wipe 穿窗入景（纵深款）——网格里一张卡放大成全屏窗口，窗内是被点开那张卡的\"世界\"， 只 2 层视差（远景面板 0.08 + 近景 2 枚浮卡 0.3，不加 b",
+      "props": [],
+      "imports": [],
+      "lines": 248,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "WhipBrakeReal",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/shot-transitions/WhipBrakeReal.tsx",
+      "summary": "E 式急刹款 whip-brake——真实项目卡排成横向长廊，甩过 7 张卡后在目标卡（card4-hires 高清纹理） 前急刹、长尾滑入落位",
+      "props": [],
+      "imports": [],
+      "lines": 186,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "GlitchDisplace",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/tear-streak-transitions/GlitchDisplace.tsx",
+      "summary": "glitch-displace｜噪声置换撕裂——整页被切成 16 条不等高横条，各条在 ±70px 内高速左右错位抖动， 抖动最猛时硬切到下一页，再抖几帧归位",
+      "props": [],
+      "imports": [],
+      "lines": 355,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "InvisibleCut",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/transition-hidden-cut/InvisibleCut.tsx",
+      "summary": "invisible-cut：前景遮挡隐形切——离镜头极近的失焦前景物贴脸横扫，糊满全屏的那一两帧里 背景从 A 无痕硬切成 B，前景扫出画时观众以为还是同一镜",
+      "props": [],
+      "imports": [],
+      "lines": 272,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "LightLeakBurn",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/transition-hidden-cut/LightLeakBurn.tsx",
+      "summary": "light-leak-burn〔转场〕：一团暖色胶片漏光从右上角斜扫入画，亮度顶峰时吞掉旧画面七成以上（高光溢出、 对比度被冲淡），光峰帧硬切新画面，光沿对角线退散时新画面已在光下",
+      "props": [],
+      "imports": [],
+      "lines": 262,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "VersusSlam",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/transition-hidden-cut/VersusSlam.tsx",
+      "summary": "versus-slam 对撞开屏：左右两个半屏（78° 斜切边）从画外加速对冲，沿斜缝砰地撞合",
+      "props": [],
+      "imports": [],
+      "lines": 217,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "LetterformZoom",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/transition-travel/LetterformZoom.tsx",
+      "summary": "letterform-zoom〔转场〕：巨型章节标题的字形是一扇扇\"窗\"，窗里透出下一页",
+      "props": [],
+      "imports": [],
+      "lines": 285,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "WhiteFlashLogoSimplifyCut",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/white-flash-logo-simplify-cut/WhiteFlashLogoSimplifyCut.tsx",
+      "summary": "white-flash-logo-simplify-cut — White Flash Simplify 冲白降维切换 液态金属质感的彩色词标静置流光，蓄力后从字心炸出一记白闪过曝",
+      "props": [],
+      "imports": [],
+      "lines": 205,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BlindsSlice",
+      "category": "transition",
+      "category_cn": "转场",
+      "file": "transition/wipe-transitions/BlindsSlice.tsx",
+      "summary": "blinds-slice｜百叶窗切条错峰翻换 12 根 160px 竖条从左到右错峰翻面，波扫过后整页由 A 换成 B",
+      "props": [
+        "mark",
+        "position",
+        "letterSpacing",
+        "position",
+        "background"
+      ],
+      "imports": [],
+      "lines": 178,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BlurSlide",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/blur-slide/BlurSlide.tsx",
+      "summary": "blur-slide — Blur Slide 逐词入场（第二轮重设计：编辑排版海报） 手法不变：标题逐词入场，y 位移 + blur + opacity 三通道共用同一个进度 p",
+      "props": [],
+      "imports": [],
+      "lines": 147,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BraceExpand",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/brace-expand/BraceExpand.tsx",
+      "summary": "brace-expand — Brace Expand Reveal 括号拉幕 一对紧贴的花括号先小字号出现在正中，随即带一次过冲向左右弹开并放大到标题级，括号之间的标题像被拉开的",
+      "props": [],
+      "imports": [],
+      "lines": 143,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BrandInkOpen",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/brand-ink-open/BrandInkOpen.tsx",
+      "summary": "brand-ink-open —— 墨线十字准星描画 → 字标逐字 letterpress → 打字机副标 → 满一秒静止 → 上浮消散",
+      "props": [],
+      "imports": [],
+      "lines": 134,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CaptionPillRelocated",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/caption-in-frame/CaptionPillRelocated.tsx",
+      "summary": "字幕搬家 —— 字幕进画面的另一式：**整条字幕**（圆角纸条 + 字 + 入场动画）不再站在画面下沿， 而是吊在构图里别的东西上（这里吊在一张深色卡的下缘，像一张贴上去的便条）",
+      "props": [
+        "text",
+        "highlight",
+        "words",
+        "aspect"
+      ],
+      "imports": [
+        "@dg/film",
+        "@dg/motion",
+        "@dg/polish",
+        "@dg/tokens"
+      ],
+      "lines": 141,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TextOverArt",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/caption-in-frame/TextOverArt.tsx",
+      "summary": "字压图 —— 字幕进画面的一式：整句话**压在画面上**、自带一层柔底，图形跟着念到的字动",
+      "props": [
+        "text",
+        "highlight",
+        "words",
+        "aspect"
+      ],
+      "imports": [
+        "@dg/film",
+        "@dg/motion",
+        "@dg/polish",
+        "@dg/tokens"
+      ],
+      "lines": 161,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CountdownArcScatter",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/countdown-arc-scatter/CountdownArcScatter.tsx",
+      "summary": "countdown-arc-scatter — 表盘数字扫过：等大数字沿大弧切向排布，整盘扫过 96° 后急停， \"5\" 停在弧顶随即平移落位成标题首字符，其余数字带 blur 原",
+      "props": [],
+      "imports": [],
+      "lines": 217,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "FlyingWords",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/flying-words/FlyingWords.tsx",
+      "summary": "flying-words — 词语纵深隧道：关键词在远处纵深生成，沿 z 轴向相机飞来擦身而过，透明度按 [0,1,0.5,0.2,0] 生命周期曲线变化",
+      "props": [],
+      "imports": [],
+      "lines": 198,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "GlitchCycle",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/glitch-cycle/GlitchCycle.tsx",
+      "summary": "glitch-cycle — 乱码轮播：同一行等宽槽位循环轮播 4 条状态短语，每条头尾按概率关键帧 [1,0,0,0.1,0,0,1] 全乱码、中段偶发单字抖动，切换瞬间叠 RG",
+      "props": [],
+      "imports": [],
+      "lines": 221,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "GradientWordSweep",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/gradient-word-sweep/GradientWordSweep.tsx",
+      "summary": "gradient-word-sweep v3 —— 批次 12 按用户意见微调（v2 结构保留）： 1) 闪电偏紫红色 + 线宽调细（约减半）",
+      "props": [],
+      "imports": [],
+      "lines": 312,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "KeywordColorCaption",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/keyword-color-caption/KeywordColorCaption.tsx",
+      "summary": "关键词换色 —— 字幕**压在画面上**，只有「要强调的那几个词」换颜色，字底不留纸条",
+      "props": [
+        "text",
+        "highlight",
+        "words"
+      ],
+      "imports": [
+        "@dg/film",
+        "@dg/motion",
+        "@dg/tokens"
+      ],
+      "lines": 127,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "LeadWordZoomAssemble",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/lead-word-zoom-assemble/LeadWordZoomAssemble.tsx",
+      "summary": "首词向观众漂移：先快后停，峰值处挂住",
+      "props": [],
+      "imports": [],
+      "lines": 261,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "MarkerUnderlineTitle",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/marker-underline-title/MarkerUnderlineTitle.tsx",
+      "summary": "marker-underline-title —— 白底大标题落定后，斜体 \"new\" 下方一道 马克笔下划线从左到右描画（粗细变化/端头圆润/微歪/边缘毛糙）",
+      "props": [],
+      "imports": [],
+      "lines": 121,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "OutlinedCaption",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/outline-caption/OutlinedCaption.tsx",
+      "summary": "白字黑边 —— 最常见的那种硬字幕：白字 + 一圈黑描边，压在**任何**底上都读得出来",
+      "props": [
+        "text",
+        "highlight",
+        "words"
+      ],
+      "imports": [
+        "@dg/film",
+        "@dg/motion",
+        "@dg/tokens"
+      ],
+      "lines": 129,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "OutlineWordFill",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/outline-word-fill/OutlineWordFill.tsx",
+      "summary": "outline-word-fill — Outline→Solid Fill 空心字瞬时点亮 空心词从约 3.2 倍急缓收缩落位居中",
+      "props": [],
+      "imports": [],
+      "lines": 153,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "PaperTitleCard",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/paper-title-card/PaperTitleCard.tsx",
+      "summary": "paper-title-card —— 一句话逐词 letterpress 压印上纸字卡 章节转场/价值主张呼吸位：单句文案逐词压印入场（scale 大→1 + blur→0）， ",
+      "props": [],
+      "imports": [],
+      "lines": 179,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "PillChipSlotCycleHandled",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/pill-chip-slot-cycle-handled/PillChipSlotCycleHandled.tsx",
+      "summary": "pill-chip-slot-cycle-handled — Chip Slot Cycle 胶囊滚轮挤开（motion-lab 定稿转原生 Remotion） 白底句式 \"You",
+      "props": [],
+      "imports": [],
+      "lines": 140,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "PillSlotCycle",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/pill-slot-cycle/PillSlotCycle.tsx",
+      "summary": "pill-slot-cycle —— 句中词槽轮换：固定句干 + 句尾 pill 老虎机式滚一格 源：notion-ai 4.5–8.5s",
+      "props": [],
+      "imports": [],
+      "lines": 309,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TextColumnConverge",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/text-column-converge/TextColumnConverge.tsx",
+      "summary": "text-column-converge —— raycast-teams（实测素材 28–36s 段）重做版： 原片测量（1280 宽）：NEW 左缘钉死 x=412，特性词右缘",
+      "props": [],
+      "imports": [],
+      "lines": 191,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TitleDemoteToLabel",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/title-demote-to-label/TitleDemoteToLabel.tsx",
+      "summary": "title-demote-to-label —— 大标题降格为节标签（两式串播） 源：perplexity-promo 16–18.5s",
+      "props": [],
+      "imports": [],
+      "lines": 292,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "LetterformDriftAssembly",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/type-assembly-moves/LetterformDriftAssembly.tsx",
+      "summary": "字形漂移合拢（letterform-drift-assembly）——Stranger Things 片头式入场",
+      "props": [],
+      "imports": [],
+      "lines": 135,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "SplitTextStagger",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/type-assembly-moves/SplitTextStagger.tsx",
+      "summary": "逐字遮罩裂升（split-text-stagger）——GSAP SplitText 惯用入场",
+      "props": [],
+      "imports": [],
+      "lines": 124,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TextOnPath",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/type-assembly-moves/TextOnPath.tsx",
+      "summary": "文字沿曲线流入（text-on-path）——字符沿一条上升曲线（图表增长线）鱼贯流入，行进中按切线角旋转",
+      "props": [],
+      "imports": [],
+      "lines": 255,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "LetterDropPhysics",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/type-entrance-moves/LetterDropPhysics.tsx",
+      "summary": "字符坠落堆积（letter-drop-physics）——FallingLetterAnimation",
+      "props": [],
+      "imports": [],
+      "lines": 173,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "FontWeightPump",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/type-rhythm-sync/FontWeightPump.tsx",
+      "summary": "字重脉冲（font-weight-pump）——标题笔画随节拍变粗又弹回，像文字跟着低音鼓蹦迪",
+      "props": [],
+      "imports": [],
+      "lines": 225,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "KaraokeFillSync",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/type-rhythm-sync/KaraokeFillSync.tsx",
+      "summary": "卡拉OK填色随读（karaoke-fill-sync）——旁白读到哪个词，哪个词就从左到右被填亮",
+      "props": [],
+      "imports": [],
+      "lines": 141,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "TypewriterErrorRetype",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/typewriter-moves/TypewriterErrorRetype.tsx",
+      "summary": "typewriter-error-retype｜打字机误删重打 浅底居中大字（眉题 Introducing video-shotcraft）：f2 起 2f/字符打出 \"just ",
+      "props": [],
+      "imports": [],
+      "lines": 137,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "VerticalWordRollBlurCycle",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/vertical-word-roll-blur-cycle/VerticalWordRollBlurCycle.tsx",
+      "summary": "vertical-word-roll-blur-cycle — Word Roll 竖向词条滚轮（motion-lab 定稿转原生 Remotion） 标语（video-shotc",
+      "props": [],
+      "imports": [],
+      "lines": 147,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "WordRelayFilmstrip",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/word-relay-filmstrip/WordRelayFilmstrip.tsx",
+      "summary": "word-relay-filmstrip —— 左列证据胶片步进、右侧大词原位接力（名词恒定 + 动词轮换） 第二轮重设计（石墨 · 电影感编辑部）： - look = graph",
+      "props": [],
+      "imports": [],
+      "lines": 409,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "WordRelayGeometry",
+      "category": "typography",
+      "category_cn": "字幕与字",
+      "file": "typography/word-relay-geometry/WordRelayGeometry.tsx",
+      "summary": "word-relay-geometry — 三个利益词接力，每个词各带一套只属于它的几何： Faster —— 虚线大圆 + 刻度环减速自转，一道彗星弧沿环飞跑（\"在转\"＝快） T",
+      "props": [],
+      "imports": [],
+      "lines": 280,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "AvatarBracketCarousel",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/avatar-bracket-carousel/AvatarBracketCarousel.tsx",
+      "summary": "avatar-bracket-carousel — Bracket Carousel 对焦框头像轮换（motion-lab 定稿转原生 Remotion） \"Your ___ ag",
+      "props": [],
+      "imports": [],
+      "lines": 271,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BezierSourceConvergeMerge",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/bezier-source-converge-merge/BezierSourceConvergeMerge.tsx",
+      "summary": "bezier-source-converge-merge — Bezier Converge 多源曲线汇流吞并（motion-lab 定稿转原生 Remotion） 左侧四个来源节",
+      "props": [],
+      "imports": [],
+      "lines": 385,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "CardStack",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/card-stack/CardStack.tsx",
+      "summary": "card-stack — 一组卡从屏幕下方逐张 spring 弹入叠成一摞，全员落位后整摞一次性展成扇面—— 每张按序号偏转 6.5°、横移 138px、向后退一层 z",
+      "props": [],
+      "imports": [],
+      "lines": 312,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "Carousel3D",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/carousel-3d/Carousel3D.tsx",
+      "summary": "carousel-3d — 8 张卡排成圆环整环自转一圈：每卡只绕 Y 公转、自身 billboard 朝外，正反两层同向贴图 + backface-visibility:hidd",
+      "props": [],
+      "imports": [],
+      "lines": 303,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ClipCardLooping",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/clipcard-looping/ClipCardLooping.tsx",
+      "summary": "clipcard-looping —— ClipCard 交叉淡化循环回归卡 覆盖维护者 review 点名的三个边界场景： 1) 未静音(muted=false)的交叉淡化循环—",
+      "props": [],
+      "imports": [
+        "@dg/lib/ClipCard"
+      ],
+      "lines": 77,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ClonerDepthEcho",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/cloner-depth-echo/ClonerDepthEcho.tsx",
+      "summary": "cloner-depth-echo —— 克隆纵队（第二轮重设计 · 酸柠暗场 · 边缘部署） 手法不变：一张主卡\"复印\"出 7 个克隆体沿纵深等距排开成队 → 停一拍让观众数清 ",
+      "props": [],
+      "imports": [],
+      "lines": 311,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "DeckDealFlyin",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/deck-deal-flyin/DeckDealFlyin.tsx",
+      "summary": "deck-deal-flyin —— 牌堆特写环绕 → 预备 → 一摞卡硬加速发进网格 → 相机追着发牌升起 → 满板定格（第二轮重设计） 手法不变：实体牌堆（真实卡片切片）特写 ",
+      "props": [],
+      "imports": [],
+      "lines": 307,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "DocParkLeftPillDeal",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/doc-park-left-pill-deal/DocParkLeftPillDeal.tsx",
+      "summary": "doc-park-left-pill-deal — Doc Park 文档靠左 + 结论慢发牌（motion-lab 定稿转原生 Remotion） 扫描结束文档不淡出，而是向左滑",
+      "props": [],
+      "imports": [],
+      "lines": 349,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "DocumentTypewriterReveal",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/document-typewriter-reveal/DocumentTypewriterReveal.tsx",
+      "summary": "document-typewriter-reveal —— 整页真排版文档在光标后自己\"写\"出来、侧栏跟进、历史条目逐个落入轨道 （第二轮重设计 · 极光暗场 · 悬浮应用窗） 手",
+      "props": [],
+      "imports": [],
+      "lines": 255,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "DrawSvgTrace",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/draw-svg-trace/DrawSvgTrace.tsx",
+      "summary": "draw-svg-trace —— 描边生长圈注（第二轮重设计 · 纸墨编辑风） 手法不变：一条带笔头的墨线沿元素轮廓跑一圈把它\"画\"出来 → 闭合瞬间加深加粗（白底上不用发光）→",
+      "props": [],
+      "imports": [],
+      "lines": 244,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ContactShadowLift",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/element-body-moves/ContactShadowLift.tsx",
+      "summary": "contact-shadow-lift｜接触阴影离面抬升 第二轮重设计（瓷白桌面 · 2.5D 斜俯拍 · 逐张点名）： - look = porcelain（冷白 + 钴蓝）",
+      "props": [],
+      "imports": [],
+      "lines": 217,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "IntegrationHubMap",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/integration-hub-map/IntegrationHubMap.tsx",
+      "summary": "integration-hub-map v5 —— 批次 14 单点节奏修正： 用户意见（逐字）\"动作对了，但是需要翻的时候很快，最后快完成的时候变慢下来\" → rotateY 0",
+      "props": [],
+      "imports": [],
+      "lines": 652,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ListReveal",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/list-reveal/ListReveal.tsx",
+      "summary": "list-reveal — 菜单逐项找位 + 整体慢漂移（两层不相干的运动） 第二轮重设计（石墨暗场 · 侧边栏海报）： - look = graphite（近单色暗场，白为强调、",
+      "props": [],
+      "imports": [],
+      "lines": 153,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ListStackPress",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/list-stack-press/ListStackPress.tsx",
+      "summary": "list-stack-press —— 列表卡从底部逐张飞上摞起，每张落地压弹整摞、计数器同步跳格 \"堆叠有重量\"：每张新卡落上来，已落定的整摞被压下再弹回——物理反馈里读出 \"这",
+      "props": [],
+      "imports": [],
+      "lines": 238,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "NeonFrameForerun",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/neon-frame-forerun/NeonFrameForerun.tsx",
+      "summary": "neon-frame-forerun —— 霓虹框先行：框自左缘中点两头奔画圈出位置 → 框内页面由暗转亮 → 组件从 3D 上空带软影错峰贴落 → 背景霓虹群终段熄灭让位",
+      "props": [],
+      "imports": [],
+      "lines": 324,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "NeonFrameForerunOrbit",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/neon-frame-orbit-drop/NeonFrameForerunOrbit.tsx",
+      "summary": "neon-frame-forerun-orbit v5（批次 14 #1）",
+      "props": [],
+      "imports": [],
+      "lines": 354,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "PageWaterfallWall",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/page-waterfall-wall/PageWaterfallWall.tsx",
+      "summary": "page-waterfall-wall —— 页面瀑布墙：真实页面截图切片排成 3 列，在后仰墙面上差速反向无限滚动， 外层镜头缓推，做\"内容多到流不完\"的一览",
+      "props": [],
+      "imports": [],
+      "lines": 101,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "VerticalTicker",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/page-waterfall-wall/VerticalTicker.tsx",
+      "summary": "Column content — any ReactNode (screenshot-slice divs, <Img>, text cards…)",
+      "props": [
+        "columns",
+        "backgroundColor",
+        "maskHeight",
+        "tiltDeg",
+        "perspective",
+        "scale",
+        "columnWidth",
+        "gap"
+      ],
+      "imports": [],
+      "lines": 129,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ProductCardProgressiveAssemble",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/product-card-progressive-assemble/ProductCardProgressiveAssemble.tsx",
+      "summary": "product-card-progressive-assemble — 详情卡像被逐字段抓取般自建 图 → 标题 → 分类 pill → 价格（原价被划线降级、新价 spring ",
+      "props": [],
+      "imports": [],
+      "lines": 297,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "RadialWave",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/radial-wave/RadialWave.tsx",
+      "summary": "radial-wave — Grid Radial Wave 点阵涟漪（motion-lab 定稿转原生 Remotion） 17×9 圆点阵列，波从中心向外按欧氏距离 stagg",
+      "props": [],
+      "imports": [],
+      "lines": 57,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ResearchCardStackScroll",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/research-card-stack-scroll/ResearchCardStackScroll.tsx",
+      "summary": "research-card-stack-scroll — Research Stack 论文卡叠压滚流（motion-lab 定稿转原生 Remotion） 深色论文卡沿微微向右下",
+      "props": [],
+      "imports": [],
+      "lines": 155,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "RowEmbed",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/row-embed/RowEmbed.tsx",
+      "summary": "row-embed —— 内容行从空中降下、rotateX 收平、嵌入瞬间底边亮强调色缝 \"结构化数据长进页面\"的详情页/列表镜头",
+      "props": [],
+      "imports": [],
+      "lines": 175,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "ValueStaggerGradient",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/value-stagger-gradient/ValueStaggerGradient.tsx",
+      "summary": "value-stagger-gradient — Value Stagger 数值梯度（motion-lab 定稿转原生 Remotion） stagger 不只错开时间，还把属性",
+      "props": [],
+      "imports": [],
+      "lines": 153,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": false,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "BentoLightUp",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/wall-reveal-moves/BentoLightUp.tsx",
+      "summary": "",
+      "props": [],
+      "imports": [],
+      "lines": 146,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    },
+    {
+      "name": "WireframeDrawOn",
+      "category": "ui-entrance",
+      "category_cn": "界面件",
+      "file": "ui-entrance/wall-reveal-moves/WireframeDrawOn.tsx",
+      "summary": "",
+      "props": [],
+      "imports": [],
+      "lines": 226,
+      "uses": {
+        "three": false,
+        "glsl": false,
+        "canvas": false,
+        "svg": true,
+        "katex": false,
+        "rough": false
+      }
+    }
+  ]
+}

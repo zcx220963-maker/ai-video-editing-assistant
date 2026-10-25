@@ -304,7 +304,7 @@ def section_single_source() -> None:
     check("_frame_diff_stats" in mine and "_empty_check" in mine,
           "两个入口确实被用到了（上一条不是「压根没读」的绿）")
 
-    skill = (Path(__file__).resolve().parents[1] / "examples" / "skills"
+    skill = (Path(__file__).resolve().parents[1] / "examples" / "retired"
              / "motion_explainer" / "SKILL.md")
     if skill.is_file():
         body = skill.read_text(encoding="utf-8")

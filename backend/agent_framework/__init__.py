@@ -1,4 +1,4 @@
-"""智能创作助手 Agent 框架 —— Agent Loop 核心骨架。
+﻿"""智能创作助手 Agent 框架 —— Agent Loop 核心骨架。
 
 当前提供可端到端运行的最小闭环：
 - MainLoop：外层常驻循环，持续消费用户请求
@@ -138,6 +138,13 @@ from .tools.web import (
     register_web_tools,
 )
 from .tools.fetch_media import FetchMediaTool, register_fetch_media_tools
+from .tools.short_video import (
+    MakeShortVideoTool,
+    ReshootShotTool,
+    RenderShortFilmTool,
+    ListShortFilmsTool,
+    register_short_video_tools,
+)
 from .media_fetch import FetchPolicy, FetchRejected, fetch_media
 from .ingest import IngestRejected, ingest_bytes, ingest_local_file
 from .tools.cron import (
@@ -305,6 +312,12 @@ __all__ = [
     "register_web_tools",
     "FetchMediaTool",
     "register_fetch_media_tools",
+    "MakeShortVideoTool",
+    "ReshootShotTool",
+    "RenderShortFilmTool",
+    "ListShortFilmsTool",
+    "ExportFilmTool",
+    "register_short_video_tools",
     "FetchPolicy",
     "FetchRejected",
     "fetch_media",

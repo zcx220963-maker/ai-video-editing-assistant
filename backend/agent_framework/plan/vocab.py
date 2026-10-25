@@ -46,13 +46,12 @@ SYSTEM_INJECTED_PARAMS: frozenset[str] = frozenset({"go_straight"})
 # `<skills>` 全部候选与 `load_skill(name, section=…)` 的读法一起摆出来——
 # 视角给模型，安全网不动（与 §5 的 `require_explicit_call` 同一条处置）。
 _IMPLICIT_SKILLS: dict[str, tuple[str, ...]] = {
-    "plan_motion": ("motion_explainer_skill",),
-    # 出片与局部改带的是同一份技能：零素材通道没有任何素材事实可依赖（没有 ASR 文本、
-    # 没有镜头描述），代码镜怎么写、字段旋钮怎么声明、指针五条怎么用，全在那份正文里。
-    "render_motion_code": ("motion_explainer_skill",),
-    # 局部改改的就是同一份归一后的分镜（字段名与必填项一字不差），
-    # 少了这份技能，模型会按别的入参形状提交 edits，闸在入库前退它。
-    "patch_motion_code": ("motion_explainer_skill",),
+    # 2026-10-25：图形科普链退役，`plan_motion` / `render_motion_code` /
+    # `patch_motion_code` 三条摘了（节点已下白名单，映射留着只会让人以为它还活着）。
+    # 换成简洁线的两个工具——它们**一次调用就跑完整条链**，而"查资料怎么查、
+    # 文案怎么写、改一镜该用哪个工具"全在新技能正文里，卡面不预注入就只剩工具描述。
+    "make_short_video": ("short_video_skill",),
+    "reshoot_shot": ("short_video_skill",),
     # 口播链的 patch_video **原先不挂**技能，理由是「指针形状与可改字段白名单写在
     # input_schema 里，没有第二份要随身带的字段字典」——那个理由只覆盖**入参形状**。
     # T41 把它挂上，是因为**约束散文**另有出处：节点描述里那四条（必须带 base_artifact_id、
@@ -111,16 +110,26 @@ class PlanVocabulary:
         return _IMPLICIT_SKILLS.get((node or "").removeprefix(MCP_PREFIX), ())
 
     def whitelist(self) -> set[str]:
-        """允许上卡的剪辑节点名 = Storyline 白名单 ∩ 已注册工具。
+        """允许上卡的步骤名 = Storyline 白名单 ∩ 已注册工具，**加上**声明了
+        ``plan_node = True`` 的原生工具。
 
-        契约未接入（Storyline 没连上）时退化成「注册表里带 DAG 契约的工具」：
-        仍以真实存在的工具为界，模型无从臆造。
+        为什么要有第二类（2026-10-25）：计划卡的步骤原来只认 Storyline DAG 节点，
+        那是「一镜一节点、节点间有依赖」的剪辑链的形状。而 `make_short_video` 这种
+        **一次调用跑完整条链**的工具没有 DAG 形状——它一句话进去、一条成片出来，
+        却仍然是一个"步骤"，模型会（也应该）把它写进计划卡。
+        不收它进来的后果很具体：模型在卡上写 `make_short_video`，校验器回一句
+        「节点不存在，不许臆造」，然后白烧一轮重写计划。
+
+        契约未接入（Storyline 没连上）时仍退化成「注册表里带 DAG 契约的工具」+
+        这些声明过的原生工具——仍以真实存在的工具为界，模型无从臆造。
         """
         names = set(self.contract.names)
         if not names:
             names = {n for n in self._registry.tool_names
                      if getattr(self._registry.get(n), "contract", None) is not None}
-        return {n for n in names if self.resolve_tool(n) is not None}
+        native = {n for n in self._registry.tool_names
+                  if getattr(self._registry.get(n), "plan_node", False)}
+        return {n for n in (names | native) if self.resolve_tool(n) is not None}
 
     def vocabulary(self) -> set[str]:
         return (set(self.catalog.names) | set(self._registry.tool_names)

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """T31 帧通道（``storyline_server.motion.judge_channel``）的离线用例。
 
 **这份文件判的是一件「本来悬空」的事。** 闸㉖ 回看环（``review_loop.py``）从落地那天起
@@ -65,7 +65,7 @@ from storyline_server.motion import review_loop as rl            # noqa: E402
 _fails = 0
 _checks = 0
 ROOT = Path(__file__).resolve().parents[1]
-SKILL = ROOT / "examples" / "skills" / "motion_explainer"
+SKILL = ROOT / "examples" / "retired" / "motion_explainer"
 
 
 def check(cond: bool, label: str) -> None:

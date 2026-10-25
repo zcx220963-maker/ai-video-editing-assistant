@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """2026-10-17 真机片之后的那一批修复：每一条都先证红（老行为在这里会挂），再证绿。
 
 背景：7fa1e10 能出片，但有五个毛病——字幕样式没上屏、后半截定格、镜数少画面不连贯、
@@ -340,22 +340,11 @@ def case_duration() -> None:
 
 
 def case_family() -> None:
-    print("③ 连贯：版式族上限随镜数放宽")
-    check(cs.layout_family_cap(6) == 2 and cs.layout_family_cap(8) == 2,
-          "短片仍是每族 2 镜（下限不变）")
-    check(cs.layout_family_cap(20) == 5,
-          "20 镜每族最多 5 镜（老行为 2 镜 → 逼着用上 10 个族）")
-    shots = [{"id": f"s{i:02d}", "card": f"science/card-{i % 5}"} for i in range(1, 6)] + \
-            [{"id": f"s{i:02d}", "card": f"typography/card-{i % 5}"} for i in range(6, 11)] + \
-            [{"id": f"s{i:02d}", "card": f"data/card-{i % 5}"} for i in range(11, 16)] + \
-            [{"id": f"s{i:02d}", "card": f"opening/card-{i % 5}"} for i in range(16, 21)]
-    errs, _ = cs.check_layout_family(shots)
-    check(not errs, f"20 镜四族各 5 镜：不报（老行为四族全报超额）{errs[:1]}")
-    over = shots + [{"id": "s21", "card": "science/card-9"},
-                    {"id": "s22", "card": "science/card-8"}]
-    errs, _ = cs.check_layout_family(over)
-    check(errs and "最多 6 镜" in errs[0] and "science" in errs[0],
-          f"22 镜 science 占 7 镜：照样报，说的是按镜数算出来的上限 {errs[:1]}")
+    print("③ 连贯：版式族配额**已整道删除**（2026-10-24）")
+    # 闸⑮ 与 layout_family_cap 一起删了：它判的是「版式别扎堆」，属于审美，
+    # 交给静默视觉评审。这里只守「钩子真的走了」。
+    check(not hasattr(cs, "check_layout_family") and not hasattr(cs, "layout_family_cap"),
+          "闸⑮ 与它的配额函数一起删了——留着会让人以为它还在判")
 
 
 def case_replace() -> None:
@@ -660,7 +649,7 @@ def case_no_demo() -> None:
     card, derived = cs._norm_cite({"card": "no/such-card", "derived_from": ["x/Y.tsx"]}, "s01", errs)
     check(card == "" and derived == [] and not errs,
           "模型凭印象写了卡名和 demo 路径：忽略，不打回整份分镜")
-    skill = (Path(__file__).resolve().parents[1] / "examples" / "skills" / "motion_explainer"
+    skill = (Path(__file__).resolve().parents[1] / "examples" / "retired" / "motion_explainer"
              / "SKILL.md").read_text(encoding="utf-8")
     check("exclude: demos/, shots/" in skill and "禁止从零写" not in skill,
           "技能正文：排除 demo 目录、不再要求照抄")

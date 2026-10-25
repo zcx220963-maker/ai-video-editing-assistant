@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """R7-T22：转场落在**拼接层**、进出场落在**母版**——两侧各自的那条保证怎么被证住。
 
 这个通道一次加进来四件事，它们**不在同一层**，所以这份文件按层分段，而不是按开关分：
@@ -63,7 +63,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # 不存在的文件——而 read_text 抛的是异常，不是「这条判据没跑，记未判」。
 REMOTION_SRC = (ROOT.parent if (ROOT.parent / "remotion").is_dir() else ROOT) / "remotion" / "src"
 FILM_TSX = REMOTION_SRC / "FilmLayout.tsx"
-SKILL = ROOT / "examples" / "skills" / "motion_explainer" / "SKILL.md"
+SKILL = ROOT / "examples" / "retired" / "motion_explainer" / "SKILL.md"
 
 
 def check(cond: bool, label: str) -> None:

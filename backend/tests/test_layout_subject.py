@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """闸⑮（版式族配额）与闸⑯（主体具名）——R5-T15。
 
 这两道闸判的都是**整片层**的事，而且都在 `plan_motion` 就硬拦（不烧像素，改十遍只花几秒）：
@@ -52,7 +52,7 @@ def check(cond: bool, label: str) -> None:
 def skill_text() -> str:
     """技能正文（模型读的那一份）。模型读正文、机器判常量，两边漂一次 =
     「闸拦了人却不知道为什么」，所以下面每一条常量都在正文里逐字钉一遍。"""
-    rel = Path("examples") / "skills" / "motion_explainer" / "SKILL.md"
+    rel = Path("examples") / "retired" / "motion_explainer" / "SKILL.md"
     for cand in (_HERE.parents[1] / rel, Path("/app") / rel):
         if cand.is_file():
             return cand.read_text("utf-8")
@@ -182,54 +182,11 @@ def main() -> int:
           "族表够铺开：⑮ 的绿色样本要 ≥ ceil(6/4)=2 个族、每族还得分到两张卡")
 
     # ------------------------------------------------------------------
-    print("\n① 闸⑮ 第 1 条（卡名种类 ≥ ceil(镜数/4)）——先证红再证绿")
-    eight_same = [_shot(i + 1, ch="vector", card_id="typography/paper-title-card")
-                  for i in range(8)]
-    errs, _ = cs.check_layout_family(eight_same)
-    check(any("闸⑮" in e and "只用了 1 张不同的卡" in e for e in errs),
-          f"8 镜全摆同一张卡 → 打回（{errs[0][:80] if errs else '没红'}）")
-    check(any("typography/paper-title-card×8" in e for e in errs),
-          "打回理由把这张卡摆了几镜摊平了——不摊平，读者不知道重复在哪")
-    check(any("这一档至少要 2 张" in e for e in errs),
-          "打回理由报的是**这一档**的门槛（ceil(8/4)=2），不是常量表本身")
-    check(-(-8 // 4) == 2 and any(f"这一档至少要 {-(-8 // 4)} 张" in e for e in errs),
-          "门槛是现算的 ceil(镜数/4)，与 8 镜这一档对得上")
-
-    two_kinds_ok = _mixed6()
-    check(cs.check_layout_family(two_kinds_ok) == ([], []),
-          "6 镜六族 → 绿（镜数没到配额档但 ⑮ 的起步档就是 6）")
-
-    # ------------------------------------------------------------------
-    print("\n② 闸⑮ 第 2 条（同一族 ≤2 镜）——**八张不同的卡挤在同一族**就是对第 1 条的反例")
-    same_family = [_shot(i + 1, ch="vector", card_id=f"typography/{n}")
-                   for i, n in enumerate(TYPO_EXTRA)]
-    errs, _ = cs.check_layout_family(same_family)
-    check(any("只用了 1 张" not in e and "typography 族占了 6 镜" in e for e in errs),
-          f"6 镜六张不同的卡、全在 typography 族 → 打回（{errs[0][:80] if errs else '没红'}）")
-    check(len(errs) == 1,
-          "这一份样本只犯族这一条——证明「族 ≤2」不是「卡名种类」的马甲，它自己会红")
-    check(any("s01、s02、s03、s04、s05、s06" in e for e in errs),
-          "族超限那一条把超限的镜逐个点名")
-    check(any("当前族分布" in e for e in errs),
-          "打回理由带上当前整片族分布——模型才知道往哪个族挪")
-
-    ok8 = [_shot(i + 1, ch="vector", card_id=card(fam, i % 2))
-           for i, fam in enumerate(["opening", "opening", "data", "data",
-                                    "effects", "effects", "camera", "camera"])]
-    check(cs.check_layout_family(ok8) == ([], []),
-          "8 镜四族各两镜 → 绿（族的门槛是「不超过 2」，不是「必须各一」）")
-
-    print("\n③ 闸⑮ 的分母与未判档：三镜片谈「族配额」连分母都不成立")
-    three_same = [_shot(i + 1, ch="vector", card_id="typography/paper-title-card")
-                  for i in range(3)]
-    check(cs.check_layout_family(three_same) == ([], []),
-          f"3 镜同一张卡也放行：镜数不到 {cs.MIN_SHOTS_FOR_QUOTA} 不判"
-          "（放行 ≠ 通过，回执那半在 test_code_gates 里按未判报）")
-    check(cs.MIN_SHOTS_FOR_QUOTA == 6 and cs.LAYOUT_FAMILY_MAX_SHOTS == 2,
-          "两枚常数与正文/回执同源（改了这里就得改正文，见 §6）")
-    no_card = [_shot(i + 1, ch="vector", card_id="", subject="活字盘") for i in range(6)]
-    check(cs.check_layout_family(no_card) == ([], []),
-          "一镜都没选卡时不在这里喊第二遍（「没选卡」是 card 那一道的错，报两遍会把清单淹掉）")
+    print("\n① 闸⑮ 版式族配额 —— **2026-10-24 整道删除**")
+    # 它判的是「版式别扎堆 / 卡名别重复」，属于审美；而机器形态只数得到卡名，
+    # 模型最省事的过法就是随便换一张卡。函数与 `layout_family_cap` 一起删了。
+    check(not hasattr(cs, "check_layout_family") and not hasattr(cs, "layout_family_cap"),
+          "闸⑮ 与它的配额函数一起走了——留着会让人以为它还在判")
 
     # ------------------------------------------------------------------
     print("\n④ 闸⑯ `subject` 一栏——2026-10-18 起只提醒、不打回")
@@ -344,12 +301,9 @@ def main() -> int:
           f"⑮ 契约入口不打回；DEMOS_ENABLED={cs.DEMOS_ENABLED} 时它不进整片判据"
           f"（{verrs[:1]}）")
 
-    # ⑮⑯ 是「整片层」的闸：模型真机上改的是**一镜**，闸却按整片算——这两个数就是
+    # ⑯ 是「整片层」的闸：模型真机上改的是**一镜**，闸却按整片算——这个数就是
     # 「改一镜要顺带改几镜」的代价，写出来免得读的人以为它是逐镜闸。
-    check(cs.check_layout_family.__doc__ and "同一**族**" in cs.check_layout_family.__doc__,
-          "⑮ 的判据口径写在函数 docstring 里（下一把手改判据前先读那一段）")
-    check("卡库目录名" in cs.check_layout_family.__doc__,
-          "「族」的定义写明了取卡库类别目录名，不是模型自报的自由字符串（§9-Q84）")
+    # （⑮ 那两条 docstring 断言随函数一起删了，2026-10-24。）
 
     # ------------------------------------------------------------------
     print("\n⑧ 单源钉：计划卡/回执的账、schema、正文、文案词表——四处各读同一份常量")

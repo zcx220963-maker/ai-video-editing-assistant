@@ -159,6 +159,18 @@ class Tool(ABC):
 
     owner_user_id: str | None = None
 
+    # ---- 能不能上计划卡 ----
+    #
+    # 计划卡的步骤白名单原来是「Storyline DAG 契约里的节点」——那套东西是给
+    # 「一镜一节点、节点间有依赖」的剪辑链用的。**一次性跑完整条链的原生工具**
+    # （`make_short_video` 这种：一句主题进去、一条成片出来）没有 DAG 形状，
+    # 但它确实是一个"步骤"，模型会把它写进计划卡。
+    #
+    # 默认 False：不擅自扩大卡面。只有明确声明 `plan_node = True` 的工具才进白名单，
+    # 校验器对它走「无契约工具」那条分支（`tool_kind="tool"`、`requires=[]`），
+    # 参数仍按它自己的 `parameters` 逐项核对。
+    plan_node: bool = False
+
     # ---- 缺必填参数时回给模型的话 ----
 
     def missing_params_error(self, missing: list[str],

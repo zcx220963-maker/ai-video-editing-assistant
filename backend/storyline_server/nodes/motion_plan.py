@@ -36,6 +36,7 @@ from ..motion import code_spec as cspec
 from ..motion import design_review
 from ..motion import remotion_client as rc
 from ..motion import recipe_index
+from ..motion import review_reconcile
 from ..motion import shot_writer
 from .core_nodes import StoryNode, _flag_on, _obj, _resolve_target_duration
 
@@ -1194,7 +1195,7 @@ class PlanMotionNode(StoryNode):
                 art = spec.get("art") if isinstance(spec.get("art"), Mapping) else {}
                 loop = await self._visual_loop(
                     state, spec, refs=refs, files=files, notes=notes,
-                    failures=failures, art=art)
+                    failures=failures, art=art, layouts=layouts)
                 spent = float(loop["cost_yuan"])
                 visual = loop["first"]
                 # 评审那一轮可能**升级了申报**（`_bump_channel_by_review`：评审说「该有
@@ -1250,6 +1251,28 @@ class PlanMotionNode(StoryNode):
                                "unjudged": last.get("unjudged", [])}
                               if last else {}),
                 }
+                # 评审与机器判据对账的账（T0.5）：冲突的那几条**不进重写**，但必须
+                # 在回执与卡上看得见——「评审说看不见、机器量到主体占了 30%」这件事，
+                # 只写进日志等于没说。同时按 T0.5 的约定往 `style_unjudged` 追加一条：
+                # 这几镜的画面**这一轮没有定论**（未判不是通过）。
+                rec = loop.get("reconcile") or {}
+                if rec.get("unverified") or rec.get("downgraded"):
+                    payload["visual_reconcile"] = {
+                        "unverified": rec["unverified"][:12],
+                        "downgraded": rec["downgraded"][:12],
+                        "unread": len(rec["unread"] or []),
+                        "hint": ("评审与机器读数冲突的镜**没有重写**：机器说画面里有东西，"
+                                 "评审说看不见。记未判——要看就自己点开预览那一帧。"
+                                 if rec.get("unverified") else
+                                 "有评审意见被机器读数判为误判，已降级为提醒、没有重写。"),
+                    }
+                    if rec.get("unverified"):
+                        payload["style_unjudged"] = list(
+                            payload.get("style_unjudged") or []) + [
+                            f"视觉评审与机器读数冲突（未判，未重写）：{r['note']}"
+                            for r in rec["unverified"][:12]]
+                    payload["preview_notes"] = (list(payload.get("preview_notes") or [])
+                                                + rec["notes"][:6])[:12]
                 if visual["failed"]:
                     # 头一句必须是「已入库、可出片」：真机 run 901597a97570 里模型先读到
                     # 33 镜「仍红」，再把 37 镜的 brief 整份重交了一遍（9217 补全 token，
@@ -1397,7 +1420,11 @@ class PlanMotionNode(StoryNode):
                            refs: dict[str, str], files: dict[str, Any],
                            notes: list[str],
                            failures: dict[str, dict[str, str]],
-                           art: Mapping[str, Any]) -> dict[str, Any]:
+                           art: Mapping[str, Any],
+                           layouts: Mapping[str, Any] | None = None,
+                           fills: Mapping[str, Any] | None = None,
+                           motion: Mapping[str, Any] | None = None
+                           ) -> dict[str, Any]:
         """渲完静帧之后：看 → 按意见改 → 重渲那几镜 → **再看**，最多 `review_rounds` 轮。
 
         为什么要有第二眼：`rewrite_shot_code` 只保证「改出来的代码过闸①」，不保证
@@ -1410,11 +1437,21 @@ class PlanMotionNode(StoryNode):
 
         只报不拦，也不抛。原地更新 ``refs`` / ``files`` / ``notes`` / ``failures``
         （调用方还要拿它们写回执与卡面），返回每一轮的账。
+
+        **对账（2026-10-24，T0.5）**：评审的每一条红在进 `rewrite_failed` 之前，
+        先跟机器读数对一次（`review_reconcile.reconcile`）。评审说「看不见主体」而
+        闸⑲-a 量到主体占了 30% 时，记未判、**不重写**——一次写手调用 + 一次重渲 +
+        一次重评的代价，换来的是可能把对的画面改坏。``layouts`` 是预览那一趟的版面账
+        （闸⑲-a/⑩ 的读数），``fills``/``motion`` 由调用方按需给（没给就照旧重写，
+        但回执会写明「这一条没有机器读数可对账」）。
         """
         cap = design_review.review_rounds(spec)
         out: dict[str, Any] = {
             "rounds": [], "rewritten": {}, "skipped": [], "first": {}, "last": {},
-            "reviewed": [], "cost_yuan": 0.0, "stale": [], "still_red": []}
+            "reviewed": [], "cost_yuan": 0.0, "stale": [], "still_red": [],
+            # 评审与机器判据对账的账（T0.5）：冲突的、判为误判的、没有读数可对的。
+            "reconcile": {"unverified": [], "downgraded": [], "unread": [],
+                          "notes": []}}
         todo = dict(files)
         prev_fix: dict[str, str] = {}
         stale: set[str] = set()
@@ -1453,6 +1490,32 @@ class PlanMotionNode(StoryNode):
             if stale:
                 row["stale"] = sorted(stale)
             if not fresh:
+                break
+            # 评审与机器判据对账（T0.5，2026-10-24）：**排在所有「按意见改」的动作之前**。
+            # 理由很直接：一条评审误判如果先升了申报、补了构图、进了教训账，再在对账里
+            # 被拦下来，那三处副作用已经落下了——这一镜的 brief 与 subject_channel 都变了，
+            # 而画面根本没打算重写。先对账，只让「机器也同意」的那些意见往下走。
+            try:
+                recon = review_reconcile.reconcile(
+                    fresh, shots=spec["shots"], scanned=layouts,
+                    contrast=cspec.style_facts(spec["shots"])["contrast"],
+                    fills=fills, motion=motion)
+            except Exception as exc:  # noqa: BLE001 —— 对账炸了就当没对过，照旧重写
+                recon = {"kept": [dict(f) for f in fresh], "unverified": [],
+                         "downgraded": [], "unread": [], "notes": [
+                             f"评审对账未判（{type(exc).__name__}: {str(exc)[:100]}），"
+                             "这一轮按评审意见原样重写"]}
+            for key in ("unverified", "downgraded", "unread"):
+                out["reconcile"][key].extend(recon[key])
+            if recon["notes"]:
+                out["reconcile"]["notes"].extend(recon["notes"])
+            row["reconciled"] = {
+                "unverified": [r["shot"] for r in recon["unverified"]],
+                "downgraded": [r["shot"] for r in recon["downgraded"]],
+                "unread": len(recon["unread"])}
+            fresh = recon["kept"]
+            if not fresh:
+                # 这一轮的红全被对账拦下了：没有要改的镜，别再空跑一次重写。
                 break
             # 评审说「该有体积 / 该是公式 / 该是手绘」时，把这一镜的申报升上去
             # （只升不降）。**必须排在 `_feed_review_lessons` 与 `rewrite_failed` 之前**：

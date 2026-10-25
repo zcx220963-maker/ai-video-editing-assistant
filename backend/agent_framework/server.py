@@ -1015,6 +1015,13 @@ def create_app(
 
     app.add_exception_handler(HTTPException, http_error)
 
+    # 简洁视频线（一句话出片）：3 个接口 + `/studio` 单页。
+    # 单独一个模块，不往本文件里堆路由——这里已经 3,400 行了。
+    # 设计见 `docs/设计-简洁视频Agent-2026-10-24.md`：它不接 MQ、不用 Session、
+    # 不进 DAG，因为它一次请求 = 一次任务，没有"下一句话"。
+    from . import simple_api
+    simple_api.register(app, storage=storage, auth=auth)
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}

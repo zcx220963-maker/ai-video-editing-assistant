@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -123,7 +124,12 @@ def strip_caption_periods(s: str) -> str:
     return out
 
 # R1: card / derived_from 契约栏——模型必须声明选了哪张卡、代码来自哪些 demo
-_SKILL_DIR = Path(__file__).resolve().parents[2] / "examples/skills/motion_explainer"
+#
+# 2026-10-25：图形科普链退役，技能目录从 `examples/skills/` 移到 `examples/retired/`。
+# 移走的原因是**它同时是模型可选的技能**——留在 `skills/` 下，模型会按 description
+# 选中它，然后照着正文去调 `plan_motion`（已摘白名单，只会拿到 UnknownTool）。
+# 挪到 `retired/` 后：模型看不见它，而这里（配方卡扫描、技能名读取）照旧能用。
+_SKILL_DIR = Path(__file__).resolve().parents[2] / "examples/retired/motion_explainer"
 
 @lru_cache(maxsize=1)
 def motion_skill_name() -> str:
@@ -1801,7 +1807,7 @@ def _palette_of(shot: Mapping[str, Any], film_palette: str | None = None
     三层都认不出返回 None——**不猜**。
 
     为什么先认代码绑定而不是先认整片默认：`bg` 在镜头 schema 里**可省略**（只有
-    `bleed: true` 的镜必须给，闸⑲ 的 :data:`VARIETY_BG_SHARE` 也只要求 ≥25% 的镜申报），
+    `bleed: true` 的镜必须给（闸⑲ 已删，这条要求现在只剩契约本身在守），
     所以「拿 bg 反查色板」对多数镜根本不触发——一部片子里会是一半镜头的字幕条跟着色板、
     一半还是老的白底黑字粉高亮，比统一的老样子更花。而权威来源一直都在同一份代码里：
     :func:`shot_colors` 静态认得出顶上那句 ``const palette = palettes["…"]``，
@@ -2287,7 +2293,7 @@ def style_facts(shots: list[dict[str, Any]], *,
     ``film`` 是**整片那一份 spec**（可省）：给了的话，账里 `palettes` 那一栏记的是
     这一镜**实际用上的**那套色板（自己绑的 → 自己底色反查的 → 整片默认），而不是
     「代码里写了没有」。这一栏 2026-10-17 起不再有任何判据读它（闸⑲ 的色板配额那一档
-    删了，理由见 `check_style_variety`），它现在是**给人看的一份读数**：
+    删了，函数本身也于 2026-10-24 删除），它现在是**给人看的一份读数**：
     「这条片子的每一镜到底落在哪套色板上」只有这一处答得出来，
     而「整片一个调子」这件事本来就是要用眼睛核的。
     """
@@ -2347,7 +2353,7 @@ def style_facts(shots: list[dict[str, Any]], *,
                            | ({""} if any(not str(s.get("texture") or "").strip()
                                           for s in shots) else set())),
         # 闸⑳ 的账（R19）：哪几镜走了原创哨兵。计划卡与出片回执读这一栏——
-        # 「1 镜原创」是**绿**（见 check_original_share），但用户仍该看得见是哪一镜。
+        # 「1 镜原创」是**绿**（闸⑳ 已于 2026-10-24 删除），但用户仍该看得见是哪一镜。
         "original_shots": original_shot_ids(shots),
         "hollow": [str(s.get("id") or f"i{i + 1}") for i, s in enumerate(shots)
                    if not has_concrete_item(str(s.get("text") or ""))],
@@ -2417,100 +2423,19 @@ def check_draw_floor(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]
 
 
 # ---------------------------------------------------------------------------
-# 闸⑲ 风格配额（R19）：质感 / 满幅 / 底色——**逼丰富**的那一道
+# 闸⑲ 风格配额 —— **已于 2026-10-24 整道删除**
 # ---------------------------------------------------------------------------
 #
-# 与 ⑦⑮⑯ 的分工：那三道判的是**反雷同**（通道别只一种、卡别同族扎堆、主体别写抽象词），
-# 这一道判的是**逼丰富**。在它之前，质感 / 满幅 / 底色这三条**没有任何闸在判**，
-# 于是一条 20 镜片可以全用一种质感 + 全常规版式而照样过闸——闸绿了，成片却是
-# 「同一张 PPT 换了二十遍字」。
+# 它判的是「逼丰富」：质感种数 / 满幅镜数 / `bg` 申报率 / （更早的）色板种数。
+# 2026-10-23 先撤出整片判据，2026-10-24 连函数与下面四个常数一起删——它们判的是
+# 「画得好不好」，交给 `design_review` 按画面判更准。判据原文见
+# `docs/已删的闸-2026-10-24.md`。
 #
-# 强度分两档，判据的性质不同（不是偷懒）：
-#   · **结构判据（打回）**：满幅镜数。这件事在**代码字节**上就能数清（`bleed` 是归一
-#     后的布尔栏），而且「一镜都没满幅」是**确定的**退化形态。
-#   · **程度判据（只提醒）**：质感种数、`bg` 申报率。质感有「跟整片默认」这一态
-#     （没申报 ≠ 没质感），底色也不是每镜都该有——把这两条做成硬闸就会误伤
-#     「整片一档柔光 + 几镜换底色」这种合法配法。与闸⑨「宁可漏报，不许误报」同一纪律。
-#
-# 2026-10-17 删掉了「色板种数 ≥ ceil(n/4)」那一档。它与这一道其余三条**方向相反**：
-# 那三条逼的是「别二十镜一个框、一个质感」，而它逼的是「别二十镜一个色」——
-# 于是系统会奖励一部片子铺开六套底色，而用户在真机上要的恰恰是**整片一个底色**
-# （「怎么做让它默认的整体风格一致?就是起码的底色和字幕保持一致」，紧接着的
-# 决定是「整片一个字段作默认，个别镜可覆盖」）。它逼出来的东西正是用户要消除的东西，
-# 所以删的是**这一档**，不是这一道：质感 / 满幅 / 底色三条原样留着。
-# 换掉它的新载体是 spec 顶层那个 `palette` 字段（见 `FILM_KNOBS`），
-# 以及账里逐镜读得出的 `style_facts()["palettes"]`——那条读数现在答的是
-# 「每一镜实际落在哪套色板上」，人一眼看得出整片是不是一个调子。
-
-#: 这一道从几镜起判。三镜片各画各的是常态，不是纪律（与 ⑦ 的起步镜数同一个道理）。
-VARIETY_MIN_SHOTS = 6
-#: 质感种数下限。
-VARIETY_MIN_TEXTURES = 3
-#: 满幅镜数下限 = ceil(n / 这个数)（20 镜 → 4 镜）。
-VARIETY_BLEED_DIV = 5
-#: `bg` 申报率下限（满幅镜另有一条更硬的：满幅**必须**给 `bg`，见判据 ③）。
-VARIETY_BG_SHARE = 0.25
+# 留一句值得记住的：2026-10-17 删掉的「色板种数 ≥ ceil(n/4)」那一档，方向与其余三条
+# **相反**——用户在真机上要的恰恰是「整片一个底色」，而它奖励铺开六套色板。
+# 「逼丰富」的闸常常在奖励用户想消除的东西，这是它们被撤掉的根本原因。
 
 
-def check_style_variety(shots: list[dict[str, Any]]
-                        ) -> tuple[list[str], list[str], list[str]]:
-    """闸⑲ 风格配额：整片的**丰富度**够不够。→ (打回, 提醒, 未判)。
-
-    三条判据，强度见上面那段（原来的第一条「色板种数」删了，理由也写在那一段里）：
-
-    1. **满幅镜数** ≥ ``ceil(n / VARIETY_BLEED_DIV)``（结构 → 打回）。不写 `bleed` 时
-       每一镜都被裁进同一条居中的画面带里，这正是成片「像 PPT」的结构原因（R14 把
-       `bleed` 这条路开出来了，这一条是**逼它真的被用上**）。
-    2. **质感种数** ≥ ``VARIETY_MIN_TEXTURES``（程度 → 只提醒）。质感有「跟整片默认」
-       这一态，只数**申报过的**值，并把「没申报的镜数」写进提醒里——宁可漏报。
-    3. **`bg` 申报率** ≥ ``VARIETY_BG_SHARE``，且**满幅镜必须给 `bg`**（程度 → 只提醒）。
-       满幅不给底色时深色板的正文会压在母版奶油底上，而闸④ 还拿 `bg` 当判空的基准色。
-    """
-    errors: list[str] = []
-    warns: list[str] = []
-    undetermined: list[str] = []
-    n = len(shots)
-    if n < VARIETY_MIN_SHOTS:
-        return errors, warns, undetermined
-    facts = style_facts(shots)
-    ids = [str(s.get("id") or f"s{i + 1:02d}") for i, s in enumerate(shots)]
-
-    # ① 满幅镜数
-    bleeds = facts["bleed_shots"]
-    want_bleed = -(-n // VARIETY_BLEED_DIV)
-    if len(bleeds) < want_bleed:
-        errors.append(
-            f"闸⑲ 风格配额：{n} 镜只有 {len(bleeds)} 镜满幅（`bleed: true`），"
-            f"这一档至少要 {want_bleed} 镜。不写 `bleed` 时每一镜都被裁进同一条居中的"
-            "画面带里（左右留页边距、上下留安全区）——二十镜二十个母题共用同一个框，"
-            "这正是成片**像 PPT** 的结构原因。画整屏插画、满版描线、大场景、"
-            "背景要铺满的镜头就写 `bleed: true`（满幅镜记得同时给 `bg`）")
-
-    # ② 质感种数（只提醒）
-    tex = facts["textures"]
-    if len(tex) < VARIETY_MIN_TEXTURES:
-        undeclared = sum(1 for s in shots if not str(s.get("texture") or "").strip())
-        shown = "、".join(sorted(t or "跟整片默认" for t in tex)) or "none"
-        warns.append(
-            f"质感提醒：{n} 镜只用了 {len(tex)} 种画面质感"
-            f"（{shown}），低于 {VARIETY_MIN_TEXTURES} 种这条线。"
-            + (f"其中 {undeclared} 镜没写 `texture`（跟整片默认）。" if undeclared else "")
-            + "质感是**打磨层**不是构图层（滤镜跑在拼接之前的那一趟逐镜切片上），"
-              "换一档不重烧任何一镜的帧，所以「第 3 镜老电视、其余柔光」这种配法是免费的")
-
-    # ③ 底色申报（只提醒；满幅那一条更硬）
-    with_bg = [sid for sid, s in zip(ids, shots) if str(s.get("bg") or "").strip()]
-    bleed_no_bg = [sid for sid, s in zip(ids, shots)
-                   if s.get("bleed") is True and not str(s.get("bg") or "").strip()]
-    if bleed_no_bg or len(with_bg) < n * VARIETY_BG_SHARE:
-        warns.append(
-            f"底色提醒：{len(with_bg)}/{n} 镜申报了 `bg`"
-            + (f"，其中 {len(bleed_no_bg)} 个满幅镜没给（{'、'.join(bleed_no_bg)}）"
-               if bleed_no_bg else "")
-            + "——满幅镜**必须**给 `bg`：不给的话深色板的正文会压在母版的奶油底上"
-              "（页边一圈奶油、中间一块深色），而闸④ 还拿 `bg` 当「这一镜画了东西没有」"
-              "的基准色，读不到基准色它在这一镜上拒绝判空（未判不是通过）")
-    return errors, warns, undetermined
 
 
 # ---------------------------------------------------------------------------
@@ -2549,50 +2474,14 @@ def original_shot_ids(shots: list[dict[str, Any]]) -> list[str]:
     return out
 
 
-def check_original_share(shots: list[dict[str, Any]]
-                         ) -> tuple[list[str], list[str]]:
-    """闸⑳ 原创配额：走原创哨兵的镜不得超过整片的 ``ORIGINAL_MAX_SHARE``。
-
-    → (打回清单, 提醒清单)。提醒恒空：**绿就是绿**——1 镜原创的片子不该在回执上
-    多出一条「注意有几镜是原创」，那会把「通过了」读成「有问题但算了」。
-    哪几镜走了原创由 ``style_facts["original_shots"]`` 如实报账（计划卡与回执都读它）。
-    """
-    errors: list[str] = []
-    n = len(shots)
-    if n < ORIGINAL_MIN_SHOTS:
-        return errors, []
-    ids = original_shot_ids(shots)
-    quota = max(1, int(n * ORIGINAL_MAX_SHARE))
-    if len(ids) > quota:
-        errors.append(
-            f"闸⑳ 原创配额：{n} 镜里有 {len(ids)} 镜声明了原创"
-            f"（{ORIGINAL_SENTINEL}：{'、'.join(ids)}），上限是 {quota} 镜"
-            f"（整片的 {ORIGINAL_MAX_SHARE:.0%}）——卡库是这条链的风格上限，"
-            "原创哨兵是给「卡库表达不了的那几镜」开的窄口子，不是绕开取材的常规路。"
-            "占多数的镜仍须声明它派生自哪份 demo（照 shots/INDEX.md 那一栏抄）")
-    return errors, []
-
-
 # ---------------------------------------------------------------------------
-# 闸⑮ 版式族配额 / 闸⑯ 画面主体具名（R5-T15；与 ⑦ 一样判在烧像素之前）
+# 闸⑯ 画面主体具名（R5-T15；与 ⑦ 一样判在烧像素之前）
 # ---------------------------------------------------------------------------
 
 #: 闸⑮：同一**族**最多几镜的**下限**。族 = 卡库里那个类别目录名（`card` 写成 `<类别>/<卡名>`）。
-#: 实际上限按镜数放宽，见 :func:`layout_family_cap`。
+#: **闸⑮ 与它的计算函数已于 2026-10-24 删除**；这个常量只被一条测试按值断言，留着是历史。
 LAYOUT_FAMILY_MAX_SHOTS = 2
 
-
-def layout_family_cap(n: int) -> int:
-    """n 镜的片子里同一族最多几镜：``max(LAYOUT_FAMILY_MAX_SHOTS, ceil(n/4))``。
-
-    原先恒为 2（2026-10-17 改）：20 镜的片子要摊进 10 个族，而卡库一共 11 个族——一条讲
-    「薄肌理论」的科普片被逼着用上 `interaction`（光标/协作）、`ui-entrance`（卡片入场）这类
-    与题材无关的族，模型在记录里原话是「I need exactly 2 per family across 10 families」，
-    结果每一镜一套视觉语言，用户看到的是「画面不连贯」。按镜数放宽到四分之一：20 镜每族
-    最多 5 镜，题材对口的那几族（science / typography / data）够用，又不至于一族包场。
-    「不同的卡 ≥ ceil(n/4) 张」那一条不动——它防的是同一张卡反复用，与连贯不冲突。
-    """
-    return max(LAYOUT_FAMILY_MAX_SHOTS, -(-int(n) // 4))
 
 #: ⑯ 的通道白名单。**与 :func:`shot_style_channel` 的返回值是同一套词**（不多不少）——
 #: 两处对得上，才谈得上「申报的通道」与「代码里认得的通道」逐字对账。`text` 不在里面：
@@ -2634,62 +2523,6 @@ ABSTRACT_SUBJECTS: frozenset[str] = frozenset({
 def card_family(card: str) -> str:
     """卡 id → 版式**族**：``data/chart-live-moves`` → ``data``（卡库的类别目录名）。"""
     return str(card or "").split("/", 1)[0].strip()
-
-
-def check_layout_family(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
-    """闸⑮：整片层的版式族配额。→ (打回清单, 提醒清单)。
-
-    两条判据，读的都是**已经过白名单的** ``card``（见 :func:`_norm_cite`）：
-
-    1. `card` **取值**（卡名）种类 ≥ ``ceil(镜数 / 4)``——整片至少要有那么多个不同的版式；
-    2. 同一**族**（卡库里的类别，`<类别>/<卡名>` 的前半截）最多 ``LAYOUT_FAMILY_MAX_SHOTS`` 镜。
-
-    第 2 条蕴含第 1 条（同族 ≤2 镜 ⇒ n 镜至少要 n/2 个族 ⇒ n/2 ≥ ceil(n/4)）。两条都判不是
-    啰嗦：合同把两条都冻结了，而第 1 条是「族」这个口径万一被放松时还站着的那道地板。
-
-    **为什么族取卡库目录名，而不是让模型自报一栏 `layout`**：自报的自由字符串没有任何
-    白名单，写什么都能凑够「取值种类」——而这条闸要拦的恰恰是「每镜换一个名字、画面上
-    还是同一张卡」。卡库的类别是**已经存在、已经被 `_known_card_ids()` 当白名单使的**
-    东西，不新造字段：一份片子里 `data` 族摆三镜，观众看到的就是同一套版式在重复。
-    §9-Q84 记了这条口径（同时也记了合同原话里那个不存在的 `layout` 栏）。
-
-    纯文字/纯色块镜由闸⑦「每镜必画」逐镜拦掉（:func:`check_draw_floor`），不在这里重算。
-    镜数不到 ``MIN_SHOTS_FOR_QUOTA`` 不判——三镜片谈「族配额」连分母都不成立。
-    `card` 为空的那几镜不在这里喊第二遍（``_norm_cite`` 已经逐镜报过），配额账只把
-    **选定了卡**的镜算进分母与族账。
-    """
-    errors: list[str] = []
-    n = len(shots)
-    if n < MIN_SHOTS_FOR_QUOTA:
-        return errors, []
-    pairs = [(str(s.get("id") or f"s{i + 1:02d}"), str(s.get("card") or "").strip())
-             for i, s in enumerate(shots)]
-    pairs = [p for p in pairs if p[1]]
-    if not pairs:
-        return errors, []       # 一镜都没选卡：那是出处/卡名那一栏的错，不在这儿喊第二遍
-    kinds: dict[str, list[str]] = {}
-    fams: dict[str, list[str]] = {}
-    for sid, card in pairs:
-        kinds.setdefault(card, []).append(sid)
-        fams.setdefault(card_family(card), []).append(sid)
-
-    want = -(-n // 4)                                     # ceil(n/4)，整数运算不引 float
-    if len(kinds) < want:
-        errors.append(
-            f"闸⑮ 版式族配额：{n} 镜只用了 {len(kinds)} 张不同的卡（"
-            + "、".join(f"{c}×{len(v)}" for c, v in kinds.items())
-            + f"），这一档至少要 {want} 张。同一张卡摆好几镜，画面上就是同一个母题换了文案"
-            "——把重复的那几镜换成别的卡（卡库按类别分好了，见 shots/INDEX.md）")
-    cap = layout_family_cap(n)
-    over = {f: v for f, v in fams.items() if len(v) > cap}
-    if over:
-        errors.append(
-            f"闸⑮ 版式族配额：{n} 镜里 "
-            + "；".join(f"{f} 族占了 {len(v)} 镜（{'、'.join(v)}）" for f, v in over.items())
-            + f"——{n} 镜的片子同一族最多 {cap} 镜。族是卡库的类别目录名，"
-            "同一族连着摆好几镜，观众看到的是同一套版式在重复。当前族分布："
-            + "、".join(f"{f}×{len(v)}" for f, v in fams.items()))
-    return errors, []
 
 
 def check_subject_named(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
@@ -2772,66 +2605,6 @@ def check_subject_named(shots: list[dict[str, Any]]) -> tuple[list[str], list[st
 # ---------------------------------------------------------------------------
 # 闸㉝ 具名件（2026-10-17）：每一镜至少用上简笔画零件库里的一件
 # ---------------------------------------------------------------------------
-
-
-def drawn_parts(code: str) -> list[str]:
-    """这一镜的代码真用上了哪几件 `@dg/lib/draw/*`（升序）。
-
-    「用上」与画法通道同一套证据口径（:func:`shot_used_channels`）：**import 了还得在
-    代码体里出现那个绑定名**。「`import { Figure } from '@dg/lib/draw/Figure'` 而 JSX
-    里一个 `<Figure/>` 都没有」是凑配额最省事的写法，这道闸不认。
-    """
-    bindings = imported_bindings(code)
-    return sorted(p for p in _DRAW_PARTS
-                  if (names := bindings.get(p)) is not None and _uses_binding(code, names))
-
-
-def check_named_parts(shots: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
-    """闸㉝（**2026-10-18 起不在整片判据里**，只在回执里报）：每一镜至少用上一件
-    **简笔画零件库**的件。→ (打回清单, 提醒清单)。
-
-    退出的理由见 ``WHOLE_FILM_GATES`` 上方那段注释：机器形态只剩「import 名出现了」，
-    而过法可以是在角落摆一支 `<Arrow/>`——它拦不住「画得不像」，却会逼所有镜都依赖
-    一套固定模板。用户明确要求不要再给一堆模板；「像不像」改由静帧视觉评审按画面判。
-    这个函数保留，便于回执继续报「哪几镜用了零件、哪几镜没用」，但不进 ``WHOLE_FILM_GATES``。
-
-    **它治的是用户那句「画的一点也不写实」。** 零件库
-    （`remotion/src/lib/draw/`，别名 `@dg/lib/draw/*`）把「一个能被认出的东西由哪几笔
-    构成」预先写好了：人、机器、厂房、齿轮、图表、天平、钟…。库在那里而没人用，
-    于是真机上出现的是「180 个点拼成的一个椭圆，标注『19 世纪·富态』」——形状随意、
-    认不出是什么。这一道判据的机器形态就是**「这一镜有没有一件具名的东西」**。
-
-    **判据是静态的，判在烧像素之前**（与 ⑦ 同一档），所以它**判不出「像不像」**：
-    它只认「用没用上库里那一件」。一个 `<Figure/>` 摆在画面角落、主体仍旧是那团点阵，
-    这一道不响——那一格是盲描述那一路的活（见 :func:`check_subject_named` 末段）。
-    把这条说清楚，是为了不让读回执的人以为「㉝ 绿了＝画得像」。
-
-    **为什么是硬闸（不在 `SOFT_GATES` 里）**：用户对这一条的原话是「必需像」，
-    而它在代码层永远可满足——库里没有合用的那件时，仍可自己用 `<path>` 画，
-    只要**同时**用上库里一件（哪怕只是一支 `<Arrow/>` 指着自己画的那个东西）。
-    一道永远可满足、且直接对应用户那句抱怨的判据，做成「建议」就等于没做。
-
-    没有 code 的镜**跳过**：取材轮落在 `plan_motion` 的入口就被拦下了（`forage_scan`），
-    走不到这里；真走到这里的空代码由契约那一层报「code 为空」，不在这儿喊第二遍。
-    """
-    errors: list[str] = []
-    for i, s in enumerate(shots):
-        code = str(s.get("code") or "")
-        if not code.strip():
-            continue
-        if drawn_parts(code):
-            continue
-        sid = str(s.get("id") or f"s{i + 1:02d}")
-        _err(errors,
-             f"闸㉝ 具名件：{sid}：这一镜一件简笔画零件都没用上——库里没有**能被认出的"
-             f"东西**，画面上就只有随手拼的形状。把这一镜的 `subject`（"
-             f"{str(s.get('subject') or '没填')}）照着「外轮廓 → 标志物 → 3~6 个部件」"
-             f"拆成库里的件拼出来：{', '.join(_DRAW_PARTS)}。库里的件不够用时，"
-             f"仍要自己用 `<path>`/`<circle>` 补，但**同时也要用上至少一件**"
-             f"（哪怕只是一支 `<Arrow/>` 指着你画的那个东西）——这一道管的是"
-             f"「画面上有没有一件具名的东西」。用上库里件的镜，"
-             f"`subject_channel` 就填 `rough`")
-    return errors, []
 
 
 # ---------------------------------------------------------------------------
@@ -3283,7 +3056,6 @@ def check_motion_anchors(shots: list[dict[str, Any]]) -> list[str]:
 #
 # **闸号 ㉘ 与它的下半场 ㉗ 一起不再被占用**，与 ⑪/⑬/⑱/㉛ 同一处置。
 # ---------------------------------------------------------------------------
-
 
 
 def check_motion_windows(shot: Mapping[str, Any], *, events: Sequence[Mapping[str, Any]],
@@ -3842,7 +3614,6 @@ def check_transition_effect(secs: Sequence[float], total_sec: float, *,
             f"逐镜切片是好的（缓存那边对得上），问题在拼接这一趟"]
 
 
-
 # ---------------------------------------------------------------------------
 # 闸⑨ 跨镜结构雷同（同一张卡复制一份只换色相 → 在烧像素之前打回）
 # ---------------------------------------------------------------------------
@@ -3937,7 +3708,7 @@ def check_derived_similarity(shots: list[dict[str, Any]]
 
     闸⑳ 的原创哨兵（R19）**跳过这一道**：`derived_from == ["<original>"]` 的镜声明里
     压根没有 demo，无从比起——那不是「声明造假」，是另一条合法的路。跳过它**不等于
-    免检**：lint（闸①）与闸④⑧⑩ 照样判它，配额由 :func:`check_original_share` 管。
+    免检**：lint（闸①）与闸④⑧⑩ 照样判它；配额那条判据（闸⑳）已于 2026-10-24 删除。
     """
     errors: list[str] = []
     warns: list[str] = []
@@ -4179,41 +3950,6 @@ def structure_groups(codes: list[str], *, threshold: float = STRUCT_SAME
             groups.setdefault(find(i), []).append(i)
     return sorted((sorted(v) for v in groups.values() if len(v) >= 2),
                   key=lambda g: (-len(g), g[0]))
-
-
-def check_shot_structure(shots: list[dict[str, Any]]
-                         ) -> tuple[list[str], list[str]]:
-    """闸⑨：跨镜结构雷同。→ (打回清单, 提醒清单)。"""
-    errors: list[str] = []
-    warns: list[str] = []
-    codes = [str(s.get("code") or "") for s in shots]
-    ids = [str(s.get("id") or f"s{i + 1:02d}") for i, s in enumerate(shots)]
-    if len(codes) < STRUCT_MIN_GROUP:
-        return errors, warns
-    for group in structure_groups(codes):
-        label = "、".join(ids[i] for i in group)
-        if len(group) >= STRUCT_MIN_GROUP:
-            errors.append(
-                f"闸⑨ 跨镜同构：{len(group)} 镜（{label}）的代码骨架一模一样——"
-                "剥掉文案字符串与颜色之后，它们的标识符、数字与符号序列完全重合，"
-                "也就是**只换了字与色相，没换画法**。这不叫多风格，叫拼贴："
-                "让这些镜各用一种自己的母题（手绘 roughjs / 真三维 three / 公式 katex / "
-                "几何图示四种里至少三种），并且每镜的版式、时间轴与图形参数都要不同。"
-                "技能正文「画面丰富度合同」那一节写着四类母题怎么选")
-        else:
-            warns.append(
-                f"结构提醒：{label} 两镜的代码骨架相似度 ≥{STRUCT_SAME:.2f}"
-                "（剥掉文案与颜色后几乎逐字相同）。两镜同构可以是同一拍的两个镜头，"
-                "第三镜再照抄就是拼贴——出片前看一眼这两帧是不是一回事")
-    near = [(i, j, s) for i, j, s in structure_pairs(codes)
-            if STRUCT_NEAR <= s < STRUCT_SAME]
-    if near:
-        warns.append(
-            f"结构提醒：{len(near)} 对镜的骨架相似度落在 {STRUCT_NEAR:.2f}~{STRUCT_SAME:.2f}"
-            "（实测互不相同的参考实现最高只到 0.74，所以这一档只是可疑不是定罪）："
-            + "、".join(f"{ids[i]}↔{ids[j]}" for i, j, _ in sorted(
-                near, key=lambda x: -x[2])[:8]))
-    return errors, warns
 
 
 # ---------------------------------------------------------------------------
@@ -5395,59 +5131,29 @@ def autofix_duplicate_caption(spec: Mapping[str, Any]) -> tuple[dict[str, Any], 
     return {**spec, "shots": out}, notes
 
 
-#: 整片层的判据（闸⑦ 每镜必画 / 闸⑲ 风格丰富度 / 闸⑫ 与 demo 骨架同构 /
-#: 闸⑳ 原创配额 / 闸⑨ 跨镜同构 / 闸⑩ 文字对比度 / 闸⑮ 版式族配额 / 闸⑯ 主体具名 /
-#: 闸㉜ 字幕归属）。
+#: 整片层的判据：**只剩两道**（⑯ 主体具名 / ㉜ 字幕归属）。
 #: **三处调用点**（plan_motion 入库前、render 烧像素前、patch 落盘前）与**两处报账**
 #: （计划卡、出片回执）都从这一个元组取，规则因此不可能只在某一路上生效；这也是
 #: 「清单只有一个」那条纪律落在这一族判据上的样子（同一形状的清单漂移踩过三次，
 #: 见 §9-Q90/Q91）。
 #:
-#: ⑦ 与 ⑲ 是**一对**，别把它们的职责搞混：⑦ 管**地板**（每一镜都得用代码画出东西来），
-#: ⑲ 管**逼丰富**（色板 / 满幅 / 质感 / 底色这四条在此之前没有任何闸在判）。
-#: ⑫ 与 ⑳ 同理：⑫ 判「声明派生就要真像」，⑳ 判「走原创的那几镜别超过 20%」。
-#: **闸㉝（每镜至少用一件简笔画零件）2026-10-18 退出整片判据**。它当初要治的是
-#: 「画出来认不出是什么」，但机器形态只剩「import 名出现了」——模型最省事的过法是
-#: 在画面角落摆一支 `<Arrow/>`，主体照样是一团点阵。用户对这一条的判断是「以前设定
-#: 有很多是错的，不要限制这么多、不要给一堆模板」：零件库降级为**可选参考件**，
-#: 「像不像」交给静帧视觉评审（``design_review``）按画面判。函数与 ``drawn_parts``
-#: 保留，回执可以继续报「这一镜用了哪几件」，但不再拦。
-#: 只在用 demo 时才有意义的三道（⑫ 骨架相似 / ⑳ 原创配额 / ⑮ 版式族配额）：
-#: `DEMOS_ENABLED` 关着时不进整片判据（见那个常量的注释）。
-_DEMO_GATES = (check_derived_similarity, check_original_share, check_layout_family)
-
-#: **2026-10-23：整片判据收成一道。** 用户判断「DS 10.17 的画图能力不需要这些约束，
-#: 让模型按技能与提示词自由发挥」。撤掉的六道与理由：
+#: **2026-10-23：整片判据从 9 道收成 1 道；同日晚上加回 ⑯。** 用户判断「DS 10.17
+#: 的画图能力不需要这些约束，让模型按技能与提示词自由发挥」。撤掉的七道：
+#: ⑦ 每镜必画 / ⑲ 风格配额 / ⑨ 跨镜同构 / ⑩ 文字对比度 / ⑫ 骨架相似 /
+#: ⑳ 原创配额 / ⑮ 版式族配额——它们判的都是「画得好不好」，那是审美，
+#: 交给 `design_review` 按画面判更准。
 #:
-#: · ⑦ `check_draw_floor`「每镜必画」——判「画没画」，属于审美；
-#: · ⑲ `check_style_variety`「风格配额」——逼丰富，恰好是限制；
-#: · ⑨ `check_shot_structure`「跨镜同构」——判「像不像 PPT」，交给模型；
-#: · ⑯ `check_subject_named`「主体具名」——判「画的是不是那个东西」；
-#: · ⑩ `check_ink_contrast`「字色对比度」——读不清是审美，不是崩；
-#: · ⑫⑳⑮（demo 三道）——`DEMOS_ENABLED` 本来就关着。
+#: 留下的两道不是审美判据：
+#: · ㉜ 字幕归属——同屏两条字幕会叠成重影，那是代码里摆了两份元件，不是「好不好看」；
+#: · ⑯ 主体具名——申报 `subject_channel=three` 而代码里一个 three 都没有，是账实不符。
+#:   允许它不判的实测后果见 `docs/诊断-能力显弱的真实断点-2026-10-23.md`。
 #:
-#: **留下的这一道不是审美判据，是结构性 bug**：同屏两条字幕会叠成重影，
-#: 那是代码里摆了两份字幕元件，不是「好不好看」。
-#:
-#: 六个函数**不删**（回执、`style_facts` 与测试仍在读它们的读数），只是不再进
-#: `validate_code_spec` 的打回清单——「不拦 ≠ 不明说」。
-#:
-#: **⑯ 同日加回（2026-10-23 晚）。** 与上面撤掉的五道，区别在**判的是什么**：
-#: ⑦⑨⑩⑲⑫⑳ 判的都是「画得好不好」——那是审美，交给 `design_review` 按画面判更准；
-#: ⑯ 判的是「**说了有没有做到**」——申报 `subject_channel=three` 而代码里一个 three
-#: 都没有，是账实不符，不是品味问题，没有「人眼替机器判」的余地。
-#:
-#: 允许它不判的实测后果（《一秒》20:36 那轮）：12 镜里 8 镜申报了
-#: three/katex/rough/canvas，而代码里这四个词出现 **0 次**，全片 `style_channels`
-#: 只剩 `["vector"]`；视觉评审把 s07 的心脏写成「扁平卡通剪影，只有一圈暗描边，
-#: 没有厚度、粗糙度、接触阴影」——它申报的是 three。**申报与实现之间没有任何机制。**
-#:
-#: 配套：`shot_writer._channel_samples_block()` 同日给了 three/katex/rough/canvas 的
-#: 可抄骨架。**只拦不给范本会让那几镜反复退到超时**，两处必须一起上。
-#: 注意 ⑯ 里 `subject` 那一半（空着 / 抽象词 / 长度越界）**仍是提醒**，不进打回清单。
-#:
-#: ⑯ 排在 ㉜ **之前**：`test_caption_layer` 立了一条「新闸接在尾上、不插队」的约定，
-#: 而 ㉜ 必须留在最后一位。⑯ 是「加回来的旧闸」，接在头部不违反那条约定。
+#: **2026-10-24：撤掉的函数里有 5 个已经删掉**（`check_style_variety` /
+#: `check_original_share` / `check_layout_family` / `check_named_parts` /
+#: `check_shot_structure`）。上一轮写的「保留供回执读读数」并不成立——回执从来没读过
+#: 它们的读数，它们只是留在文件里被测试养着。⑦ `check_draw_floor` **留着**：
+#: 它还在 `whole_film_gate_results` 里给回执产「文案具体项低于 40%」那条提醒。
+#: 判据原文归档 `docs/已删的闸-2026-10-24.md`。
 WHOLE_FILM_GATES = (check_subject_named, check_caption_ownership)
 
 #: 「建议」档：这几道的打回项降为提醒（加 `（建议）` 前缀），与"打回档"同在一条回执里，
@@ -5476,8 +5182,7 @@ WHOLE_FILM_GATES = (check_subject_named, check_caption_ownership)
 #:
 #: 配套：`shot_writer._channel_samples_block()` 同时给了 three/katex/rough/canvas 的
 #: 可抄骨架。**只硬拦不给范本会让那几镜反复退到超时**，两处必须一起上。
-SOFT_GATES = frozenset({check_style_variety, check_layout_family, check_original_share,
-                        check_shot_structure, check_derived_similarity})
+SOFT_GATES = frozenset({check_derived_similarity})
 #: 旧名（并档前"只在预览档软"的那一份）。并档后与 `SOFT_GATES` 是**同一个集合**，
 #: 留着只为不打断既有引用（`test_caption_layer.py` 按名字查过它）。
 #: **别只往其中一个加东西**——加进任一个就等于加进另一个，那正是并档要消掉的东西。
@@ -5572,6 +5277,249 @@ def whole_film_gate_results(shots: list[dict[str, Any]]
     if len(ink) > 2:
         undetermined.extend(ink[2])
     return errors, warns, undetermined
+
+
+# ---------------------------------------------------------------------------
+# 闸的出口静态检查（T0.4，2026-10-24）
+#
+# **为什么这一节存在**：`whole_film_gate_results` 返回 `(打回, 提醒, 未判)`，而闸⑦ 的
+# 提醒、闸⑩ 的未判档在 2026-10-16 并档时被整段裁掉了——`warns.extend(check_draw_floor(...)[1])`
+# 那两行不在了，于是回执里 `style_warnings` 恒为空、`style_unjudged` 恒为空，
+# 「没人量过」被写成「量过且通过」。**藏了至少三个月，没有任何测试会红。**
+#
+# 一个出口「有没有人读」是**可以静态验证的**：闸的返回值只有两条出路——被下标取走
+# （`gate(...)[1]`）或被解包（`a, b = gate(...)`）。所以这一节做三件事：
+#
+# 1. `GATE_EXIT_CONSUMERS`：**消费点显式声明**。哪些闸的哪个出口被谁读，写在这里；
+# 2. `audit_gate_exits()`：AST 扫源码，比对「声明的」与「真在消费的」，不一致就报；
+# 3. `GATE_EXITS_UNWIRED`：多出口但不进整片汇总的闸，逐条写明理由——不写就是漏了。
+#
+# 纪律：**新加一道闸 = 在三个注册表里挑一个登记**。不登记会被 audit 点名，
+# 而不是像 2026-10-16 那样悄悄少一个出口。
+# ---------------------------------------------------------------------------
+
+#: 出口的名字，按位置排。`errors` 永远是第 0 个；两态闸没有 `undetermined`。
+GATE_EXIT_LABELS: tuple[str, ...] = ("errors", "warns", "undetermined")
+
+#: 多出口闸的**消费点声明**：`{闸: (出口名, ...)}`。
+#:
+#: 只登记「**不在** `WHOLE_FILM_GATES` 里、但出口仍被整片汇总读」的那几道：
+#: 进元组的那几道由 `whole_film_gate_results` 的通用循环统一消费，不用在这里重列
+#: （重列就是第二份清单，正是本仓踩过三次的那种漂移）。
+#:
+#: · ⑦ `check_draw_floor` 的 `errors` **故意不读**：回执上 `style_facts()["text_only"]`
+#:   已经单独报它了，再进 `errors` 就是同一件事两处各写一遍；但它的 `warns`
+#:   （「文案具体项低于 40%」）没有第二条路，必须在这里消费。
+#: · ⑩ `check_ink_contrast` 的 `warns`（「认不出底色/字色」）与 `undetermined`
+#:   （「这一镜没量过」）同理：它们就是回执 `style_unjudged` 那一行的唯一来源。
+GATE_EXIT_CONSUMERS: dict[Any, tuple[str, ...]] = {
+    check_draw_floor: ("warns",),
+    check_ink_contrast: ("warns", "undetermined"),
+}
+
+#: 多出口、但**刻意不进整片汇总**的闸：`{闸名: 理由}`。
+#:
+#: 判据是「它判的是逐镜的产物，消费点在逐镜那一段」——`code_render` 每渲完一镜就
+#: 当场用它的读数，汇总层再跑一遍既贵又重复。**没有理由的闸不许留在这里**：
+#: 那正是「出口丢了没人知道」的入口。
+GATE_EXITS_UNWIRED: dict[str, str] = {
+    "check_subject_present": "逐镜几何读数，消费点在 code_render 的逐镜回看（需 scanned 读数）",
+    "check_text_over_subject": "逐镜版面读数，消费点在 code_render 的逐镜回看（需 scanned 读数）",
+    "check_badge_composition": "逐镜版面读数，消费点在 code_render 的逐镜回看（需 scanned 读数）",
+    "check_motion_windows": "逐镜动效窗口，消费点在 code_render 的逐镜渲染段（需 events）",
+    "check_degenerate_forms": "逐镜版面读数，消费点在 code_render 的逐镜回看",
+    "check_av_accounting": "成片音画对账，消费点在 render 的音轨合成段（需实测时长）",
+    "check_transition": "成片转场表，消费点在 render 的拼片段（需接缝表）",
+    "check_transition_effect": "成片转场时长，消费点在 render 的拼片段（需总时长）",
+    "check_derived_similarity": "已从整片判据撤下（DEMOS_ENABLED 关着），保留供回执读读数",
+}
+
+
+def gate_arity(gate: Any) -> int:
+    """这道闸返回几个出口：2（打回/提醒）或 3（打回/提醒/未判）。
+
+    从**返回注解**数，不实测：注解是契约的一部分（`test_code_spec` 钉着），
+    而实测会随输入变——一个闸「有时返回两个、有时三个」正是 audit 要报的那种事。
+    注解不是 `tuple[...]` 时退回 1（单出口，不是本节的检查对象）。
+    """
+    ann = str(getattr(gate, "__annotations__", {}).get("return") or "")
+    if "tuple" not in ann:
+        return 1
+    depth, commas = 0, 0
+    for ch in ann[ann.find("["):]:
+        if ch in "[(":
+            depth += 1
+        elif ch in "])":
+            depth -= 1
+            if depth == 0:
+                break
+        elif ch == "," and depth == 1:
+            commas += 1
+    return max(1, commas + 1)
+
+
+def _exit_index(gate: Any, label: str) -> int:
+    """出口名 → 位置；越界返回 -1（声明写错时由 audit 报出来）。"""
+    try:
+        return GATE_EXIT_LABELS.index(label)
+    except ValueError:
+        return -1
+
+
+def _consumed_exits(source: str, gates: Mapping[str, Any]) -> dict[str, set[int]]:
+    """扫一段源码，返回 `{闸名: {被读的出口下标}}`。
+
+    认三种写法（今天代码里只出现前两种，第三种是闸元组的通用循环）：
+
+    1. `gate(shots)[1]`                    → 直接下标
+    2. `got = gate(shots)` + `got[1]`      → 赋值后下标（同一模块内按名字认，不追作用域）
+    3. `for gate in WHOLE_FILM_GATES:` 里 `got = run_film_gate(gate, shots)` + `got[i]`
+       → 记成「元组里每一道闸都读了 i」——这正是 `whole_film_gate_results` 的形状。
+    """
+    used: dict[str, set[int]] = {name: set() for name in gates}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return used
+
+    # 别名表：变量名 → 闸名（或 "__WHOLE__" 表示「WHOLE_FILM_GATES 里每一道」）。
+    alias: dict[str, str] = {}
+    whole: set[int] = set()
+
+    def _const_index(node: ast.AST) -> int | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return node.value
+        return None
+
+    def _call_gate(node: ast.AST) -> str | None:
+        if not isinstance(node, ast.Call):
+            return None
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else (
+            func.attr if isinstance(func, ast.Attribute) else "")
+        if name == "run_film_gate":
+            return "__WHOLE__"
+        return name if name in gates else None
+
+    # ① 赋值 / 解包（顺序扫一遍；后面的下标能用到前面的别名）
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        gname = _call_gate(node.value)
+        if gname is None:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                alias[target.id] = gname
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                # `a, b = gate(...)` 一次读走前 len 个出口
+                if gname == "__WHOLE__":
+                    whole |= set(range(len(target.elts)))
+                else:
+                    used.setdefault(gname, set()).update(range(len(target.elts)))
+
+    # ② 下标（`gate(...)[i]` 与 `alias[i]`）
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Subscript):
+            continue
+        idx = _const_index(node.slice)
+        if idx is None:
+            continue
+        base = node.value
+        if isinstance(base, ast.Call):
+            gname = _call_gate(base)
+        elif isinstance(base, ast.Name):
+            gname = alias.get(base.id)
+        else:
+            gname = None
+        if not gname:
+            continue
+        if gname == "__WHOLE__":
+            whole.add(idx)
+        else:
+            used.setdefault(gname, set()).add(idx)
+
+    for gate in WHOLE_FILM_GATES:
+        used.setdefault(gate.__name__, set()).update(whole)
+    return used
+
+
+def audit_gate_exits(*, source: str | None = None,
+                     extra_sources: Mapping[str, str] | None = None) -> list[str]:
+    """静态检查：**每道闸的每个出口都得有人读**。→ 问题清单（空 = 通过）。
+
+    ``source`` 缺省读本文件；``extra_sources`` 给「消费点在别的模块」的那几道
+    （今天没有，留口子是因为判据将来可能搬到 `code_render` 一侧）。
+
+    报三类：
+    1. **出口没人读**——闸返回了 `warns`/`undetermined`，源码里却没有一处取它；
+    2. **声明与代码不一致**——`GATE_EXIT_CONSUMERS` 说读了 `warns`，源码里没读；
+    3. **多出口闸没登记**——新加一道闸却没进 `WHOLE_FILM_GATES` / `GATE_EXIT_CONSUMERS`
+       / `GATE_EXITS_UNWIRED` 任一处。
+
+    第 1 条就是 2026-10-16 那个 bug 的形状：注释掉
+    `warns.extend(check_draw_floor(shots)[1])`，这里立刻报 ⑦ 的 `warns` 没人读。
+    """
+    problems: list[str] = []
+    here = Path(__file__).resolve()
+    text = source if source is not None else here.read_text("utf-8")
+    gates: dict[str, Any] = {}
+    for gate in tuple(WHOLE_FILM_GATES) + tuple(GATE_EXIT_CONSUMERS):
+        gates[gate.__name__] = gate
+    consumed = _consumed_exits(text, gates)
+    for name, extra in (extra_sources or {}).items():
+        for gate_name, idxs in _consumed_exits(extra, gates).items():
+            consumed.setdefault(gate_name, set()).update(idxs)
+
+    # ① 元组里的闸：每个真实出口都必须被通用循环读到
+    for gate in WHOLE_FILM_GATES:
+        arity = gate_arity(gate)
+        for i in range(arity):
+            if i not in consumed.get(gate.__name__, set()):
+                problems.append(
+                    f"闸出口丢失：{gate.__name__} 的第 {i} 个出口"
+                    f"（{GATE_EXIT_LABELS[i] if i < len(GATE_EXIT_LABELS) else i}）"
+                    f"在 WHOLE_FILM_GATES 的汇总循环里没有任何消费点——"
+                    f"回执会把「没量过」写成「量过且通过」")
+
+    # ② 显式声明的那几道：声明了几个就得读几个，多读不算错
+    for gate, labels in GATE_EXIT_CONSUMERS.items():
+        arity = gate_arity(gate)
+        got = consumed.get(gate.__name__, set())
+        for label in labels:
+            idx = _exit_index(gate, label)
+            if idx < 0:
+                problems.append(
+                    f"闸出口声明写错：{gate.__name__} 声明了不存在的出口 {label!r}"
+                    f"（只有 {', '.join(GATE_EXIT_LABELS)}）")
+                continue
+            if idx >= arity:
+                problems.append(
+                    f"闸出口声明越界：{gate.__name__} 只有 {arity} 个出口，"
+                    f"却声明消费第 {idx} 个（{label}）")
+                continue
+            if idx not in got:
+                problems.append(
+                    f"闸出口丢失：{gate.__name__} 声明消费 {label}，"
+                    f"但源码里没有一处读它的第 {idx} 个返回值")
+
+    # ③ 多出口闸必须在三个注册表之一里出现（新加闸忘了登记 = 出口注定丢）
+    registered = ({g.__name__ for g in WHOLE_FILM_GATES}
+                  | {g.__name__ for g in GATE_EXIT_CONSUMERS}
+                  | set(GATE_EXITS_UNWIRED))
+    mod = globals()
+    for name, obj in mod.items():
+        if not name.startswith("check_") or not callable(obj):
+            continue
+        if getattr(obj, "__module__", "") != __name__:
+            continue
+        if gate_arity(obj) < 2 or name in registered:
+            continue
+        problems.append(
+            f"闸没登记：{name} 有 {gate_arity(obj)} 个出口，却不在 "
+            f"WHOLE_FILM_GATES / GATE_EXIT_CONSUMERS / GATE_EXITS_UNWIRED 任一处——"
+            f"不登记就等于「出口丢了没人知道」")
+    return problems
 
 
 # ---------------------------------------------------------------------------

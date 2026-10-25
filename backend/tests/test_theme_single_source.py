@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """主题唯一来源（R4-T9 + R4-T8-1）：色板与三档预设只有一处住址。
 
 判据不是「palettes.json 里有 8 个色板」——那只证明了今天有 8 个。真正要钉住的是
@@ -209,9 +209,9 @@ def test_skill_table_matches_preset() -> None:
     if not raw or remo is None:
         _unverified.append("⑤ palettes.json / remotion 不可达——三档表比对未验证")
         return
-    skill = (_backend_dir() / "examples" / "skills" / "motion_explainer" / "SKILL.md")
+    skill = (_backend_dir() / "examples" / "retired" / "motion_explainer" / "SKILL.md")
     if not skill.is_file():
-        skill = remo.parent / "backend" / "examples" / "skills" / "motion_explainer" / "SKILL.md"
+        skill = remo.parent / "backend" / "examples" / "retired" / "motion_explainer" / "SKILL.md"
     if not skill.is_file():
         _unverified.append("⑤ SKILL.md 不可达——三档表比对未验证")
         return

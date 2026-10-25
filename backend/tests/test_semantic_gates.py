@@ -253,36 +253,17 @@ def main() -> int:
                  '  );\n'
                  '};\n'
                  'export default Shot;\n')
-    check(cs.drawn_parts(_S09_DOTS) == [],
-          f"180 个点摆成椭圆：一件库里的件都没用上（实得 {cs.drawn_parts(_S09_DOTS)}）")
-    _e33, _w33 = cs.check_named_parts([_shot(subject="富态轮廓的点阵图", code=_S09_DOTS)])
-    check(len(_e33) == 1 and "㉝" in _e33[0] and "s01" in _e33[0] and not _w33,
-          f"真机那个红样**函数本身**仍判得出（实得 {_e33[:1]}）")
-    check(not any(fn.__name__ == "check_named_parts" for fn in cs.WHOLE_FILM_GATES),
-          "㉝ 自 2026-10-18 起**退出整片判据**：它只判「import 名出现过」，"
-          "拦不住「画得不像」，却逼所有镜依赖一套固定模板——用户要求不要再给一堆模板，"
-          "「像不像」改由静帧视觉评审按画面判")
-
-    # 用上库里一件就放行；只 import、不在 JSX 里出现则**不放行**（与 `subject_channel` 同一套
-    # 「import 了还得真用得上」的证据口径——这是本仓反复踩过的那条：自报不算证据）。
-    _USE = ('import { Machine } from "@dg/lib/draw/Machine";\n'
-            + _S09_DOTS.replace('<svg ', '<Machine x={960} y={880} w={520} kind="steam" />\n      <svg ', 1))
-    check(cs.drawn_parts(_USE) == ["@dg/lib/draw/Machine"]
-          and cs.check_named_parts([_shot(code=_USE)])[0] == [],
-          "自己画的那团点阵**留着**、旁边摆一件库里的件 → 放行"
-          "（这一道管的是「有没有一件具名的东西」，不是「许不许自己画」）")
-    _IMPORT_ONLY = ('import { Machine } from "@dg/lib/draw/Machine";\n' + _S09_DOTS)
-    check(cs.drawn_parts(_IMPORT_ONLY) == []
-          and len(cs.check_named_parts([_shot(code=_IMPORT_ONLY)])[0]) == 1,
-          "只 import、JSX 里一次都没出现 → **照旧打回**（自报不算证据，与⑯同一口径）")
-
-    # 空代码的镜由别的判据管（镜头结构、⑦ 那几条），㉝ 不在这里重复报一遍。
-    check(cs.check_named_parts([_shot(code=""), _shot(2, code="   ")])[0] == [],
-          "空代码的镜 ㉝ 不报（那是别的判据的地盘，重复报一次就是两份账）")
+    # ㉝（每镜至少用一件简笔画零件）与 `drawn_parts` **2026-10-24 一起删除**：
+    # 它只判「import 名出现过」，拦不住「画得不像」，却逼所有镜依赖一套固定模板；
+    # 用户 2026-10-18 就要求「不要再给一堆模板」，零件库降级为可选参考件。
+    check(not hasattr(cs, "check_named_parts") and not hasattr(cs, "drawn_parts"),
+          "㉝ 与它的识别函数一起走了——零件库现在是可选参考件，不是必用件")
 
     # 单源：那 13 个件名只在 `_DRAW_PARTS` 写一遍，同时喂 import 白名单与「rough 通道」。
     # 不这么办的话，「用库里的人偶画画」会被闸⑦ 判成「只画了文字与色块」——一件真画了
     # 东西的镜反而被打回，那是最坏的一种错（判据把人往反方向赶）。
+    _USE = ('import { Machine } from "@dg/lib/draw/Machine";\n'
+            + _S09_DOTS.replace('<svg ', '<Machine x={960} y={880} w={520} kind="steam" />\n      <svg ', 1))
     check(all(p in cs.IMPORT_WHITELIST for p in cs._DRAW_PARTS)
           and set(cs._DRAW_PARTS).issubset(set(cs.PICTORIAL_CHANNELS["rough"])),
           "13 个件既在白名单里、又记在 `rough` 通道上（一处常量两个读者）")
@@ -290,14 +271,6 @@ def main() -> int:
           f"用库里的件画画 = 真用上了 `rough` 通道（实得 {cs.shot_used_channels(_USE)}）"
           "——不然闸⑦ 会把一件真画了东西的镜判成「只画了文字与色块」，"
           "那是最坏的一种错（判据把人往反方向赶）")
-
-    # 它判不出「像不像」——这一条**必须**在这里写下来，否则下一个人会以为 ㉝ 过了就等于
-    # 画对了。一件 `<Figure/>` 摆在角落、主体仍是一团点阵，㉝ 一声不响：那是 ⑲-b 的活。
-    _CORNER = ('import { Figure } from "@dg/lib/draw/Figure";\n'
-               + _S09_DOTS.replace('<svg ', '<Figure x={120} y={1000} h={120} />\n      <svg ', 1))
-    check(cs.check_named_parts([_shot(code=_CORNER)])[0] == [],
-          "㉝ **判不出**「像不像」：摆在角落的一件也放行——所以别把「㉝ 过了」"
-          "当成「画对了」，那一格归 ⑲-b（见 `test_motion_judge_channel.py` ⑧）")
 
     # =================================================================
     print("\n〔⑳(c) 判据本体〕两镜代码可以写得不同，画面上却是同一张卡")
@@ -328,12 +301,11 @@ def main() -> int:
     check(warns == [] and undet == [],
           "打回那一档不再往提醒/未判里各抄一份（三态不重号）")
 
-    # **并列断言**：同一条片子上，闸⑨（跨镜同构）必须**不报**——两条闸判的不是一件事。
-    # ⑨ 比的是**代码骨架**且要 ≥3 镜才定罪；⑳(c) 比的是**画面**、两镜即算。上面那三镜的
-    # 代码彼此不同，所以 ⑨ 一点话都没有；而 ⑳(c) 照样抓到了 s01/s02 那一对。
-    errs9, _ = cs.check_shot_structure(card_shots)
-    check(errs9 == [],
-          f"闸⑨ 对同一组镜头不报（两个问题的答案不一样，所以两条闸并存）：{errs9}")
+    # **并列断言**：同一条片子上，闸⑨（跨镜同构）**已于 2026-10-24 删除**。
+    # ⑨ 比的是代码骨架、要 ≥3 镜才定罪；它判「像不像 PPT」，属于审美，
+    # 交给静帧视觉评审。⑳(c) 比的是**画面**、两镜即算，那一格不受影响。
+    check(not hasattr(cs, "check_shot_structure"),
+          "闸⑨ 已删——判「跨镜同构」交给静帧视觉评审，不再用代码骨架定罪")
 
     # 几何撞上、配色不同 → 放行：同版式不同配色是**合法**的系列镜头。
     errs, warns, undet = cs.check_degenerate_forms(

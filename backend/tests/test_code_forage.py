@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """取材轮（T20 / P9）的离线用例：模型「读得到卡、读不到码」这一条要真被堵上。
 
 判据的原话是「注入内容里含被引用 demo 的字节，且 ``load_skill(path=)`` 不截断；
@@ -44,7 +44,7 @@ from storyline_server.nodes import motion_plan as mp                       # noq
 _fails = 0
 _checks = 0
 
-SKILL_DIR = _BACKEND / "examples" / "skills" / "motion_explainer"
+SKILL_DIR = _BACKEND / "examples" / "retired" / "motion_explainer"
 DEMOS = SKILL_DIR / "demos"
 
 

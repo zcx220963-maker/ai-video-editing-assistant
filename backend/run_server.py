@@ -108,6 +108,7 @@ from agent_framework.catalog import get_catalog
 from agent_framework.media_fetch import FetchPolicy
 from agent_framework import uploads
 from agent_framework.tools.fetch_media import register_fetch_media_tools
+from agent_framework.tools.short_video import register_short_video_tools
 from agent_framework.tools.runs import register_run_tools
 from agent_framework.tools.web import register_web_tools
 from agent_framework.video_editing import (
@@ -367,6 +368,11 @@ def build_runtime(
     # 连不上 Storyline = 本服务没有剪辑能力，启动时会明确告警，不静默降级成 mock。
     editing_contract = ContractSlot()
     register_fetch_media_tools(registry, storage=storage, policy=fetch_policy)
+    # 图形科普短片（**一条链路**：一句话 → 分镜 → 逐镜代码 → 质检 → 一次渲完 → 链接）。
+    # 这是"没有实拍素材"时唯一的出片通道；有素材的口播剪辑仍走上面的 Storyline 节点。
+    # 它与 `/studio` 共用同一份工程落盘（`storyline_server/simple/project.py`），
+    # 所以对话里做的片子，网页里也能打开、也能改一镜。
+    register_short_video_tools(registry, storage=storage)
     # rerun_from：从某节点回退并重跑（上游产物复用、产物作用域换新）
     register_run_tools(registry, editing_contract)
     # 画面风格：用户在对话里说一句（或贴参考视频/图片），直接改这个对话的风格包。

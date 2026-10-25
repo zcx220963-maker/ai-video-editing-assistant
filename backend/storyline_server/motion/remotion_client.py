@@ -197,6 +197,37 @@ def render_stills_multi(*, code: str, variants: list[dict[str, Any]],
     return list(j.get("stills") or [])
 
 
+def put_asset(name: str, data: bytes, *, base: str | None = None,
+              timeout: int = 120) -> dict[str, Any]:
+    """把一张图推进渲染容器的 `public/assets/`，镜头里用 `staticFile('assets/<name>')` 取。
+
+    **这条腿原来没接**：`/assets` 口与 lint 白名单（`staticFile('assets/xxx.png')`）
+    2026-10-24 就都在了，但没有任何调用方——所以"脚本产出的图"这条路一直是空的。
+    插画叙事片的画面全靠它。
+
+    名字要过服务端的正则（小写字母数字开头，可含 `._-`，≤61 位），所以这里先归一。
+    """
+    import base64
+    import re
+
+    safe = re.sub(r"[^a-z0-9._-]", "-", str(name or "").strip().lower())
+    if not safe or not re.match(r"^[a-z0-9]", safe):
+        raise RemotionError(f"素材名不合法：{name!r}")
+    status, j = _request("POST", "/assets", base=base,
+                         payload={"name": safe,
+                                  "b64": base64.b64encode(data).decode("ascii")},
+                         timeout=timeout)
+    if not j.get("ok"):
+        raise RemotionError(f"素材上传被拒：{j.get('error') or j}", status=status)
+    return j
+
+
+def list_assets(*, base: str | None = None, timeout: int = 30) -> list[str]:
+    """渲染容器里现有的素材名（排查"图推上去了没"用）。"""
+    _, j = _request("GET", "/assets", base=base, payload=None, timeout=timeout)
+    return [str(x) for x in (j.get("assets") or [])]
+
+
 def endpoints(*, base: str | None = None, health_timeout: int = 10,
               lint_timeout: int = 60, render_timeout: int = 900,
               fetch_timeout: int = 300) -> dict[str, Any]:
