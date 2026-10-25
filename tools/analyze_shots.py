@@ -39,7 +39,7 @@ def main() -> int:
     scenes = ((doc.get("plan") or {}).get("scenes") or [])
     print("-" * 92)
     print(f"{'镜':<4}{'指纹(path/poly/rect/circ/ell/line/linG/radG)':<42}"
-          f"{'cap模式':<9}{'外层字幕':<9}{'text':>5}{'line':>6}{'dash':>6}")
+          f"{'cap模式':<9}{'外层字幕':<9}{'text':>5}{'表':>4}{'line':>6}")
     fps = []
     for i, b in enumerate(bodies):
         fp = _scene_fingerprint(b)
@@ -48,9 +48,9 @@ def main() -> int:
         cap = cap if isinstance(cap, dict) else {}
         mode = str(cap.get("mode") or "overlay")
         has_rc = "有" if "<RichCaption" in b else "—"
+        has_tbl = "有" if "<CompareTable" in b else "—"
         print(f"s{i + 1:02d}  {str(fp):<42}{mode:<9}{has_rc:<9}"
-              f"{count(r'<text\b', b):>5}{count(r'<line\b', b):>6}"
-              f"{count(r'strokeDasharray', b):>6}")
+              f"{count(r'<text\b', b):>5}{has_tbl:>4}{count(r'<line\b', b):>6}")
     uniq = len(set(fps))
     print("-" * 92)
     print(f"画法多样性：{uniq}/{len(bodies)} 种不同的指纹")
@@ -58,10 +58,15 @@ def main() -> int:
              if isinstance(s, dict) and isinstance(s.get("caption"), dict)
              and str(s["caption"].get("mode") or "") == "drawn"]
     rc = [i + 1 for i, b in enumerate(bodies) if "<RichCaption" in b]
+    tbl = [i + 1 for i, b in enumerate(bodies) if "<CompareTable" in b]
+    want_tbl = [i + 1 for i, s in enumerate(scenes)
+                if isinstance(s, dict) and isinstance(s.get("table"), dict)]
     texts = [count(r'<text\b', b) for b in bodies]
     lines = [count(r'<line\b', b) for b in bodies]
     print(f"分镜标 drawn 的镜：{drawn or '（一镜都没标）'}")
     print(f"外层加了字幕的镜：{rc}（共 {len(rc)} 镜）")
+    print(f"分镜给了 table 的镜：{want_tbl or '（一镜都没给）'}")
+    print(f"真画出对照表的镜：{tbl or '（一镜都没画）'}")
     print(f"drawn 的镜里有没有真画字："
           + ("、".join(f"s{i:02d}={texts[i - 1]} 个 <text>" for i in drawn) if drawn else "—"))
     print(f"版式文字合计 {sum(texts)} 个 <text>；虚线连线合计 {sum(lines)} 条 <line>")

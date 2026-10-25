@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any
 
 from . import facts, kernel, qa, system
+from .director import (  # noqa: F401  —— 提示词搬去 director.py
+    PLAN_SYSTEM as _PLAN_SYSTEM, STORY_SYSTEM as _STORY_SYSTEM)
 from . import voice as vo
 from .kernel import KernelError
 # 叙事片的"画法"拆到 story.py、"看自己画的一帧"拆到 review.py
@@ -93,40 +95,6 @@ STORY_TARGET_SHOT_SEC = 9.0
 STORY_MAX_SHOTS = 24
 
 #: 叙事片的分镜导演。与科普那份的区别：**要故事，不要知识点**。
-_STORY_SYSTEM = """你是叙事短片的分镜导演。把用户的主题写成一份**分镜脚本**。
-
-这不是科普讲解，是**讲故事**：第二人称（"你"）或第三人称视角，有时间线，有悬念。
-
-硬指标：
-· 镜数 = 用户给的秒数 ÷ 9，最少 3 个、最多 24 个；
-· **每镜 5~12 秒**（这是长镜片子，不要切碎）；
-· 每镜一句字幕，**字数 ≈ 秒数 ÷ 0.22**（9 秒的镜约 40 字，最多 48 字）。
-  **这是旁白，不是标题**：要能连着读下来，有主语有动词。
-  写短了片子就短——总长由这些句子说多久决定，不由你写的秒数决定。
-· 相邻两镜的画面要**明显不同**（不同地点/不同尺度/不同时间）。
-
-每一镜写六样：
-1. `text`：这一镜的**旁白/字幕**（约 `秒数 ÷ 0.22` 个字，最多 48 字）；
-2. `hi`：`text` 里要**高亮**的那一小段（2~5 个字，是这句的重音，必须是 text 的子串）；
-3. `plate`：**这一镜要画的那一张插画**（≤90 字）。写清：**谁/什么**在画面里、
-   在哪个位置、什么姿态、光从哪来、背景是什么。
-   写"一个男人站在巨大的绿色荧光屏前，屏幕上是起伏的波形，他的侧脸被屏幕照亮，
-   背景是全黑的机房"，不写"展示信号"。
-   **每镜必须有一个能被指认的具体物体或人**（剪影也算），不要写抽象概念；
-4. `plate_style`（可选）：这一镜的特殊画风（"航拍视角"、"微距"、"水墨"），一般不写；
-5. `chapter`：这一镜所属的**章节**（≤12 字，如"第 183 号文明"）。同段落可重复，
-   换段落时换新的；
-6. `time`：这一镜的**时间坐标**（≤12 字，如"地球时间 1975 年"、"两百年后"）。没有就不写；
-7. `caption`（可选）：这一镜的字幕怎么放，`{"mode": "overlay|drawn|none", "at": "bottom|lower|center|upper|left", "size": 0.047}`。`overlay`=外层统一加（不写就是这个）；`drawn`=**你自己把这句话画进画面**（题款/批注/碑文/纸卡/屏幕上的字），外层一个字不加；`none`=这镜不要字幕。**画面里本来就有适合承载文字的东西（墙、纸、碑、屏幕、卷轴）时才用 `drawn`**；`drawn` 全片最多 1/3 的镜（位置每镜都变，观众跟不住），`at` 全片也只变 2~3 档。
-
-全片要有**递进与收束**：开场给一个画面把人拽进来 → 中段推进 → 结尾留一个问句或反转。
-
-**还要给一件贯穿全片的物件**（`motif`）：一件具体的东西，在第 3 镜之后反复出现，
-每次的大小/位置/明暗都不同（参考片里那个"蓝色小点"就是这么用的）。
-它让十几个独立的镜头变成**一部片子**，而不是十几张图。
-`motif` 写 4~10 个字，必须是**能画出来的具体物件**（一个蓝点 / 一枚硬币 / 一道裂缝 / 一只眼睛）。
-""" + facts.SOURCES_RULE + """
-只回一行 JSON：{"title": "…", "motif": "…", "sources": [], "scenes": [{"text": "…", "hi": "…", "plate": "…", "chapter": "…", "time": "…", "caption": {"mode": "overlay", "at": "lower"}}]}"""
 #: 转场长度（帧）。8 帧 @30fps ≈ 0.27 秒——够看清是"过渡"而不是"跳帧"，
 #: 又不至于把 4 秒一镜的节奏吃掉。再长就该加镜数了，不是加转场。
 TRANS_FRAMES = 8
@@ -143,34 +111,6 @@ TRANS_TSX = {
 #: 硬切是节奏的一部分，不是"没做转场"。
 TRANS_CYCLE = ("slide", "zoom", "wipe", "blur", "slide", "cut")
 
-_PLAN_SYSTEM = """你是知识科普短片的分镜导演。把用户的主题拆成一份**镜头表**。
-
-硬指标（写之前先算好，这决定片子像不像 PPT）：
-· 镜数 = 用户给的秒数 ÷ 4，最少 3 个、最多 56 个；
-· **任何一镜都不超过 5.2 秒**；
-· 相邻两镜的视觉手段必须不同（不要连续两镜都是"大标题 + 色块"）；
-· **每镜字幕的字数按这一镜的秒数算**：约 `秒数 ÷ 0.22` 个字（旁白语速），
-  最多 20 个字。4 秒的镜写 ~16 字，2.5 秒的镜写 ~10 字。
-  **片子的总长是由这些句子说多久决定的**——写得都短，成片就会比你要求的短。
-
-每一镜写五样：
-1. `text`：这一镜的字幕（约 `秒数 ÷ 0.22` 个字，最多 20 字，可以没有标点）；
-2. `brief`：画面上到底出现什么，**必须写成三层**（≤120 字）：
-   背景层（底色/光晕/网格/色带）、中景（**至少 3 件实体**，最大的那件占画面 30%~55%）、
-   前景（角标/刻度/细线/浮层）。**背景层和 HUD 不算"实体"**——实体是能被指着说
-   "那是一只鲸鱼/那是一个齿轮/那是一根上升的曲线"的东西。
-   写"一只鲸鱼从左向右穿过楼群，尾巴扫过第三栋楼的窗户"，不写"展示海洋生态"；
-3. `hue`：这一镜的主色，十六进制（要**高饱和**：橙 #FF6B2C / 青 #22D3EE /
-   黄 #FFC93C / 玫 #FF3D7F / 绿 #34D399）。整片只允许 2~3 个色相，按叙事推进换；
-4. `motion`：两拍怎么动（≤40 字）。第一拍入画（0~50%），第二拍主运动（60~100%）；
-5. `transition`：**怎么切进这一镜**，从这六个里挑一个：
-   `cut`（硬切，最干脆）/ `slide`（推入，同段落内换视角）/ `wipe`（擦除，换段落）/
-   `zoom`（冲入，强调一个数字）/ `blur`（模糊，时间跳跃）/ `fade`（淡入，收束或回忆）。
-   相邻两处不要连着用同一个；全片至少有 3 处 `cut`，`fade` 最多两次。
-
-全片要有**递进**：开场抓人 → 中段讲机制 → 收束给一句题眼。
-""" + facts.SOURCES_RULE + """
-只回一行 JSON：{"title": "…", "sources": [], "scenes": [{"text": "…", "brief": "…", "hue": "#FF6B2C", "motion": "…", "transition": "slide"}]}"""
 
 _SCENE_SYSTEM = """你在写一个 Remotion 场景组件。只写**一个组件**，不写 import、不写 export。
 
@@ -701,7 +641,10 @@ async def _make_story(prompt: str, *, seconds: float, aspect: str, fps: int,
     tick("plan", 0, 0)
     if scenes:
         # 分镜由调用方给定（人改过的脚本 / 复用上一次的分镜）：跳过规划调用。
-        plan_obj, calls = {"title": "", "scenes": list(scenes)}, 0
+        # **两种形状都收**：list（只要 scenes）与 dict（`/simple/plan` 的整份产物）。
+        # 收 dict 是为了「先看分镜、改完再继续」那条路——`motif` / `sources` 不能在
+        # 这一步丢掉（丢了跨镜接力与出处账就没了）。
+        plan_obj, calls = _adopt_plan(scenes), 0
     else:
         plan_obj, calls = await plan_story(prompt, seconds=seconds, aspect=aspect,
                                            llm=llm, user_id=user_id,
@@ -880,6 +823,22 @@ async def _make_story(prompt: str, *, seconds: float, aspect: str, fps: int,
             "elements": {i + 1: system.element_count(b) for i, b in enumerate(bodies)},
             "voice": voice_info,
             "total_sec": round(sum(secs), 2)}
+
+
+def _adopt_plan(scenes: Any) -> dict[str, Any]:
+    """把调用方给的分镜收成 plan 对象。**list 与 dict 两种形状都收**。
+
+    list 只有 scenes，`motif` / `sources` 必然为空——那是"人只给了几句台词"的情况，
+    接力与出处账跟着没有，可以接受。dict 是 `/simple/plan` 的整份产物，
+    原样收下（前端"先看分镜、改完再继续"走这条），`sources` 再过一遍归一化。
+    """
+    src = scenes if isinstance(scenes, dict) else {}
+    raw = src.get("scenes") if src else scenes
+    got = [s for s in raw if isinstance(s, dict)] if isinstance(raw, list) else []
+    return {"title": str(src.get("title") or ""),
+            "motif": str(src.get("motif") or "")[:20],
+            "sources": facts.normalize(src.get("sources")),
+            "scenes": got}
 
 
 async def make_film(prompt: str, *, seconds: float = 60.0,

@@ -288,6 +288,26 @@ def main() -> int:
     # 动效模式不补：快节奏靠加镜数，不靠拉长留白（那是另一件事）。
     check(vo.fill_to([3.6] * 25, 100.0, hi=5.2)[0] <= 5.2, "（动效上限更紧，也不会超）")
 
+    print("\n⑯ 分阶段确认：给了分镜就不再调规划，但 motif / sources 不能丢")
+    # 为什么这条重要：一次成片二十几次调用、十几分钟。主题或讲法错了只能整条重跑。
+    # 「先看分镜、改完再继续」把错的那一步从 24 次调用降到 1 次。
+    # 而这条路的坑在**收编**：把 /simple/plan 的产物传回来时，如果只取 scenes，
+    # 跨镜接力（motif）与出处账（sources）会在这一步悄悄丢掉。
+    got = film._adopt_plan([{"text": "一句"}])
+    check(got["scenes"] == [{"text": "一句"}] and got["motif"] == "" and got["sources"] == [],
+          f"只给 list → 只有 scenes（{got}）")
+    got = film._adopt_plan({"title": "标题", "motif": "蓝点",
+                            "sources": [{"claim": "47% 的人", "source": "X"}],
+                            "scenes": [{"text": "一句", "caption": {"mode": "drawn"}}]})
+    check(got["title"] == "标题" and got["motif"] == "蓝点",
+          "dict 形状 → title 与 motif 都留下（接力不断）")
+    check(len(got["sources"]) == 1 and got["sources"][0]["source"] == "X",
+          "sources 过一遍归一化后留下（出处账不丢）")
+    check(got["scenes"][0]["caption"] == {"mode": "drawn"},
+          "每镜的 caption 原样带过去（字幕版式不丢）")
+    for bad in (None, [], {}, {"scenes": "不是列表"}, {"scenes": [None, 1]}):
+        check(film._adopt_plan(bad)["scenes"] == [], f"_adopt_plan({bad!r}) → 空 scenes，不炸")
+
     print(f"\n{_CHECKS - _FAILS}/{_CHECKS} 通过")
     return 0 if _FAILS == 0 else 1
 

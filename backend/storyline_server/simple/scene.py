@@ -18,7 +18,7 @@ import json
 import re
 from typing import Any
 
-from . import caption
+from . import caption, table
 
 #: 运镜四档轮换。推/拉/横移/微推——同一档连用两镜会看出"卡住"。
 _STORY_ZOOM = ((1.0, 1.10), (1.12, 1.0), (1.0, 1.06), (1.08, 1.02))
@@ -114,6 +114,14 @@ def wrap_story_scene(body: str, scene: dict[str, Any], *, index: int) -> str:
         lines.append(f"      <RichCaption text={q(text)} hi={q(hi)} t={{t}}"
                      f" bottom={{{cap['bottom']}}} size={{{cap['size']}}}"
                      f" align={q(cap['align'])} />")
+    # 对照表：数据由分镜给，排版由组件算。表格是"数据→坐标"，让模型重画必然歪
+    # （列宽不齐、行高不一、数值不对齐）——实测两次它都只把数据念进字幕。
+    tbl = table.plan(scene)
+    if tbl:
+        lines.append(f"      <CompareTable title={q(tbl['title'])}"
+                     f" cols={{{json.dumps(tbl['cols'], ensure_ascii=False)}}}"
+                     f" rows={{{json.dumps(tbl['rows'], ensure_ascii=False)}}}"
+                     f" link={q(tbl['link'])} t={{t}} />")
     lines += ["    </AbsoluteFill>", "  );", "};"]
     return inner + "\n" + "\n".join(lines)
 

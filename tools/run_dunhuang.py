@@ -44,9 +44,11 @@ PROMPT = """主题：敦煌藏经洞里那 5 万卷文书，被谁封起来的�
    要落的点：最后一句要慢，留白。
 
 信息层要求（这些必须成块出现，不要混在字幕里）：
-· 第 2 段：七种文字并列一行；
-· 第 4 段：一张「散落各国」对照表（地名 + 件数），用虚线连回敦煌；
-· 全片：右上角小字出处，左下角注脚。像纪录片的信息层，贴边、字号小。
+· 第 2 段：七种文字并列一行（这一镜可以用 `caption.mode = "drawn"` 画进卷轴）；
+· 第 4 段：**必须给 `table` 字段**——「散落各国」对照表，`cols: ["地点", "件数"]`，
+  `rows` 给 5~6 个真实数据（伦敦/巴黎/圣彼得堡/东京/华盛顿），`link: "敦煌"`。
+  **不要把这张表写进字幕**，数据放 table 里，外层会画成表；
+· 全片：右上角小字出处，左下角注脚。
 
 字幕纪律：这条片子里有几镜的画面本来就有适合承载文字的东西（洞窟墙壁、经卷、书页、纸）。
 这些镜可以让字幕成为画面的一部分（`caption.mode = "drawn"`，你自己把这句话画进去）；
@@ -118,11 +120,39 @@ async def main() -> int:
     await st.start()
     tok = await Authenticator(st).issue_jwt(uid)
 
+    # ---- 阶段 1：先出分镜（只花 1 次调用）----
+    print("=" * 70, flush=True)
+    print("阶段 1　POST /simple/plan　只出分镜，不写画面、不渲", flush=True)
+    t_plan = time.time()
+    got_plan = call("/simple/plan", tok, {
+        "prompt": PROMPT, "seconds": seconds, "aspect": "landscape",
+        "mode": "story"})
+    plan = got_plan["plan"]
+    print(f"用时 {time.time() - t_plan:.0f}s　{got_plan['shots']} 镜　"
+          f"{got_plan['calls']} 次调用　title=《{plan.get('title')}》", flush=True)
+    print(f"贯穿物件 motif: {plan.get('motif')}", flush=True)
+    print(f"出处 {len(plan.get('sources') or [])} 条", flush=True)
+    print("-" * 70, flush=True)
+    for i, s in enumerate(plan.get("scenes") or []):
+        cap = (s.get("caption") or {}) if isinstance(s.get("caption"), dict) else {}
+        tbl = s.get("table") if isinstance(s.get("table"), dict) else None
+        tag = []
+        if str(cap.get("mode") or "") == "drawn":
+            tag.append("自画字幕")
+        if tbl:
+            tag.append(f"表:{tbl.get('title') or tbl.get('cols')}")
+        print(f"s{i + 1:02d} [{len(str(s.get('text') or ''))}字]"
+              f"{('　' + ' '.join(tag)) if tag else ''}", flush=True)
+        print(f"     {str(s.get('text') or '')[:56]}", flush=True)
+    print("=" * 70, flush=True)
+
+    # ---- 阶段 2：带着分镜出片（跳过规划，不再花那 1 次调用）----
+    print("阶段 2　POST /simple/video + scenes　跳过规划，直接写画面并渲", flush=True)
     sub = call("/simple/video", tok, {
         "prompt": PROMPT, "seconds": seconds, "aspect": "landscape",
-        "mode": "story", "voice": True})
+        "mode": "story", "voice": True, "scenes": plan})
     jid = sub["job_id"]
-    print(f"作业 {jid}　{seconds:g}s　mode={sub.get('mode')} style={sub.get('style')}", flush=True)
+    print(f"作业 {jid}　mode={sub.get('mode')} style={sub.get('style')}", flush=True)
 
     t0 = time.time()
     last, view = "", {}

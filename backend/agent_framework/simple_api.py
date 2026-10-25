@@ -107,7 +107,8 @@ async def _run_film(job: dict[str, Any], *, storage: Any) -> None:
                 user_id=job["user_id"],
                 conversation_id=job.get("conversation_id") or "",
                 on_stage=on_stage, voice=bool(job.get("voice", True)),
-                mode=job.get("style") or film.MODE_EXPLAINER)
+                mode=job.get("style") or film.MODE_EXPLAINER,
+                scenes=job.get("scenes") or None)
         except KernelError as exc:
             job.update(status="failed", stage=exc.stage, error=str(exc),
                        lint_errors=exc.lint_errors)
@@ -316,6 +317,9 @@ def register(app: Any, *, storage: Any, auth: Any) -> None:
             "aspect": kernel.norm_aspect(body.get("aspect")),
             "takes_n": max(1, min(takes.MAX_TAKES, int(body.get("takes") or 1))),
             "voice": bool(body.get("voice", True)),
+            # 「先看分镜、改完再继续」那条路：`/simple/plan` 的整份产物原样传回来，
+            # 有它就不再调规划（省掉那 1 次调用，也省掉"重跑出来还是另一个样子"）。
+            "scenes": body.get("scenes") or None,
             "status": "queued", "stage": "queued", "takes": [],
         }
         _JOBS[job["id"]] = job
@@ -323,6 +327,42 @@ def register(app: Any, *, storage: Any, auth: Any) -> None:
             job, storage=storage))
         return {"job_id": job["id"], "status": "queued", "mode": mode,
                 "style": style}
+
+    @app.post("/simple/plan")
+    async def plan_only(request: Request,
+                        user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """只出分镜，不写画面、不渲。**只花 1 次调用**（约 30~60 秒）。
+
+        为什么单独一个端点：一次成片 5~30 分钟、二十几次调用、中间零反馈。
+        主题或讲法错了，用户只能整条重跑。先出分镜表让人看一眼——十五句话读完
+        只要十秒，读完就知道这条片子对不对。改完把 `plan` 原样传给
+        `POST /simple/video` 的 `scenes` 字段，错的那一步就只花 1 次调用。
+        """
+        body = await request.json()
+        prompt = str(body.get("prompt") or "").strip()
+        if not prompt:
+            raise HTTPException(400, "缺少 prompt：写一句你想看到的画面")
+        sec = kernel.clamp_seconds(body.get("seconds"))
+        asp = kernel.norm_aspect(body.get("aspect"))
+        conv = str(body.get("conversation_id") or "")
+        want = str(body.get("mode") or "").strip().lower()
+        style = film.MODE_STORY if want == film.MODE_STORY else film.MODE_EXPLAINER
+        await kernel.ensure_storage()
+        try:
+            if style == film.MODE_STORY:
+                got, calls = await film.plan_story(
+                    prompt, seconds=sec, aspect=asp, user_id=user_id,
+                    conversation_id=conv)
+            else:
+                got, calls = await film.plan(
+                    prompt, seconds=sec, aspect=asp, user_id=user_id,
+                    conversation_id=conv)
+        except KernelError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, f"分镜失败：{type(exc).__name__}: {exc}") from exc
+        return {"ok": True, "style": style, "calls": calls,
+                "shots": len(got.get("scenes") or []), "plan": got}
 
     @app.get("/simple/job/{job_id}")
     async def job_view(job_id: str,
@@ -429,10 +469,20 @@ video{width:100%;border-radius:10px;margin-top:16px;background:#000}
       <select id="t"><option value="1">1 条（直接出片）</option>
       <option value="2">2 条</option><option value="3" selected>3 条</option></select>
     </label>
-    <button id="go">出片</button>
+    <button id="plan">先看分镜</button>
+    <button id="go">直接出片</button>
   </div>
   <div class="status" id="st"></div>
   <div class="err" id="er"></div>
+</div>
+
+<div id="planbox" class="card" style="display:none">
+  <div class="hint" id="plannote"></div>
+  <div id="planshots"></div>
+  <div class="row">
+    <button id="cont">分镜没问题，出片</button>
+    <span class="hint">上面每一句都能直接改；改完再点。确认后才开始烧渲染。</span>
+  </div>
 </div>
 
 <div id="picks" class="grid"></div>
@@ -450,18 +500,60 @@ var jobId = "", sel = -1, timer = null;
 function setStatus(t) { $("st").innerHTML = t ? "<b>" + t + "</b>" : ""; }
 function setErr(t) { $("er").textContent = t || ""; }
 
-$("go").onclick = async function () {
+var planObj = null;
+
+$("plan").onclick = async function () {
   var prompt = $("p").value.trim();
   if (!prompt) { setErr("先写一句你想看到的画面"); return; }
+  setErr(""); $("planbox").style.display = "none"; planObj = null;
+  $("plan").disabled = true; setStatus("出分镜中…（只花 1 次调用，约半分钟）");
+  try {
+    var r = await fetch("/simple/plan", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: prompt, seconds: +$("s").value,
+                             aspect: $("a").value, mode: $("m").value })
+    });
+    var d = await r.json();
+    if (!r.ok) { setErr(d.detail || ("HTTP " + r.status)); setStatus(""); return; }
+    planObj = d.plan;
+    $("plannote").textContent = (d.plan.title ? "《" + d.plan.title + "》　" : "") +
+      d.shots + " 镜　" + d.calls + " 次调用" +
+      (d.plan.motif ? "　贯穿物件：" + d.plan.motif : "");
+    $("planshots").innerHTML = (d.plan.scenes || []).map(function (s, i) {
+      var tag = (s.caption && s.caption.mode === "drawn") ? "（自画字幕）" : "";
+      var tbl = s.table ? "（对照表：" + (s.table.title || s.table.cols.join("/")) + "）" : "";
+      return '<div style="display:flex;gap:10px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.07)">' +
+        '<span style="color:#8a8a8a;min-width:26px">' + (i + 1) + '</span>' +
+        '<input data-i="' + i + '" value="' + String(s.text || "").replace(/"/g, "&quot;") +
+        '" style="flex:1;background:transparent;border:0;border-bottom:1px dashed rgba(255,255,255,.15);color:#f2f5f8;font:inherit;padding:2px 0">' +
+        '<span style="color:#b8860b;font-size:12px;white-space:nowrap">' + tag + tbl + '</span></div>';
+    }).join("");
+    $("planbox").style.display = "block";
+    setStatus("");
+  } catch (e) { setErr("" + e); setStatus(""); }
+  finally { $("plan").disabled = false; }
+};
+
+$("cont").onclick = async function () {
+  if (!planObj) { setErr("先点「先看分镜」"); return; }
+  document.querySelectorAll("#planshots input").forEach(function (inp) {
+    var i = +inp.dataset.i;
+    if (planObj.scenes[i]) planObj.scenes[i].text = inp.value.trim() || planObj.scenes[i].text;
+  });
+  $("planbox").style.display = "none";
+  await submit({ prompt: $("p").value.trim(), seconds: +$("s").value,
+                 aspect: $("a").value, mode: $("m").value, takes: 1,
+                 scenes: planObj });
+};
+
+async function submit(payload) {
   setErr(""); $("v").style.display = "none"; $("meta").textContent = "";
   $("picks").innerHTML = ""; $("pickrow").style.display = "none"; sel = -1;
-  $("go").disabled = true; setStatus("提交中…");
+  $("go").disabled = true; $("plan").disabled = true; setStatus("提交中…");
   try {
     var r = await fetch("/simple/video", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: prompt, seconds: +$("s").value,
-                             aspect: $("a").value, takes: +$("t").value,
-                             mode: $("m").value })
+      body: JSON.stringify(payload)
     });
     if (r.status === 401) {
       setStatus(""); setErr("没有登录。先在「设置」里登录并填好模型 key。");
@@ -471,8 +563,16 @@ $("go").onclick = async function () {
     var j = await r.json();
     jobId = j.job_id; poll();
   } catch (e) {
-    setStatus(""); setErr("提交失败：" + e.message); $("go").disabled = false;
+    setStatus(""); setErr("提交失败：" + e.message);
+    $("go").disabled = false; $("plan").disabled = false;
   }
+};
+
+$("go").onclick = function () {
+  var prompt = $("p").value.trim();
+  if (!prompt) { setErr("先写一句你想看到的画面"); return; }
+  submit({ prompt: prompt, seconds: +$("s").value, aspect: $("a").value,
+           mode: $("m").value, takes: +$("t").value });
 };
 
 function poll() {

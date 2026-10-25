@@ -865,6 +865,90 @@ const Vignette = ({ strength = 0.55 }: any) => {
     </svg>
   );
 };
+
+/** 对照表：两三列、最多六行。**这是信息图的主力**，也是模型自己画不出来的那一类——
+ *  表格是「数据 → 坐标」的映射，让模型每次重画必然歪（列宽不齐、行高不一、数值不对齐）。
+ *  所以它做成**确定性组件**：分镜只给数据，排版由这里算。
+ *
+ *  `cols` 两到三列；`rows` 每行与 `cols` 等长。第一列左对齐，其余列：能认出是数字
+ *  （含 % 与千分位）就右对齐并染成暖色——那一列就是这张表的重点。
+ *  `link` 给了文字就在左侧画一条竖虚线 + 端点圆，表示「这些项都出自同一处」。
+ *  行逐个淡入，`start + 0.10 + i*0.05`，让眼睛跟着往下走。 */
+const CompareTable = ({ title = '', cols = [], rows = [], x = 0.5, y = 0.52,
+                        w = 0.46, link = '', t = 1, start = 0.08,
+                        hue = '#E8A33D' }: any) => {
+  const { width, height } = useVideoConfig();
+  const base = Math.min(width, height);
+  const p = easeOut(at(t, start, 0.4));
+  const cs = (Array.isArray(cols) ? cols : []).map((c: any) => String(c ?? ''));
+  const rs = (Array.isArray(rows) ? rows : [])
+    .filter((r: any) => Array.isArray(r) && r.length)
+    .slice(0, 6)
+    .map((r: any) => r.map((c: any) => String(c ?? '')));
+  if (!cs.length || !rs.length) return null;
+  const nCol = Math.min(3, Math.max(2, cs.length));
+  const boxW = width * R(w, 0.46);
+  const rowH = base * 0.038;
+  const fsHead = base * 0.016;
+  const fsCell = base * 0.019;
+  const fsTitle = base * 0.022;
+  const padX = base * 0.022;
+  const isNum = (s: string) => /^[\d.,%+\-]+$/.test(s.trim());
+  const left = width * R(x, 0.5) - boxW / 2;
+  const top = height * R(y, 0.52) - (rowH * (rs.length + 1)) / 2;
+  return (
+    <div style={{ position: 'absolute', left, top, width: boxW, opacity: p,
+                  fontFamily: TOKENS.fontStack,
+                  // **不铺底色**：`dg/no-raw-styled-div` 禁止用 div 带纯色 background
+                  // 画色块（要用 SVG rect + 主题色板）。而这里铺一块半透明底本来也
+                  // 不是必需的——画面是暗的，白字加描边直接读得清，铺底反而遮画面。
+                  // 表格靠一圈细线立起来，跟参考片那种"信息层"一个意思。
+                  border: '1px solid rgba(255,255,255,0.14)',
+                  borderRadius: base * 0.008,
+                  padding: `${base * 0.018}px ${padX}px`,
+                  boxSizing: 'border-box' }}>
+      {title ? (
+        <div style={{ fontSize: fsTitle, color: hue, letterSpacing: '0.12em',
+                      marginBottom: base * 0.012 }}>{title}</div>
+      ) : null}
+      <div style={{ display: 'flex', fontSize: fsHead, color: 'rgba(242,245,248,0.55)',
+                    letterSpacing: '0.10em', paddingBottom: base * 0.008,
+                    borderBottom: '1px solid rgba(255,255,255,0.14)' }}>
+        {cs.slice(0, nCol).map((c: string, i: number) => (
+          <div key={i} style={{ flex: i ? 1 : 1.4,
+                                textAlign: i ? 'right' : 'left' }}>{c}</div>
+        ))}
+      </div>
+      {rs.map((r: string[], ri: number) => (
+        <div key={ri} style={{
+          display: 'flex', fontSize: fsCell, height: rowH, alignItems: 'center',
+          opacity: easeOut(at(t, start + 0.10 + ri * 0.05, 0.25)),
+          borderBottom: ri < rs.length - 1 ? '1px solid rgba(255,255,255,0.07)' : 'none',
+        }}>
+          {r.slice(0, nCol).map((c: string, i: number) => (
+            <div key={i} style={{ flex: i ? 1 : 1.4,
+                                  textAlign: i ? 'right' : 'left',
+                                  color: i && isNum(c) ? hue : '#F2F5F8',
+                                  fontVariantNumeric: 'tabular-nums' }}>{c}</div>
+          ))}
+        </div>
+      ))}
+      {link ? (
+        <>
+          <div style={{ position: 'absolute', left: -base * 0.05, top: base * 0.02,
+                        bottom: base * 0.02, width: 0,
+                        borderLeft: `1px dashed ${hue}66` }} />
+          <div style={{ position: 'absolute', left: -base * 0.05 - base * 0.007,
+                        top: base * 0.02, width: base * 0.014, height: base * 0.014,
+                        borderRadius: '50%', background: hue, opacity: 0.85 }} />
+          <div style={{ position: 'absolute', left: -base * 0.05 - base * 0.09,
+                        top: base * 0.016, fontSize: fsHead, color: hue,
+                        opacity: 0.9, whiteSpace: 'nowrap' }}>{link}</div>
+        </>
+      ) : null}
+    </div>
+  );
+};
 """
 
 #: 给模型看的能力清单。**必须与上面的实现一一对应**——名字写错它就调不到，
@@ -927,6 +1011,9 @@ MANIFEST: list[dict[str, str]] = [
      "props": "opacity, seed"},
     {"name": "Vignette", "desc": "四角压暗（全局层已有一层，单镜一般不用）",
      "props": "strength"},
+    {"name": "CompareTable", "desc": "**对照表**：两三列、最多六行，数值列右对齐并染色。"
+                                    "信息图的主力（地名+件数 / 古今读音 / 参数对比）",
+     "props": "title, cols[2~3], rows[[...]], x, y, w, link(左侧虚线锚点文字)"},
 ]
 
 #: 全局层：叠在**整片**之上（不是每镜）。七层一次渲完才有资格做这件事。

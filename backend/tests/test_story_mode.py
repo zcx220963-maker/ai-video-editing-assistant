@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from storyline_server.simple import (  # noqa: E402
-    caption as cap_mod, film, morph, qa, scene, story, system)
+    caption as cap_mod, film, morph, qa, scene, story, system, table as table_mod)
 
 _CHECKS = 0
 _FAILS = 0
@@ -112,6 +112,36 @@ def main() -> int:
           "`RichCaption` 按短边算字号（不是按宽度）")
     check("WebkitTextStroke" in system.SYSTEM_TSX and "scrim = 0" in system.SYSTEM_TSX,
           "去掉了底部黑条（scrim 默认 0），改成描边 + 双层阴影")
+
+    print("\n③c 对照表：分镜只给数据，排版由组件算")
+    # 为什么必须这样：表格是"数据 → 坐标"的映射。实测两次在提示词里明写
+    # 「散落各国对照表」，模型画出来的 <text> 是 0 个——它只会把数据念进字幕。
+    tbl_scene = {**SCENE, "table": {"title": "散落各国", "link": "敦煌",
+                                    "cols": ["地点", "件数"],
+                                    "rows": [["伦敦", "13000"], ["巴黎", "7000"]]}}
+    wt = film.wrap_story_scene(inner, tbl_scene, index=0)
+    check("<CompareTable" in wt, "有 table 数据 → 外层画对照表")
+    check('cols={["地点", "件数"]}' in wt, "列名原样传进组件（不在这里重排）")
+    check('[["伦敦", "13000"], ["巴黎", "7000"]]' in wt, "行数据原样传进组件")
+    check("link" in wt and "敦煌" in wt, "link 给了就传（左侧虚线锚点）")
+    # 校验与截断：列 <2 / 行空 / 非 dict 都不画，但整片照出（表格是加分项不是前置条件）
+    check(cap_mod.__name__ and table_mod.plan({**SCENE, "table": {"cols": ["只有一列"],
+                                                                "rows": [["x"]]}}) is None,
+          "只有一列 → 不画（表格至少要两列）")
+    check(table_mod.plan({**SCENE, "table": {"cols": ["a", "b"], "rows": []}}) is None,
+          "没有行 → 不画")
+    check(table_mod.plan({**SCENE, "table": "不是字典"}) is None, "形状错 → 不画，不炸")
+    many = {"cols": ["a", "b"], "rows": [[str(i), str(i)] for i in range(20)]}
+    got_many = table_mod.plan({**SCENE, "table": many})
+    check(len(got_many["rows"]) == table_mod.MAX_ROWS,
+          f"行数截到 {table_mod.MAX_ROWS}（再多字号就小到看不清，该拆成两镜）")
+    short = table_mod.plan({**SCENE, "table": {"cols": ["a", "b"], "rows": [["x"]]}})
+    check(short["rows"][0] == ["x", ""], "行比列短 → 补空串（不在这里补，组件会错位）")
+    check("<CompareTable" not in film.wrap_story_scene(inner, SCENE, index=0),
+          "没给 table → 不画（老片子行为不变）")
+    check("CompareTable" in system.SYSTEM_TSX and
+          any(m["name"] == "CompareTable" for m in system.MANIFEST),
+          "组件清单与实现都在（清单写错模型就调不到）")
 
     print("\n④ 高亮词必须是正文子串")
     bad = film.wrap_story_scene(inner, {"text": "换你守在 1379 号站", "hi": "警告"}, index=0)
