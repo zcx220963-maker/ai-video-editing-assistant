@@ -8,6 +8,33 @@
 *.pem
 *.key
 
+# ---- 只放「clone 下来能跑 + 能跑测试」的那一份（2026-10-25 收口）----
+# 远程仓库的判据只有一条：**别人 clone 下来，`docker compose up` 能起、
+# `python tests/test_xxx.py` 能跑**。别的都不该在里面。
+#
+# 下面这些本地都留着（探针、退役语料、开发文档、一次性脚本），但**不入库**：
+#   /tools/                      探针与书稿素材。代码零引用；要复用的探针在
+#                                git 历史里（`git show 210ee01:tools/probe_layout.py`）
+#   /backend/examples/retired/   退役技能的语料（318 个文件）。技能代码已删，
+#                                语料留着只是本地查证用
+#   /backend/examples/probes/    探针样例 tsx
+#   /backend/examples/templates.json  无人引用（运行时读的是
+#                                `backend/storyline_server/data/templates.json`）
+#   /check.bat /selfcheck.py     本地自检脚本，不在 compose 里
+#   /*.md（开发计划/链路全解/提示词）  过程文档；`/docs/` 本来就不入库
+#
+# **保留入库的**：`backend/tests/`（144 个）——「克隆下来能跑测试」是
+# 「这个项目做完了没有」唯一可验证的定义，删了就只能靠感觉。
+/tools/
+/backend/examples/retired/
+/backend/examples/probes/
+/backend/examples/templates.json
+/check.bat
+/selfcheck.py
+/开发计划-*.md
+/提示词-*.md
+/链路全解-*.md
+
 # ---- 本地垃圾暂存区（2026-10-25 收口）----
 # `attic/` 是「从工作树里挪出来、但还没想好怎么处理」的东西：一次性的 rgb 中间件
 # （单个 182 MB）、对比截图、探针 json。**它不是归档，也不该入库**——
@@ -15,12 +42,9 @@
 # 所以退役代码直接 `git rm`，不再复制一份到 attic。
 /attic/
 
-# ---- tools/ 下的一次性探针与过程产物（2026-10-25 收口）----
-# `tools/` 里真正该入库的是**能重跑的探针**（`smoke_*.py` / `probe_*.py` /
-# `check_tools.py` / `e2e_*.py`），它们下次改动时要再跑一遍。
+# ---- 一次性探针与过程产物 ----
 # `_` 开头的那批是当天为了看一眼临时写的（跑测试的循环、拆文件的脚本、
 # 量电平的 shell、从容器里拷出来的日志与抽帧），一条都不该入库。
-# 判据：**能不能重跑**。能重跑的留下，看一眼就扔的用 `_` 开头。
 /tools/_*
 
 # ---- 运行时数据（4 GB 级，全部可再生）----
