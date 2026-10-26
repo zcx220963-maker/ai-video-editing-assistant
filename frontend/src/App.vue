@@ -389,12 +389,12 @@ const skillForm = ref(null);      // null=查看态;非空=编辑态
 const skillBusy = ref(false);
 // —— 布局:左栏收起/展开 + 右侧抽屉拖宽 ——
 const railOpen = ref(localStorage.getItem("ca.railOpen") !== "0");
-// 「一句话出片」的模式：默认**先出分镜**（SKILL.md 里已经规定默认先给分镜），
-// 勾上这个才跳过预览直接烧渲染。一次成片十几到几十分钟，跳过预览是"我知道我要什么"。
-const filmAuto = ref(localStorage.getItem("ca.filmAuto") === "1");
-function setFilmAuto(v) {
-  filmAuto.value = !!v;
-  localStorage.setItem("ca.filmAuto", v ? "1" : "0");
+// 「一句话出片」的模式：`preview`（默认，先出分镜给你看）或 `auto`（跳过预览直接烧渲染）。
+// 一次成片十几到几十分钟，跳过预览是"我知道我要什么"。存 localStorage，跟这个浏览器走。
+const filmMode = ref(localStorage.getItem("ca.filmMode") || "preview");
+function setFilmMode(v) {
+  filmMode.value = v === "auto" ? "auto" : "preview";
+  localStorage.setItem("ca.filmMode", filmMode.value);
 }
 function toggleRail() {
   railOpen.value = !railOpen.value;
@@ -3946,9 +3946,11 @@ async function send() {
   const cid = await ensureActive();
   const atts0 = atts(cid).slice();
   if (!text && !atts0.length) return;
-  // 全自动：告诉模型别先给分镜。默认（不勾）什么都不加——SKILL.md 里
+  // 全自动：告诉模型别先给分镜。默认（preview）什么都不加——SKILL.md 里
   // 已经规定"默认先出分镜、用户确认后再出片"，所以默认这条路不需要额外指令。
-  if (filmAuto.value && text) text = "【全自动：不用给我看分镜，直接出片】\n" + text;
+  if (filmMode.value === "auto" && text) {
+    text = "【全自动：不用给我看分镜，直接出片】\n" + text;
+  }
 
   ensureSocket(cid);
   msgs(cid).push({ role: "user", text: shown, state: "done", attachments: atts0 });
@@ -5561,6 +5563,15 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         <input ref="fileInput" type="file" multiple accept="video/*,audio/*,image/*" hidden @change="onFiles" />
         <!-- 按钮单独占一行，放在输入框上方：输入框可以整行铺开，长句不用在按钮中间挤着换行。 -->
         <div class="composer-bar">
+        <!-- 「一句话出片」的模式，放在这一行最左：默认先给分镜（十几分钟起烧，
+             先看一眼讲法），选「全自动出片」才跳过预览。存 localStorage。 -->
+        <select class="film-mode" :title="filmMode === 'auto'
+                  ? '跳过预览，直接烧渲染（十几分钟）'
+                  : '先出分镜给你看，确认后再出片'"
+                :value="filmMode" @change="setFilmMode($event.target.value)">
+          <option value="preview">先看分镜</option>
+          <option value="auto">全自动出片</option>
+        </select>
         <button class="clip" :class="{ busy: uploading }"
                 :title="uploading ? '上传中：' + uploading + ' ' + (uploadPercent ? uploadPercent + '%' : '') : '上传素材（也可直接拖入）'"
                 @click="pickFiles">
@@ -5572,12 +5583,6 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           {{ cancelling ? "取消中…" : "取消上传" }}
         </button>
         <button class="clip" :class="{ busy: fetchingLink, on: linkOpen }" title="按链接取素材" @click="toggleLink">＋链接</button>
-        <!-- 「一句话出片」的模式：默认先给分镜（十几分钟起烧，先看一眼讲法），
-             勾上才跳过预览直接出片。存 localStorage，跟这个浏览器走。 -->
-        <label class="film-auto" :title="filmAuto ? '跳过预览，直接烧渲染（十几分钟）' : '先出分镜给你看，确认后再出片'">
-          <input type="checkbox" :checked="filmAuto" @change="setFilmAuto($event.target.checked)" />
-          <span>{{ filmAuto ? "全自动出片" : "先看分镜" }}</span>
-        </label>
         </div>
 
         <div class="composer-row">
@@ -7639,16 +7644,19 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .clip:hover { color: var(--vermilion); border-color: var(--vermilion); }
 .clip.busy { color: var(--vermilion); border-style: solid; cursor: wait; }
-/* 「先看分镜 / 全自动出片」：外形跟旁边的 .clip 一致，但是个开关。 */
-.film-auto {
-  flex: none; display: inline-flex; align-items: center; gap: 7px;
-  padding: 12px 12px; cursor: pointer; user-select: none;
+/* 「先看分镜 / 全自动出片」：外形跟旁边的 .clip 一致，但是个下拉。 */
+.film-mode {
+  flex: none; appearance: none; -webkit-appearance: none;
+  padding: 12px 26px 12px 12px; cursor: pointer;
   font-family: var(--serif); font-size: 13px; letter-spacing: 1px;
-  color: var(--ink-soft); border: 1px dashed var(--line); border-radius: 4px;
-  transition: all 0.18s;
+  color: var(--ink-soft); background: transparent;
+  border: 1px dashed var(--line); border-radius: 4px; transition: all 0.18s;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+                    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 14px) 50%, calc(100% - 9px) 50%;
+  background-size: 5px 5px, 5px 5px; background-repeat: no-repeat;
 }
-.film-auto:hover { color: var(--vermilion); border-color: var(--vermilion); }
-.film-auto input { accent-color: var(--vermilion); margin: 0; cursor: pointer; }
+.film-mode:hover { color: var(--vermilion); border-color: var(--vermilion); }
 /* 风格下拉：外形与旁边的 .clip 一致，但它是 <select>——原生小三角收进内边距里。 */
 .style-pick {
   appearance: none; -webkit-appearance: none;
