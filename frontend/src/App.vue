@@ -5563,15 +5563,6 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         <input ref="fileInput" type="file" multiple accept="video/*,audio/*,image/*" hidden @change="onFiles" />
         <!-- 按钮单独占一行，放在输入框上方：输入框可以整行铺开，长句不用在按钮中间挤着换行。 -->
         <div class="composer-bar">
-        <!-- 「一句话出片」的模式，放在这一行最左：默认先给分镜（十几分钟起烧，
-             先看一眼讲法），选「全自动出片」才跳过预览。存 localStorage。 -->
-        <select class="film-mode" :title="filmMode === 'auto'
-                  ? '跳过预览，直接烧渲染（十几分钟）'
-                  : '先出分镜给你看，确认后再出片'"
-                :value="filmMode" @change="setFilmMode($event.target.value)">
-          <option value="preview">先看分镜</option>
-          <option value="auto">全自动出片</option>
-        </select>
         <button class="clip" :class="{ busy: uploading }"
                 :title="uploading ? '上传中：' + uploading + ' ' + (uploadPercent ? uploadPercent + '%' : '') : '上传素材（也可直接拖入）'"
                 @click="pickFiles">
@@ -5586,6 +5577,16 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
         </div>
 
         <div class="composer-row">
+          <!-- 出片模式：贴在输入框**左侧**、与它底部对齐（`.composer-row` 是 flex-end）。
+               默认「先看分镜」——一次成片十几分钟起烧，先看一眼讲法；
+               选「全自动」才跳过预览。存 localStorage。 -->
+          <select class="film-mode" :title="filmMode === 'auto'
+                    ? '跳过预览，直接烧渲染（十几分钟）'
+                    : '先出分镜给你看，确认后再出片'"
+                  :value="filmMode" @change="setFilmMode($event.target.value)">
+            <option value="preview">先看分镜</option>
+            <option value="auto">全自动</option>
+          </select>
           <textarea
             ref="draftEl"
             v-model="draft"
@@ -7644,19 +7645,22 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .clip:hover { color: var(--vermilion); border-color: var(--vermilion); }
 .clip.busy { color: var(--vermilion); border-style: solid; cursor: wait; }
-/* 「先看分镜 / 全自动出片」：外形跟旁边的 .clip 一致，但是个下拉。 */
+/* 出片模式：贴在输入框左侧。实线细框 + 与输入框同底，跟旁边的 .send 齐底；
+   不用虚线（虚线在这个位置像"没做完的占位"），也不用宋体（跟输入框的无衬线打架）。 */
 .film-mode {
   flex: none; appearance: none; -webkit-appearance: none;
-  padding: 12px 26px 12px 12px; cursor: pointer;
-  font-family: var(--serif); font-size: 13px; letter-spacing: 1px;
-  color: var(--ink-soft); background: transparent;
-  border: 1px dashed var(--line); border-radius: 4px; transition: all 0.18s;
+  padding: 13px 24px 13px 11px; cursor: pointer;
+  font-family: var(--sans); font-size: 13px; line-height: 1.4;
+  color: var(--ink-soft); background-color: rgba(255, 253, 247, 0.9);
+  border: 1px solid var(--line); border-radius: 4px; transition: all 0.18s;
   background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
                     linear-gradient(135deg, currentColor 50%, transparent 50%);
-  background-position: calc(100% - 14px) 50%, calc(100% - 9px) 50%;
-  background-size: 5px 5px, 5px 5px; background-repeat: no-repeat;
+  background-position: calc(100% - 13px) 50%, calc(100% - 8.5px) 50%;
+  background-size: 4.5px 4.5px, 4.5px 4.5px; background-repeat: no-repeat;
 }
-.film-mode:hover { color: var(--vermilion); border-color: var(--vermilion); }
+.film-mode:hover, .film-mode:focus {
+  color: var(--vermilion); border-color: var(--vermilion); outline: none;
+}
 /* 风格下拉：外形与旁边的 .clip 一致，但它是 <select>——原生小三角收进内边距里。 */
 .style-pick {
   appearance: none; -webkit-appearance: none;
