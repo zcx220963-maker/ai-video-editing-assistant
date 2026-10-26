@@ -423,7 +423,11 @@ def register(app: Any, *, storage: Any, auth: Any) -> None:
 
     @app.get("/studio", response_class=HTMLResponse)
     async def studio() -> str:
-        """单页。不需要登录也能打开——没登录时提交会 401，页面自己提示去设置。"""
+        """独立单页。**没有入口了**（2026-10-26）——出片模式改成对话框左侧的下拉，
+        走 `plan_short_film` + `make_short_video(scenes=…)` 那条路，两套 UI 做同一件事
+        只会让人困惑。这一页留着当兜底：对话那条路坏掉时手动访问 `:8000/studio`
+        还能出片（它自己从 `localStorage["ca.token"]` 取登录态）。
+        """
         return STUDIO_HTML
 
 
