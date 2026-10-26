@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """短视频三件套：一句话出片 / 只改一镜 / 重渲整片。
 
 这是简洁视频线**唯一的对外入口**——在这之前它只有 `/studio` 一个网页，
@@ -256,9 +256,21 @@ class MakeShortVideoTool(Tool):
         project.update(fid, mp4_url=pub["url"], object_key=pub["object_key"],
                        audio=audio_name)
         out["mp4_url"] = pub["url"]
+        # 成片回执要带**播放卡片契约**的两个键（2026-10-26 修）：
+        #   `media_url` —— `MediaCardHook` 只认这个名字，它据此发一条 type=media 帧，
+        #                  前端才渲染 `<video controls>` + 「下载成片」。
+        #   `video`     —— 对象键（不是 presigned 直链），落进 qa.parts 当持久指针；
+        #                  读历史时按它现签一条新链接，链接过期也不丢片子。
+        # 这条线原先只回 `mp4_url`，Hook 一个都不匹配，于是用户看到的是一串
+        # presigned 地址而不是能播的卡片（真机反馈）。两个键都要有，缺一个就残一半。
+        out["media_url"] = pub["url"]
+        out["video"] = pub["object_key"]
+        out["duration"] = round(float(got["total_sec"]), 1)
         out["size_mb"] = round(pub["bytes"] / 1048576, 1)
         out["render_ms"] = (kernel.describe_receipt(res).get("ms") or {}).get("render_ms")
-        out["hint"] = ("把 mp4_url 直接发给用户（能点开就播）。用户要改某一镜就用 "
+        out["hint"] = ("成片卡片会**自动**出现在对话里（可播放、可下载）——"
+                       "不要把这串 presigned 地址贴进回答，那是给程序用的，几百个字符没人看。"
+                       "用户要改某一镜就用 "
                        "reshoot_shot(film_id, shot, note)，**不要重新做一条**。"
                        "报告里带上 shots / audit.ratio / bgm；"
                        "**如果 numbers_without_source 非空，必须主动告诉用户哪几镜的"
