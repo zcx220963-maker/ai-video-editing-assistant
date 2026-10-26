@@ -389,6 +389,13 @@ const skillForm = ref(null);      // null=查看态;非空=编辑态
 const skillBusy = ref(false);
 // —— 布局:左栏收起/展开 + 右侧抽屉拖宽 ——
 const railOpen = ref(localStorage.getItem("ca.railOpen") !== "0");
+// 「一句话出片」的模式：默认**先出分镜**（SKILL.md 里已经规定默认先给分镜），
+// 勾上这个才跳过预览直接烧渲染。一次成片十几到几十分钟，跳过预览是"我知道我要什么"。
+const filmAuto = ref(localStorage.getItem("ca.filmAuto") === "1");
+function setFilmAuto(v) {
+  filmAuto.value = !!v;
+  localStorage.setItem("ca.filmAuto", v ? "1" : "0");
+}
 function toggleRail() {
   railOpen.value = !railOpen.value;
   localStorage.setItem("ca.railOpen", railOpen.value ? "1" : "0");
@@ -3934,16 +3941,20 @@ function onFrame(cid, p) {
 }
 
 async function send() {
-  const text = draft.value.trim();
+  let text = draft.value.trim();
+  const shown = text;            // 界面上显示原文；前缀只发给模型，不污染对话
   const cid = await ensureActive();
   const atts0 = atts(cid).slice();
   if (!text && !atts0.length) return;
+  // 全自动：告诉模型别先给分镜。默认（不勾）什么都不加——SKILL.md 里
+  // 已经规定"默认先出分镜、用户确认后再出片"，所以默认这条路不需要额外指令。
+  if (filmAuto.value && text) text = "【全自动：不用给我看分镜，直接出片】\n" + text;
 
   ensureSocket(cid);
-  msgs(cid).push({ role: "user", text, state: "done", attachments: atts0 });
+  msgs(cid).push({ role: "user", text: shown, state: "done", attachments: atts0 });
   const conv = convs.value.find((c) => c.id === cid);
   if (conv && conv.title === "新对话") {
-    conv.title = (text || atts0[0].filename).slice(0, 18);
+    conv.title = (shown || atts0[0].filename).slice(0, 18);
     renameConv(cid, conv.title);
   }
   draft.value = "";
@@ -5561,6 +5572,12 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
           {{ cancelling ? "取消中…" : "取消上传" }}
         </button>
         <button class="clip" :class="{ busy: fetchingLink, on: linkOpen }" title="按链接取素材" @click="toggleLink">＋链接</button>
+        <!-- 「一句话出片」的模式：默认先给分镜（十几分钟起烧，先看一眼讲法），
+             勾上才跳过预览直接出片。存 localStorage，跟这个浏览器走。 -->
+        <label class="film-auto" :title="filmAuto ? '跳过预览，直接烧渲染（十几分钟）' : '先出分镜给你看，确认后再出片'">
+          <input type="checkbox" :checked="filmAuto" @change="setFilmAuto($event.target.checked)" />
+          <span>{{ filmAuto ? "全自动出片" : "先看分镜" }}</span>
+        </label>
         </div>
 
         <div class="composer-row">
@@ -7622,6 +7639,16 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .clip:hover { color: var(--vermilion); border-color: var(--vermilion); }
 .clip.busy { color: var(--vermilion); border-style: solid; cursor: wait; }
+/* 「先看分镜 / 全自动出片」：外形跟旁边的 .clip 一致，但是个开关。 */
+.film-auto {
+  flex: none; display: inline-flex; align-items: center; gap: 7px;
+  padding: 12px 12px; cursor: pointer; user-select: none;
+  font-family: var(--serif); font-size: 13px; letter-spacing: 1px;
+  color: var(--ink-soft); border: 1px dashed var(--line); border-radius: 4px;
+  transition: all 0.18s;
+}
+.film-auto:hover { color: var(--vermilion); border-color: var(--vermilion); }
+.film-auto input { accent-color: var(--vermilion); margin: 0; cursor: pointer; }
 /* 风格下拉：外形与旁边的 .clip 一致，但它是 <select>——原生小三角收进内边距里。 */
 .style-pick {
   appearance: none; -webkit-appearance: none;

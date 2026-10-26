@@ -78,16 +78,14 @@ class MakeShortVideoTool(Tool):
             "把**一句主题**做成一条完整短视频：写分镜 → 逐镜写画面代码 → 逐帧质检 → "
             "一次渲完 → 回一条能播的链接。**不需要用户上传任何素材**，画面全部由代码画出来，"
             "适合知识科普、原理讲解、数据解读这类没有实拍素材的内容。\n"
-            "时长 8~180 秒；镜数按画法自动算（动效：每镜 ≤5.2 秒，60 秒 15 镜；"
-            "叙事：每镜 4.5~12 秒，135 秒 15 镜）。\n"
-            "**两种画法，按内容选**（`style`）：\n"
-            "· `explainer`（默认）动效科普——几何图形/图表/色块动起来，节奏快、饱和度高。"
-            "讲清一个原理、一组数据、一个流程时用它。\n"
-            "· `story` 叙事片——剪影/大远景/单光源，镜头少而长，像纪录片。"
-            "有故事线、有时间推进、要情绪（“人类收到第一段外星信号之后”）时用它。\n"
+            "时长 8~300 秒。**镜数由内容定**（叙事每镜 4.5~12 秒、动效每镜 ≤5.2 秒），"
+            "不由公式定——同样 165 秒，15 镜和 22 镜都可能对。\n"
+            "**画法默认 `auto`，不用选**：系统按「有没有主角和时间」自己判，"
+            "超过 90 秒一律叙事片（长片要长镜，否则碎成 PPT）。\n"
+            "**用户要先看分镜就别调这个**，调 `plan_short_film`（10 秒、1 次调用），"
+            "确认后把它的 `plan` 传给这里的 `scenes` 出片。\n"
             "**这会花 5~30 分钟（时长越长越久）且期间没有中间反馈**，"
-            "调用前先跟用户确认主题、时长与画法；调完之后直接把成片链接发给用户，"
-            "不要只说“已生成”。\n"
+            "调完之后直接把成片链接发给用户，不要只说“已生成”。\n"
             "如果用户之后要改某一镜（“第 7 镜那个太阳太大”），用 reshoot_shot，"
             "**不要重新调这个工具**——重做一条既贵又不会更接近用户想要的样子。"
         )
@@ -118,6 +116,9 @@ class MakeShortVideoTool(Tool):
                         "description": "配乐。**两种写法都收**：附件音频的 material_id"
                                        "（用户把歌挂成附件时用它），或曲名（如「We Never」）。"
                                        "**不填就不配乐**。短于片长会循环铺满，不会换成别的"},
+                "scenes": {"type": "object",
+                           "description": "分镜（`plan_short_film` 返回的 `plan` 原样传回来）。"
+                                          "给了就**跳过分镜调用**——用户看过、改过的讲法不会再变一次"},
             },
             "required": ["prompt"],
         }
@@ -129,7 +130,7 @@ class MakeShortVideoTool(Tool):
     async def execute(self, prompt: str, seconds: Any = 30.0,
                       aspect: str = "portrait", render: bool = True,
                       voice: bool = True, style: str = "auto",
-                      bgm: str = "") -> str:
+                      bgm: str = "", scenes: Any = None) -> str:
         text = str(prompt or "").strip()
         if len(text) < 4:
             return "Error: prompt 太短，至少给一个完整主题（例如“为什么天空是蓝色的”）"
@@ -143,7 +144,8 @@ class MakeShortVideoTool(Tool):
         try:
             got = await film.make_film(text, seconds=sec, aspect=asp,
                                        user_id=user_id, conversation_id=conv_id,
-                                       voice=bool(voice), mode=mode)
+                                       voice=bool(voice), mode=mode,
+                                       scenes=scenes or None)
         except kernel.KernelError as exc:
             return _json({"ok": False, "stage": exc.stage, "error": str(exc),
                           "lint_errors": exc.lint_errors[:5]})
@@ -262,6 +264,92 @@ class MakeShortVideoTool(Tool):
                        "**如果 numbers_without_source 非空，必须主动告诉用户哪几镜的"
                        "数字没查出出处**——别让用户以为都核实过了。")
         return _json(out)
+
+
+class PlanShortFilmTool(Tool):
+    """一句话 → 分镜表（不写画面、不渲染）。约 10 秒、1 次调用。
+
+    为什么要单独一个工具：一次成片二十几次调用、十几分钟到半小时，中间零反馈。
+    主题或讲法错了只能整条重跑。先出分镜表让人看一眼——十五句话读下来十秒，
+    读着不对就别烧那半小时。
+
+    用户确认后把返回的 `plan` 原样传给 `make_short_video` 的 `scenes`，那一步
+    就不再调分镜（省 1 次调用，也省掉"重跑出来还是另一个样子"）。
+    """
+
+    #: 它只是"看一眼"，不产出可交付的东西，不该上计划卡。
+    plan_node = False
+
+    def __init__(self, storage: Any = None) -> None:
+        self._storage = storage
+
+    @property
+    def name(self) -> str:
+        return "plan_short_film"
+
+    @property
+    def display_name(self) -> str:
+        return "先出分镜（不出片）"
+
+    @property
+    def description(self) -> str:
+        return ("只出分镜表，**不写画面、不渲染**。约 10 秒、1 次调用。\n"
+                "用户说「先看分镜」「先给我看看讲法」「别急着出」时用它。\n"
+                "返回的 `plan` 里有 angle（它自己选的角度）、hook（开场钩子）、"
+                "scenes（每镜一句字幕 + 画面描述）。用户确认后，把 `plan` **原样**"
+                "传给 `make_short_video` 的 `scenes` 字段出片。")
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string",
+                           "description": "主题。给一句话就够，**不要写分镜**——分镜是这一步的产出"},
+                "seconds": {"type": "number",
+                            "description": f"时长秒数，{MIN_SEC:.0f}~{MAX_SEC:.0f}，默认 30"},
+                "aspect": {"type": "string", "enum": ["portrait", "landscape", "square"],
+                           "description": "画幅，默认 portrait（竖屏）"},
+            },
+            "required": ["prompt"],
+        }
+
+    async def execute(self, prompt: str, seconds: Any = 30.0,
+                      aspect: str = "portrait") -> str:
+        text = str(prompt or "").strip()
+        if len(text) < 2:
+            return "Error: prompt 太短，至少给一个话题（例如「0 的历史」）"
+        sec = _clamp_seconds(seconds)
+        asp = kernel.norm_aspect(aspect)
+        user_id, conv_id = _ident()
+        await kernel.ensure_storage()
+        mode = await film.pick_style(text, seconds=sec, user_id=user_id,
+                                     conversation_id=conv_id)
+        try:
+            if mode == film.MODE_STORY:
+                got, calls = await film.plan_story(
+                    text, seconds=sec, aspect=asp, user_id=user_id,
+                    conversation_id=conv_id)
+            else:
+                got, calls = await film.plan(
+                    text, seconds=sec, aspect=asp, user_id=user_id,
+                    conversation_id=conv_id)
+        except kernel.KernelError as exc:
+            return _json({"ok": False, "stage": exc.stage, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 —— 回喂给模型，别让整轮崩掉
+            return _json({"ok": False, "stage": "plan",
+                          "error": f"{type(exc).__name__}: {exc}"})
+        return _json({
+            "ok": True, "style": mode, "calls": calls,
+            "shots": len(got.get("scenes") or []),
+            "plan": got,
+            "next": ("把 plan 原样传给 make_short_video 的 scenes 出片；"
+                     "用户要改就直接改 plan.scenes[i].text 再传"),
+        })
 
 
 class ReshootShotTool(Tool):
@@ -560,6 +648,7 @@ class ListShortFilmsTool(Tool):
 
 
 def register_short_video_tools(registry, *, storage: Any = None) -> None:
+    registry.register(PlanShortFilmTool(storage=storage))
     registry.register(MakeShortVideoTool(storage=storage))
     registry.register(ReshootShotTool(storage=storage))
     registry.register(RenderShortFilmTool(storage=storage))
@@ -568,6 +657,6 @@ def register_short_video_tools(registry, *, storage: Any = None) -> None:
 
 
 __all__ = [
-    "MakeShortVideoTool", "ReshootShotTool", "RenderShortFilmTool",
+    "PlanShortFilmTool", "MakeShortVideoTool", "ReshootShotTool", "RenderShortFilmTool",
     "ExportFilmTool", "ListShortFilmsTool", "register_short_video_tools",
 ]

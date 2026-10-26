@@ -35,17 +35,20 @@ def check(cond: bool, label: str) -> None:
 
 
 def main() -> int:
-    print("\n① 四个工具：装得上、名字与参数对")
+    print("\n① 六个工具：装得上、名字与参数对")
     reg = ToolRegistry()
     register_short_video_tools(reg, storage=None)
-    check(reg.tool_names == ["make_short_video", "reshoot_shot",
+    check(reg.tool_names == ["plan_short_film", "make_short_video", "reshoot_shot",
                              "render_short_film", "export_film_project",
                              "list_short_films"],
-          f"注册表里正好这五个（{reg.tool_names}）")
+          f"注册表里正好这六个（{reg.tool_names}）")
     defs = {d["function"]["name"]: d["function"] for d in reg.get_definitions()}
+    check(set(defs["plan_short_film"]["parameters"]["properties"])
+          == {"prompt", "seconds", "aspect"},
+          "plan_short_film 只要 prompt/seconds/aspect——分镜是它的产出，不是输入")
     check(set(defs["make_short_video"]["parameters"]["properties"])
-          == {"prompt", "seconds", "aspect", "style", "render", "voice", "bgm"},
-          "make_short_video 的参数是 prompt/seconds/aspect/style/render/voice/bgm")
+          == {"prompt", "seconds", "aspect", "style", "render", "voice", "bgm", "scenes"},
+          "make_short_video 的参数含 scenes（把 plan_short_film 的 plan 传回来）")
     check(defs["make_short_video"]["parameters"]["required"] == ["prompt"],
           "只有 prompt 必填（其余都有缺省，模型不必猜）")
     check(set(defs["reshoot_shot"]["parameters"]["properties"])

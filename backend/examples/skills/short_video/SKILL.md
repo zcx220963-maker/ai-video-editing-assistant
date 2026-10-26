@@ -26,10 +26,15 @@ always: false
    同一个关键词最多查一次：结果不理想就换说法或删掉这个数，**不要原样重查**。
    查到的报告先看**数据期**（出版年 ≠ 数据年），文案里写数据期。
 
-2. **定题、时长、画法，然后一次调用**：
+2. **默认先出分镜**（10 秒、1 次调用）：调 `plan_short_film(prompt, seconds, aspect)`，
+   把返回的 `angle`（它自己选的角度）、`hook`（开场钩子）、每镜一句字幕列给用户看。
+   用户说「可以」「出吧」之后，再调 `make_short_video(scenes=<那份 plan>)` 出片。
+   **只有用户明确说「直接出」「不用给我看」时才跳过这一步**。
+
+3. **出片（一次调用）**：
 
    ```
-   make_short_video(prompt="…", seconds=60, aspect="portrait", render=true)
+   make_short_video(prompt="…", seconds=60, aspect="portrait", scenes=<plan 或省略>)
    ```
 
    - `prompt` 里把**讲法**写进去（「从瑞利散射讲到日落变红」），不要只写名词。
