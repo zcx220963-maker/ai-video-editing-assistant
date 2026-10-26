@@ -66,13 +66,6 @@ BATCH = 4
 MIN_ELEMENTS = 8
 
 #: 不合格的严重程度。数字小的先重写——预算有限时先救"全黑"，最后才救"层次少"。
-SEVERITY = {"unknown": 0, "black": 1, "empty": 2, "dark": 3, "flat": 4, "sparse": 5}
-
-#: ---- 叙事片（`mode="story"`）的另一套阈值 ----
-#:
-#: 两套阈值的差别不是"松紧"，是**方向**：几何动效要"亮 + 高饱和 + 层次多"，
-#: 插画叙事要"暗 + 低饱和 + 一张完整的图"。用前者的尺去量后者，
-#: 会把参考片那种 YAVG 41.6 / SATAVG 6.3 的画面**第一帧就判成寡淡打回**。
 STORY_DARK_LUM = 6.0      # 比 3 高一点：插画片的暗部也要看得见东西
 STORY_EMPTY_RATIO = 0.10  # 一张插画铺满整帧，内容占比天然高；低于 10% 说明图没加载
 
@@ -234,63 +227,7 @@ async def audit(code: str, secs: list[float], *, aspect: str,
     }
 
 
-def merge_audit(full: dict[str, Any], part: dict[str, Any]) -> dict[str, Any]:
-    """把"只复核了某几镜"的结果并回整片读数里。
-
-    不复核就报"已修好"是自欺；重跑整片又太贵。所以只换掉被复核的那几行，
-    其余原样保留——报告里因此能同时看到"补过之后这一镜好了"和"别的镜没动过"。
-    """
-    if not (full.get("ok") and part.get("ok")):
-        return full
-    rows = {s["index"]: s for s in full.get("shots") or []}
-    for s in part.get("shots") or []:
-        rows[s["index"]] = s
-    shots = [rows[k] for k in sorted(rows)]
-    bad = [s["index"] for s in shots if s["worst"] != "ok"]
-    return {**full, "shots": shots, "bad": bad,
-            "ratio": round((len(shots) - len(bad)) / max(1, len(shots)), 3)}
 
 
-def priority(shots: list[dict[str, Any]], bad: list[int]) -> list[int]:
-    """把不合格的镜按严重程度排序（全黑先于寡淡）。预算有限时先救重的。"""
-    rank = {s["index"]: SEVERITY.get(s["worst"], 9) for s in shots}
-    return sorted(bad, key=lambda n: (rank.get(n, 9), n))
 
 
-def hint_for(shots: list[dict[str, Any]], index: int) -> str:
-    """给重写用的具体指令——不说"重写"，说"上一版错在哪"。"""
-    row = next((s for s in shots if s["index"] == index + 1), None)
-    if not row:
-        return ""
-    v = row["worst"]
-    if v == "unknown":
-        # 静帧都渲不出来 = 这一镜在**运行时**就炸了（数组 undefined / NaN 属性最常见）。
-        # 这种镜必须简化，不能只是"加点东西"。
-        return ("上一版这一镜**渲不出来**（运行时报错，常见原因是数组是 undefined、"
-                "或某个属性算成了 NaN）。请大幅简化：只用 `Backdrop` + 一个内容组件"
-                "（`StatCard` / `BarChart` / `OrbitDiagram` / `GlowOrb` 任选其一），"
-                "所有数组都给字面量默认值，所有数字用 `Math.max(0, …)` 兜一层。")
-    if v == "black":
-        return ("上一版这一镜抽帧是**全黑**的。必须先用 `Backdrop` 铺满整帧，"
-                "再放一件占画面 ≥30% 的实体；不要只有几个点或一行字。")
-    if v in ("empty", "dark"):
-        return (f"上一版这一镜**只有渐变背景和一行字**（内容占比 {row['content']:.0%}，"
-                f"平均亮度 {row['mean_lum']:.0f}/255）。这是一页排版，不是画面。"
-                "必须加一件**占画面 ≥30% 的实体**：具体的物件/人物/图表/几何体，"
-                "有外轮廓、有受光面与背光面、有落地影；再加一个高饱和色块（≥20% 画面）。"
-                "**`Backdrop` 的 hue 要传高饱和色（#22D3EE / #FF6B2C / #FFC93C），"
-                "不要传 #0a0c12 这类近黑色**——那会让整帧发黑。")
-    if v == "flat":
-        return (f"上一版这一镜**没有颜色**（亮且有色 的像素只占 {row['vivid']:.0%}，"
-                "目标是 ≥20%）。整帧是一层深蓝渐变加白字，看着像黑白片。"
-                "必须加**至少两块高饱和色**：用 `Ribbon` 铺一条斜色带（它自带 20% 覆盖），"
-                "或者把主体换成实心的高饱和色（#FF6B2C / #22D3EE / #FFC93C / #FF3D7F），"
-                "再用 `HudFrame` 加前景四角标记，把画面撑满。"
-                "**不要**只把字改大——那是排版，不是画面。")
-    if v == "sparse":
-        return (f"上一版这一镜只有 **{row.get('elements') or 0} 个视觉元素**（目标 ≥8），"
-                "层次不够——像素上不空，但看着还是「一个主体 + 一行字」。"
-                "必须补成三层：背景层（`Backdrop` + `ScanGrid` 或 `Ribbon` 或 `Particles`）、"
-                "中景（**≥3 件实体**，最大那件占画面 30%~55%）、前景（`HudFrame`，"
-                "或自己画角标/刻度/细线）。")
-    return ""
