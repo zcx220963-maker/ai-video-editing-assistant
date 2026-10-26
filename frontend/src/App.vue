@@ -392,10 +392,22 @@ const railOpen = ref(localStorage.getItem("ca.railOpen") !== "0");
 // 「一句话出片」的模式：`preview`（默认，先出分镜给你看）或 `auto`（跳过预览直接烧渲染）。
 // 一次成片十几到几十分钟，跳过预览是"我知道我要什么"。存 localStorage，跟这个浏览器走。
 const filmMode = ref(localStorage.getItem("ca.filmMode") || "preview");
+const filmOpen = ref(false);
+const fmEl = ref(null);
+function pickFilm(v) {
+  setFilmMode(v);
+  filmOpen.value = false;
+}
 function setFilmMode(v) {
   filmMode.value = v === "auto" ? "auto" : "preview";
   localStorage.setItem("ca.filmMode", filmMode.value);
 }
+// 点别处收起下拉。`@click.stop` 在触发元素上，所以这里只管"外面"。
+onMounted(() => {
+  document.addEventListener("click", (e) => {
+    if (fmEl.value && !fmEl.value.contains(e.target)) filmOpen.value = false;
+  });
+});
 function toggleRail() {
   railOpen.value = !railOpen.value;
   localStorage.setItem("ca.railOpen", railOpen.value ? "1" : "0");
@@ -5578,15 +5590,22 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 
         <div class="composer-row">
           <!-- 出片模式：贴在输入框**左侧**、与它底部对齐（`.composer-row` 是 flex-end）。
-               默认「先看分镜」——一次成片十几分钟起烧，先看一眼讲法；
-               选「全自动」才跳过预览。存 localStorage。 -->
-          <select class="film-mode" :title="filmMode === 'auto'
-                    ? '跳过预览，直接烧渲染（十几分钟）'
-                    : '先出分镜给你看，确认后再出片'"
-                  :value="filmMode" @change="setFilmMode($event.target.value)">
-            <option value="preview">先看分镜</option>
-            <option value="auto">全自动</option>
-          </select>
+               默认「先看分镜」——一次成片十几分钟起烧，先看一眼讲法；选「全自动」才跳过预览。
+               **不用原生 `<select>`**：它的选项列表由系统画，那一片蓝色高亮没法用 CSS 改。 -->
+          <div class="film-mode" ref="fmEl" :class="{ open: filmOpen }"
+               :title="filmMode === 'auto'
+                 ? '跳过预览，直接烧渲染（十几分钟）'
+                 : '先出分镜给你看，确认后再出片'"
+               @click.stop="filmOpen = !filmOpen">
+            <span>{{ filmMode === "auto" ? "全自动" : "先看分镜" }}</span>
+            <i class="fm-caret"></i>
+            <ul v-if="filmOpen" class="film-menu">
+              <li :class="{ on: filmMode === 'preview' }"
+                  @click.stop="pickFilm('preview')">先看分镜</li>
+              <li :class="{ on: filmMode === 'auto' }"
+                  @click.stop="pickFilm('auto')">全自动</li>
+            </ul>
+          </div>
           <textarea
             ref="draftEl"
             v-model="draft"
@@ -7645,22 +7664,39 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .clip:hover { color: var(--vermilion); border-color: var(--vermilion); }
 .clip.busy { color: var(--vermilion); border-style: solid; cursor: wait; }
-/* 出片模式：贴在输入框左侧。实线细框 + 与输入框同底，跟旁边的 .send 齐底；
-   不用虚线（虚线在这个位置像"没做完的占位"），也不用宋体（跟输入框的无衬线打架）。 */
+/* 出片模式：贴在输入框左侧。实线细框 + 与输入框同底，跟旁边的 .send 齐底。
+   自己画下拉而不用 <select>：原生选项列表的高亮是系统画的（一片蓝），改不动。 */
 .film-mode {
-  flex: none; appearance: none; -webkit-appearance: none;
-  padding: 13px 24px 13px 11px; cursor: pointer;
+  flex: none; position: relative;
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 13px 11px; cursor: pointer; user-select: none;
   font-family: var(--sans); font-size: 13px; line-height: 1.4;
-  color: var(--ink-soft); background-color: rgba(255, 253, 247, 0.9);
+  color: var(--ink); background: rgba(255, 253, 247, 0.9);
   border: 1px solid var(--line); border-radius: 4px; transition: all 0.18s;
-  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
-                    linear-gradient(135deg, currentColor 50%, transparent 50%);
-  background-position: calc(100% - 13px) 50%, calc(100% - 8.5px) 50%;
-  background-size: 4.5px 4.5px, 4.5px 4.5px; background-repeat: no-repeat;
 }
-.film-mode:hover, .film-mode:focus {
-  color: var(--vermilion); border-color: var(--vermilion); outline: none;
+.film-mode:hover, .film-mode.open {
+  color: var(--vermilion); border-color: var(--vermilion);
 }
+.fm-caret {
+  width: 0; height: 0; flex: none; margin-top: 1px;
+  border-left: 4px solid transparent; border-right: 4px solid transparent;
+  border-top: 5px solid currentColor; transition: transform 0.18s;
+}
+.film-mode.open .fm-caret { transform: rotate(180deg); }
+.film-menu {
+  position: absolute; left: -1px; bottom: calc(100% + 6px);
+  min-width: calc(100% + 2px); margin: 0; padding: 4px;
+  list-style: none; z-index: 40;
+  background: #fffdf7; border: 1px solid var(--line); border-radius: 4px;
+  box-shadow: 0 8px 24px rgba(60, 40, 20, 0.12);
+}
+.film-menu li {
+  padding: 7px 12px; border-radius: 3px; cursor: pointer;
+  font-size: 13px; color: var(--ink); white-space: nowrap; transition: all 0.12s;
+}
+.film-menu li:hover { background: var(--vermilion); color: #fff8ec; }
+.film-menu li.on { color: var(--vermilion); font-weight: 600; }
+.film-menu li.on:hover { color: #fff8ec; }
 /* 风格下拉：外形与旁边的 .clip 一致，但它是 <select>——原生小三角收进内边距里。 */
 .style-pick {
   appearance: none; -webkit-appearance: none;
