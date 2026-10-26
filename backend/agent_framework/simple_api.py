@@ -146,6 +146,13 @@ async def _run_film(job: dict[str, Any], *, storage: Any) -> None:
         except Exception:  # noqa: BLE001
             pass
         # 复用单镜那条渲染路：模块里自带 `<Series>`，composition 仍然是 `shot`。
+        _a = got.get("audit") or {}
+        if not _a.get("ok"):
+            _b = _a.get("bad") or []
+            job.update(status="failed", stage="audit", audit=_a,
+                       error=(f"{len(_b)}/{got['shots']} 镜是空帧或全黑，已停止渲染。"
+                              f"镜号：{_b[:12]}。工程与 tsx 已存，重画这些镜即可。"))
+            return
         item = {"index": 0, "code": got["code"]}
         job["status"] = "rendering"
         job["stage"] = "render"
@@ -314,7 +321,10 @@ def register(app: Any, *, storage: Any, auth: Any) -> None:
             "prompt": prompt[:2000],
             "mode": mode,
             "style": style,
-            "seconds": kernel.clamp_seconds(body.get("seconds")),
+            # 没给时长就**按内容量估**（原来缺省 6.0 → 夹到 8 秒：用户只说"做个
+            # 关于 X 的视频"就得到 8 秒，那是默认值在替他做决定）。
+            "seconds": kernel.clamp_seconds(
+                body.get("seconds") or film.estimate_seconds(prompt)),
             "aspect": kernel.norm_aspect(body.get("aspect")),
             "takes_n": max(1, min(takes.MAX_TAKES, int(body.get("takes") or 1))),
             "voice": bool(body.get("voice", True)),

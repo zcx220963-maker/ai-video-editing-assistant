@@ -53,6 +53,17 @@ def _clamp_seconds(value: Any, default: float = 30.0) -> float:
     return max(MIN_SEC, min(MAX_SEC, v))
 
 
+def _secs_or_estimate(value: Any, prompt: str) -> float:
+    """给了就用给的；没给就**按内容量估**，不用常数兜。
+
+    原来 `seconds` 缺省 30——用户只说"做个关于 X 的视频"，默认值就在替他做决定。
+    现在这条判断交给调用方（agent）从用户原话里取（"两分钟"→120）；取不到才估。
+    """
+    if value in (None, "", 0):
+        return _clamp_seconds(film.estimate_seconds(prompt))
+    return _clamp_seconds(value)
+
+
 async def _publish_stills(got: dict[str, Any], *, asp: str, user_id: str,
                           storage: Any = None,
                           limit: int = PREVIEW_STILLS) -> list[str]:
@@ -139,7 +150,11 @@ class MakeShortVideoTool(Tool):
                            "description": "主题或一句话需求。可以带讲法，例如"
                                           "“为什么天空是蓝色的，从瑞利散射讲到日落变红”"},
                 "seconds": {"type": "number",
-                            "description": f"时长秒数，{MIN_SEC:.0f}~{MAX_SEC:.0f}，默认 30"},
+                            "description": (
+                                f"时长秒数，{MIN_SEC:.0f}~{MAX_SEC:.0f}。**不要用默认值**："
+                                "先从用户原话里取（「两分钟」→120、「半分钟」→30）；"
+                                "用户没说，就按内容量估：一个知识点 30~45 秒、一个概念讲透 "
+                                "60~90 秒、一个故事 120~180 秒。都不传＝按内容量自动估")},
                 "aspect": {"type": "string", "enum": ["portrait", "landscape", "square"],
                            "description": "画幅，默认 portrait（竖屏）"},
                 "style": {"type": "string", "enum": ["auto", "explainer", "story"],
@@ -167,14 +182,14 @@ class MakeShortVideoTool(Tool):
     def read_only(self) -> bool:
         return False
 
-    async def execute(self, prompt: str, seconds: Any = 30.0,
+    async def execute(self, prompt: str, seconds: Any = None,
                       aspect: str = "portrait", render: bool = True,
                       voice: bool = True, style: str = "auto",
                       bgm: str = "", scenes: Any = None) -> str:
         text = str(prompt or "").strip()
         if len(text) < 4:
             return "Error: prompt 太短，至少给一个完整主题（例如“为什么天空是蓝色的”）"
-        sec = _clamp_seconds(seconds)
+        sec = _secs_or_estimate(seconds, text)
         asp = kernel.norm_aspect(aspect)
         want = str(style or "").strip().lower()
         mode = want if want in (film.MODE_STORY, film.MODE_EXPLAINER) else "auto"
@@ -215,8 +230,16 @@ class MakeShortVideoTool(Tool):
             "calls": got["calls"],
             "transitions": got["transitions"],
             "coverage": round(float((got.get("coverage") or {}).get("ratio") or 0), 3),
+            # 组件覆盖率现在**恒接近 0**（画法全交给模型后，它不再用设计系统组件，
+            # 全用裸 SVG）。所以真正该看的是"有几种不同的画法"——`variety` 越接近
+            # `shots` 越好。报告里两个都给，别让人对着 0.0 以为片子坏了。
+            "variety": int(got.get("variety") or 0),
             "audit": {
                 "ratio": round(float((got.get("audit") or {}).get("ratio") or 0), 3),
+                # `defects` 是客观缺陷（空帧/全黑），`concerns` 是模型看图给的意见。
+                # 前者拦出片，后者只如实报出来——审美不该由代码否决。
+                "defects": (got.get("audit") or {}).get("defects") or [],
+                "concerns": (got.get("audit") or {}).get("concerns") or [],
                 "bad": (got.get("audit") or {}).get("bad") or [],
             },
             "fallback_shots": got.get("fallback") or [],
@@ -328,7 +351,7 @@ class MakeShortVideoTool(Tool):
                        "reshoot_shot(film_id, shot, note)，**不要重新做一条**。"
                        "报告里带上 shots / audit.ratio / bgm；"
                        "**如果 numbers_without_source 非空，如实说一句哪几镜的数字没标出处**"
-                       "——但**不要为了补出处回头去检索**，片子已经出完了。")
+                       "——片子已出完，这时候补不进去了；该查的在出片前就该查清。")
         return _json(out)
 
 
@@ -377,19 +400,23 @@ class PlanShortFilmTool(Tool):
                 "prompt": {"type": "string",
                            "description": "主题。给一句话就够，**不要写分镜**——分镜是这一步的产出"},
                 "seconds": {"type": "number",
-                            "description": f"时长秒数，{MIN_SEC:.0f}~{MAX_SEC:.0f}，默认 30"},
+                            "description": (
+                                f"时长秒数，{MIN_SEC:.0f}~{MAX_SEC:.0f}。**不要用默认值**："
+                                "先从用户原话里取（「两分钟」→120、「半分钟」→30）；"
+                                "用户没说，就按内容量估：一个知识点 30~45 秒、一个概念讲透 "
+                                "60~90 秒、一个故事 120~180 秒。都不传＝按内容量自动估")},
                 "aspect": {"type": "string", "enum": ["portrait", "landscape", "square"],
                            "description": "画幅，默认 portrait（竖屏）"},
             },
             "required": ["prompt"],
         }
 
-    async def execute(self, prompt: str, seconds: Any = 30.0,
+    async def execute(self, prompt: str, seconds: Any = None,
                       aspect: str = "portrait") -> str:
         text = str(prompt or "").strip()
         if len(text) < 2:
             return "Error: prompt 太短，至少给一个话题（例如「0 的历史」）"
-        sec = _clamp_seconds(seconds)
+        sec = _secs_or_estimate(seconds, text)
         asp = kernel.norm_aspect(aspect)
         user_id, conv_id = _ident()
         await kernel.ensure_storage()

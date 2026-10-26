@@ -27,6 +27,12 @@ from typing import Any
 from . import facts, kernel, qa, system
 from .director import (  # noqa: F401  —— 提示词搬去 director.py
     PLAN_SYSTEM as _PLAN_SYSTEM, STORY_SYSTEM as _STORY_SYSTEM)
+# 三条确定性修补搬去 `fixes.py`（2026-10-26）：它们必须能在 **lint 之前**被调用，
+# 而 lint 在 kernel / story 里跑，那两个模块反向 import film 就是循环。
+# 这里重新导出，`assemble()` 与 `tests/test_simple_film.py` 的旧名字照旧可用。
+from .fixes import (  # noqa: F401
+    fix_div_bg as _fix_div_bg, fix_fonts as _fix_fonts, fix_rects as _fix_rects,
+    fix_svg_frame as _fix_svg_frame)
 from . import voice as vo
 from .kernel import KernelError
 # 叙事片的"画法"拆到 story.py、"看自己画的一帧"拆到 review.py
@@ -88,9 +94,9 @@ import { TOKENS } from '@dg/tokens';
 #: 会把长镜判成"像 PPT"、把暗调判成"寡淡"——判据方向正好相反。
 MODE_EXPLAINER, MODE_STORY = "explainer", "story"
 MODES = (MODE_EXPLAINER, MODE_STORY)
-#: 叙事片的镜长区间。上限 12 秒是"长镜但不变幻灯片"的经验值；
-#: 参考片有 35 秒的镜，那是靠**镜内运镜**撑住的，我们镜内只有缓推，先到 12 秒。
-STORY_MIN_SHOT_SEC, STORY_MAX_SHOT_SEC = 4.5, 12.0
+#: 叙事片的镜长区间。上限 12 秒是"长镜但不变幻灯片"的经验值（参考片有 35 秒的镜，
+#: 那是靠镜内运镜撑住的）。下限 2 秒：**短镜是节奏的一部分**——全片挤在 5~8 秒像 PPT。
+STORY_MIN_SHOT_SEC, STORY_MAX_SHOT_SEC = 2.0, 12.0
 STORY_TARGET_SHOT_SEC = 9.0
 #: 叙事片的镜数上限（镜少而长，不是靠镜数堆时长）。
 STORY_MAX_SHOTS = 24
@@ -111,6 +117,18 @@ TRANS_TSX = {
 #: **刻意留了 `cut`**：全片每一处都是转场，观感会像 PPT 的"每页都飞入"；
 #: 硬切是节奏的一部分，不是"没做转场"。
 TRANS_CYCLE = ("slide", "zoom", "wipe", "blur", "slide", "cut")
+
+
+def estimate_seconds(text: str) -> float:
+    """用户没说时长时，按**内容量**估一个（30~180 秒，取 5 的整数倍）。
+
+    分句每个多 25 秒、每字 0.6 秒、底 30 秒。原来 `seconds` 缺省 6.0（夹到 8 秒）——
+    用户只说"做个关于 X 的视频"就得到 8 秒，**那是默认值在替他做决定**。
+    """
+    raw = str(text or "").strip()
+    n = len([p for p in re.split(r"[，,、；;。！？!?\n]+", raw) if p.strip()])
+    sec = 30.0 + 25.0 * (n - 1) + 0.6 * len(raw)
+    return float(max(30, min(180, round(sec / 5) * 5)))
 
 
 def transitions_for(scenes: list[dict[str, Any]]) -> list[str]:
@@ -200,36 +218,6 @@ def _looks_complete(body: str) -> bool:
     return not stack and in_str is None
 
 
-def _fix_div_bg(code: str) -> str:
-    """`backgroundColor: X` → `backgroundImage: linear-gradient(X, X)`。
-
-    闸① 有一条 `dg/no-raw-styled-div`：**不许用 `<div>` 的 backgroundColor 画纯色块**
-    （纯色块要走 SVG 的 `<rect fill>`）。模型每几镜就会犯一次，而一条 60 秒片子
-    已经烧了 16 次调用——为一个色块重来一遍不值。
-    渐变的观感与纯色完全一致，所以这里是等价替换，不是"绕过判据"。
-    """
-    def repl(m: re.Match[str]) -> str:
-        val = m.group(1)
-        return f"backgroundImage: `linear-gradient({val}, {val})`"
-
-    return re.sub(r"backgroundColor\s*:\s*('[^']*'|\"[^\"]*\"|[A-Za-z0-9_$.]+)", repl, code)
-
-
-def _fix_fonts(code: str) -> str:
-    """把任何字体族字面量换成 `TOKENS.fontStack`。
-
-    为什么必须有这一步：镜像里只装了 Noto CJK / DejaVu 几族，模型一写
-    `fontFamily="Georgia, 'Times New Roman', serif"` 就会被闸① 按
-    `dg/font-family-whitelist` 挡下——一次 60 秒片子已经烧了 16 次调用，
-    为了一个字体名重来一遍不值。这里是**确定性修补**，比在提示词里求它管用。
-    """
-    code = re.sub(r'fontFamily\s*=\s*(["\'])[^"\']*\1',
-                  'fontFamily={TOKENS.fontStack}', code)
-    code = re.sub(r'fontFamily\s*:\s*(["\'])[^"\']*\1',
-                  'fontFamily: TOKENS.fontStack', code)
-    return code
-
-
 def timeline(secs: list[float], kinds: list[str], *,
              fps: int = kernel.DEFAULT_FPS) -> dict[str, Any]:
     """整片时间表：每镜的**序列时长**、起始帧、切点帧、总帧数。
@@ -283,7 +271,7 @@ def assemble(bodies: list[str], secs: list[float], kinds: list[str], *,
     """
     parts = [SCENE_HEADER, system.SYSTEM_TSX, ""]
     for i, body in enumerate(bodies):
-        body = _fix_rects(_fix_fonts(_fix_div_bg(body)))
+        body = _fix_svg_frame(_fix_rects(_fix_fonts(_fix_div_bg(body))))
         # 每镜都可能写 `const MOTIF_AT = …`，15 镜放一个模块里会撞 `no-redeclare`。
         # 连它里面的引用一起改名（`MOTIF_AT.x` → `MOTIF_AT_07.x`）——
         # 锚点在 `rebuild()` 里已经读过了，这里改名不影响接力。
@@ -400,22 +388,6 @@ async def shot_stills(code: str, tl: dict[str, Any], index: int, *,
     return [p["jpeg_b64"] for p in pairs]
 
 
-_DIM_RE = re.compile(r"\b(width|height|rx|ry|r)=\{([^{}]+)\}")
-
-
-def _fix_rects(code: str) -> str:
-    """给 SVG 的尺寸属性兜一层 `Math.max(0, …)`。
-
-    为什么值得一个正则：这类错误**不报错、不中断、不留痕迹**，只是画面上少一块。
-    lint 看不见（语法合法），渲染也返回 200，只有翻浏览器控制台才发现。
-    代价是负值会被夹成 0（那一块仍然不显示），但至少不会因为 `NaN` 传染到相邻属性。
-    """
-    def fix_attr(a: re.Match[str]) -> str:
-        name, expr = a.group(1), a.group(2).strip()
-        if expr.startswith("Math.max("):
-            return a.group(0)
-        return f"{name}={{Math.max(0, {expr})}}"
-
-    return _DIM_RE.sub(fix_attr, code)
+_DIM_RE = re.compile(r"\b(width|height|rx|ry|r)=\{([^{}]+)\}")  # noqa: F401 —— 已随 _fix_rects 搬去 fixes.py，留着兼容旧引用
 
 

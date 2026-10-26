@@ -122,6 +122,10 @@ def fill_to(secs: list[float], target: float, *, hi: float,
     return out
 
 
+#: 单镜 TTS 重试（2026-10-26）：edge-tts 偶发返回 0 字节，一次失败就放弃会让那镜「有字幕没声音」。
+VOICE_RETRIES, VOICE_RETRY_DELAY = 3, 0.8
+
+
 async def narrate(texts: list[str], out_dir: Path, *, voice: str = DEFAULT_VOICE,
                   rate: str = DEFAULT_RATE) -> dict[str, Any]:
     """每镜一条 mp3。**并发 3 路**——TTS 是网络往返，串行 15 镜要 20 秒。
@@ -138,13 +142,16 @@ async def narrate(texts: list[str], out_dir: Path, *, voice: str = DEFAULT_VOICE
     async def one(i: int) -> None:
         async with sem:
             dst = out_dir / f"v{i + 1:02d}.mp3"
-            try:
-                sec = await synthesize(texts[i], dst, voice=voice, rate=rate)
-            except KernelError:
-                failed.append(i + 1)
-                return
-            files[i] = dst
-            secs[i] = sec
+            for attempt in range(VOICE_RETRIES):
+                try:
+                    files[i], secs[i] = dst, await synthesize(texts[i], dst, voice=voice, rate=rate)
+                    return
+                except KernelError:
+                    files[i] = None
+                    dst.unlink(missing_ok=True)
+                    if attempt + 1 < VOICE_RETRIES:
+                        await asyncio.sleep(VOICE_RETRY_DELAY * (attempt + 1))
+            failed.append(i + 1)
 
     await asyncio.gather(*[one(i) for i in range(len(texts))])
 

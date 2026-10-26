@@ -671,6 +671,20 @@ class SkillLoader:
                     self.last_import_report = got
             except Exception as exc:  # noqa: BLE001 - 组件登记失败不许拦导入
                 print(f"[skills] 组件登记失败（技能本身已可用）：{str(exc)[:300]}")
+        # **`retired/` 里的技能要从库里删掉**（2026-10-26）。原来这里只 upsert、从不删，
+        # 于是移走的旧技能永远留在库里、还会被模型选中。真机：`motion_explainer_skill`
+        # （59 KB，旧链整本手册）文件早挪到 `examples/retired/`，库里仍在，模型每次出片
+        # 先误加载它、烧掉 15 次调用和 4 个报错，才转去正确的 `short_video_skill`。
+        # 只清系统内置的（`owner_user_id is None`），不碰用户自己导入的同名技能。
+        retired = root.parent / "retired"
+        if owner_user_id is None and retired.is_dir():
+            for sub in sorted(retired.iterdir()):
+                md = sub / "SKILL.md"
+                if not sub.is_dir() or not md.exists():
+                    continue
+                meta_r, _body_r = _parse_frontmatter(
+                    md.read_text(encoding="utf-8", errors="ignore"))
+                await self._skills.drop(meta_r.get("name") or sub.name)
         return imported
 
     async def import_zip(self, filename: str, data: bytes,

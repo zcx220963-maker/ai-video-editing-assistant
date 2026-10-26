@@ -152,7 +152,8 @@ def fetch_artifact(artifact: str, dest: Path, *, base: str | None = None,
 
 def render_stills(*, code: str, input_props: dict[str, Any], frames: list[int],
                   scale: float = 0.4, base: str | None = None,
-                  timeout: int = 120, with_layout: bool = False) -> Any:
+                  timeout: int = 120, with_layout: bool = False,
+                  with_warnings: bool = False) -> Any:
     """预览静帧：渲这一镜的几帧小 JPEG → ``[{frame, jpeg_b64}]``。
 
     成本约是整镜渲染的百分之一（打包 1~3 秒 + 每帧几百毫秒），用在渲染前的计划确认卡上
@@ -162,6 +163,10 @@ def render_stills(*, code: str, input_props: dict[str, Any], frames: list[int],
     本来就带回一行版面读数（字压字、字压图、出画——见 `server.mjs` 的 `renderStills`），
     原先这里只取图、把读数丢了，于是「烧像素之前就能改」的那一次机会白白放过。
     缺省仍回列表，别的调用方不受影响。
+
+    ``with_warnings=True`` 时改回 ``{"stills": […], "warnings": […], "layout": …}``：
+    把渲染时浏览器控制台里的 ``console.error`` / ``console.warn``（含报错 file:line）
+    一并带回——2026-10-26 加：静帧渲成一片黑时，这里就是定位到 sNN.tsx 某一行的唯一线索。
     """
     payload = {"code": code, "input_props": input_props, "frames": list(frames),
                "scale": scale}
@@ -170,9 +175,14 @@ def render_stills(*, code: str, input_props: dict[str, Any], frames: list[int],
     if status != 200 or not j.get("ok"):
         raise RemotionError(f"预览静帧失败：{j.get('error') or j}", status=status)
     stills = list(j.get("stills") or [])
-    if with_layout:
+    if with_layout or with_warnings:
         layout = j.get("layout")
-        return {"stills": stills, "layout": layout if isinstance(layout, dict) else None}
+        out: dict[str, Any] = {"stills": stills}
+        if with_layout:
+            out["layout"] = layout if isinstance(layout, dict) else None
+        if with_warnings:
+            out["warnings"] = list(j.get("warnings") or [])
+        return out
     return stills
 
 

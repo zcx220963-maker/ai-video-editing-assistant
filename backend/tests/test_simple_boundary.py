@@ -27,7 +27,10 @@ API = BACKEND / "agent_framework" / "simple_api.py"
 
 #: 内核三件的行数预算。2026-10-25 实测 301 行，给到 500 是留足余量。
 #: 这条数不是拍脑袋：超了通常意味着有人在往里塞"顺手也做一下"的东西。
-CORE_LINE_BUDGET = 500
+#: 2026-10-26 提到 510：`kernel.stills_pairs` 要把渲染时浏览器控制台的 error/warning
+#: 一并带回（`warnings`），给"静帧一片黑"一个可定位到 file:line 的线索——这不是
+#: "顺手也做一下"，是 18/23 空镜那轮唯一能查根因的通道。kernel 由 368 → 371。
+CORE_LINE_BUDGET = 510
 
 #: Python 逻辑（不含 system.py 的 TSX 载荷）预算。
 #:
@@ -72,7 +75,24 @@ CORE_LINE_BUDGET = 500
 #:      它只会把数据念进字幕）；而它是知识类视频信息密度最高的形态。
 #:      提示词搬出去是因为 film.py 顶破了 1,115——拆的边界是"文本资产 vs 编排代码"。
 #: 下一次再超，得说清买了什么才准提。
-PACKAGE_LINE_BUDGET = 3800
+#: 2026-10-26 十一次数：加「读数回写环」后 3,856，预算提到 3,900。
+#:   买的是：`qa.readout_fix()` 把 content/mean_lum 翻成写手能执行的诊断，
+#:   写镜循环每轮把诊断并进 notes。此前评审 hint 限 40 字，传不出「填充色只差 8/255」，
+#:   三轮重写后 26 镜仍然全近黑（content 0.02~0.18），成片 70% 是死镜。
+#: 2026-10-26 十二次数：加「重写不许把画面写坏」后 3,916，预算提到 3,950。
+#:   买的是：重写后只渲那一镜复检，变空就退回原版。此前 31 次重写把 23/27 镜
+#:   写成 content=0.0 的纯背景（没被重写的 4 镜全正常），整片报废。
+#: 2026-10-26 十三次数：定位到 18/23 空镜的**真根因**后 4,022，预算提到 4,060。
+#:   买的是两件事：
+#:   ⑯ `fixes.fix_svg_frame()`（约 45 行）：满幅 `<svg>` 补 `position:absolute; inset:0`。
+#:      `<AbsoluteFill>` 是 flex 列容器，直接塞进去的 `<svg>` 是 flex item，
+#:      width/height 表现属性在 flex 里不给它撑主尺寸 → 高度塌 0，整帧只剩背景。
+#:      实测：把 s01 背景 rect 换亮红仍 content 0.0（整只 svg 没渲）；display:block 无效；
+#:      只有 position:absolute 把 content 0.0 → 0.09。这就是 18/23 镜全空的根因。
+#:   ⑰ 浏览器控制台回传链（server.mjs onBrowserLog → remotion_client.with_warnings →
+#:      kernel.stills_pairs → shot_evidence.warnings → qa.readout_fix）：静帧渲黑时
+#:      把 console.error 连同 file:line 带回，给模型和人都能直接定位。
+PACKAGE_LINE_BUDGET = 4060
 
 #: 不许出现在 import 里的东西。
 BANNED = ("code_spec", "storyline_server.nodes", "storage.repositories",

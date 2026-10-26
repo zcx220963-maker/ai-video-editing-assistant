@@ -23,7 +23,7 @@ import asyncio
 from typing import Any
 
 from ..motion import remotion_client as rc
-from . import caption, kernel, system
+from . import caption, fixes, kernel, system
 from .kernel import KernelError
 from .scene import _ensure_motif  # noqa: F401  —— 写手内部用，也对外保持旧名字可用
 
@@ -39,7 +39,7 @@ from .scene import _ensure_motif  # noqa: F401  —— 写手内部用，也对�
 #: 现在的做法与 Remotion 官方 Agent Skills 一致：给**画法纪律**，不给零件目录。
 #: 画面全部由模型用 SVG 画（`<path>` / `<polygon>` / 渐变 / 遮罩），
 #: 外层只提供三样它不该管的东西：运镜、文字层、以及一个"画不出来时"的兜底。
-_STORY_SCENE_SYSTEM = """你在画一个叙事短片的一镜。只写场景本身，不写字幕、不加运镜。
+_STORY_SCENE_SYSTEM = """你在画一个叙事短片的一镜。画面、运镜、字幕、章节标记——**全由你决定**。
 
 输出格式（一字不差）：
 ```tsx
@@ -54,44 +54,28 @@ const Scene = ({ dur }: { dur: number }) => {
   );
 };
 ```
-**第一行 `const MOTIF_AT` 必须写**（归一化坐标，`r` 是半径占宽度的比例）。
-它只声明、不渲染：外层在切镜时用它把"那件东西"从上一镜的位置接到下一镜的位置，
-观众的眼睛才跟得住。**不写这一行，切镜那一处就会断。**
-**不要 AbsoluteFill 外层**（外面会套运镜），用 Fragment。
+**第一行 `const MOTIF_AT` 必须写**（归一化坐标，`r` 是半径占宽度的比例）；这一镜没有那件
+东西就写 `const MOTIF_AT = null;`。它只声明、不渲染：外层切镜时用它把"那件东西"从上一镜
+的位置接到下一镜的位置——**不写这一行，切镜那一处就会断。**
+**外层只做兜底**：你自己写 `<AbsoluteFill>`（含运镜/字幕），就不套外面那一层。
+
+**接着上一镜画**：光从同一方向来、配色同一套——但要换机位/换尺度；构图不许重复。
 
 **画面全部由你画**：`<svg viewBox={`0 0 ${width} ${height}`}>` + `<defs>`（线性/径向渐变、
 遮罩）+ `<path>` / `<polygon>` / `<rect>` / `<circle>` / `<ellipse>` / `<line>`。
 `width`/`height` 从 `useVideoConfig()` 拿。**没有"可选零件清单"——要画什么就画什么。**
 
-三层结构（缺一层就会像一页排版）：
-1. **背景**：天空/空间。用 **2~3 段不同色的线性渐变**（三段同色 = 这一镜失败）
-   + 一处径向光晕（日/月/信号/火）。
-2. **中景**：**一个能被指着说的具体东西**——射电望远镜、人影、城市废墟、行星、
-   舰队、控制台、断裂的舰体……占画面 **25%~55%**，用 `<path>` 画轮廓，
-   填近黑，边缘给 1~3px 的冷色描边当轮廓光。
-3. **前景**（可选）：地面/水面/栏杆/尘埃，压住画面下沿，让空间有纵深。
+画面结构**由你定**：要空间感就分层（背景/中景/前景）；要平面、要特写、要一整块纯色也行。
+唯一硬要求：**这一镜得有能被指着说的东西，而且它要看得见**——面积 ≥ 画面 15%、与背景差 ≥40 级。
+**"留空"是背景留空，不是主体消失**：一块大暗部加一个小点，在手机上是纯黑。
+· 变化要有先后：先建立，再动。挤在同一瞬间变完就是一次跳变，不是动效。
 
-光与色（决定像电影还是像 PPT）：
-· **全片只有一个主光**，亮部面积 <15%。
-· **整帧平均亮度 ≥ 38/255**（参考片实测 p50 = 41.6；低于 30 就像"欠曝"）；
-  主体与背景的亮度差 **≥ 40 级**（差不够就看不见）。
-· 底色 `#05070c`~`#141a24`；高饱和色**只用来点光**（火/信号/星）。
-· **不要高饱和**：大块面用灰蓝/褐黑，SATAVG 目标 5~12。
-· 两拍：0~60% 建立画面，60~100% 一个缓慢变化（光变强、粒子移动、轮廓微移）。
+光与色：**基调照 `tone` 画**（底色、主色、构图习惯、笔触都在那里，别自己另起一套）。
+只有两条硬底线，因为它们决定"看不看得见"：整帧平均亮度 ≥ 38/255；主体与背景差 ≥ 40 级。
 
-**不要写**：`ChapterMark` / `TimeMark` / `RichCaption`（字幕与标记由外层统一加）、
-`Camera`（外层已经套了运镜）。你自己再画一套会出现两个章节号。
-不引用外部图片/字体。时间只从 `t` 拿，不写死秒数。
-
-**如果这一镜里画了那件贯穿的东西，必须在组件体最上面声明它的位置**（只声明，不渲染）：
-
-```tsx
-const MOTIF_AT = { x: 0.62, y: 0.45, r: 0.05 };   // 归一化坐标，r 是半径占宽度的比例
-```
-
-这一行是给**外层**看的：切镜时外层会用它把"那件东西"从上一镜的位置**接到**下一镜的位置，
-于是观众的眼睛跟得住。不写这一行，这一镜就没有接力——那一处会显得断。
-（这一镜里没有那件东西时，写成 `const MOTIF_AT = null;`）"""
+**这一镜的语言由你定**：`Camera`（推/拉/横移）、`ChapterMark` / `TimeMark` / `RichCaption`
+都可以用。**用了就自己写 `<AbsoluteFill>`**（写它＝外层不再插手）；不写外层兜底加一层缓推 + 一句字幕。
+不引用外部图片/字体。时间只从 `t` 拿，不写死秒数。"""
 
 
 async def write_scene_story_code(scene: dict[str, Any], *, index: int, total: int,
@@ -104,17 +88,18 @@ async def write_scene_story_code(scene: dict[str, Any], *, index: int, total: in
     它在每一镜里以不同大小/位置出现，十几张独立的图才变成"一部片子"。
     参考片里那个"蓝色小点"就是这么用的（第 2 镜一个点、第 6 镜是舰队、末镜是地球）。
     """
+    cap = caption.plan(scene)
+    text = str(scene.get("text") or "").strip()
     ask = (f"这是第 {index + 1}/{total} 镜，时长 {seconds:g} 秒。\n"
            f"**这一镜要画的画面**：{str(scene.get('plate') or scene.get('brief') or '').strip()}\n"
-           # 字幕归谁画，由分镜的 `caption.mode` 定（见 caption.py）。drawn 时下面
-           # 那段"不要画字幕"要**当场反过来说**——否则写手照旧不画，外层也不加，
-           # 这一镜就没字了。
-           + (caption.drawn_brief(scene) if caption.plan(scene)["mode"] == "drawn" else
-              f"（这一镜的字幕是「{str(scene.get('text') or '').strip()}」——"
+           # 字幕归谁画由分镜的 `caption.mode` 定（见 caption.py）。drawn 时下面那段
+           # "不要画字幕"要当场反过来说——否则写手照旧不画，外层也不加，这一镜就没字。
+           + (caption.drawn_brief(scene) if cap["mode"] == "drawn" else
+              f"（这一镜的字幕是「{text}」——"
               f"**不要把它画进画面**，字幕由外层统一加。）\n")
            + (f"**全片贯穿的一件东西**：{motif}。这一镜里它也要出现，"
-              f"大小/位置/明暗和别的镜不同（很小的一处也算；"
-              f"它是让十几镜连成一部片子的那根线）。\n" if motif and index >= 2 else "")
+              f"大小/位置/明暗和别的镜不同（很小的一处也算；它是让十几镜连成一部片子的那根线）。\n"
+              if motif and index >= 2 else "")
            + "\n**输出的第一行必须是这一句**（位置用归一化坐标 0~1，r 是半径占宽度比例）：\n"
              "`const MOTIF_AT = { x: <0~1>, y: <0~1>, r: <0.02~0.3> };`\n"
              "（这一镜里没有那件东西就写 `const MOTIF_AT = null;`）\n"
@@ -123,39 +108,40 @@ async def write_scene_story_code(scene: dict[str, Any], *, index: int, total: in
              f"{'0.18~0.38（偏左）' if index % 2 == 0 else '0.62~0.82（偏右）'}；"
              f"y 取 {['0.28~0.42', '0.48~0.60', '0.66~0.80'][index % 3]}；"
              f"r 取 {['0.03~0.05', '0.06~0.09', '0.10~0.14'][index % 3]}。\n"
-           + (f"\n**上一版的问题（必须修掉）**：{extra}\n" if extra else "")
+           # `extra` 是整片的语法（tone + 前两镜 + 可用画法），不是"上一版的问题"。
+           # 原来这里标成「上一版的问题（必须修掉）」——tone 被当成 bug 清单发下去了。
+           + (f"\n{extra}\n" if extra else "")
            + f"画幅 {aspect}。只写那两行（`MOTIF_AT` 与 `const Scene`），不写 import/export。")
     last = ""
+    retry = ""      # 上一版被挡下的原因，拼进下一次；盲重试＝同一句话采样三次（2026-10-26 改）
     for _ in range(3):
         try:
             raw = await kernel._complete(
                 [{"role": "system", "content": _STORY_SCENE_SYSTEM},
-                 {"role": "user", "content": ask}],
+                 {"role": "user", "content": ask + retry}],
                 llm=llm, user_id=user_id, conversation_id=conversation_id)
         except Exception as exc:  # noqa: BLE001
             raise KernelError("scene", f"第 {index + 1} 镜写场景失败：{exc}") from exc
         body = kernel.extract_code(raw) or str(raw or "").strip()
         if "const Scene" not in body:
             last = "没按格式回 `const Scene`"
+            retry = "\n\n**上一版没有 `const Scene`**：只要 `MOTIF_AT` 与 `Scene` 两行。"
             continue
-        # 从 `const MOTIF_AT` 或 `const Scene` 里**靠前**的那个开始留。
-        # 2026-10-25 踩过：原来一刀切在 `const Scene`，把模型写在最上面的
-        # `const MOTIF_AT = {…}` 声明切掉了——于是锚点永远读不到、跨镜接力永远不接，
-        # 而 lint 与渲染都正常，表现是"功能像没做一样"。
+        # 从靠前的那个开始留：一刀切在 `const Scene` 会切掉写在最上面的
+        # `const MOTIF_AT`，于是锚点读不到、接力不接，而 lint 与渲染都正常。
         _marks = [p for p in (body.find("const MOTIF_AT"), body.find("const Scene")) if p >= 0]
         body = body[min(_marks):].strip()
-        # 延迟 import：避免模块级循环。**这两个名字都是从 film 来的**——
-        # 2026-10-25 拆文件时只搬了 `_looks_complete`、漏了 `SCENE_HEADER`，
-        # 于是每一镜都在这里 NameError，然后被兜底静默盖住（整片 15 镜全成兜底、
-        # 日志上只看到"质检 1.0"）。拆文件时**凡是引用了没搬走的全局名，都要在这里出现**。
+        # 延迟 import：拆文件时漏搬 `SCENE_HEADER` 会让每镜在这里 NameError，
+        # 然后被兜底静默盖住（整片全兜底，日志只显示"质检 1.0"）。
         from .film import SCENE_HEADER, _looks_complete
         if not _looks_complete(body):
             last = "组件体不完整"
+            retry = "\n\n**上一版组件体不完整**（标签没闭合），重写并自己数一遍闭合。"
             continue
-        body = _ensure_motif(body)      # 用了没声明 → 补一个安全声明（否则渲染炸）
-        # **每镜写完立刻 lint**：括号配平查不出"标签没闭合"这类错，而那种错
-        # 会让整片在 `parse-error 第 2427 行` 处失败——那时已经烧了 15 次调用，
-        # 还得靠人肉去数第几个镜。这里探一遍，坏的就只重写这一镜。
+        # 确定性修补必须在 lint 之前：字体族 / div 纯色块这两类必然被挡，不该烧模型调用。
+        body = fixes.before_lint(_ensure_motif(body))
+        # **每镜写完立刻 lint**：括号配平查不出"标签没闭合"，而那种错会让整片
+        # 在 `parse-error` 处失败——那时已烧掉十几次调用，还得人肉数第几镜。
         probe = (SCENE_HEADER + "\n" + system.SYSTEM_TSX + "\n" + body
                  + "\n\nexport default Scene;\n")
         try:
@@ -166,6 +152,19 @@ async def write_scene_story_code(scene: dict[str, Any], *, index: int, total: in
             errs = got_lint.get("errors") or []
             last = "lint：" + "；".join(
                 f"[{e.get('rule')}] {str(e.get('msg'))[:60]}" for e in errs[:2])
+            rows = "\n".join(f"- 第 {e.get('line')} 行 [{e.get('rule')}] "
+                             f"{str(e.get('msg'))[:120]}" for e in errs[:6])
+            retry = (f"\n\n**上一版被 lint 挡下，这几条必须改掉**：\n{rows}\n"
+                     "（字体只写 `TOKENS.fontStack`；纯色块用 SVG rect。）")
+            continue
+        # **字幕必须真的画进去**（2026-10-26）：字幕交给模型画之后，真机 26 镜里 17 镜
+        # 根本没写那行字——旁白念了、画面上没有，观众感觉"音画不同步"。用代码判字在不在，
+        # 比让评审看图可靠（评审看图只能"觉得像有字"）。
+        if cap["mode"] == "drawn" and text and \
+                sum(1 for c in set(text) if c in body) < len(set(text)) * 0.9:
+            last = "字幕没画进画面"
+            retry = (f"\n\n**上一版没把字幕画进画面**：画面里必须出现「{text}」这一整句，"
+                     "用 `<text>` 或 div 写出来。")
             continue
         return body
     raise KernelError("scene", f"第 {index + 1} 镜写了 3 次仍不成形：{last}")

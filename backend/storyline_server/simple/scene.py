@@ -18,28 +18,19 @@ import json
 import re
 from typing import Any
 
-from . import caption, table
+from . import caption
 
 #: 运镜四档轮换。推/拉/横移/微推——同一档连用两镜会看出"卡住"。
 _STORY_ZOOM = ((1.0, 1.10), (1.12, 1.0), (1.0, 1.06), (1.08, 1.02))
 _STORY_PAN = ((0.10, 0.0), (-0.08, 0.0), (0.0, 0.06), (0.0, -0.05))
 
-#: 整片的**提亮层**（白，5% 不透明度，盖在画面上、文字下）。
+#: 整片的**提亮层**（白，盖在画面上、文字下）。
 #:
-#: 为什么需要它：提示词里写着"整帧平均亮度 ≥ 38/255"，模型还是稳定做到 27。
-#: 它不是不会画亮，是**对绝对亮度没有直觉**——和"对占画面多少没有直觉"是同一个毛病。
-#: 与其继续在提示词里加数字（实测加了也没用），不如在最后一道确定性代码里补。
-#:
-#: 这个数不是拍的。实测在一条 100 秒叙事片上：
-#:
-#:     原片                 YAVG p50 = 27.0　SATAVG p50 = 6.2
-#:     +eq brightness 0.05  YAVG p50 = 39.9　SATAVG p50 = 7.6
-#:     参考片               YAVG p50 = 41.6　SATAVG p50 = 6.3
-#:
-#: 5% 白叠加与 `eq=brightness=0.05` 等效（+12.75/255），所以放在 Remotion 里做
-#: **不用重编码**——`voice.mux` 的 `-c:v copy` 得以保留。
-#: 加对比度（contrast 1.08/1.12）反而把中位压回 31~34，所以**只提亮、不加对比**。
-GRADE_OPACITY = 0.05
+#: **2026-10-26 置 0**：曝光改由 `showrunner` 的按镜闭环接管（`brightness(gain)`，
+#: 一镜一个倍数）。盖白是**加性**的——会把黑压成灰、把饱和色洗淡，实测成片 SATAVG
+#: 只有 6.7（接近黑白）；`brightness()` 是**乘性**的，提亮同时保住色度，所以这一层
+#: 不再需要。留着常量是为了能一行回退。
+GRADE_OPACITY = 0.0
 
 
 def _scene_fingerprint(body: str) -> tuple[int, ...]:
@@ -67,7 +58,8 @@ def _caption_fit(text: str) -> float:
     return caption.fit(text)
 
 
-def wrap_story_scene(body: str, scene: dict[str, Any], *, index: int) -> str:
+def wrap_story_scene(body: str, scene: dict[str, Any], *, index: int,
+                     gain: float = 1.0, bg: str = "") -> str:
     """把模型画的场景包成完整一镜：`Camera` 运镜 + 章节号 + 时间标记 + 字幕。
 
     为什么运镜与章节标记由外层统一加，而不是让模型写：
@@ -92,36 +84,47 @@ def wrap_story_scene(body: str, scene: dict[str, Any], *, index: int) -> str:
     def q(s: str) -> str:
         return json.dumps(s, ensure_ascii=False)
 
+    # **模型自己写了画框（`<AbsoluteFill`）→ 运镜由它定，外层只留提亮层。**
+    # 这是"不把画法写死"的落点：原来 23 镜全被套上同一个 Camera 缓推，
+    # 收据上"组件覆盖率 100%"就是这么来的——那 100% 是外层注入的，不是它画的。
+    own = "<AbsoluteFill" in body
+    tag = f"      <Inner{index + 1:02d} dur={{dur}} />"
+    if gain > 1.02:
+        # 曝光闭环：实测偏暗就按倍数提亮。**只包场景、不包字幕**（字幕本来就白）。
+        # 用 CSS filter 而不是全片盖白：盖白会把黑压成灰、把饱和色洗淡。
+        tag = (f"      <div style={{{{ filter: 'brightness({gain:.2f})' }}}}>\n"
+               f"        <Inner{index + 1:02d} dur={{dur}} />\n"
+               f"      </div>")
+    cam = [] if own else [
+        f"      <Camera z0={{{z0}}} z1={{{z1}}} panX={{{px}}} panY={{{py}}}>",
+        tag,
+        "      </Camera>",
+    ]
+    # **兜底底色跟着 tone 走**（原来写死 `#05070c`）。这一层是模型没铺满整帧时露出来的
+    # 东西——写死近黑，等于给所有片子垫了一块暗底；亮色调的片子会被它压暗。
+    # 字幕/章节号的颜色按底色明暗反着来：白字压在明黄底上等于没有字。
+    bgc = bg or "#05070c"
+    fg = "#F2F5F8" if sum(int(bgc[i:i + 2], 16) for i in (1, 3, 5)) < 420 else "#12161F"
     lines = [
         "const Scene = ({ dur }: { dur: number }) => {",
         "  const frame = useCurrentFrame();",
         "  const t = dur > 0 ? frame / dur : 0;",
         "  return (",
-        "    <AbsoluteFill style={{ backgroundColor: '#05070c' }}>",
-        f"      <Camera z0={{{z0}}} z1={{{z1}}} panX={{{px}}} panY={{{py}}}>",
-        f"        <Inner{index + 1:02d} dur={{dur}} />",
-        "      </Camera>",
+        f"    <AbsoluteFill style={{{{ backgroundColor: '{bgc}' }}}}>",
+    ] + (cam or [tag]) + [
         # 提亮层：在画面之上、文字之下（文字不该被一起洗白）。见 GRADE_OPACITY。
         f"      <AbsoluteFill style={{{{ backgroundColor: '#ffffff',"
         f" opacity: {GRADE_OPACITY} }}}} />",
     ]
-    if chapter:
-        lines.append(f"      <ChapterMark index={q(chapter)} t={{t}} />")
-    if tmark:
-        lines.append(f"      <TimeMark text={q(tmark)} t={{t}} />")
+    if chapter and not own:
+        lines.append(f"      <ChapterMark index={q(chapter)} hue={q(fg)} t={{t}} />")
+    if tmark and not own:
+        lines.append(f"      <TimeMark text={q(tmark)} hue={q(fg)} t={{t}} />")
     cap = caption.plan(scene)
-    if text and cap["mode"] == "overlay":
-        lines.append(f"      <RichCaption text={q(text)} hi={q(hi)} t={{t}}"
+    if text and cap["mode"] == "overlay" and not own:
+        lines.append(f"      <RichCaption text={q(text)} hi={q(hi)} t={{t}} color={q(fg)}"
                      f" bottom={{{cap['bottom']}}} size={{{cap['size']}}}"
                      f" align={q(cap['align'])} />")
-    # 对照表：数据由分镜给，排版由组件算。表格是"数据→坐标"，让模型重画必然歪
-    # （列宽不齐、行高不一、数值不对齐）——实测两次它都只把数据念进字幕。
-    tbl = table.plan(scene)
-    if tbl:
-        lines.append(f"      <CompareTable title={q(tbl['title'])}"
-                     f" cols={{{json.dumps(tbl['cols'], ensure_ascii=False)}}}"
-                     f" rows={{{json.dumps(tbl['rows'], ensure_ascii=False)}}}"
-                     f" link={q(tbl['link'])} t={{t}} />")
     lines += ["    </AbsoluteFill>", "  );", "};"]
     return inner + "\n" + "\n".join(lines)
 
@@ -141,69 +144,49 @@ def _ensure_motif(body: str) -> str:
             + body)
 
 
-#: 叙事片的**兜底场景**（三套轮换）。每套都是手写并**实测过**的：
-#: 内容占比 ~47%、平均亮度 ~37/255、边缘 1.5+ —— 也就是"画面确实有东西"。
-#:
-#: 为什么要这一层：真机两轮下来，模型有 5/15 镜始终画成"一层近黑底色"
-#: （内容 5%、亮度 22）。它的错不在"不会画"，而在**对亮度没有直觉**——
-#: 打回两次给了具体数字，它还是把天空三段写成近乎同色。
-#: 与其继续烧调用，不如把这几镜换成"一定看得见"的那一套：
-#: 三层天空 + 一处光源 + 一个占画面 25% 的剪影。
-_STORY_SAFE_BODIES = (
-    # A 夜晚基地：射电望远镜 + 人影 + 星场
-    """const Scene = ({ dur }: { dur: number }) => {
-  const frame = useCurrentFrame();
-  const t = dur > 0 ? frame / dur : 0;
-  return (
-    <>
-      <Sky top="#0a1020" mid="#241d33" low="#7a4630" glowHue="#ffd9a0" glow={0.7} />
-      <StarField count={150} seed={9} t={t} />
-      <Horizon y={0.70} ground="#080b12" glowHue="#ffb066" ripple={0.6} t={t} />
-      <Dish x={0.66} y={0.62} r={0.24} tilt={-16} rim="#7fe6cf" t={t} />
-      <Figure x={0.16} y={0.98} h={0.42} rim="#7fe6cf" t={t} />
-      <Beam x={0.66} y={0.42} angle={250} spread={9} length={0.7}
-            hue="#8ff0d8" opacity={0.5} t={t} />
-    </>
-  );
-};""",
-    # B 太空：行星 + 舰队 + 星场
-    """const Scene = ({ dur }: { dur: number }) => {
-  const frame = useCurrentFrame();
-  const t = dur > 0 ? frame / dur : 0;
-  return (
-    <>
-      <Sky top="#05070f" mid="#0d1526" low="#1b2740" glowHue="#9fd4ff" glow={0.35} />
-      <StarField count={220} seed={13} t={t} />
-      <Planet x={0.68} y={0.34} r={0.22} hue="#c9a06a" ring t={t} />
-      <Fleet y={0.80} count={300} seed={5} hue="#cfd8e3" spread={1.1} t={t} />
-      <Beam x={0.2} y={0.1} angle={62} spread={6} length={0.9}
-            hue="#9fd4ff" opacity={0.28} t={t} />
-    </>
-  );
-};""",
-    # C 城市废墟：天际线 + 火点 + 落日
-    """const Scene = ({ dur }: { dur: number }) => {
-  const frame = useCurrentFrame();
-  const t = dur > 0 ? frame / dur : 0;
-  return (
-    <>
-      <Sky top="#0b0a12" mid="#3a1f22" low="#8a4a26" glowY={0.55}
-           glowHue="#ffb066" glow={0.75} />
-      <Sun x={0.5} y={0.55} r={0.05} hue="#ffcf8f" halo={0.7} />
-      <Horizon y={0.74} ground="#05070a" glowHue="#ff7a2f" ripple={0.25} t={t} />
-      <Ruin y={0.74} seed={4} count={22} hue="#ff7a2f" fires={7} t={t} />
-      <Figure x={0.82} y={0.97} h={0.34} flip rim="#ff9d5c" t={t} />
-    </>
-  );
-};""",
-)
+#: 兜底镜的色相轮换。**只保证"这一镜有颜色、看得见"，不决定风格。**
+_FALLBACK_HUES = ("#FF6B2C", "#22D3EE", "#FFC93C", "#FF3D7F")
 
 
-def safe_story_scene(scene: dict[str, Any], *, index: int) -> str:
-    """叙事片的兜底一镜：**一定画得出来**的那三套轮换（见 `_STORY_SAFE_BODIES`）。
+def _fallback_body(index: int) -> str:
+    """兜底一镜：**按镜号推**出来的最小场景，不是现成画面。
 
-    代价说清：它不画 `plate` 里那件具体的东西，所以是兜底不是常态。
-    报告里单独列 `fallback`，不假装那也是模型画的。
+    原来这里是三套手写插画（射电望远镜/行星/城市废墟）——那是模板。现在只留"一定看得见"
+    的几何：三段底色 + 一处径向光 + 一个落在 `MOTIF_AT` 的主体 + 一条地平线，按镜号轮换。
     """
-    body = _STORY_SAFE_BODIES[index % len(_STORY_SAFE_BODIES)]
-    return wrap_story_scene(body, scene, index=index)
+    hue = _FALLBACK_HUES[index % len(_FALLBACK_HUES)]
+    x = 0.32 if index % 2 == 0 else 0.68
+    y = (0.42, 0.56, 0.68)[index % 3]
+    gid = f"fb{index + 1:02d}"
+    return f"""const MOTIF_AT = {{ x: {x}, y: {y}, r: 0.06 }};
+const Scene = ({{ dur }}: {{ dur: number }}) => {{
+  const frame = useCurrentFrame();
+  const t = dur > 0 ? frame / dur : 0;
+  const {{ width, height }} = useVideoConfig();
+  const cx = width * {x}, cy = height * {y}, r = width * 0.15 * (1 + 0.06 * t);
+  return (
+    <svg width={{width}} height={{height}}>
+      <defs>
+        <linearGradient id="{gid}-bg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#0a1020" />
+          <stop offset="0.55" stopColor="#241d33" />
+          <stop offset="1" stopColor="#4a2b26" />
+        </linearGradient>
+        <radialGradient id="{gid}-glow">
+          <stop offset="0" stopColor="{hue}" stopOpacity="0.85" />
+          <stop offset="1" stopColor="{hue}" stopOpacity="0" />
+        </radialGradient>
+      </defs>
+      <rect x={{0}} y={{0}} width={{width}} height={{height}} fill="url(#{gid}-bg)" />
+      <circle cx={{cx}} cy={{cy}} r={{r * 2.8}} fill="url(#{gid}-glow)" />
+      <path d={{`M 0 ${{height * 0.78}} L ${{width}} ${{height * 0.74}} L ${{width}} ${{height}} L 0 ${{height}} Z`}}
+            fill="#05070c" />
+      <circle cx={{cx}} cy={{cy}} r={{r}} fill="{hue}" opacity={{0.92}} />
+    </svg>
+  );
+}};"""
+
+
+def safe_story_scene(scene: dict[str, Any], *, index: int, bg: str = "") -> str:
+    """兜底一镜（见 `_fallback_body`）。报告里单独列 `fallback`，不假装是模型画的。"""
+    return wrap_story_scene(_fallback_body(index), scene, index=index, bg=bg)

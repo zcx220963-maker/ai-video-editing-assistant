@@ -24,15 +24,14 @@ from pathlib import Path
 from typing import Any
 
 from ..motion import remotion_client as rc
+from .fixes import before_lint      # 确定性修补：必须在 lint 之前（见 fixes.py）
 
 DEFAULT_SECONDS = 6.0
 #: 单条上限。2026-10-25 从 60 提到 300。
 #:
-#: 为什么是 300 而不是 180：**有旁白时总长由文案决定**，你说 180 秒、
-#: 45 句旁白说下来可能是 181.5 秒——差 0.8% 就把整条片子拒掉是错的
-#: （实测就这么拒过一次）。所以这里的 300 只是一个"物理兜底"，
-#: 真正的结构上限在 `film`：`MAX_SHOTS(56) × MAX_SHOT_SEC(5.2) = 291 秒`，
-#: 超了由 `split_seconds` 给出带解释的报错。
+#: 为什么是 300 而不是 180：**有旁白时总长由文案决定**，45 句旁白说下来可能是
+#: 181.5 秒——差 0.8% 就把整条片子拒掉是错的。真正的结构上限在 `film`：
+#: `MAX_SHOTS(56) × MAX_SHOT_SEC(5.2) = 291 秒`，超了由 `split_seconds` 带解释报错。
 MIN_SECONDS, MAX_SECONDS = 2.0, 300.0
 DEFAULT_ASPECT = "portrait"
 DEFAULT_FPS = 30
@@ -235,6 +234,7 @@ async def write_code(prompt: str, *, seconds: float = DEFAULT_SECONDS,
 
     errors: list[dict[str, Any]] = []
     for attempt in range(max(0, int(fix_rounds)) + 1):
+        src = before_lint(src)      # 首版与重写版都要：模型常又写回一个新字体名
         try:
             # **必须 to_thread**：remotion_client 是同步 urllib，直接 await 会把事件循环
             # 卡住整个渲染时长——60 秒片子渲 200 秒，期间 HTTP 轮询全部超时（实测踩过）。
@@ -294,12 +294,15 @@ async def stills_pairs(code: str, frames: list[int], *,
     try:
         got = await asyncio.to_thread(
             rc.render_stills, code=code, input_props=props_of(sec, aspect, fps),
-            frames=picks, scale=scale, base=base)
+            frames=picks, scale=scale, base=base, with_warnings=True)
     except rc.RemotionError as exc:
         raise KernelError("stills", f"静帧渲染失败：{exc}") from exc
+    warns = list((got.get("warnings") if isinstance(got, dict) else []) or [])
+    stills = got.get("stills") if isinstance(got, dict) else got
     return [{"frame": int(item.get("frame", -1)),
-             "jpeg_b64": str(item.get("jpeg_b64") or "")}
-            for item in got if item.get("jpeg_b64")]
+             "jpeg_b64": str(item.get("jpeg_b64") or ""),
+             "warnings": list(warns)}
+            for item in stills if item.get("jpeg_b64")]
 
 
 async def stills_frames(code: str, frames: list[int], *,

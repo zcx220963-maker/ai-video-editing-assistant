@@ -413,12 +413,23 @@ async function renderStills(payload) {
     const onBrowserLog = (log) => {
       const text = String(log?.text ?? '');
       const lat = text.indexOf(LAYOUT_MARKER);   // 实测可能带 " Tab N, file:line " 前缀
-      if (lat < 0) return;
-      try {
-        layoutLines.push(JSON.parse(text.slice(lat + LAYOUT_MARKER.length)));
-      } catch (err) {
-        if (logNotes.length < 4) logNotes.push(`版面行解析失败：${String(err).slice(0, 120)}`);
+      if (lat >= 0) {
+        try {
+          layoutLines.push(JSON.parse(text.slice(lat + LAYOUT_MARKER.length)));
+        } catch (err) {
+          if (logNotes.length < 4) logNotes.push(`版面行解析失败：${String(err).slice(0, 120)}`);
+        }
+        return;
       }
+      // 2026-10-26：原先这里 `return`，把组件运行时的 console.error / 警告全丢了——
+      // 静帧渲成一片黑、is_blank 打回、模型重写三次还是黑，却没有任何线索。
+      // 现在把 error / warning 带回（附 file:line），调用方据此能直接定位到 sNN.tsx 的某一行。
+      const type = String(log?.type ?? 'log');
+      if (type !== 'error' && type !== 'warning') return;
+      if (logNotes.length >= 40) return;
+      const loc = log?.location;
+      const where = loc ? ` @ ${loc.url || ''}:${loc.lineNumber ?? '?'}:${loc.columnNumber ?? '?'}` : '';
+      logNotes.push(`[browser:${type}]${where} ${text.slice(0, 400)}`);
     };
     for (const job of jobs) {
       // 分段口里每一段的时长可以不同（时长由 props 决定），所以组合要按段选一次；

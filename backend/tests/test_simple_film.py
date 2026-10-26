@@ -62,11 +62,15 @@ def main() -> int:
     already = '<rect width={Math.max(0, w)} height={Math.max(0, h)} />'
     check(film._fix_rects(already) == already, "已经夹过的不重复夹")
 
-    print("\n④ 兜底场景：结构完整、组件齐全")
+    print("\n④ 兜底场景：结构完整、画得出东西、每镜不同")
     fb = film.safe_story_scene({"text": "一句字幕"}, index=0)
     check(film._looks_complete(fb), "兜底场景是完整组件（括号配平、以 }; 收尾）")
-    used = system.used_components(fb)
-    check(len(used) >= 3, f"用到的组件 ≥3 件（{used}）")
+    # 兜底**不再用现成场景**（原来是三套手写插画＝模板），改成按镜号推出来。
+    # 所以判据从"用了几件组件"换成"真的画得出东西、而且每镜不一样"。
+    prims = sum(fb.count(f"<{t}") for t in ("rect", "circle", "path"))
+    check(prims >= 4, f"兜底至少 4 个图元（底色/光晕/主体/地平线，实测 {prims}）")
+    check("const MOTIF_AT" in fb, "兜底也声明 MOTIF_AT（切镜接力才不断）")
+    check(fb != film.safe_story_scene({"text": "一句字幕"}, index=1), "每镜的兜底不一样")
     check("const Scene" in fb, "导出的是约定的 `const Scene`（assemble 靠它改名）")
 
     print("\n⑤ 设计系统的比例兜底：收「比例」的组件必须过 R()/N()")

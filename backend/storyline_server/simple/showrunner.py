@@ -31,13 +31,19 @@ MIN_SHOT_SEC, MAX_SHOT_SEC = 1.0, 15.0
 #: 总时长与目标的允许偏差。超了让导演重给一次，**不替它改值**。
 DURATION_TOLERANCE = 0.15
 #: 评审回路最多几轮。3 轮是成本上限（16 镜 × 3 = 48 次带图调用）。
-JUDGE_ROUNDS = 3
+JUDGE_ROUNDS = 1
 #: 每轮最多重画几镜。再多说明分镜本身有问题，该重做分镜。
 MAX_FIX_PER_ROUND = 8
+#: 单镜「写-渲-看」最多几轮（2026-10-26）。反馈必须在**每一步之内**，
+#: 不能一口气盲写 28 镜再事后返修——那样错 20 个，4 轮修不完只能整片打回。
+SHOT_TRIES = 3
 #: 导演调用最多试几次（格式/约束不合格就带着问题重问）。
 PLAN_TRIES = 3
 #: 镜长要比旁白长出的留白（秒）。与 `voice.GAP_SEC` 同源，这里只用于校验。
 VOICE_GAP = 0.35
+#: 曝光闭环：写手提示写的就是 40/255，真机实测整片 p50 = 27.5、98.4% 的帧低于它，
+#: 而 `physical()` 只判 <3 全黑 → 一直合法。渲完按读数补 gain，不靠模型"记得画亮"。
+EXPOSURE_TARGET, EXPOSURE_MAX_GAIN = 40.0, 2.6      # 封顶 2.6：再高会把噪点一起提上来
 
 
 PLAN_SYSTEM = """你是这部短片的导演。只做一件事：把用户那句话变成一份**分镜表**。
@@ -46,36 +52,41 @@ PLAN_SYSTEM = """你是这部短片的导演。只做一件事：把用户那句
 
 {
   "title": "片名（≤12 字）",
-  "tone": "整片的画法基调，一句话（配色 / 笔触 / 用不用 3D）",
+  "tone": "整片的画法基调。**必须写清四件**：① 底色（给色值）② 主色两个（给色值）③ 构图习惯（满/空、对称/偏心、地平线高低）④ 笔触（矢量平涂/剪纸/手绘/3D/照片拼贴）。这四件决定十几镜像不像同一部片子；含糊一句，每镜就会各画各的",
   "motif": "贯穿全片的那一件东西（≤8 字，没有就空串）",
+  "caption": {"size": 0.045, "at": "lower", "color": "#F2F5F8", "scrim": 0},
   "shots": [
-    {"sec": 3.2, "text": "这一镜的字幕（≤20 字）", "plan": "画什么、怎么动、用什么技术"}
+    {"sec": 3.2, "text": "这一镜的字幕（≤20 字）", "plan": "画什么、怎么动、用什么技术",
+     "transition": "cut"}
   ]
 }
+
+## 先想审美，再写分镜
+
+`caption` 是**全片一套的字幕规格**——字幕由写手逐镜画进画面，只有这一份能让 23 镜的字一样：
+`size` 字号占短边 0.03~0.06、`at` 位置 bottom/lower/center/upper/left、`color` 字色、`scrim` 底衬 0~0.4。
+
+`tone` 是**你对这个题材的审美判断**，不是填空题：先想三个方向（各一句"长什么样 + 为什么
+适合这题材"），挑最贴的那一个写进 `tone`。**避开偷懒答案**——暗底加一个光点、深蓝科技感、
+极简白底黑字、"电影感"三个字本身，那是模型的默认口味，不是这个题材的选择。
+**用户原话里点了风格就必须照它**（"剪纸""高饱和""像苹果发布会""手绘笔记"），不许改成你偏好的。
 
 ## 镜数与镜长由你定
 
 **这是你最重要的判断，不要套公式。**
 
 - 总时长约 [[SECONDS]] 秒，但**不是均分**：一句话该停 2 秒就 2 秒，该停 9 秒就 9 秒。
-- 单镜 [[MINSEC]]~[[MAXSEC]] 秒，[[LO]]~[[HI]] 镜都算对。
-- 讲得下就少几镜（长镜更沉），讲不下就多几镜。
-- **节奏参考**（不是硬指标，是经验）：
-  · 快切科普那一档是 14+ 镜 / 60 秒、每镜 3~5 秒、画面很密；
-  · 叙事长镜那一档是 4~12 秒一镜、单镜画面自己撑得住。
-  这一条属于哪档，你自己判——用户要"深刻、克制"就别快切；
-  用户要"燃、炸"就快切。
+- 单镜 [[MINSEC]]~[[MAXSEC]] 秒，[[LO]]~[[HI]] 镜都算对。讲得下就少几镜，讲不下就多几镜。
+- **节奏参考**（经验，不是硬指标）：快切科普是 14+ 镜 / 60 秒、每镜 3~5 秒、画面很密；
+  叙事长镜是 4~12 秒一镜、单镜自己撑得住。用户要"深刻克制"就别快切，要"燃"就快切。
 
-## `plan` 要写到能被别人画出来的程度
+## `plan` 要写到能被别人画出来
 
-写清三样：**画什么**（具体物件，不是"科技感"）、**怎么动**（哪一段在变）、
-**用什么技术**。技术从下面四样里选，**按内容挑，不是按习惯挑**：
+写清**画什么**（具体物件，不是"科技感"）、**怎么动**、**用什么技术**。技术按内容挑，不按习惯挑：
+· `svg` 手绘矢量（默认：抽象概念/图表/剪影/星空/光晕）· `three` 3D（有体积有反射，贵 3~5 倍）
+· `components` 设计系统（逐词字幕/科技卡/数据卡）· `html` 真排版（表格/长文/网页感）
 
-· `svg` —— 手绘矢量：抽象概念、图表、剪影、星空、光晕。**默认用这个。**
-· `three` —— 3D：有体积、有光、有反射、需要真实感的东西（行星、金属、玻璃）。
-  渲染比 svg 贵 3~5 倍，**只在"非它不可"时用**。
-· `components` —— 设计系统组件：逐词字幕、科技卡、数据卡、进度条。
-· `html` —— 需要真排版时（表格、长文、网页截图感）。
+`transition` 只写 `cut` 或 `fade`，**默认 `cut`**（硬切是节奏的一部分）；只有段落交界、时间跳跃、情绪收束才用 `fade`，全片不超过 1/3 的切点。
 
 ## 字幕
 
@@ -99,7 +110,7 @@ SHOT_CONTEXT = """## 整片的画法基调（每一镜都要遵守，否则十�
 整帧平均亮度仍要 **≥38/255**，主体与背景亮度差 **≥40 级**。
 （真机踩过：tone 写"克制不鲜艳"，15 镜全做成 17/255，观众看不出画的是什么。）
 
-## 前两镜画过什么（**这一镜不要重复它们的母题**）
+## 前两镜画过什么（**接着它们画同一个世界；但不要重复构图**）
 
 {prev}
 
@@ -109,6 +120,11 @@ SHOT_CONTEXT = """## 整片的画法基调（每一镜都要遵守，否则十�
 · `three` 3D——有体积/有光/有反射的东西；比 svg 贵 3~5 倍，非它不可时用
 · `components` 设计系统组件——逐词字幕、科技卡、数据卡
 · `html` 真排版——表格、长文、网页感"""
+
+
+#: 整片画面合格线（2026-10-26）。不合格的镜占比超过这个就不许出片。
+#: 26 镜里 26 镜不合格（合格率 0.0）照样渲完交付过，所以要有一道真闸。
+QUALITY_PASS_RATIO = 0.6
 
 
 def parse_json(text: str) -> dict[str, Any] | None:
@@ -131,17 +147,14 @@ def parse_json(text: str) -> dict[str, Any] | None:
 
 
 def plan_problems(obj: dict[str, Any] | None, seconds: float) -> list[str]:
-    """校验导演给的 plan。返回问题列表（空 = 合格）。
-
-    名字里刻意没有 `check_`：`simple/` 的边界测试禁止任何 `check_*` 调用
-    （那是旧链「闸」的命名习惯，新路径里不该再有闸）。这里只是**格式校验**，
-    不是审美判据。
-
-    **只做物理校验，不替它改值**：越界就让它重给，而不是钳一下继续跑——
-    钳过的镜长会让「节奏由内容决定」这件事当场失效。
+    """校验导演给的 plan。返回问题列表（空 = 合格）。名字里没有 `check_`（边界测试禁止）。
+    **只做物理校验，不替它改值**：越界就让它重给——钳过的镜长会让"节奏由内容定"失效。
     """
     if not isinstance(obj, dict):
         return ["没有回合法 JSON"]
+    # `tone` 是整片唯一的画法载体。空的就等于 23 个写手各画各的，必散。
+    if len(str(obj.get("tone") or "").strip()) < 12:
+        return ["`tone` 太短——整片唯一的画法基调，要写清底色/主色/构图/笔触，否则每镜各画各的"]
     shots = obj.get("shots")
     if not isinstance(shots, list) or not shots:
         return ["`shots` 不是非空数组"]
@@ -172,8 +185,12 @@ def plan_problems(obj: dict[str, Any] | None, seconds: float) -> list[str]:
 
 
 def normalize(obj: dict[str, Any]) -> dict[str, Any]:
-    """导演的 plan → 内部形状。`plan` 字段映射成写手认的 `plate`。"""
+    """导演的 plan → 内部形状。`plan` 映射成写手认的 `plate`。
+
+    **白名单式转换**：没在这里留一手的字段会被丢掉。`caption` / `transition` 都为此专门保留。
+    """
     shots: list[dict[str, Any]] = []
+    cap0 = obj.get("caption") if isinstance(obj.get("caption"), dict) else {}
     for s in obj.get("shots") or []:
         if not isinstance(s, dict):
             continue
@@ -182,6 +199,9 @@ def normalize(obj: dict[str, Any]) -> dict[str, Any]:
             "text": str(s.get("text") or "").strip()[:40],
             "plate": str(s.get("plan") or s.get("plate") or "").strip(),
             "tech": str(s.get("tech") or "").strip(),
+            # 转场要带出来：白名单式转换不留就会丢，全片退回硬编码循环（2026-10-26 真机）。
+            "transition": str(s.get("transition") or "").strip().lower(),
+            "caption": s.get("caption") if isinstance(s.get("caption"), dict) else cap0,
         })
     return {
         "title": str(obj.get("title") or "").strip()[:24],
@@ -202,12 +222,12 @@ def _total_sec(obj: dict[str, Any]) -> float:
 
 def structural_ok(obj: dict[str, Any] | None, seconds: float) -> bool:
     """结构合格吗：镜数、单镜时长、text 都对，只有总长可能不对。
-
-    总长是唯一一处"模型难一次命中、但代码能按比例救回来"的偏差；
-    镜数错、单镜 30 秒那种救不了，只能重问。
+    总长是唯一"模型难一次命中、但代码能按比例救回来"的偏差；镜数错那种救不了。
     """
     if not isinstance(obj, dict):
         return False
+    if len(str(obj.get("tone") or "").strip()) < 12:
+        return False   # tone 不合格不能按"只差时长"救——救回来的是没有画法基调的一稿
     shots = obj.get("shots")
     if not isinstance(shots, list) or not (MIN_SHOTS <= len(shots) <= MAX_SHOTS):
         return False
@@ -361,11 +381,7 @@ async def judge(evidence: list[dict[str, Any]], shots: list[dict[str, Any]],
 
 
 def physical(ev: dict[str, Any]) -> str:
-    """物理判据：ok / black / white / unknown。
-
-    **只判"没渲出来"**：全黑或全白。偏暗是审美，交给评审——
-    成片 YAVG 27~34 是合法的，不该被机器打回。
-    """
+    """物理判据：ok / black / white / unknown。只判"没渲出来"——偏暗是审美，交给评审。"""
     r = ev.get("readings") or {}
     if not r:
         return "unknown"
@@ -426,6 +442,9 @@ async def make(prompt: str, *, seconds: float = 60.0,
     n = len(shots)
     secs = [float(s["sec"]) for s in shots]
     tone = str(plan_obj.get("tone") or "")
+    # 兜底底色从 `tone` 里取第一个色值（`tone` 现在必须写底色）。取不到才用 #05070c。
+    _m = re.search(r"#[0-9a-fA-F]{6}", tone)
+    film_bg = _m.group(0) if _m else ""
     motif = str(plan_obj.get("motif") or "")
 
     # ── ② 旁白：**只校验，不改值** ─────────────────────────────────────────
@@ -460,16 +479,38 @@ async def make(prompt: str, *, seconds: float = 60.0,
     done = 0
     scene_errors: list[str] = []
 
-    async def one(i: int) -> str:
+    async def one(i: int) -> tuple[str, str]:
         nonlocal done
         async with sem:
+            kw = dict(total=n, tone=tone, shots=shots, aspect=aspect, llm=llm,
+                      user_id=user_id, conversation_id=conversation_id, motif=motif)
             try:
-                body = await write_shot(shots[i], index=i, total=n, tone=tone,
-                                        shots=shots, aspect=aspect, llm=llm,
-                                        user_id=user_id,
-                                        conversation_id=conversation_id,
-                                        motif=motif)
-                return wrap_story_scene(body, shots[i], index=i)
+                body, hint = "", ""
+                # 写一镜 → 立刻渲这一镜 → 看读数 → 不对就带着读数重写。
+                # 反馈在每一步之内，不攒到最后批量返修：那样 28 镜里错 20 个，
+                # 4 轮返修修不完，只能整片打回（2026-10-26 连续三次都是这个死法）。
+                for attempt in range(SHOT_TRIES):
+                    try:
+                        body = await write_shot(shots[i], index=i, **kw, extra=hint)
+                    except KernelError:
+                        hint = ("上一版画不出来。**简化这一镜**：只画 plate 里最核心的那一个"
+                                "东西，其余全去掉，不要细节、不要第二层。")
+                        continue
+                    cand = wrap_story_scene(body, shots[i], index=i, bg=film_bg)
+                    code_i, _ = assemble([cand], [secs[i]], ["cut"], fps=fps,
+                                         motifs=[parse_motif_at(cand)])
+                    ev = await shot_evidence(code_i, [secs[i]], aspect=aspect,
+                                             fps=fps, only=1)
+                    rd = (ev[0].get("readings") if ev else {}) or {}
+                    if not qa.is_blank(rd):
+                        return cand, body          # 这一镜成了，定稿
+                    warns = (ev[0].get("warnings") if ev else []) or []
+                    hint = qa.readout_fix(rd, warnings=warns) or \
+                        "这一帧渲出来几乎空白——主体没画出来，重画这一镜"
+                    if warns:
+                        hint += "\n\n渲染时浏览器控制台报错（按 file:line 定位）：\n" \
+                                + "\n".join(f"- {w}" for w in warns[:8])
+                return wrap_story_scene(body, shots[i], index=i, bg=film_bg), body
             finally:
                 done += 1
                 tick("scenes", done, n)
@@ -477,13 +518,19 @@ async def make(prompt: str, *, seconds: float = 60.0,
     results = await asyncio.gather(*[one(i) for i in range(n)],
                                    return_exceptions=True)
     bodies: list[str] = []
+    # `raws` = 模型自己写的那半（不含外层注入的 Camera / 字幕）。
+    # 覆盖率必须量这个：量 `bodies` 的话，外层给每镜都塞了 Camera+RichCaption，
+    # 于是 ratio 恒等于 1.0——那个 100% 不度量任何东西（真机 23 镜全是它）。
+    raws: list[str] = []
     for i, r in enumerate(results):
         if isinstance(r, Exception):
             # 兜底会盖住失败原因，所以错误原文必须收起来（报告里要能看见）。
             scene_errors.append(f"s{i + 1:02d} {type(r).__name__}: {str(r)[:160]}")
-            bodies.append(safe_story_scene(shots[i], index=i))
+            bodies.append(safe_story_scene(shots[i], index=i, bg=film_bg))
+            raws.append("")
         else:
-            bodies.append(r)
+            bodies.append(r[0])
+            raws.append(r[1])
     calls += n
 
     kinds = transitions_for_story(shots)
@@ -500,19 +547,34 @@ async def make(prompt: str, *, seconds: float = 60.0,
     rewritten: list[int] = []
     evidence: list[dict[str, Any]] = []
     notes: dict[int, str] = {}
+    #: 每镜被重画过几次。`sorted()[:MAX_FIX_PER_ROUND]` 每轮都取镜号最小的 8 个，
+    #: 前 8 镜一直不合格就永远轮不到第 9 镜之后（2026-10-26：23 镜里只有 2~13 被修过）。
+    tries: dict[int, int] = {}
     for _round in range(JUDGE_ROUNDS):
         tick("audit", 0, n)
         evidence = await shot_evidence(code, secs, aspect=aspect, fps=fps)
+        was_blank = {int(e["index"]): qa.is_blank(e.get("readings") or {})
+                     for e in evidence}
         # 物理判据先过一遍：没渲出来（全黑/全白）的镜不用问模型，直接重画。
         blind = [int(e["index"]) for e in evidence if physical(e) != "ok"]
         notes = await judge(evidence, shots, tone, llm=llm, user_id=user_id,
                             conversation_id=conversation_id)
+        # 读数翻成诊断再交给写手：评审的 hint 限 40 字，传不出对比度差多少。
+        # 这一步不改画法，只把「缺多少」说清楚——怎么改仍由模型自己定。
+        for e in evidence:
+            _r = e.get("readings") or {}
+            _fix = qa.readout_fix(_r)
+            if _fix:
+                _no = int(e["index"])
+                notes[_no] = (notes[_no] + "；" + _fix) if notes.get(_no) else _fix
         for no in blind:
             notes.setdefault(no, "这一帧几乎是全黑或全白——画面没画出来，重画")
         if not notes:
             break
         fixed = 0
-        for shot_no, hint in sorted(notes.items())[:MAX_FIX_PER_ROUND]:
+        for shot_no, hint in sorted(notes.items(),
+                                   key=lambda kv: (tries.get(kv[0], 0), kv[0])
+                                   )[:MAX_FIX_PER_ROUND]:
             i = shot_no - 1
             if not (0 <= i < n):
                 continue
@@ -522,8 +584,22 @@ async def make(prompt: str, *, seconds: float = 60.0,
                                         user_id=user_id,
                                         conversation_id=conversation_id,
                                         extra=hint, motif=motif)
-                bodies[i] = wrap_story_scene(body, shots[i], index=i)
+                cand = wrap_story_scene(body, shots[i], index=i, bg=film_bg)
+                old = bodies[i]
+                bodies[i] = cand
+                code, tl = rebuild()
+                # 重写不许把画面写坏：只渲这一镜，比原来更空就退回原版。
+                # 2026-10-26 真机：31 次重写把 23 镜写成 content=0.0 的纯背景，
+                # 而没被重写的 4 镜（含 s27 那张脑网格）全正常。
+                probe = await shot_evidence(code, secs, aspect=aspect, fps=fps,
+                                            only=shot_no)
+                if (probe and not was_blank.get(shot_no, True)
+                        and qa.is_blank(probe[0].get("readings") or {})):
+                    bodies[i] = old
+                    code, tl = rebuild()
+                    continue
                 rewritten.append(shot_no)
+                tries[shot_no] = tries.get(shot_no, 0) + 1
                 fixed += 1
             except KernelError:
                 pass
@@ -532,7 +608,28 @@ async def make(prompt: str, *, seconds: float = 60.0,
         calls += fixed
         code, tl = rebuild()
 
+    # ── ④.5 曝光闭环：量出来的亮度 → 每镜一个 gain（不靠模型记得画亮，也不全片盖白）
+    gains: dict[int, float] = {}
+    for e in evidence:
+        lum = float((e.get("readings") or {}).get("mean_lum") or 0)
+        if lum > 0:
+            gains[int(e["index"]) - 1] = round(
+                min(EXPOSURE_MAX_GAIN, max(1.0, EXPOSURE_TARGET / lum)), 2)
+    if any(g > 1.05 for g in gains.values()):
+        bodies = [wrap_story_scene(raws[i], shots[i], index=i, gain=gains.get(i, 1.0), bg=film_bg)
+                  if raws[i] else bodies[i] for i in range(n)]
+        code, tl = rebuild()
+
     # ── 记账（形状与旧链一致，`short_video` 与前端都直接吃） ────────────────
+    evidence = await shot_evidence(code, secs, aspect=aspect, fps=fps)
+    notes = await judge(evidence, shots, tone, llm=llm, user_id=user_id,
+                        conversation_id=conversation_id)
+    for _e in evidence:
+        _r = _e.get("readings") or {}
+        _fx = qa.readout_fix(_r)
+        if _fx:
+            _n0 = int(_e["index"])
+            notes[_n0] = (notes[_n0] + "；" + _fx) if notes.get(_n0) else _fx
     bad = sorted(set(notes) | {int(e["index"]) for e in evidence if physical(e) != "ok"})
     # 行形状与旧 `qa.audit` 对齐（`content` / `vivid` 摊在顶层）：
     # `reshoot_shot` 与前端都直接读 row["content"]，改成嵌套会让它们静默拿到 None。
@@ -546,9 +643,20 @@ async def make(prompt: str, *, seconds: float = 60.0,
             "readings": r,
             "verdicts": [physical(e)], "worst": physical(e),
         })
+    _blank = {int(e["index"]) for e in evidence if qa.is_blank(e.get("readings") or {})}
+    defects = sorted(_blank | {int(e["index"]) for e in evidence if physical(e) != "ok"})
+    concerns, bad = sorted(set(notes) - set(defects)), defects
+    _pass = round((n - len(bad)) / max(1, n), 3)
     audit = {
-        "ok": bool(evidence),
-        "ratio": round((n - len(bad)) / max(1, n), 3),
+        # `ok` 现在表示「**画面合格**」，不再是「抽帧成功」。
+        # 2026-10-26 那次：26 镜全不合格、ratio 0.0，但 ok=True（它只表示抽到了帧），
+        # 消费方读成「画面没问题」，还解释成「质检服务没连上」。语义必须分开。
+        "ok": bool(evidence) and not defects,
+        "evidence": bool(evidence),
+        "defects": defects,
+        "concerns": concerns,
+        "pass_ratio": _pass,
+        "ratio": _pass,
         "bad": bad,
         "shots": rows,
         "frames": sum(int(e.get("frames") or 0) for e in evidence),
@@ -572,7 +680,7 @@ async def make(prompt: str, *, seconds: float = 60.0,
         # 出处账按镜盘数字，键名沿用旧的，免得两处各改一遍。
         "plan": {**plan_obj, "scenes": shots},
         "secs": secs, "calls": calls, "shots": n, "mode": "auto",
-        "coverage": system.coverage(bodies), "audit": audit,
+        "coverage": system.coverage(raws), "audit": audit,
         "rewritten": rewritten, "patched": [], "fallback": [],
         "picture": "code", "scene_errors": scene_errors,
         "variety": len({_scene_fingerprint(b) for b in bodies}),
@@ -592,7 +700,8 @@ async def make(prompt: str, *, seconds: float = 60.0,
 
 async def shot_evidence(code: str, secs: list[float], *, aspect: str,
                    fps: int = kernel.DEFAULT_FPS, base: str | None = None,
-                   scale: float = 0.30) -> list[dict[str, Any]]:
+                   scale: float = 0.30,
+                   only: int | None = None) -> list[dict[str, Any]]:
     """渲帧 + 量读数，**不下结论**——新路径专用。
 
     与 `qa.audit()` 的区别：那边把读数折成 verdict，这里原样交出去由模型判断。
@@ -603,9 +712,13 @@ async def shot_evidence(code: str, secs: list[float], *, aspect: str,
     `jpeg` 取 0.5 那一帧（镜中段）——0.15 那一点常落在进场动画里，看不出这一镜。
     """
     frames, owners = qa.sample_frames(secs, fps=fps)
+    if only is not None:                      # 只渲指定镜（重写后复检用）
+        keep = [(f, o) for f, o in zip(frames, owners) if o == only - 1]
+        frames, owners = [f for f, _ in keep], [o for _, o in keep]
     total = sum(secs)
     got: dict[int, dict[str, float]] = {}
     jpegs: dict[int, str] = {}
+    warns_by_shot: dict[int, list[str]] = {}
 
     for i in range(0, len(frames), qa.BATCH):
         chunk = frames[i:i + qa.BATCH]
@@ -615,9 +728,14 @@ async def shot_evidence(code: str, secs: list[float], *, aspect: str,
                                               scale=scale, base=base)
         except KernelError:
             continue
+        f2o = {f: o for f, o in zip(chunk, owners[i:i + qa.BATCH])}
         for p in pairs:
-            got[p["frame"]] = qa.measure(p["jpeg_b64"])
-            jpegs[p["frame"]] = p["jpeg_b64"]
+            fr = p["frame"]
+            got[fr] = qa.measure(p["jpeg_b64"])
+            jpegs[fr] = p["jpeg_b64"]
+            ow = f2o.get(fr)
+            if ow is not None and p.get("warnings"):
+                warns_by_shot.setdefault(ow, []).extend(p["warnings"])
 
     # 按镜聚合：读数取三个采样点里**最好的那个**（一帧画满就算这镜画到了）。
     by_shot: dict[int, list[int]] = {}
@@ -629,7 +747,8 @@ async def shot_evidence(code: str, secs: list[float], *, aspect: str,
     for i in range(len(secs)):
         fs = by_shot.get(i) or []
         if not fs:
-            out.append({"index": i + 1, "readings": {}, "jpeg": "", "frames": 0})
+            out.append({"index": i + 1, "readings": {}, "jpeg": "", "frames": 0,
+                        "warnings": []})
             continue
         rows = [got[f] for f in fs]
         readings = {
@@ -641,7 +760,8 @@ async def shot_evidence(code: str, secs: list[float], *, aspect: str,
         mid = fs[len(fs) // 2]
         out.append({"index": i + 1, "readings": readings,
                     "jpeg": jpegs.get(mid) or jpegs.get(fs[0]) or "",
-                    "frames": len(fs)})
+                    "frames": len(fs),
+                    "warnings": list(dict.fromkeys(warns_by_shot.get(i, [])))})
     return out
 
 
@@ -660,11 +780,11 @@ JUDGE_SYSTEM = """你看的是这部短片里的一帧，和它旁边的几个�
 
 1. **有没有一件能被指着说的东西**？（望远镜/人影/城市/行星/控制台/表格/数据）
    只有渐变和色块、或者只有一行字 → 要改。
-2. **是不是几乎什么都没有 / 太暗**？大片空白、主体看不见、像一页排版 → 要改。
+2. **画面是不是空的**？`content` < 0.08 = 主体和背景几乎同色 = 没画东西 → 要改。tone 说"留空/极简"只放宽"满"的要求，**不豁免"主体看得见"**——留空是留负空间，不是黑屏。
 3. **和前面几镜是不是同一个母题**（又是城市+落日、又是同一个圆）→ 要改：
    换地点、换尺度、换时间、换视角。
 4. **有没有兑现这一镜的 plan**？plan 说要画 A，画面上没有 A → 要改。
-5. **字幕压的地方读得清吗**？白字压在亮部 → 要改。
+5. **字幕在不在、读得清吗**？缺字/被截断/白字压亮部 → 要改（字幕由写手自己画，外层不补）。
 
 **改法里必须带可执行的目标值**，否则写手不知道"亮多少"：
 

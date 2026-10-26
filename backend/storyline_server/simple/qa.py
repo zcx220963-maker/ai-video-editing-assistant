@@ -114,6 +114,67 @@ def sample_frames(secs: list[float], *, fps: int) -> tuple[list[int], list[int]]
     return frames, owners
 
 
+#: 「这帧根本没画东西」的线。**和 `EMPTY_RATIO` 是两件事**：
+#: `EMPTY_RATIO=0.22` 是给几何动效科普片（大色块、高饱和）定的追求值；
+#: 暗调剪影/细线片（近黑底 + 一处光晕）实测 0.03~0.20 就是正常画面。
+#: 2026-10-26 真机：s03 content=0.061、s08=0.127 的画面都是合格的「观测仪器感」，
+#: 却被 0.22 判不合格，23 镜里打回 21 镜，四轮重写全部白费。
+BLANK_RATIO, BLANK_LUM = 0.02, 8.0
+
+
+def is_blank(readings: dict[str, Any]) -> bool:
+    """这一帧是不是**客观上空**：几乎没画东西 / 接近全黑 / 全白。
+
+    这是唯一该由代码拦的东西。审美（有没有主体、留白克不克制、像不像片子）
+    交给 `judge` 里那个看图说话的模型——它比任何比例阈值都可靠。
+    2026-10-26 教训：拿 `content >= 0.22` 当闸，把 content=0.061 的
+    「近黑底 + 白色剪影 + 光晕」合格画面判成不合格，23 镜打回 21 镜，四轮重写全白费。
+    """
+    if not readings:
+        return False
+    lum = float(readings.get("mean_lum") or 0.0)
+    return (float(readings.get("content") or 0.0) < BLANK_RATIO
+            or lum < BLANK_LUM or lum >= 250.0)
+
+
+def readout_fix(r: dict[str, Any], *, warnings: list[str] | None = None) -> str:
+    """把读数翻成**写手能执行的诊断**——给数字，不指定构图。
+
+    2026-10-26：只说「几乎什么都没画，怎么画由你定」，模型重写三次还是全黑。
+    它看不见自己的输出，需要的不是鼓励，是**一个无法反驳的数字**：
+    整帧 95% 的像素亮度都在多少以下、背景是多少。加上对比度的物理事实
+    （差不到 20/255 就等于看不见），它就知道该改明度而不是改构图。
+
+    `warnings` 是渲染时浏览器控制台抓到的 ``console.error`` / ``console.warn``
+    （由 `server.mjs` 的 `onBrowserLog` 带回，含 file:line）。如果这一镜渲出来是黑屏、
+    却又带报错，那「几乎没画东西」根本不是构图问题，是**组件运行时挂了**——
+    这条信息能让模型直接去修那一行，而不是又重写一遍整镜。
+    """
+    content = float(r.get("content") or 0.0)
+    lum = float(r.get("mean_lum") or 0.0)
+    p95 = float(r.get("p95_lum") or 0.0)
+    bg = float(r.get("bg_lum") or 0.0)
+    bad: list[str] = []
+    if content < BLANK_RATIO:
+        bad.append(f"与背景亮度差 >20 的像素只占 {content:.1%}")
+    if lum < BLANK_LUM:
+        bad.append(f"整帧平均亮度 {lum:.0f}/255")
+    if p95 < 90 and (bad or content < 0.05):
+        bad.append(f"**整帧最亮的 5% 像素也只有 {p95:.0f}/255**（背景 {bg:.0f}）"
+                   f"——差不到 20 就等于看不见，屏幕上一片黑")
+    if not bad:
+        return ""
+    msg = ("读数：" + "；".join(bad) + "。"
+           "改法你定，但必须先让「看得见」成立：主体用实心亮色"
+           "（#E8F0F5 或 #4FD1E0，明度 200+/255），背景保持 #0a0c14；"
+           "描边细线也要 2px 以上、opacity 0.6 以上。")
+    if warnings:
+        msg += ("\n\n但更可能是**组件运行时出错**——下面这行报错才是根因，"
+                "照着 file:line 去修那一处，别重写整镜：\n"
+                + "\n".join(f"- {w}" for w in warnings[:8]))
+    return msg
+
+
 def verdict(m: dict[str, float], *, story: bool = False) -> str:
     """一帧的判定：ok / empty / dark / black / flat / unknown。
 

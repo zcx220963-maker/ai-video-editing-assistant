@@ -11,17 +11,15 @@
 
 1. **太大**：字号按**宽度**算，同一个 0.038 在 1920 宽是 73px、1280 宽是 48.6px、
    720 竖屏是 27px——观感差三倍。参考片 1280×720 实测约 34px（占短边 0.047）。
-2. **割开画面**：那条 36% 高的黑渐变盖在画面下三分之一。参考片没有这东西，
-   它靠描边 + 阴影保证可读。
+2. **割开画面**：那条 36% 高的黑渐变盖在画面下三分之一。参考片没有这东西，它靠描边 + 阴影。
 3. **死板**：要不要字幕、放哪、多大，全由外层定，分镜插不上话。
 
 ## 三层职责（这是"灵活但不屎山"的关键）
 
-    可读性下限   外层代码（不可协商）：最小字号、描边、安全区、不出画
     版式意图     分镜（每镜给）：要不要字幕、放哪、多大
-    具体实现     画面写手：`drawn` 时自己把字画进画面（题款/批注/碑文/纸卡）
+    具体实现     画面写手：**默认**自己把字画进画面（题款/批注/碑文/纸卡/屏幕上的字）
 
-**判据只有一条**：分镜说 `drawn` 就不加，没说就兜底。不判断"画得好不好"。
+**判据只有一条**：默认 `drawn`（模型自己画）；分镜点名 `overlay` 才由外层兜底。
 不设闸——字幕可读性判不了像素，硬判就是旧链那种没有区分力的闸。
 """
 
@@ -44,10 +42,10 @@ CAPTION_AT = {
 DEFAULT_AT = "lower"
 
 #: 三种模式。
-#: - `overlay`：外层画（默认）
-#: - `drawn`：模型自己画进画面，外层一个字不加
+#: - `drawn`：模型自己画进画面（**默认**），外层一个字不加
+#: - `overlay`：外层画（只有分镜点名才用）
 #: - `none`：这镜不要字幕（纯画面，靠旁白）
-MODES = ("overlay", "drawn", "none")
+MODES = ("drawn", "overlay", "none")
 
 #: 字号占**短边**的比例，按字数分档。
 #:
@@ -75,21 +73,16 @@ def fit(text: str) -> float:
 
 
 def plan(scene: dict[str, Any]) -> dict[str, Any]:
-    """这一镜的字幕怎么放。
+    """这一镜的字幕怎么放 → ``{mode, bottom, size, align}``。
 
-    返回 ``{mode, bottom, size, align}``：
-      mode    `overlay` / `drawn` / `none`
-      bottom  底边距画面底部的比例（`drawn`/`none` 时无意义，给 0）
-      size    字号占短边的比例（分镜没给就按字数算）
-      align   `center` / `left`
-
-    分镜没写 `caption` 时返回默认档 —— **老片子行为不变**。
+    **默认 `drawn`**（2026-10-26 改）：文字交给画面写手画，外层不插手。原来默认
+    `overlay`，等于每镜贴一条同款字幕——那是"像模板"的一半。点名 `overlay` 才兜底。
     """
     cap = scene.get("caption")
     cap = cap if isinstance(cap, dict) else {}
-    mode = str(cap.get("mode") or "overlay").strip().lower()
+    mode = str(cap.get("mode") or "drawn").strip().lower()
     if mode not in MODES:
-        mode = "overlay"
+        mode = "drawn"
     at = str(cap.get("at") or DEFAULT_AT).strip().lower()
     bottom = CAPTION_AT.get(at, CAPTION_AT[DEFAULT_AT])
 
@@ -107,18 +100,24 @@ def plan(scene: dict[str, Any]) -> dict[str, Any]:
 
 
 def drawn_brief(scene: dict[str, Any]) -> str:
-    """`drawn` 模式下给画面写手的那句话（告诉它字幕要自己画）。
+    """`drawn` 模式下给写手的那句话：字幕内容 + **全片统一规格**（字号/位置/字色/底衬）。
 
-    为什么必须单独说：`_STORY_SCENE_SYSTEM` 里明写「不要画字幕，字幕由外层加」——
-    分镜说 `drawn` 时那条纪律要**当场反过来说**，否则写手照旧不画，
-    而外层又不加，这一镜就没字了。
+    规格来自分镜的 `caption`（导演给一次，`normalize` 下发到每一镜）——这是"23 镜一套字"
+    的唯一来源。写手照它画，不许自己另定一套。
     """
     text = str(scene.get("text") or "").strip()
     hi = str(scene.get("hi") or "").strip()
     if not text:
         return ""
     tail = f"，重音是「{hi}」" if hi and hi in text else ""
-    return (f"\n**这一镜的字幕要你自己画进画面**：内容是「{text}」{tail}。\n"
-            "像题款、手写批注、碑文、纸卡、屏幕上的字、墙上的标语那样画，"
-            "让它成为画面的一部分——**外层这一镜不会加任何字幕**。\n"
-            "位置自己定（不要每镜都贴底居中），字号要能看清但不要压过画面主体。\n")
+    p = plan(scene)
+    raw = scene.get("caption") if isinstance(scene.get("caption"), dict) else {}
+    spec = (f"**全片统一规格（照它画，不许自己另定一套）**：字号 = 短边 × {p['size']}、"
+            f"距底 {p['bottom']:.3f}（{raw.get('at') or 'lower'}，{p['align']} 对齐）、"
+            f"字色 {raw.get('color') or '与画面反差最大'}、底衬 {raw.get('scrim') or 0}。\n")
+    return (f"\n**这一镜的字幕要你自己画进画面**：内容是「{text}」{tail}。"
+            + spec
+            + "像题款、手写批注、碑文、纸卡、屏幕上的字那样画，让它成为画面的一部分"
+            "——**外层这一镜不会加任何字幕**。\n"
+            "硬要求（决定看不看得清，不是审美）：整句完整出现、不许截断；"
+            "离画面边缘 ≥8%（外层可能套 1.1 倍缓推，会裁掉边缘）；与压住的底色差 ≥40 级亮度。\n")
