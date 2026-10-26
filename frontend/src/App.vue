@@ -5048,6 +5048,12 @@ async function testSearchConn() {
 // 出图后端那三个处理器（保存 / 清除页面覆盖 / 自检）随面板删除：
 // /settings/image 与 /settings/image/test 两条路由后端已不再提供，前端留着只会打空。
 
+// 「一句话出片」是独立的一页（`GET /studio`）：它有自己的分镜表、进度和成片播放，
+// 塞进侧栏抽屉会挤成一团。同源，所以 `ca.token` 直接共享，进去就是登录态。
+function openShortFilm() {
+  location.href = "/studio";
+}
+
 function newConv() {
   const c = freshConv();
   convs.value.unshift(c);
@@ -5141,6 +5147,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
       <button class="new" @click="newConv"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span class="lbl"> 开一册新卷</span></button>
 
       <div class="rail-btns">
+        <button class="help" @click="openShortFilm"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><polygon points="5 3 19 12 5 21 5 3"/></svg> 一句话出片</button>
         <button class="help" :class="{ on: activePanel === 'library' }" @click="toggleLibrary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg> 素材库</button>
         <button class="help" :class="{ on: activePanel === 'bgm' }" @click="toggleBgm"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg> 音乐库</button>
         <button class="help" :class="{ on: activePanel === 'textlib' }" @click="toggleTextLib"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M4 7V4h16v3"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="7" x2="12" y2="20"/></svg> 文字库</button>

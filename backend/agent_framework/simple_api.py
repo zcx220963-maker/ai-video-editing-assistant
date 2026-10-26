@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """简洁视频线的 HTTP 口 + 作业表 + `/studio` 单页。
 
 三个接口，没有第四个：
@@ -466,8 +466,19 @@ video{width:100%;border-radius:10px;margin-top:16px;background:#000}
 .err{color:var(--bad);font-size:13px;margin-top:12px;white-space:pre-wrap}
 .hint{color:var(--dim);font-size:12px;margin-top:10px}
 </style></head><body><div class="wrap">
-<h1>一句话出片</h1>
+<h1><a href="/" style="color:var(--dim);text-decoration:none;font-size:13px;
+  font-weight:400;margin-right:12px">← 返回</a>一句话出片</h1>
 <div class="sub">写一句你想看到的画面。成片会自己分镜、逐镜画、配旁白与配乐，一次渲完。</div>
+
+<div class="card" id="authcard">
+  <label>登录令牌（一次性，存在本机浏览器里）
+    <input id="tk" placeholder="粘贴 JWT：eyJhbGci…" style="width:100%;margin-top:6px;
+      background:#0e131b;color:var(--ink);border:1px solid var(--line);
+      border-radius:8px;padding:9px 12px;font:inherit">
+  </label>
+  <div class="row"><button id="save">保存令牌</button>
+    <span class="hint">这个页面不带登录态，得手动粘一次。存进 localStorage 后不再问。</span></div>
+</div>
 
 <div class="card">
   <textarea id="p" placeholder="例：人类第一次收到来自半人马座的外星信号。1975 年一台射电望远镜捕捉到一段重复的脉冲，四十年后人们才明白那是一次告别。"></textarea>
@@ -529,10 +540,31 @@ var jobId = "", sel = -1, timer = null;
 function setStatus(t) { $("st").innerHTML = t ? "<b>" + t + "</b>" : ""; }
 function setErr(t) { $("er").textContent = t || ""; }
 
+// 令牌：**先读主界面登录时存的那份**（`ca.token`，同一个源，localStorage 共享），
+// 读不到才让用户手动粘。这样从主界面点进来就已经是登录态，不用任何操作。
+// 后端 `auth.http_user_id` 只认 Authorization 头、不认 cookie，所以必须显式带。
+function token() {
+  return localStorage.getItem("ca.token") || localStorage.getItem("studio_jwt") || "";
+}
+function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({ "Authorization": "Bearer " + token() },
+                               opts.headers || {});
+  return fetch(path, opts);
+}
+$("tk").value = localStorage.getItem("studio_jwt") || "";
+if (token()) $("authcard").style.display = "none";
+$("save").onclick = function () {
+  localStorage.setItem("studio_jwt", $("tk").value.trim());
+  $("authcard").style.display = "none";
+  setErr(""); setStatus("令牌已保存");
+  loadBgm();
+};
+
 var planObj = null;
 
-(function loadBgm() {
-  fetch("/simple/bgm").then(function (r) { return r.json(); }).then(function (d) {
+function loadBgm() {
+  api("/simple/bgm").then(function (r) { return r.json(); }).then(function (d) {
     var sel = $("b");
     (d.songs || []).forEach(function (s) {
       var o = document.createElement("option");
@@ -546,7 +578,8 @@ var planObj = null;
       sel.appendChild(o);
     }
   }).catch(function () {});
-})();
+}
+if (token()) loadBgm();
 
 $("plan").onclick = async function () {
   var prompt = $("p").value.trim();
@@ -554,7 +587,7 @@ $("plan").onclick = async function () {
   setErr(""); $("planbox").style.display = "none"; planObj = null;
   $("plan").disabled = true; setStatus("出分镜中…（只花 1 次调用，约半分钟）");
   try {
-    var r = await fetch("/simple/plan", {
+    var r = await api("/simple/plan", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt: prompt, seconds: +$("s").value,
                              aspect: $("a").value, mode: $("m").value })
@@ -597,7 +630,7 @@ async function submit(payload) {
   $("picks").innerHTML = ""; $("pickrow").style.display = "none"; sel = -1;
   $("go").disabled = true; $("plan").disabled = true; setStatus("提交中…");
   try {
-    var r = await fetch("/simple/video", {
+    var r = await api("/simple/video", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
@@ -625,7 +658,7 @@ function poll() {
   clearTimeout(timer);
   timer = setTimeout(async function () {
     try {
-      var r = await fetch("/simple/job/" + jobId);
+      var r = await api("/simple/job/" + jobId);
       if (!r.ok) throw new Error((await r.json()).detail || r.status);
       var j = await r.json();
       paint(j);
@@ -684,7 +717,7 @@ $("rend").onclick = async function () {
   if (sel < 0) { setErr("先点一张候选"); return; }
   setErr(""); $("rend").disabled = true;
   try {
-    await fetch("/simple/render", {
+    await api("/simple/render", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ job_id: jobId, take: sel })
     });
