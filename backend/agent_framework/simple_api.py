@@ -107,7 +107,7 @@ async def _run_film(job: dict[str, Any], *, storage: Any) -> None:
                 user_id=job["user_id"],
                 conversation_id=job.get("conversation_id") or "",
                 on_stage=on_stage, voice=bool(job.get("voice", True)),
-                mode=job.get("style") or film.MODE_EXPLAINER,
+                mode=job.get("style") or "auto",
                 scenes=job.get("scenes") or None)
         except KernelError as exc:
             job.update(status="failed", stage=exc.stage, error=str(exc),
@@ -176,7 +176,8 @@ async def _run_film(job: dict[str, Any], *, storage: Any) -> None:
                 track, tune = await bgm_pick.mix_into(
                     track, kernel.out_dir() / f"track-{job['id']}-bgm.m4a",
                     storage=storage, user_id=job["user_id"], prompt=job["prompt"],
-                    total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm")
+                    total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm",
+                    bgm_name=job.get("bgm") or "")
                 job["bgm"] = (tune or {}).get("filename") or ""
                 audio_name = "audio.m4a"
                 import shutil
@@ -300,10 +301,10 @@ def register(app: Any, *, storage: Any, auth: Any) -> None:
         if not prompt:
             raise HTTPException(400, "缺少 prompt：写一句你想看到的画面")
         _prune()
-        # `mode` 三个值：`shot` 单镜试片 / `film` 多镜动效科普 / `story` 多镜叙事片。
-        # 后两个都是"成片"，差别只在画法与判据（见 `film.MODES`）。
+        # `mode` 四个值：`shot` 单镜试片 / `film` 多镜动效科普 / `story` 多镜叙事片 /
+        # **`auto`（缺省）让系统自己判画法**——普通用户不该看到那两个词。
         raw = str(body.get("mode") or "").strip().lower()
-        style = film.MODE_STORY if raw == film.MODE_STORY else film.MODE_EXPLAINER
+        style = raw if raw in (film.MODE_STORY, film.MODE_EXPLAINER) else "auto"
         mode = "shot" if raw == "shot" else "film"
         job = {
             "id": uuid.uuid4().hex[:12],
@@ -317,6 +318,9 @@ def register(app: Any, *, storage: Any, auth: Any) -> None:
             "aspect": kernel.norm_aspect(body.get("aspect")),
             "takes_n": max(1, min(takes.MAX_TAKES, int(body.get("takes") or 1))),
             "voice": bool(body.get("voice", True)),
+            # 配乐**只在点名时才加**（2026-10-26 改）。空 = 不配乐。
+            # 点名的那首短了就循环铺满，不换成别的（见 `bgm.mix_into`）。
+            "bgm": str(body.get("bgm") or "").strip()[:60],
             # 「先看分镜、改完再继续」那条路：`/simple/plan` 的整份产物原样传回来，
             # 有它就不再调规划（省掉那 1 次调用，也省掉"重跑出来还是另一个样子"）。
             "scenes": body.get("scenes") or None,
@@ -327,6 +331,23 @@ def register(app: Any, *, storage: Any, auth: Any) -> None:
             job, storage=storage))
         return {"job_id": job["id"], "status": "queued", "mode": mode,
                 "style": style}
+
+    @app.get("/simple/bgm")
+    async def bgm_library(user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """曲库列表，给前端下拉用。读不到就回空列表——**空列表的意思是"没有可选的"**，
+        不是"自动挑"。配乐只在用户点名时才加（见 `bgm.mix_into`）。"""
+        rows: list[dict[str, Any]] = []
+        try:
+            from pathlib import Path
+            got = await storage.materials.search(
+                user_id, "", conv_id=None, kinds=("audio",), origin="bgm", limit=50)
+            for r in got or []:
+                rows.append({"name": Path(str(r.get("filename") or "")).stem,
+                             "filename": str(r.get("filename") or ""),
+                             "duration": round(float(r.get("duration_sec") or 0), 1)})
+        except Exception:  # noqa: BLE001 —— 曲库读不到不该让页面打不开
+            rows = []
+        return {"ok": True, "songs": rows}
 
     @app.post("/simple/plan")
     async def plan_only(request: Request,
@@ -346,8 +367,11 @@ def register(app: Any, *, storage: Any, auth: Any) -> None:
         asp = kernel.norm_aspect(body.get("aspect"))
         conv = str(body.get("conversation_id") or "")
         want = str(body.get("mode") or "").strip().lower()
-        style = film.MODE_STORY if want == film.MODE_STORY else film.MODE_EXPLAINER
         await kernel.ensure_storage()
+        # 没指定画法就先让模型判（和 `make_film` 同一条判据），这样前端不用逼用户选。
+        style = (want if want in (film.MODE_STORY, film.MODE_EXPLAINER)
+                 else await film.pick_style(prompt, seconds=sec, user_id=user_id,
+                                            conversation_id=conv))
         try:
             if style == film.MODE_STORY:
                 got, calls = await film.plan_story(
@@ -449,8 +473,9 @@ video{width:100%;border-radius:10px;margin-top:16px;background:#000}
   <textarea id="p" placeholder="例：人类第一次收到来自半人马座的外星信号。1975 年一台射电望远镜捕捉到一段重复的脉冲，四十年后人们才明白那是一次告别。"></textarea>
   <div class="row">
     <label>模式
-      <select id="m"><option value="film" selected>成片 · 动效科普</option>
+      <select id="m"><option value="auto" selected>成片 · 自动（推荐）</option>
       <option value="story">成片 · 叙事片</option>
+      <option value="film">成片 · 动效科普</option>
       <option value="shot">单镜（快出预览）</option></select>
     </label>
     <label>时长
@@ -459,11 +484,15 @@ video{width:100%;border-radius:10px;margin-top:16px;background:#000}
       <option value="20">20 秒</option><option value="30" selected>30 秒</option>
       <option value="60">60 秒</option><option value="90">90 秒</option>
       <option value="120">120 秒</option><option value="180">180 秒</option>
-      <option value="240">240 秒</option></select>
+      <option value="240">240 秒</option><option value="270">270 秒</option>
+      <option value="300">300 秒（上限）</option></select>
     </label>
     <label>画幅
       <select id="a"><option value="portrait" selected>竖屏 9:16</option>
       <option value="landscape">横屏 16:9</option><option value="square">方图 1:1</option></select>
+    </label>
+    <label>配乐
+      <select id="b"><option value="">不配乐</option></select>
     </label>
     <label>候选
       <select id="t"><option value="1">1 条（直接出片）</option>
@@ -501,6 +530,23 @@ function setStatus(t) { $("st").innerHTML = t ? "<b>" + t + "</b>" : ""; }
 function setErr(t) { $("er").textContent = t || ""; }
 
 var planObj = null;
+
+(function loadBgm() {
+  fetch("/simple/bgm").then(function (r) { return r.json(); }).then(function (d) {
+    var sel = $("b");
+    (d.songs || []).forEach(function (s) {
+      var o = document.createElement("option");
+      o.value = s.name;
+      o.textContent = s.name + (s.duration ? "（" + Math.round(s.duration) + " 秒）" : "");
+      sel.appendChild(o);
+    });
+    if (!(d.songs || []).length) {
+      var o = document.createElement("option");
+      o.value = ""; o.textContent = "曲库是空的（先在音乐库导入）";
+      sel.appendChild(o);
+    }
+  }).catch(function () {});
+})();
 
 $("plan").onclick = async function () {
   var prompt = $("p").value.trim();
@@ -543,7 +589,7 @@ $("cont").onclick = async function () {
   $("planbox").style.display = "none";
   await submit({ prompt: $("p").value.trim(), seconds: +$("s").value,
                  aspect: $("a").value, mode: $("m").value, takes: 1,
-                 scenes: planObj });
+                 bgm: $("b").value, scenes: planObj });
 };
 
 async function submit(payload) {
@@ -572,7 +618,7 @@ $("go").onclick = function () {
   var prompt = $("p").value.trim();
   if (!prompt) { setErr("先写一句你想看到的画面"); return; }
   submit({ prompt: prompt, seconds: +$("s").value, aspect: $("a").value,
-           mode: $("m").value, takes: +$("t").value });
+           mode: $("m").value, takes: +$("t").value, bgm: $("b").value });
 };
 
 function poll() {

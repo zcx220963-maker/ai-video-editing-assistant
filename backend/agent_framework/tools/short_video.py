@@ -104,15 +104,20 @@ class MakeShortVideoTool(Tool):
                             "description": f"时长秒数，{MIN_SEC:.0f}~{MAX_SEC:.0f}，默认 30"},
                 "aspect": {"type": "string", "enum": ["portrait", "landscape", "square"],
                            "description": "画幅，默认 portrait（竖屏）"},
-                "style": {"type": "string", "enum": ["explainer", "story"],
-                          "description": "画法。explainer=动效科普（默认，讲原理/数据）；"
-                                         "story=叙事片（有故事线/要情绪，镜头少而长）"},
+                "style": {"type": "string", "enum": ["auto", "explainer", "story"],
+                          "description": "画法。**默认 auto，系统自己判**（判据：这条片子"
+                                         "有没有主角和时间）。只有用户明确说「要动效那种」"
+                                         "或「要纪录片那种」时才指定"},
                 "render": {"type": "boolean",
                            "description": "是否渲成片。true（默认）= 出 mp4 链接；"
                                           "false = 只写代码与质检、回静帧，用来先确认方向"},
                 "voice": {"type": "boolean",
                           "description": "是否配旁白（默认 true）。旁白由每镜字幕合成，"
                                          "并**按语音时长定镜长**；TTS 失败会自动退回无声"},
+                "bgm": {"type": "string",
+                        "description": "配乐。**两种写法都收**：附件音频的 material_id"
+                                       "（用户把歌挂成附件时用它），或曲名（如「We Never」）。"
+                                       "**不填就不配乐**。短于片长会循环铺满，不会换成别的"},
             },
             "required": ["prompt"],
         }
@@ -123,14 +128,15 @@ class MakeShortVideoTool(Tool):
 
     async def execute(self, prompt: str, seconds: Any = 30.0,
                       aspect: str = "portrait", render: bool = True,
-                      voice: bool = True, style: str = film.MODE_EXPLAINER) -> str:
+                      voice: bool = True, style: str = "auto",
+                      bgm: str = "") -> str:
         text = str(prompt or "").strip()
         if len(text) < 4:
             return "Error: prompt 太短，至少给一个完整主题（例如“为什么天空是蓝色的”）"
         sec = _clamp_seconds(seconds)
         asp = kernel.norm_aspect(aspect)
         want = str(style or "").strip().lower()
-        mode = film.MODE_STORY if want == film.MODE_STORY else film.MODE_EXPLAINER
+        mode = want if want in (film.MODE_STORY, film.MODE_EXPLAINER) else "auto"
         user_id, conv_id = _ident()
 
         await kernel.ensure_storage()
@@ -219,11 +225,12 @@ class MakeShortVideoTool(Tool):
                 track = vo.build_track(
                     [Path(p) if p else None for p in vinfo.get("files") or []],
                     got["secs"], kernel.out_dir() / f"track-{fid}.m4a")
-                # 配乐走**曲库**（materials.origin=bgm）：取不到退本地目录，再取不到就不加。
+                # 配乐**只在点名时才加**（2026-10-26 改）：不填 `bgm` 就静音出片。
                 track, tune = await bgm_pick.mix_into(
                     track, kernel.out_dir() / f"track-{fid}-bgm.m4a",
                     storage=self._storage, user_id=user_id, prompt=text,
-                    total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm")
+                    total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm",
+                    bgm_name=bgm)
                 out["bgm"] = (tune or {}).get("filename") or ""
                 # 音轨留在工程里：重渲时画面重做、音轨照用（旁白与镜长是一起定的）
                 audio_name = "audio.m4a"

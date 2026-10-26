@@ -44,8 +44,8 @@ def main() -> int:
           f"注册表里正好这五个（{reg.tool_names}）")
     defs = {d["function"]["name"]: d["function"] for d in reg.get_definitions()}
     check(set(defs["make_short_video"]["parameters"]["properties"])
-          == {"prompt", "seconds", "aspect", "style", "render", "voice"},
-          "make_short_video 的参数是 prompt/seconds/aspect/style/render/voice")
+          == {"prompt", "seconds", "aspect", "style", "render", "voice", "bgm"},
+          "make_short_video 的参数是 prompt/seconds/aspect/style/render/voice/bgm")
     check(defs["make_short_video"]["parameters"]["required"] == ["prompt"],
           "只有 prompt 必填（其余都有缺省，模型不必猜）")
     check(set(defs["reshoot_shot"]["parameters"]["properties"])

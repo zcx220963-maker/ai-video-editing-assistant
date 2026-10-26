@@ -10,12 +10,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from storyline_server.simple import film, kernel, qa, system  # noqa: E402
+from storyline_server.simple import director, film, kernel, qa, system  # noqa: E402
 
 _CHECKS = 0
 _FAILS = 0
@@ -307,6 +308,61 @@ def main() -> int:
           "每镜的 caption 原样带过去（字幕版式不丢）")
     for bad in (None, [], {}, {"scenes": "不是列表"}, {"scenes": [None, 1]}):
         check(film._adopt_plan(bad)["scenes"] == [], f"_adopt_plan({bad!r}) → 空 scenes，不炸")
+
+    print("\n⑰ 画法自动判 + 镜数由内容定（2026-10-26）")
+    # 这两条是「用户只给一个话题」的前提：不该让他看到 explainer/story，
+    # 也不该让镜数由公式决定（同样 165 秒，15 镜和 22 镜都可能是对的）。
+    import inspect
+    check(inspect.signature(film.make_film).parameters["mode"].default == "auto",
+          "make_film 的 mode 缺省是 auto（不是 explainer）")
+
+    orig = kernel._complete
+
+    def stub(reply: str):
+        async def _fake(messages, **kw):
+            return reply
+        return _fake
+
+    try:
+        kernel._complete = stub("explainer")
+        check(asyncio.run(film.pick_style("为什么天空是蓝的")) == film.MODE_EXPLAINER,
+              "讲原理 → 判成 explainer")
+        kernel._complete = stub("story")
+        check(asyncio.run(film.pick_style("敦煌藏经洞")) == film.MODE_STORY,
+              "有主角和时间 → 判成 story")
+        kernel._complete = stub("随便说点什么")
+        check(asyncio.run(film.pick_style("x")) == film.MODE_EXPLAINER,
+              "回的不是这两个词 → 落到 explainer（默认分支）")
+
+        async def _boom(messages, **kw):
+            raise RuntimeError("模型挂了")
+        kernel._complete = _boom
+        check(asyncio.run(film.pick_style("x")) == film.MODE_STORY,
+              "判不出来按 story 走——有主角的片子用叙事画法不算错，反过来不一定")
+        # 长片一律叙事：动效片每镜 ≤5.2 秒，165 秒要 40 镜，碎成 PPT。
+        # 实测只给「0」+ 165 秒，判成 explainer 出来 40 镜（每镜 4 秒）。
+        kernel._complete = stub("explainer")
+        check(asyncio.run(film.pick_style("0", seconds=165)) == film.MODE_STORY,
+              "超过 90 秒一律叙事片（不调模型，直接判）")
+        check(asyncio.run(film.pick_style("为什么天空是蓝的", seconds=60))
+              == film.MODE_EXPLAINER, "90 秒以内才交给模型判内容")
+    finally:
+        kernel._complete = orig
+
+    # 镜数：提示词里不许再出现"秒数 ÷ 9 / ÷ 4"这种公式
+    for name, sysmsg, div in (("叙事", director.STORY_SYSTEM, "÷ 9"),
+                              ("动效", director.PLAN_SYSTEM, "÷ 4")):
+        check("镜数由内容定" in sysmsg, f"{name}提示词说「镜数由内容定」")
+        check(div not in sysmsg, f"{name}提示词里没有「{div}」这个公式")
+    check("angle" in director.STORY_SYSTEM and "hook" in director.STORY_SYSTEM,
+          "叙事提示词要求先想三个角度、挑钩子最硬的那个")
+    # 用户已经给了讲法时不许模型自己另选角度（否则他会把用户的大纲推翻）
+    check("已经给了讲法就照他的" in director.STORY_SYSTEM,
+          "给了讲法就照用户的，不另选角度")
+    got = film._adopt_plan({"angle": "被禁的零", "hook": "0 被禁过",
+                            "scenes": [{"text": "x"}]})
+    check(got["angle"] == "被禁的零" and got["hook"] == "0 被禁过",
+          "分镜的 angle/hook 在「先看分镜→再出片」那条路上不丢")
 
     print(f"\n{_CHECKS - _FAILS}/{_CHECKS} 通过")
     return 0 if _FAILS == 0 else 1

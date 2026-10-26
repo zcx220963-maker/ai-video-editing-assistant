@@ -825,6 +825,39 @@ async def _make_story(prompt: str, *, seconds: float, aspect: str, fps: int,
             "total_sec": round(sum(secs), 2)}
 
 
+#: 超过这个秒数一律走叙事片。**硬规则，不交给模型判**：动效片每镜 ≤5.2 秒，
+#: 165 秒就是 40 镜——那是"快切科普"（抖音那种），不是"三分钟深度片"。
+#: 实测：只给「0」+ 165 秒，判成 explainer 出来 40 镜，每镜 4 秒，碎成 PPT。
+LONG_FORM_SEC = 90.0
+
+
+async def pick_style(prompt: str, *, seconds: float = 0.0, llm: Any = None,
+                     user_id: str = "", conversation_id: str = "") -> str:
+    """判片种。判据两条，**先看时长再看内容**。
+
+    ① 超过 :data:`LONG_FORM_SEC` 秒 → 直接叙事片（不调模型，省一次调用）；
+    ② 否则看「有没有主角和时间」。判不出来也按叙事片走——有主角的片子用叙事
+       画法永远不算错，反过来不一定。
+
+    不让用户选是因为 `explainer` / `story` 是内部术语：他只会说"讲一下 0 的历史"，
+    让他选等于把产品设计问题推给他，选错还整条白做（两套写手提示词完全不同）。
+    """
+    if seconds and float(seconds) > LONG_FORM_SEC:
+        return MODE_STORY
+    ask = (f"选题：{prompt}\n\n"
+           "这条片子更适合哪种画法？只回一个词：\n"
+           "· story —— 有主角、有时间推进、有情绪（历史故事、人物、悬疑揭秘）\n"
+           "· explainer —— 讲一个原理、一组数据、一个流程（没有主角也没有时间线）\n"
+           "判据是「有没有主角和时间」，不是「好不好看」。")
+    try:
+        raw = await kernel._complete([{"role": "user", "content": ask}],
+                                     llm=llm, user_id=user_id,
+                                     conversation_id=conversation_id)
+    except Exception:  # noqa: BLE001 —— 判不出来不该让整条片子失败
+        return MODE_STORY
+    return MODE_STORY if "story" in str(raw).lower() else MODE_EXPLAINER
+
+
 def _adopt_plan(scenes: Any) -> dict[str, Any]:
     """把调用方给的分镜收成 plan 对象。**list 与 dict 两种形状都收**。
 
@@ -835,7 +868,9 @@ def _adopt_plan(scenes: Any) -> dict[str, Any]:
     src = scenes if isinstance(scenes, dict) else {}
     raw = src.get("scenes") if src else scenes
     got = [s for s in raw if isinstance(s, dict)] if isinstance(raw, list) else []
-    return {"title": str(src.get("title") or ""),
+    return {"angle": str(src.get("angle") or "")[:24],
+            "hook": str(src.get("hook") or "")[:80],
+            "title": str(src.get("title") or ""),
             "motif": str(src.get("motif") or "")[:20],
             "sources": facts.normalize(src.get("sources")),
             "scenes": got}
@@ -847,7 +882,7 @@ async def make_film(prompt: str, *, seconds: float = 60.0,
                     conversation_id: str = "",
                     on_stage: Any = None,
                     voice: bool = True,
-                    mode: str = MODE_EXPLAINER,
+                    mode: str = "auto",
                     scenes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """一句主题 → 一条多镜成片。返回 ``{code, plan, secs, calls, ...}``。
 
@@ -858,9 +893,18 @@ async def make_film(prompt: str, *, seconds: float = 60.0,
     均分，`voice_info["degraded"]` 会写清——不把可用性绑在一个外部服务上。
 
     `mode` 见 :data:`MODE_EXPLAINER` / :data:`MODE_STORY`：两种片子两套画法与判据。
+    **缺省是 auto**（2026-10-26 改）：不是这两个值就让模型自己判（`pick_style`）。
+    用户不该看到那两个词——他只会说"讲一下 0 的历史"。
     `scenes` 给了就跳过规划调用（人改过的脚本 / 复用上一次的分镜）。
     """
-    if str(mode or "").strip().lower() == MODE_STORY:
+    want = str(mode or "").strip().lower()
+    if want not in (MODE_STORY, MODE_EXPLAINER):
+        # auto：让模型判片种。这一步多一次极短调用，但换来"用户不用选"。
+        mode = await pick_style(prompt, seconds=seconds, llm=llm,
+                                user_id=user_id, conversation_id=conversation_id)
+    else:
+        mode = want
+    if mode == MODE_STORY:
         return await _make_story(
             prompt, seconds=seconds, aspect=aspect, fps=fps, llm=llm,
             user_id=user_id, conversation_id=conversation_id,

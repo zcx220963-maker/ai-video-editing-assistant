@@ -181,13 +181,18 @@ async def plan_story(prompt: str, *, seconds: float,
     的骨架"。延迟 import 而不是搬到这边：搬了 film 又要反过来 import，
     循环就是这么来的。
     """
-    from .film import (_STORY_SYSTEM, STORY_MAX_SHOT_SEC,  # noqa: PLC0415
-                       STORY_MIN_SHOT_SEC, shot_count_story)
+    from .film import (_STORY_SYSTEM, STORY_MAX_SHOTS,  # noqa: PLC0415
+                       STORY_MAX_SHOT_SEC, STORY_MIN_SHOT_SEC)
 
-    n = shot_count_story(seconds)
+    # **镜数由内容定**（2026-10-26 改）：以前这里写死"请拆成 n 个镜头"，
+    # 于是同样的秒数永远出同样的镜数——那是公式，不是分镜。现在只给范围：
+    # 每镜 4.5~12 秒，所以 lo~hi 都算对。讲得下就少几镜（长镜更沉）。
+    lo = max(3, int(seconds / STORY_MAX_SHOT_SEC))
+    hi = min(STORY_MAX_SHOTS, int(seconds / STORY_MIN_SHOT_SEC))
     ask = (f"主题：{prompt.strip()}\n\n"
-           f"总时长 {seconds:g} 秒，请拆成 **{n} 个镜头**，每镜约 "
-           f"{seconds / n:.1f} 秒（{STORY_MIN_SHOT_SEC:g}~{STORY_MAX_SHOT_SEC:g} 秒之间）。"
+           f"总时长 {seconds:g} 秒。**镜数由内容定**：每镜 "
+           f"{STORY_MIN_SHOT_SEC:g}~{STORY_MAX_SHOT_SEC:g} 秒，所以 {lo}~{hi} 镜都算对。"
+           f"讲得下就少几镜，讲不下就多几镜，别为了凑数把一句话拆成两句。"
            f"画幅 {aspect}。")
     try:
         raw = await kernel._complete(
@@ -201,14 +206,18 @@ async def plan_story(prompt: str, *, seconds: float,
     got = _parse_json(raw)
     if not got or not isinstance(got.get("scenes"), list) or not got["scenes"]:
         raise KernelError("plan", "分镜没回合法 JSON")
-    scenes = [s for s in got["scenes"] if isinstance(s, dict)][:n]
+    scenes = [s for s in got["scenes"] if isinstance(s, dict)][:STORY_MAX_SHOTS]
     if not scenes:
         raise KernelError("plan", "分镜里没有可用镜头")
     # `motif` = 贯穿全片的那一件东西。模型没给就留空（不影响出片），
     # 给了就注入每一镜的写手提示——这是"十几张图变成一部片子"的那根线。
     # `sources` = 数字的出处账（见 `facts.py`）。存进 plan 就跟着工程落盘。
+    # `angle` / `hook` = 模型自己挑的讲法角度与开场那句钩子（用户只给话题时才有）。
+    # 留着是为了让用户能在分镜表上看见"它选了哪个角度"，而不是黑箱。
     from .facts import normalize    # 延迟 import：story 不在模块级碰 film 以外的东西
-    return {"title": str(got.get("title") or "").strip(),
+    return {"angle": str(got.get("angle") or "").strip()[:24],
+            "hook": str(got.get("hook") or "").strip()[:80],
+            "title": str(got.get("title") or "").strip(),
             "motif": str(got.get("motif") or "").strip()[:20],
             "sources": normalize(got.get("sources")),
             "scenes": scenes}, 1
