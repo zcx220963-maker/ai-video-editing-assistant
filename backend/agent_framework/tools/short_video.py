@@ -38,12 +38,51 @@ from storyline_server.simple import deliver, edit, export, facts, film, kernel, 
 MIN_SEC, MAX_SEC = 8.0, 240.0
 
 
+#: `render=false` 时最多出几张预览静帧。每张约 1~2 秒（scale 0.35），
+#: 12 张 ≈ 20 秒；比整片渲染（27 分钟）便宜两个数量级。
+#: 上限存在的理由：40 镜全出就是 80 秒，用户等不起，也没必要一次看全。
+PREVIEW_STILLS = 16
+
+
 def _clamp_seconds(value: Any, default: float = 30.0) -> float:
     try:
         v = float(value)
     except (TypeError, ValueError):
         v = default
     return max(MIN_SEC, min(MAX_SEC, v))
+
+
+async def _publish_stills(got: dict[str, Any], *, asp: str, user_id: str,
+                          storage: Any = None,
+                          limit: int = PREVIEW_STILLS) -> list[str]:
+    """每镜渲一张静帧并签名，返回 URL 数组（按镜号顺序）。
+
+    「先看再渲」那条路要用它：渲染占整条链 93% 的时间，所以把人的判断放在
+    渲染**之前**——返工成本从 27 分钟降到 30 秒。
+    单张失败不算整条失败（一张图传不上去而已）。
+    """
+    import base64
+
+    urls: list[str] = []
+    tl = got.get("timeline") or {}
+    n = int(got.get("shots") or 0)
+    for i in range(min(n, limit)):
+        try:
+            blobs = await film.shot_stills(got["code"], tl, i, aspect=asp,
+                                           fps=kernel.DEFAULT_FPS,
+                                           at=(0.55,), scale=0.35)
+        except Exception:  # noqa: BLE001 —— 这一镜出不来就跳过
+            continue
+        for b64 in (blobs or [])[:1]:
+            try:
+                pub = await deliver.publish_bytes(
+                    base64.b64decode(b64), suffix="jpg",
+                    content_type="image/jpeg", storage=storage,
+                    user_id=user_id)
+                urls.append(pub["url"])
+            except Exception:  # noqa: BLE001
+                continue
+    return urls
 
 
 def _ident() -> tuple[str, str]:
@@ -198,8 +237,22 @@ class MakeShortVideoTool(Tool):
                 f"不是硬凑的。要更接近 {want:g} 秒，就调整字幕字数或镜数重做一条。")
 
         if not render:
-            out["hint"] = ("已写好代码但**没有渲成片**。要看成片请调 render_short_film"
-                           "（传上面的 film_id）；要改某一镜用 reshoot_shot。")
+            # `render=false` 的用处是「先看再渲」（2026-10-26 补）：
+            # 渲染占整条链 93% 的时间（实测 165 秒片：渲 27 分钟、模型 2 分钟），
+            # 所以把人的判断放在**渲染之前**，返工成本从 27 分钟降到 30 秒。
+            #
+            # 但原来这一支只回文字，用户看不到画面——「先看再渲」等于没做成。
+            # 这里给每一镜出一张静帧并签名，用户点头再调 render_short_film。
+            out["stills"] = await _publish_stills(
+                got, asp=asp, user_id=user_id, storage=self._storage,
+                limit=PREVIEW_STILLS)
+            out["hint"] = (
+                f"已写好代码、**没有渲成片**。`stills` 是每镜一张预览图"
+                f"（共 {len(out['stills'])} 张，按镜号顺序）——"
+                "用 markdown 图片语法发给用户看（`![s01](链接)`），"
+                "等他点头再调 render_short_film 出成片。"
+                "要改某一镜用 reshoot_shot(film_id, shot, note)，不要重做整条。"
+                "**别把长链接直接贴成文字**，用图片语法。")
             return _json(out)
 
         # 渲画面 → 合成音轨 → 合流 → 上传。音轨失败**不整条失败**：无声的片子仍是片子。

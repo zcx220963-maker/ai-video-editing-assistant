@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """多镜成片：一句主题 → N 镜 → **一个模块、一次渲完**。
 
 为什么不是"渲 N 个 mp4 再拼"（主链的做法）：拼接层是 ffmpeg xfade，
@@ -33,6 +33,7 @@ from .kernel import KernelError
 # （两个模块都不在模块级 import 本文件，所以没有循环）。
 # 这里重新导出，是为了 `film.wrap_story_scene` / `film.review_shots` 这些名字
 # 对外仍然可用——测试与作业层都按 `film.xxx` 调，拆文件不该改调用方。
+from . import showrunner as sr   # 统筹层：新的唯一入口（2026-10-26）
 from .review import STORY_VISION_REVIEW, apply_review  # noqa: F401
 from .morph import MORPH_HUE, parse_motif_at, shared_hops  # noqa: F401
 from .scene import (  # noqa: F401  —— 包装层搬去了 scene.py，这里继续对外暴露
@@ -112,145 +113,6 @@ TRANS_TSX = {
 TRANS_CYCLE = ("slide", "zoom", "wipe", "blur", "slide", "cut")
 
 
-_SCENE_SYSTEM = """你在写一个 Remotion 场景组件。只写**一个组件**，不写 import、不写 export。
-
-输出格式（一字不差）：
-```tsx
-const Scene = ({ dur }: { dur: number }) => {
-  const frame = useCurrentFrame();
-  const t = dur > 0 ? frame / dur : 0;
-  // …画面
-  return (
-    <AbsoluteFill style={{ backgroundColor: '#0a0c12' }}>
-      {/* SVG / div 画出来的画面 */}
-    </AbsoluteFill>
-  );
-};
-```
-
-作用域里已经有这些，**直接用，不要再 import**：
-`React, AbsoluteFill, Series, useCurrentFrame, useVideoConfig, interpolate, spring,
-random, Easing, E, lerp, seg, TOKENS`
-（`seg(t, a, b, E.standard)` 切段，`lerp(t, x, y)` 插值，`E.standard` 是缓动）
-
-**设计系统（直接用，这是画面好看的主要来源）**：
-%%MANIFEST%%
-
-用法纪律：
-· **每一镜至少用 3 件上面的组件**——`Backdrop` 打底 + 一件讲内容的 + `HudFrame` 或 `Ribbon`。
-· **每镜至少 8 个视觉元素**，分三层：
-  背景层（`Backdrop` + 至少 1 条 `ScanGrid`/`Ribbon`/`Particles`）、
-  中景（**≥3 件实体**，最大的那件占画面 30%~55%）、
-  前景（`HudFrame`，或自己画角标/刻度/细线）。**层数不够就是"空"**。
-· **高饱和色块占画面 ≥20%**：没有大块饱和色时用 `Ribbon` 铺一条斜色带。
-  抽帧会量"亮且有色"的像素占比，**低于 11% 这一镜会被打回重写**——
-  深蓝渐变 + 一行白字就是这个毛病。
-· **画面任何时刻都不能是空的**：主体组件的 `start` 必须 ≤ 0.12（t=0 就进场），
-  不许"前一半什么都没有、后一半才出现"。**只有几个点/几条线不算画面**，
-  必须有一件够大的实体（占画面 ≥25%）。
-· 组件收 `t`（这一镜的进度 0~1），`start` 决定它什么时候进场（0.05/0.35 这样错开就是两拍）。
-· 组件已经处理了尺寸/颜色/缓动，**不要再自己写一遍**；要改颜色就传 `hue`。
-· 清单里没有合适的，才自己画 SVG；自己画时也要遵守下面的纪律。
-
-画面纪律（这是唯一决定好不好看的部分）：
-· **字体只能用 `TOKENS.fontStack`（黑体）或 `TOKENS.fontSerif`（衬线）**：
-  `fontFamily={TOKENS.fontStack}`。不要写 Georgia / Times / Arial / Inter / Helvetica
-  这类系统字体名——镜像里没装，闸① 会直接拦掉整片。
-· **这一镜的文案必须画在画面上**：`text` 会给你，用 `Caption` 组件画（`size` 传 0.06~0.10，
-  它是**占宽度的比例**；传 0.6 那种值会把一个字顶满整屏）。位置由构图决定（右下、左下、
-  与主体咬合都行），**不要每镜都贴底部**。
-  字要有对比：压在画面上就加描边或底色块，别让它糊在背景里。
-· **画幅就是 `useVideoConfig()` 给的 width/height**，`viewBox` 必须写 `0 0 {width} {height}`。
-  **不要写死 1920×1080**——竖屏片子里那会渲成上下或左右的黑边（实测踩过）。
-· **整帧铺满**：底色、天空、地面这些大面积色块必须铺满 width×height，
-  不许只铺中间一条。判断标准：把这一帧缩到 1/3，画面边缘不能有黑边。
-· **所有 `<rect>` 的 width/height 必须是正数**：算出来的值用 `Math.max(0, x)` 包一层，
-  否则浏览器会报 `negative value is not valid`，那个元素直接不显示。
-· 画**那一件具体的东西**，不是一页排版。大标题 + 色块 + 几行字不算画面。
-· **纯色块用 SVG 的 `<rect fill>` / `<circle fill>`**，不要用 `<div style={{backgroundColor}}>`
-  （闸① 会拦；`backgroundImage: linear-gradient(...)` 可以）。
-· **两拍动且隔开**：0~50% 完成第一拍（主体入画/大色块擦入），60~100% 第二拍（主运动/收束）。
-· **主体整段留在画面内**，起止各留 5% 余量；用位移和遮挡表现"穿过"，不要让它离场。
-· 高饱和色块占画面 ≥25%；底色用 `#0a0c12`~`#12161f` 的深灰蓝，主体亮度 ≥200/255。
-· 有光源方向：亮面、暗面、落地影。字号有阶梯，别居中堆字。
-· 只画 brief 里有的东西，不添加人物、品牌、地名。
-· 这一镜只有 `dur` 帧，所有时间点按 `t`（0~1）排，不要写死秒数。"""
-
-
-def shot_count(seconds: float) -> int:
-    """几镜。
-
-    两条约束取大者：① 按「每镜不超过 ``MAX_SHOT_SEC``」反推的最少镜数；
-    ② 按 4 秒理想节奏算的镜数。再夹到 ``MAX_SHOTS``。
-    """
-    import math
-
-    need = int(math.ceil(float(seconds) / MAX_SHOT_SEC))
-    ideal = int(round(float(seconds) / TARGET_SHOT_SEC))
-    return max(MIN_SHOTS, min(MAX_SHOTS, max(need, ideal)))
-
-
-def split_seconds(total: float, n: int) -> list[float]:
-    """把总时长均分给 n 镜，**每镜严格不超过 MAX_SHOT_SEC**。
-
-    配不出来就抛错，**不许静默摊**。2026-10-25 之前这里有一段"超了就把零头平摊
-    回前 n-1 镜"的补差循环，而它**不复查上限**：240 秒 / 40 镜会得到每镜 6.02 秒、
-    300 秒得到 7.56 秒，39 个镜全部违反"镜长 ≤5.2 秒"——而这是"不像 PPT"的硬指标。
-    错得还不报错：成片照样渲出来，只是变慢变平。所以改成明确报错。
-    """
-    if n <= 0:
-        raise KernelError("plan", "镜数必须 ≥1")
-    each = float(total) / n
-    if each > MAX_SHOT_SEC + 1e-9:
-        import math
-        need = int(math.ceil(float(total) / MAX_SHOT_SEC))
-        raise KernelError(
-            "plan",
-            f"{total:g} 秒配不出来：每镜最多 {MAX_SHOT_SEC} 秒，需要至少 {need} 镜，"
-            f"而镜数上限是 {MAX_SHOTS}。这条线单条最长 "
-            f"{MAX_SHOTS * MAX_SHOT_SEC:.0f} 秒——请把时长降到这个数以内，"
-            f"或者拆成两条。")
-    if n == 1:
-        return [round(float(total), 2)]
-
-    # 分配方式：**先向下取到 0.01，再把零头按 0.01 的份额摊给前几镜**。
-    # 为什么不是"四舍五入 + 零头全给最后一镜"：290.2 秒 / 56 镜时每镜 5.182，
-    # 四舍五入成 5.18 后最后一镜要吃 0.12 的零头变成 5.30——**超过 5.2 的上限**；
-    # 再挪给倒数第二镜就成了 5.28，还是超。向下取 + 摊零头则每镜最多 5.19。
-    import math
-
-    base = math.floor(each * 100) / 100
-    out = [base] * n
-    k = int(round((float(total) - base * n) / 0.01))
-    for i in range(min(k, n)):
-        out[i] = round(out[i] + 0.01, 2)
-    return out
-
-
-def ensure_vivid(color: Any, *, sat_floor: float = 0.62,
-                 val_floor: float = 0.86) -> str:
-    """把主色抬到"看得出颜色"的档位。
-
-    模型会传 `#0a0c12` / `#1b2733` 这类近黑色当 `hue`——它以为"深色高级"，
-    而抽帧量出来是"亮且有色 0%"（等于黑白片）。这里按 HSV 抬饱和度与明度，
-    **色相不动**，所以"橙还是橙、青还是青"，只是从灰暗变成能看见。
-
-    组件里的 `lift()` 只在背景光晕上用；场景自己写 `fill={hue}` 时不吃那一层，
-    所以必须在 Python 侧先修一遍。
-    """
-    import colorsys
-
-    s = str(color or "").strip().lstrip("#")
-    if len(s) == 3:
-        s = "".join(c * 2 for c in s)
-    if len(s) != 6 or any(c not in "0123456789abcdefABCDEF" for c in s):
-        return "#FF6B2C"
-    r, g, b = (int(s[i:i + 2], 16) / 255 for i in (0, 2, 4))
-    h, sat, val = colorsys.rgb_to_hsv(r, g, b)
-    r, g, b = colorsys.hsv_to_rgb(h, max(sat, sat_floor), max(val, val_floor))
-    return "#%02X%02X%02X" % (round(r * 255), round(g * 255), round(b * 255))
-
-
 def transitions_for(scenes: list[dict[str, Any]]) -> list[str]:
     """每一处切点用什么转场。返回长度 ``n-1`` 的列表。
 
@@ -291,91 +153,6 @@ def shot_count_story(seconds: float) -> int:
     return max(3, min(STORY_MAX_SHOTS, n))
 
 
-#: 镜内运镜的四种配法（起始倍率 → 结束倍率，横/纵位移）。
-#: 每镜换一种，避免十几镜都是"同一个方向慢慢推"——那种统一感会立刻露馅。
-#: SVG 里"负尺寸"会**静默不渲染**（浏览器只在控制台喊一句 `A negative value is not valid`，
-#: 那一块画面直接没了）。实测一条 60 秒片子报了 `height: -2652287.99` —— 抽帧看是
-#: 画面右下缺一整块黑。所以在拼装时兜一层 `Math.max(0, …)`，而不是在提示词里求模型。
-#:
-#: 为什么按**属性名**扫全文、而不是按 `<rect>` 标签扫：标签正则一遇到 JSX 表达式里
-#: 的 `>`（`fill={t > 0.5 ? a : b}`）就提前截断，后面的属性全被漏掉。属性名扫不到这个坑。
-_DIM_RE = re.compile(r"\b(width|height|rx|ry|r)=\{([^{}]+)\}")
-
-
-def _fix_rects(code: str) -> str:
-    """给 SVG 的尺寸属性兜一层 `Math.max(0, …)`。
-
-    为什么值得一个正则：这类错误**不报错、不中断、不留痕迹**，只是画面上少一块。
-    lint 看不见（语法合法），渲染也返回 200，只有翻浏览器控制台才发现。
-    代价是负值会被夹成 0（那一块仍然不显示），但至少不会因为 `NaN` 传染到相邻属性。
-    """
-    def fix_attr(a: re.Match[str]) -> str:
-        name, expr = a.group(1), a.group(2).strip()
-        if expr.startswith("Math.max("):
-            return a.group(0)
-        return f"{name}={{Math.max(0, {expr})}}"
-
-    return _DIM_RE.sub(fix_attr, code)
-
-
-def safe_scene(text: str, hue: str, *, index: int = 0) -> str:
-    """兜底场景：设计系统拼出来的、**一定过质检**的一镜。
-
-    什么时候用：模型写了两版、抽帧仍然是空的（内容占比 12%）或寡淡的。
-    那时候继续求它只是多花调用——它已经证明自己这一镜写不出来。
-    换成这个"通用但有构图"的版本，比在成片里留一个近乎全黑的帧好。
-
-    代价说清：它不画 brief 里那件具体的东西，所以它是**兜底**不是常态。
-    报告里会列出哪几镜走了兜底（`fallback`），不假装那些也是模型画的。
-
-    参数按镜号错开一点（色带角度与高度），避免连着几镜兜底时长得一模一样。
-    """
-    import json
-
-    y = (0.58, 0.64, 0.60)[index % 3]
-    ang = (-14, 12, -8)[index % 3]
-    return (
-        "const Scene = ({ dur }: { dur: number }) => {\n"
-        "  const frame = useCurrentFrame();\n"
-        "  const t = dur > 0 ? frame / dur : 0;\n"
-        f"  const HUE = {json.dumps(hue)};\n"
-        "  return (\n"
-        "    <AbsoluteFill style={{ backgroundColor: '#0a0c12' }}>\n"
-        "      <Backdrop hue={HUE} t={t} />\n"
-        f"      <Ribbon hue={{HUE}} t={{t}} y={{{y}}} thick={{0.26}} angle={{{ang}}} />\n"
-        "      <Ribbon hue=\"#FFC93C\" t={t} y={0.30} thick={0.08} angle={22} opacity={0.8} />\n"
-        "      <ScanGrid t={t} hue={HUE} y={0.70} />\n"
-        "      <GlowOrb t={t} hue={HUE} x={0.5} y={0.38} r={0.16} />\n"
-        "      <Particles count={60} t={t} hue={HUE} seed={3} />\n"
-        "      <HudFrame t={t} />\n"
-        f"      <Caption text={json.dumps(str(text or ''), ensure_ascii=False)}"
-        " t={t} start={0.05} size={0.082} y={0.86} />\n"
-        "    </AbsoluteFill>\n"
-        "  );\n"
-        "};"
-    )
-
-
-def _inject_ribbon(body: str, hue: str) -> str:
-    """给"寡淡"的镜**确定性**补一条斜色带。
-
-    为什么不继续让模型改：实测 s03 重写两次仍然是"亮且有色 9%"——它每次都去调字号
-    和位置，就是不加色块（提示词里写了也没用，模型对"占比"没有可靠直觉）。
-    而插一条 20% 高的高饱和色带是**几何上确定**的：色带面积 ≥18% 画面，
-    一定能把 vivid 抬过 11% 的线。
-
-    插在第一个 `<AbsoluteFill>` 之后，所以它在背景之上、主体之下——
-    不遮内容，只补颜色。已经有 `<Ribbon>` 的镜不重复插。
-    """
-    if "<Ribbon" in body:
-        return body
-    m = re.search(r"<AbsoluteFill\b[^>]*>", body)
-    if not m:
-        return body
-    ins = f'\n      <Ribbon hue="{hue}" t={{t}} y={{0.68}} thick={{0.2}} angle={{-12}} />'
-    return body[:m.end()] + ins + body[m.end():]
-
-
 def _parse_json(text: str) -> dict[str, Any] | None:
     m = re.search(r"\{.*\}", text or "", re.S)
     if not m:
@@ -386,34 +163,6 @@ def _parse_json(text: str) -> dict[str, Any] | None:
     except ValueError:
         return None
     return got if isinstance(got, dict) else None
-
-
-async def plan(prompt: str, *, seconds: float, aspect: str = kernel.DEFAULT_ASPECT,
-               llm: Any = None, user_id: str = "",
-               conversation_id: str = "") -> tuple[dict[str, Any], int]:
-    """一次调用出镜头表。返回 ``(plan, 调用次数)``。"""
-    n = shot_count(seconds)
-    ask = (f"主题：{prompt.strip()}\n\n"
-           f"总时长 {seconds:g} 秒，请拆成 **{n} 个镜头**，每镜约 "
-           f"{seconds / n:.2f} 秒（不得超过 {MAX_SHOT_SEC} 秒）。"
-           f"画幅 {aspect}。")
-    try:
-        raw = await kernel._complete(
-            [{"role": "system", "content": _PLAN_SYSTEM},
-             {"role": "user", "content": ask}],
-            llm=llm, user_id=user_id, conversation_id=conversation_id)
-    except Exception as exc:  # noqa: BLE001
-        raise KernelError("plan", f"分镜调用失败（{type(exc).__name__}）：{exc}") from exc
-
-    got = _parse_json(raw)
-    if not got or not isinstance(got.get("scenes"), list) or not got["scenes"]:
-        raise KernelError("plan", "分镜没回合法 JSON")
-
-    scenes = [s for s in got["scenes"] if isinstance(s, dict)][:n]
-    if not scenes:
-        raise KernelError("plan", "分镜里没有可用镜头")
-    return {"title": str(got.get("title") or "").strip(),
-            "sources": facts.normalize(got.get("sources")), "scenes": scenes}, 1
 
 
 def _looks_complete(body: str) -> bool:
@@ -449,45 +198,6 @@ def _looks_complete(body: str) -> bool:
                 return False
         i += 1
     return not stack and in_str is None
-
-
-async def write_scene(scene: dict[str, Any], *, index: int, total: int,
-                      seconds: float, prev: str = "", nxt: str = "",
-                      aspect: str = kernel.DEFAULT_ASPECT, llm: Any = None,
-                      user_id: str = "", conversation_id: str = "",
-                      extra: str = "") -> str:
-    """写一镜的组件体（不含 import / export）。`extra` 是质检打回时的具体指令。"""
-    ask = (f"这是第 {index + 1}/{total} 镜，时长 {seconds:g} 秒。\n"
-           f"**这一镜要画在画面上的文案（必须出现）**：{str(scene.get('text') or '').strip()}\n"
-           f"画面 brief：{str(scene.get('brief') or '').strip()}\n"
-           f"主色：{str(scene.get('hue') or '#FF6B2C').strip()}\n"
-           f"动效：{str(scene.get('motion') or '').strip()}\n"
-           + (f"上一镜画面：{prev}\n" if prev else "")
-           + (f"下一镜画面：{nxt}\n" if nxt else "")
-           + (f"\n**上一版的问题（必须修掉）**：{extra}\n" if extra else "")
-           + f"画幅：{aspect}。只写那一个 `const Scene = ...`，不写 import/export。")
-    last_err = ""
-    for attempt in range(3):
-        try:
-            raw = await kernel._complete(
-                [{"role": "system",
-                  "content": _SCENE_SYSTEM.replace("%%MANIFEST%%", system.manifest_block())},
-                 {"role": "user", "content": ask}],
-                llm=llm, user_id=user_id, conversation_id=conversation_id)
-        except Exception as exc:  # noqa: BLE001
-            raise KernelError("scene", f"第 {index + 1} 镜写码失败：{exc}") from exc
-
-        body = kernel.extract_code(raw) or str(raw or "").strip()
-        if "const Scene" not in body:
-            last_err = "没按格式回 `const Scene`"
-            continue
-        body = body[body.index("const Scene"):].strip()
-        if not _looks_complete(body):
-            last_err = "组件体不完整（括号不配平 / 没有以 `};` 收尾）"
-            continue
-        return body
-
-    raise KernelError("scene", f"第 {index + 1} 镜写了 3 次仍不完整：{last_err}")
 
 
 def _fix_div_bg(code: str) -> str:
@@ -620,214 +330,6 @@ def assemble(bodies: list[str], secs: list[float], kinds: list[str], *,
     return "\n".join(parts), tl
 
 
-async def _make_story(prompt: str, *, seconds: float, aspect: str, fps: int,
-                      llm: Any, user_id: str, conversation_id: str,
-                      on_stage: Any, voice: bool,
-                      scenes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """插画叙事片：分镜（1 次）→ 出图（N 次）→ 确定性拼装 → 一次渲完。
-
-    与动效模式的三处结构差别：
-    ① 镜少而长（9 秒一镜，上限 12 秒）；② 每镜画面由**一张图**决定，
-    所以场景代码是**确定性生成**的，不逐镜调模型；③ 判据换成"图加载出来没有"，
-    不判饱和度与层次（暗调低饱和正是它要的样子）。
-    """
-    def tick(stage: str, done: int, total: int) -> None:
-        if on_stage:
-            try:
-                on_stage(stage, done, total)
-            except Exception:  # noqa: BLE001
-                pass
-
-    tick("plan", 0, 0)
-    if scenes:
-        # 分镜由调用方给定（人改过的脚本 / 复用上一次的分镜）：跳过规划调用。
-        # **两种形状都收**：list（只要 scenes）与 dict（`/simple/plan` 的整份产物）。
-        # 收 dict 是为了「先看分镜、改完再继续」那条路——`motif` / `sources` 不能在
-        # 这一步丢掉（丢了跨镜接力与出处账就没了）。
-        plan_obj, calls = _adopt_plan(scenes), 0
-    else:
-        plan_obj, calls = await plan_story(prompt, seconds=seconds, aspect=aspect,
-                                           llm=llm, user_id=user_id,
-                                           conversation_id=conversation_id)
-    scenes = plan_obj["scenes"]
-    n = len(scenes)
-
-    # ---- 旁白 → 镜长 ----
-    narr: dict[str, Any] | None = None
-    if voice:
-        tick("voice", 0, n)
-        try:
-            narr = await vo.narrate([str(s.get("text") or "") for s in scenes],
-                                    kernel.out_dir() / "voice")
-        except Exception as exc:  # noqa: BLE001
-            narr = {"files": [None] * n, "secs": [0.0] * n,
-                    "failed": list(range(1, n + 1)),
-                    "error": f"{type(exc).__name__}: {exc}"}
-    if narr and any(f is not None for f in narr["files"]):
-        secs = vo.fit_secs(narr["secs"], lo=STORY_MIN_SHOT_SEC, hi=STORY_MAX_SHOT_SEC)
-        # 镜数按"目标 ÷ 9 秒"定，但每镜**实际**停多久由那句话要说多久定——
-        # 实测要 100 秒、11 镜、每句 5.8 秒 → 出来 69.3 秒，只有目标的 69%。
-        # 观众要的是"3 分钟的片子"，不是"11 个镜"。缺口摊成每镜说完之后的留白
-        # （`build_track` 本来就按镜长 pad），所以音画同步不受影响，只是节奏更慢。
-        secs = vo.fill_to(secs, float(seconds), hi=STORY_MAX_SHOT_SEC)
-    else:
-        if narr is not None:
-            narr["degraded"] = True
-        each = max(STORY_MIN_SHOT_SEC, min(STORY_MAX_SHOT_SEC, float(seconds) / n))
-        secs = [round(each, 2)] * n
-        secs[-1] = round(float(seconds) - sum(secs[:-1]), 2)
-
-    # ---- 画面：**每镜用 SVG 现画** ----
-    #
-    # 2026-10-25 删掉了"出图通道"（`plate.py` 184 行 + 这里的 Plate 分支）。
-    # 它是我误判"参考片是 AI 插画"时写的，后来证明参考片是**纯代码画的**。
-    # 留着它就是"以防万一"的代码——而那正是屎山的起点：一条没人走的路，
-    # 却要跟着每个改动一起维护。
-    bodies: list[str] = []
-    picture = "code"
-    #: 贯穿全片的那一件东西（分镜给；没给就是空串，不影响出片）。
-    motif = str(plan_obj.get("motif") or "")
-    # 每镜 1 次调用（并发 4），外层统一套运镜与文字层。
-    tick("scenes", 0, n)
-    sem = asyncio.Semaphore(SCENE_CONCURRENCY)
-    done = 0
-
-    async def one(i: int) -> str:
-        nonlocal done
-        async with sem:
-            try:
-                body = await write_scene_story_code(
-                    scenes[i], index=i, total=n, seconds=secs[i],
-                    aspect=aspect, llm=llm, user_id=user_id,
-                    conversation_id=conversation_id, motif=motif)
-            finally:
-                done += 1
-                tick("scenes", done, n)
-            return wrap_story_scene(body, scenes[i], index=i)
-
-    results = await asyncio.gather(*[one(i) for i in range(n)],
-                                   return_exceptions=True)
-    scene_errors: list[str] = []
-    for i, r in enumerate(results):
-        if isinstance(r, Exception):
-            # **兜底也要是叙事片的兜底**：这里如果退回 `safe_scene`（几何动效那套），
-            # 成片里就会混进"大圆 + 斜色带"，一眼看出不是同一个世界。
-            #
-            # 但兜底会**盖住失败原因**：2026-10-25 拆文件漏了 `SCENE_HEADER`，
-            # 15 镜全 NameError、全走兜底，日志上只看到「质检 1.0」。
-            # 所以这里把错误原文收起来，报告里必须能看见。
-            scene_errors.append(f"s{i + 1:02d} {type(r).__name__}: {str(r)[:160]}")
-            bodies.append(safe_story_scene(scenes[i], index=i))
-        else:
-            bodies.append(r)
-    calls += n
-
-    kinds = transitions_for_story(scenes)
-    plan_obj["transitions"] = kinds
-
-    def rebuild() -> tuple[str, dict[str, Any]]:
-        """拼装一次。**每次都重新读 motif 锚点**——重写过的镜位置会变，
-        沿用旧锚点会让接力接到空气上。"""
-        return assemble(bodies, secs, kinds, fps=fps,
-                        motifs=[parse_motif_at(b) for b in bodies])
-
-    code, tl = rebuild()
-    rewritten: list[int] = []
-
-    # ---- 视觉自检：渲一帧给写手**自己看**（治"母题重复"；实现在 review.py） ----
-    # 排在像素判据之前是有意的：像素判据只能抓"全黑/寡淡"，抓不到"又是城市+落日"。
-    if picture == "code" and STORY_VISION_REVIEW:
-        tick("review", 0, n)
-        code, tl, fixed = await apply_review(
-            code, tl, bodies, scenes, secs, kinds, aspect=aspect, fps=fps,
-            llm=llm, user_id=user_id, conversation_id=conversation_id,
-            motif=motif, on_progress=lambda d, t: tick("review", d, t))
-        rewritten.extend(fixed)
-        calls += len(fixed)
-
-    # ---- 判据换一套 ----
-    tick("audit", 0, n)
-    audit = await qa.audit(code, secs, aspect=aspect, fps=fps, story=True)
-
-    # ---- 太暗 / 空的镜：带**具体读数**重写一次（只重写那几镜） ----
-    #
-    # 真机第一版 10/15 镜被判 empty：模型把"暗调"做成了近黑（亮度 17/255、内容 5%）。
-    # 它的错不在"没画"，而在"只铺了一层近黑底色"。所以打回指令必须给数字，
-    # 不能只说"亮一点"——模型对"亮多少"没有直觉。
-    if picture == "code" and audit.get("ok") and audit.get("bad"):
-        for shot_no in qa.priority(audit["shots"], audit["bad"])[:6]:
-            i = shot_no - 1
-            row = next((r for r in audit["shots"] if r["index"] == shot_no), {})
-            hint = (f"整帧平均亮度只有 {row.get('mean_lum', 0):.0f}/255、"
-                    f"内容占比 {row.get('content', 0):.0%}——说明你只铺了一层近黑底色，"
-                    "或者主体太小看不见。必须做到：天空用**三段不同色**"
-                    "（如 top #0a1020 / mid #2a2340 / low #7a4630），"
-                    "加一处光源（太阳/月亮/信号光，用 `<circle>` + 径向渐变），"
-                    "和一个**占画面 ≥25% 的剪影**（望远镜/人影/城市/行星，用 `<path>` 画轮廓），"
-                    "主体与背景的亮度差 ≥40 级。整帧平均亮度要到 38/255 以上。")
-            try:
-                body = await write_scene_story_code(
-                    scenes[i], index=i, total=n, seconds=secs[i], aspect=aspect,
-                    llm=llm, user_id=user_id, conversation_id=conversation_id,
-                    extra=hint, motif=motif)
-                bodies[i] = wrap_story_scene(body, scenes[i], index=i)
-                rewritten.append(shot_no)
-            except KernelError:
-                pass
-        if rewritten:
-            calls += len(rewritten)
-            code, tl = rebuild()
-            audit = await qa.audit(code, secs, aspect=aspect, fps=fps, story=True)
-
-    # ---- 兜底：重写一轮后仍然空的镜，换成"一定画得出来"的那三套 ----
-    fallback: list[int] = []
-    if picture == "code" and audit.get("ok") and audit.get("bad"):
-        for shot_no in audit["bad"]:
-            i = shot_no - 1
-            bodies[i] = safe_story_scene(scenes[i], index=i)
-            fallback.append(shot_no)
-        if fallback:
-            code, tl = rebuild()
-            part = await qa.audit(code, secs, aspect=aspect, fps=fps,
-                                  story=True, only=fallback)
-            audit = qa.merge_audit(audit, part)
-
-    cov = system.coverage(bodies)
-    # **模板化读数**：把每镜的"画法指纹"去重，剩几个就是几种画法。
-    # 15 镜只有 3~4 种 = 在重排同一批零件；接近 15 才是每镜各画各的。
-    #
-    # 为什么不用"用了哪些组件"当读数：零件清单从提示词里拿掉之后，每镜都是
-    # `<svg>` + 自己的 path，组件集合恒等于"Camera + 文字层"，那个读数会变成 1，
-    # 反而看不出多样性。**数画法才看得出"每镜是不是各画各的"。**
-    variety = len({_scene_fingerprint(b) for b in bodies})
-    voice_info: dict[str, Any] | None = None
-    if narr is not None:
-        vsecs = [float(s) for s in (narr.get("secs") or [])]
-        voice_info = {
-            "files": [str(p) if p else "" for p in (narr.get("files") or [])],
-            "secs": [round(s, 2) for s in vsecs],
-            "failed": narr.get("failed") or [],
-            "degraded": bool(narr.get("degraded")),
-            "error": narr.get("error") or "",
-            "over": [] if narr.get("degraded")
-                    else vo.over_long(vsecs, hi=STORY_MAX_SHOT_SEC),
-        }
-
-    return {"code": code, "plan": plan_obj, "secs": secs,
-            "calls": calls, "shots": n, "mode": MODE_STORY,
-            "coverage": cov, "audit": audit, "rewritten": rewritten, "patched": [],
-            "fallback": fallback, "picture": picture, "scene_errors": scene_errors,
-            "variety": variety,
-            "timeline": tl, "transitions": kinds,
-            "bodies": bodies, "scenes": scenes,
-            "elements": {i + 1: system.element_count(b) for i, b in enumerate(bodies)},
-            "voice": voice_info,
-            "total_sec": round(sum(secs), 2)}
-
-
-#: 超过这个秒数一律走叙事片。**硬规则，不交给模型判**：动效片每镜 ≤5.2 秒，
-#: 165 秒就是 40 镜——那是"快切科普"（抖音那种），不是"三分钟深度片"。
-#: 实测：只给「0」+ 165 秒，判成 explainer 出来 40 镜，每镜 4 秒，碎成 PPT。
 LONG_FORM_SEC = 90.0
 
 
@@ -858,24 +360,6 @@ async def pick_style(prompt: str, *, seconds: float = 0.0, llm: Any = None,
     return MODE_STORY if "story" in str(raw).lower() else MODE_EXPLAINER
 
 
-def _adopt_plan(scenes: Any) -> dict[str, Any]:
-    """把调用方给的分镜收成 plan 对象。**list 与 dict 两种形状都收**。
-
-    list 只有 scenes，`motif` / `sources` 必然为空——那是"人只给了几句台词"的情况，
-    接力与出处账跟着没有，可以接受。dict 是 `/simple/plan` 的整份产物，
-    原样收下（前端"先看分镜、改完再继续"走这条），`sources` 再过一遍归一化。
-    """
-    src = scenes if isinstance(scenes, dict) else {}
-    raw = src.get("scenes") if src else scenes
-    got = [s for s in raw if isinstance(s, dict)] if isinstance(raw, list) else []
-    return {"angle": str(src.get("angle") or "")[:24],
-            "hook": str(src.get("hook") or "")[:80],
-            "title": str(src.get("title") or ""),
-            "motif": str(src.get("motif") or "")[:20],
-            "sources": facts.normalize(src.get("sources")),
-            "scenes": got}
-
-
 async def make_film(prompt: str, *, seconds: float = 60.0,
                     aspect: str = kernel.DEFAULT_ASPECT, fps: int = kernel.DEFAULT_FPS,
                     llm: Any = None, user_id: str = "",
@@ -883,216 +367,18 @@ async def make_film(prompt: str, *, seconds: float = 60.0,
                     on_stage: Any = None,
                     voice: bool = True,
                     mode: str = "auto",
-                    scenes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """一句主题 → 一条多镜成片。返回 ``{code, plan, secs, calls, ...}``。
+                    scenes: Any = None) -> dict[str, Any]:
+    """一句话 → 一条成片。**现在只走一条路**（2026-10-26）。
 
-    `on_stage(stage, done, total)` 用来推进度（作业表用），可以不给。
+    旧的 `explainer` / `story` 两条路已不再被调用（留在下面叫 `_make_legacy`，
+    等新路径跑过一轮再删）。`mode` 参数保留只为兼容旧调用点，**不再影响行为**：
+    镜数、镜长、画法全由 `showrunner` 里的导演决定。
 
-    `voice=True` 时先给每镜字幕合成旁白，**并按语音时长定镜长**（`secs` 由它决定，
-    与传进来的 `seconds` 只是"目标"，实际总长以语音为准）。TTS 全挂时自动退回无声
-    均分，`voice_info["degraded"]` 会写清——不把可用性绑在一个外部服务上。
-
-    `mode` 见 :data:`MODE_EXPLAINER` / :data:`MODE_STORY`：两种片子两套画法与判据。
-    **缺省是 auto**（2026-10-26 改）：不是这两个值就让模型自己判（`pick_style`）。
-    用户不该看到那两个词——他只会说"讲一下 0 的历史"。
-    `scenes` 给了就跳过规划调用（人改过的脚本 / 复用上一次的分镜）。
+    设计见仓库根 `设计-LLM当导演-2026-10-26.md`。
     """
-    want = str(mode or "").strip().lower()
-    if want not in (MODE_STORY, MODE_EXPLAINER):
-        # auto：让模型判片种。这一步多一次极短调用，但换来"用户不用选"。
-        mode = await pick_style(prompt, seconds=seconds, llm=llm,
-                                user_id=user_id, conversation_id=conversation_id)
-    else:
-        mode = want
-    if mode == MODE_STORY:
-        return await _make_story(
-            prompt, seconds=seconds, aspect=aspect, fps=fps, llm=llm,
-            user_id=user_id, conversation_id=conversation_id,
-            on_stage=on_stage, voice=voice, scenes=scenes)
-
-    def tick(stage: str, done: int, total: int) -> None:
-        if on_stage:
-            try:
-                on_stage(stage, done, total)
-            except Exception:  # noqa: BLE001
-                pass
-
-    tick("plan", 0, 0)
-    plan_obj, calls = await plan(prompt, seconds=seconds, aspect=aspect, llm=llm,
-                                 user_id=user_id, conversation_id=conversation_id)
-    scenes = plan_obj["scenes"]
-    n = len(scenes)
-
-    # ── 镜长：有旁白就按"这句话要说多久"定，没有才均分 ──────────────────────
-    #
-    # 均分的毛病很具体：5 个字的镜和 14 个字的镜一样长，于是慢的那几镜像卡住、
-    # 快的那几镜像抢。按语音定镜长之后，节奏由文案自己决定。
-    narr: dict[str, Any] | None = None
-    if voice:
-        tick("voice", 0, n)
-        try:
-            narr = await vo.narrate([str(s.get("text") or "") for s in scenes],
-                                    kernel.out_dir() / "voice")
-        except Exception as exc:  # noqa: BLE001 —— TTS 是外部服务，挂了不该整条失败
-            narr = {"files": [None] * n, "secs": [0.0] * n,
-                    "failed": list(range(1, n + 1)),
-                    "error": f"{type(exc).__name__}: {exc}"}
-        if narr.get("files") and any(f is not None for f in narr["files"]):
-            secs = vo.fit_secs(narr["secs"])
-            # 不再因为"比要求的长 1 秒"就拒整条：每镜已被 `fit_secs` 夹到 ≤5.2，
-            # 镜数 ≤MAX_SHOTS，所以总长天然 ≤ 291 秒。这里只做一个物理兜底。
-            total_voice = round(sum(secs), 2)
-            if total_voice > kernel.MAX_SECONDS:
-                raise KernelError(
-                    "voice",
-                    f"旁白总长 {total_voice:g} 秒，超过物理上限 "
-                    f"{kernel.MAX_SECONDS:g} 秒——请减少镜数或让每句字幕更短。")
-        else:
-            # 一条都没合成出来：退回无声 + 均分。**报告里会写清**，不假装有声。
-            narr["degraded"] = True
-            secs = split_seconds(seconds, n)
-    else:
-        secs = split_seconds(seconds, n)
-
-    # 主色先提纯一遍再交给写手：模型爱传 `#0a0c12` 当 hue，抽帧量出来就是黑白片。
-    # 在这里改而不是在 TSX 里兜，是因为场景会直接写 `fill={hue}`——那一层没有 lift()。
-    for sc in scenes:
-        sc["hue"] = ensure_vivid(sc.get("hue"))
-    kinds = transitions_for(scenes)
-    plan_obj["transitions"] = kinds
-    tick("scenes", 0, n)
-
-    sem = asyncio.Semaphore(SCENE_CONCURRENCY)
-    done = 0
-
-    async def one(i: int) -> str:
-        nonlocal done
-        async with sem:
-            try:
-                body = await write_scene(
-                    scenes[i], index=i, total=n, seconds=secs[i],
-                    prev=str(scenes[i - 1].get("brief") or "") if i else "",
-                    nxt=str(scenes[i + 1].get("brief") or "") if i + 1 < n else "",
-                    aspect=aspect, llm=llm, user_id=user_id,
-                    conversation_id=conversation_id)
-            finally:
-                done += 1
-                tick("scenes", done, n)
-            return body
-
-    results = await asyncio.gather(*[one(i) for i in range(n)], return_exceptions=True)
-    bodies: list[str] = []
-    for i, r in enumerate(results):
-        if isinstance(r, Exception):
-            raise KernelError("scene", f"第 {i + 1} 镜失败：{r}")
-        bodies.append(r)
-
-    code, tl = assemble(bodies, secs, kinds, fps=fps)
-
-    # ── 逐帧质检：抽帧量"有没有东西、有没有颜色"，不合格的带指令重写 ──────────
-    #
-    # 重写是有预算的：一条 60 秒片子 16 次调用已经不少，质检再放开重写会把调用
-    # 翻一倍。所以（a）**按严重程度排序**（全黑先于寡淡），（b）整片最多
-    # `MAX_REWRITE` 次。剩下的不合格如实报出去，不假装通过。
-    def el_map() -> dict[int, int]:
-        """每镜几个视觉元素（镜号 → 个数）。像素判据看不出"只有一层"，这个能。"""
-        return {i + 1: system.element_count(b) for i, b in enumerate(bodies)}
-
-    tick("audit", 0, n)
-    audit = await qa.audit(code, secs, aspect=aspect, fps=fps, elements=el_map())
-    rewritten: list[int] = []
-    for _round in range(2):
-        if not (audit.get("ok") and audit.get("bad")):
-            break
-        budget = MAX_REWRITE - len(rewritten)
-        if budget <= 0:
-            break
-        fixed = 0
-        for shot_no in qa.priority(audit["shots"], audit["bad"])[:budget]:
-            i = shot_no - 1
-            hint = qa.hint_for(audit["shots"], i)
-            if not hint:
-                continue
-            try:
-                bodies[i] = await write_scene(
-                    scenes[i], index=i, total=n, seconds=secs[i],
-                    prev=str(scenes[i - 1].get("brief") or "") if i else "",
-                    nxt=str(scenes[i + 1].get("brief") or "") if i + 1 < n else "",
-                    aspect=aspect, llm=llm, user_id=user_id,
-                    conversation_id=conversation_id, extra=hint)
-                rewritten.append(shot_no)
-                fixed += 1
-            except KernelError:
-                pass
-        if not fixed:
-            break
-        code, tl = assemble(bodies, secs, kinds, fps=fps)
-        audit = await qa.audit(code, secs, aspect=aspect, fps=fps, elements=el_map())
-
-    # ── 确定性补色带：重写两轮仍"寡淡"的镜，不再求模型 ──────────────────────
-    #
-    # 这一步是**几何**而不是"再试一次"：模型对"占画面多少"没有可靠直觉，
-    # 实测同一镜重写两次都还在调字号。插一条 20% 高的高饱和色带则一定有效。
-    # 只复核被补的那几镜（1 批静帧），不重跑整片 30 帧。
-    patched: list[int] = []
-    if audit.get("ok"):
-        for row in audit.get("shots") or []:
-            if row["worst"] != "flat":
-                continue
-            i = row["index"] - 1
-            fixed = _inject_ribbon(bodies[i], scenes[i]["hue"])
-            if fixed != bodies[i]:
-                bodies[i] = fixed
-                patched.append(row["index"])
-        if patched:
-            code, tl = assemble(bodies, secs, kinds, fps=fps)
-            part = await qa.audit(code, secs, aspect=aspect, fps=fps, only=patched,
-                            elements=el_map())
-            audit = qa.merge_audit(audit, part)
-
-    # ── 兜底：重写两轮 + 补色带之后仍不合格的镜，换成设计系统拼的通用场景 ──────
-    #
-    # 为什么要有这一层：一条 60 秒片子 15 镜，模型每一镜都可能有 5% 概率写出
-    # "近乎全黑"（实测 s02 内容 12%、s03 17%）。15 镜里挂 1~2 镜是**常态**，
-    # 靠重写碰运气等于每次出片都在赌。这里把"剩下的"确定性换成能看的一镜，
-    # 于是"成片里没有黑帧"变成**结构性保证**，不再是概率。
-    fallback: list[int] = []
-    if audit.get("ok"):
-        for row in audit.get("shots") or []:
-            if row["worst"] == "ok":
-                continue
-            i = row["index"] - 1
-            bodies[i] = safe_scene(str(scenes[i].get("text") or ""),
-                                   scenes[i]["hue"], index=i)
-            fallback.append(row["index"])
-        if fallback:
-            code, tl = assemble(bodies, secs, kinds, fps=fps)
-            part = await qa.audit(code, secs, aspect=aspect, fps=fps, only=fallback,
-                            elements=el_map())
-            audit = qa.merge_audit(audit, part)
-
-    cov = system.coverage(bodies)
-    voice_info: dict[str, Any] | None = None
-    if narr is not None:
-        vsecs = [float(s) for s in (narr.get("secs") or [])]
-        voice_info = {
-            "files": [str(p) if p else "" for p in (narr.get("files") or [])],
-            "secs": [round(s, 2) for s in vsecs],
-            "failed": narr.get("failed") or [],
-            "degraded": bool(narr.get("degraded")),
-            "error": narr.get("error") or "",
-            # 语音本身超过镜长上限的镜（会被切尾）——必须报出来，不能静默
-            "over": [] if narr.get("degraded") else vo.over_long(vsecs),
-        }
-    return {"code": code, "plan": plan_obj, "secs": secs,
-            "calls": calls + n + len(rewritten), "shots": n,
-            "mode": MODE_EXPLAINER,
-            "coverage": cov, "audit": audit, "rewritten": rewritten,
-            "patched": patched, "fallback": fallback,
-            "timeline": tl, "transitions": kinds,
-            "bodies": bodies, "scenes": scenes, "elements": el_map(),
-            "voice": voice_info,
-            "total_sec": round(sum(secs), 2)}
+    return await sr.make(prompt, seconds=seconds, aspect=aspect, fps=fps,
+                         llm=llm, user_id=user_id, conversation_id=conversation_id,
+                         on_stage=on_stage, voice=voice, scenes=scenes)
 
 
 async def shot_stills(code: str, tl: dict[str, Any], index: int, *,
@@ -1112,3 +398,24 @@ async def shot_stills(code: str, tl: dict[str, Any], index: int, *,
         code, frames, seconds=float(tl["total"]) / max(1, fps),
         aspect=aspect, fps=fps, scale=scale)
     return [p["jpeg_b64"] for p in pairs]
+
+
+_DIM_RE = re.compile(r"\b(width|height|rx|ry|r)=\{([^{}]+)\}")
+
+
+def _fix_rects(code: str) -> str:
+    """给 SVG 的尺寸属性兜一层 `Math.max(0, …)`。
+
+    为什么值得一个正则：这类错误**不报错、不中断、不留痕迹**，只是画面上少一块。
+    lint 看不见（语法合法），渲染也返回 200，只有翻浏览器控制台才发现。
+    代价是负值会被夹成 0（那一块仍然不显示），但至少不会因为 `NaN` 传染到相邻属性。
+    """
+    def fix_attr(a: re.Match[str]) -> str:
+        name, expr = a.group(1), a.group(2).strip()
+        if expr.startswith("Math.max("):
+            return a.group(0)
+        return f"{name}={{Math.max(0, {expr})}}"
+
+    return _DIM_RE.sub(fix_attr, code)
+
+

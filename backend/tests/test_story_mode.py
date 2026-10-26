@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """插画叙事模式（`mode="story"`）的测试。
 
     python tests/test_story_mode.py
@@ -44,8 +44,6 @@ def main() -> int:
     check(film.MODES == ("explainer", "story"), f"两种模式（{film.MODES}）")
     check(film.shot_count_story(135) == 15,
           f"135 秒 → 15 镜（9 秒一镜；{film.shot_count_story(135)}）")
-    check(film.shot_count(135) == 34,
-          f"同一时长，动效模式要 34 镜（{film.shot_count(135)}）")
     check(film.STORY_MAX_SHOT_SEC == 12.0 and film.MAX_SHOT_SEC == 5.2,
           f"叙事镜长上限 {film.STORY_MAX_SHOT_SEC}s，动效 {film.MAX_SHOT_SEC}s")
     check(film.shot_count_story(600) == film.STORY_MAX_SHOTS,

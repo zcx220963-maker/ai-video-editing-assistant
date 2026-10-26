@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """设计系统：29 个可调组件，作为**字符串**拼进生成的模块里。
 
 为什么不放进 `remotion/src/system/` 再 import：

@@ -1,4 +1,4 @@
-﻿"""内置原生工具集合。"""
+"""内置原生工具集合。"""
 
 from .file import (
     FileToolBase,

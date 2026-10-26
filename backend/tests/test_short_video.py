@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """短视频工具链的**装配**测试：四个工具装得上、参数对、工程能往返、B 链真的摘了。
 
 不调模型、不渲染。功能由 `tools/smoke_tools_e2e.py` 真机跑（约 6 次调用）。
@@ -89,8 +89,11 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="film-proj-"))
     real_out = kernel.out_dir
     kernel.out_dir = lambda: tmp          # type: ignore[assignment]
+    # `film.safe_scene`（动效那套兜底）随旧路径一起删了；叙事兜底还在，
+    # 而且它才是现在唯一的兜底，用它造一个合法的 body 来跑工程往返。
+    from storyline_server.simple.scene import safe_story_scene
+    body = safe_story_scene({"text": "测试字幕"}, index=0)
     try:
-        body = film.safe_scene("测试字幕", "#22D3EE", index=0)
         code, tl = film.assemble([body, body], [3.0, 3.0], ["slide"])
         fid = project.new_id()
         project.save(fid, code=code, prompt="冒烟", seconds=6.0, aspect="portrait",
