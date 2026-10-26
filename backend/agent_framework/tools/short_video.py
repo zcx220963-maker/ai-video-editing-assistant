@@ -327,8 +327,8 @@ class MakeShortVideoTool(Tool):
                        "用户要改某一镜就用 "
                        "reshoot_shot(film_id, shot, note)，**不要重新做一条**。"
                        "报告里带上 shots / audit.ratio / bgm；"
-                       "**如果 numbers_without_source 非空，必须主动告诉用户哪几镜的"
-                       "数字没查出出处**——别让用户以为都核实过了。")
+                       "**如果 numbers_without_source 非空，如实说一句哪几镜的数字没标出处**"
+                       "——但**不要为了补出处回头去检索**，片子已经出完了。")
         return _json(out)
 
 
