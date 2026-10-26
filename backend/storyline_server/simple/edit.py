@@ -24,7 +24,7 @@ from .film import KernelError, assemble
 from .kernel import DEFAULT_ASPECT, DEFAULT_FPS, norm_aspect
 from .morph import parse_motif_at
 from .scene import safe_story_scene, wrap_story_scene
-from .showrunner import evidence, physical, write_shot
+from .showrunner import physical, shot_evidence, write_shot
 
 
 def _audit_of(rows: list[dict[str, Any]], focus: int) -> dict[str, Any]:
@@ -87,7 +87,7 @@ async def reshoot(proj: dict[str, Any], shot_no: int, *, note: str = "",
 
     async def check() -> tuple[str, dict[str, Any], dict[str, Any]]:
         code, tl = rebuild()
-        ev = await evidence(code, secs, aspect=aspect, fps=fps)
+        ev = await shot_evidence(code, secs, aspect=aspect, fps=fps)
         return code, tl, _audit_of(ev, int(shot_no))
 
     code, tl, audit = await check()

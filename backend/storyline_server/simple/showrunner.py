@@ -11,8 +11,7 @@
 为什么单独一个文件：旧的两条路（explainer / story）还在 `film.py` 里，
 新路径先隔离出来，跑过一轮再删旧的。`film.make_film` 现在只调这里。
 
-命名：`director.py` 已被「两套分镜提示词」占用，这里是**统筹**（谁在什么时候做什么），
-不是**分镜导演**（说什么）。两层分开，改提示词时不用碰编排。
+命名：`director.py` 是「两套分镜提示词」，这里是**统筹**（谁在什么时候做什么）。
 """
 
 from __future__ import annotations
@@ -186,7 +185,57 @@ def normalize(obj: dict[str, Any]) -> dict[str, Any]:
         "motif": str(obj.get("motif") or "").strip()[:20],
         "sources": obj.get("sources") if isinstance(obj.get("sources"), list) else [],
         "shots": shots,
+        # 三次都没命中时长、最后按比例缩过 → 如实带出去（`make` 会写进 duration_note）
+        **({"scaled_from": obj["scaled_from"]} if obj.get("scaled_from") else {}),
     }
+
+
+def _total_sec(obj: dict[str, Any]) -> float:
+    """这份 plan 的总时长（镜长之和）。"""
+    return round(sum(float(x.get("sec") or 0) for x in (obj.get("shots") or [])
+                     if isinstance(x, dict)), 2)
+
+
+def structural_ok(obj: dict[str, Any] | None, seconds: float) -> bool:
+    """结构合格吗：镜数、单镜时长、text 都对，只有总长可能不对。
+
+    总长是唯一一处"模型难一次命中、但代码能按比例救回来"的偏差；
+    镜数错、单镜 30 秒那种救不了，只能重问。
+    """
+    if not isinstance(obj, dict):
+        return False
+    shots = obj.get("shots")
+    if not isinstance(shots, list) or not (MIN_SHOTS <= len(shots) <= MAX_SHOTS):
+        return False
+    for x in shots:
+        if not isinstance(x, dict) or not str(x.get("text") or "").strip():
+            return False
+        try:
+            sec = float(x.get("sec"))
+        except (TypeError, ValueError):
+            return False
+        if not (MIN_SHOT_SEC <= sec <= MAX_SHOT_SEC):
+            return False
+    return True
+
+
+def scale_to(obj: dict[str, Any], seconds: float) -> dict[str, Any]:
+    """按比例缩到目标时长，保留相对节奏（哪镜长哪镜短不变）；零头摊给最长那镜。"""
+    shots = [x for x in (obj.get("shots") or []) if isinstance(x, dict)]
+    total = sum(float(x.get("sec") or 0) for x in shots)
+    if not shots or total <= 0:
+        return obj
+    k = seconds / total
+    for x in shots:
+        x["sec"] = round(max(MIN_SHOT_SEC, min(MAX_SHOT_SEC, float(x["sec"]) * k)), 2)
+    drift = round(seconds - sum(x["sec"] for x in shots), 2)
+    if drift:
+        # 优先摊到"还有余量"的那一镜（最长的那镜）
+        target = max(shots, key=lambda x: x["sec"])
+        target["sec"] = round(max(MIN_SHOT_SEC, min(MAX_SHOT_SEC,
+                                                   target["sec"] + drift)), 2)
+    obj["scaled_from"] = round(total, 1)
+    return obj
 
 
 async def plan(prompt: str, *, seconds: float, aspect: str, llm: Any = None,
@@ -194,9 +243,11 @@ async def plan(prompt: str, *, seconds: float, aspect: str, llm: Any = None,
     """导演调用：一句话 → {title, tone, motif, shots[{sec, text, plate}]}。"""
     lo = max(MIN_SHOTS, int(seconds / MAX_SHOT_SEC))
     hi = min(MAX_SHOTS, max(lo + 1, int(seconds / MIN_SHOT_SEC)))
-    ask = (f"主题：{str(prompt).strip()}\n\n"
-           f"目标时长 {seconds:g} 秒，画幅 [[ASPECT]]。"
-           f"镜数与每镜时长由你定（{lo}~{hi} 镜都算对），不要均分。")
+    # 用户消息里不能留 `[[ASPECT]]`：占位符只替换 system（真机踩过，原样喂给了模型）。
+    base = (f"主题：{str(prompt).strip()}\n\n"
+            f"目标时长 {seconds:g} 秒——**所有镜的 sec 加起来要接近这个数**，"
+            f"画幅 {aspect}。镜数与每镜时长由你定（{lo}~{hi} 镜都算对），不要均分。")
+    ask = base
     # 不用 str.format：这段 prompt 里有 JSON 示例，花括号会被当占位符
     # （实测 KeyError: '\n  "title"'）。用 [[...]] 手工替换。
     system = (PLAN_SYSTEM
@@ -207,6 +258,7 @@ async def plan(prompt: str, *, seconds: float, aspect: str, llm: Any = None,
               .replace("[[HI]]", str(hi))
               .replace("[[ASPECT]]", aspect))
     last: list[str] = ["没调用成功"]
+    best: dict[str, Any] | None = None      # 结构合格、只是总长偏了的那一份
     for _ in range(PLAN_TRIES):
         try:
             raw = await kernel._complete(
@@ -223,10 +275,30 @@ async def plan(prompt: str, *, seconds: float, aspect: str, llm: Any = None,
                 last = ["normalize 之后没有镜头"]
                 continue
             return got, 1
-        # 带着问题回喂一次：它知道错在哪，第二次几乎都能改对。
-        ask = (f"主题：{str(prompt).strip()}\n\n"
-               "上一版不合格：\n" + "\n".join(f"· {x}" for x in last)
-               + f"\n\n目标时长 {seconds:g} 秒，画幅 [[ASPECT]]。按上面的问题改，只回 JSON。")
+        # 只差总长 → 给**精确差值与动作**。只说"差 17%"，模型不知道往哪改（真机连挂三次）。
+        if structural_ok(obj, seconds):
+            best = obj
+            total = _total_sec(obj)
+            delta = round(total - seconds, 1)
+            verb = "多" if delta > 0 else "少"
+            how = (f"把 3~4 镜各缩短 2~4 秒，或者去掉 2~3 镜"
+                   if delta > 0 else "把几镜各加长 2~3 秒，或者补 1~2 镜")
+            ask = (f"主题：{str(prompt).strip()}\n\n"
+                   f"上一版总长 **{total:g} 秒**，比目标 {seconds:g} 秒{verb} "
+                   f"{abs(delta):g} 秒。\n"
+                   f"**只改时长，讲法一个字都别动**：{how}，"
+                   f"让总数落在 {seconds * 0.95:.0f}~{seconds * 1.05:.0f} 秒。"
+                   f"其余照旧，只回 JSON。")
+        else:
+            ask = (f"主题：{str(prompt).strip()}\n\n"
+                   "上一版不合格：\n" + "\n".join(f"· {x}" for x in last)
+                   + f"\n\n目标时长 {seconds:g} 秒，画幅 {aspect}。按上面的问题改，只回 JSON。")
+    # 三次都没命中：能救就救——结构合格只是总长偏了，按比例缩到目标并记
+    # `scaled_from`（降级显式）。整条失败比"时长偏 17%"更糟。
+    if best is not None:
+        got = normalize(scale_to(best, seconds))
+        if got["shots"]:
+            return got, PLAN_TRIES
     raise KernelError("plan", "导演给了 3 次都不合格：" + "；".join(last))
 
 
@@ -324,8 +396,7 @@ async def make(prompt: str, *, seconds: float = 60.0,
                scenes: Any = None) -> dict[str, Any]:
     """一句话 → 一条成片。返回的字典与旧 `film.make_film` 同形（`short_video` 直接吃）。
 
-    四步：导演 → 旁白校验 → 逐镜写 → 评审回路。
-    代码在这里只做「渲、抽帧、把帧给模型、记账」。
+    四步：导演 → 旁白校验 → 逐镜写 → 评审回路。代码只做「渲、抽帧、给模型看、记账」。
     """
     # 延迟 import：film 在模块级 import 本文件，这里不能反过来。
     from . import system, voice as vo
@@ -427,7 +498,7 @@ async def make(prompt: str, *, seconds: float = 60.0,
     notes: dict[int, str] = {}
     for _round in range(JUDGE_ROUNDS):
         tick("audit", 0, n)
-        evidence = await qa.evidence(code, secs, aspect=aspect, fps=fps)
+        evidence = await shot_evidence(code, secs, aspect=aspect, fps=fps)
         # 物理判据先过一遍：没渲出来（全黑/全白）的镜不用问模型，直接重画。
         blind = [int(e["index"]) for e in evidence if physical(e) != "ok"]
         notes = await judge(evidence, shots, tone, llm=llm, user_id=user_id,
@@ -506,19 +577,22 @@ async def make(prompt: str, *, seconds: float = 60.0,
         "elements": {i + 1: system.element_count(b) for i, b in enumerate(bodies)},
         "voice": voice_info,
         "total_sec": round(sum(secs), 2),
+        # 导演三次都没命中时长、最后按比例缩过 → **如实写出来**，
+        # 别让用户以为"导演一次就给对了"。降级要显式。
+        **({"duration_note": (
+            f"导演给的总长是 {plan_obj['scaled_from']:g} 秒，已按比例缩到 "
+            f"{round(sum(secs), 2):g} 秒（哪镜长哪镜短的相对节奏保留）")}
+           if plan_obj.get("scaled_from") else {}),
     }
 
 
-async def evidence(code: str, secs: list[float], *, aspect: str,
+async def shot_evidence(code: str, secs: list[float], *, aspect: str,
                    fps: int = kernel.DEFAULT_FPS, base: str | None = None,
                    scale: float = 0.30) -> list[dict[str, Any]]:
     """渲帧 + 量读数，**不下结论**——新路径专用。
 
-    与 `qa.audit()` 的区别只有一处：`audit` 把读数折成 verdict（合格/空/寡淡），
-    这里原样交出去，由模型自己判断。
-
-    为什么要这个区别：阈值是「机器替人做审美判断」的产物，而两套片子的阈值
-    方向相反（一个要亮、一个要暗），合并必然误伤。**读数当证据，判断交给看图的模型。**
+    与 `qa.audit()` 的区别：那边把读数折成 verdict，这里原样交出去由模型判断。
+    阈值是「机器替人做审美判断」的产物，而两套阈值方向相反、合并必然误伤。
 
     返回每镜一条：
     ``{index, readings: {content,vivid,mean_lum,edge}, jpeg: <base64>, frames: n}``

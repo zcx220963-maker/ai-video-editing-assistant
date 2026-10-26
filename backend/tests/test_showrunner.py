@@ -106,6 +106,26 @@ def main() -> int:
     check(sr.MIN_SHOT_SEC == 1.0 and sr.MAX_SHOT_SEC == 15.0,
           f"单镜区间 {sr.MIN_SHOT_SEC}~{sr.MAX_SHOT_SEC} 秒（护栏，不是审美）")
 
+    print("\n⑧ 时长兜底：结构对、只是总长偏了 → 按比例缩，不整条失败")
+    # 真机：导演连给三次 193 秒（目标 165），旧代码直接判"3 次都不合格"整条失败。
+    # 用户要的是片子，不是一条判决——所以结构合格就按比例救回来，并如实标注。
+    over = sr.normalize(shots(12, 10, 14, 11, 9, 8))       # 6 镜共 64 秒
+    check(sr._total_sec(over) == 64.0, f"造一份超长的：{sr._total_sec(over)} 秒")
+    check(sr.structural_ok(over, 50) is True,
+          "结构合格（镜数/单镜时长/text 都对，只有总长不对）")
+    scaled = sr.scale_to(over, 50)
+    check(abs(sr._total_sec(scaled) - 50) < 0.5,
+          f"缩到目标 50 秒（实际 {sr._total_sec(scaled)}）")
+    check(scaled.get("scaled_from") == 64.0, f"记下原值 {scaled.get('scaled_from')}")
+    # 相对节奏：最长的那一镜缩完还得是最长（第 3 镜，原 14 秒）
+    check(max(range(len(scaled["shots"])),
+              key=lambda i: scaled["shots"][i]["sec"]) == 2,
+          "相对节奏保留（最长的那镜还是同一镜）")
+    check(all(sr.MIN_SHOT_SEC <= x["sec"] <= sr.MAX_SHOT_SEC for x in scaled["shots"]),
+          "缩完仍在单镜上下限内")
+    check(sr.structural_ok({"shots": [{"sec": 30, "text": "a", "plan": "p"}] * 3}, 50) is False,
+          "单镜 30 秒 → 结构不合格（救不了，只能重问）")
+
     print(f"\n{_CHECKS - _FAILS}/{_CHECKS} 通过")
     return 0 if _FAILS == 0 else 1
 
