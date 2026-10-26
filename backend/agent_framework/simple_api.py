@@ -28,7 +28,7 @@ from typing import Any
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from storyline_server.simple import film, kernel, project, takes
+from storyline_server.simple import film, kernel, project, showrunner, takes
 from storyline_server.simple.kernel import KernelError
 
 #: 同时在跑的作业数上限。渲染容器自己是串行的，这个数只防「连点十次」。
@@ -368,25 +368,19 @@ def register(app: Any, *, storage: Any, auth: Any) -> None:
         conv = str(body.get("conversation_id") or "")
         want = str(body.get("mode") or "").strip().lower()
         await kernel.ensure_storage()
-        # 没指定画法就先让模型判（和 `make_film` 同一条判据），这样前端不用逼用户选。
-        style = (want if want in (film.MODE_STORY, film.MODE_EXPLAINER)
-                 else await film.pick_style(prompt, seconds=sec, user_id=user_id,
-                                            conversation_id=conv))
+        # 2026-10-26：不再分片种，也不再 `pick_style`——镜数/镜长/画法都由导演定。
+        # 原来这里二选一调 `plan` / `plan_story`，而 explainer 那份分镜已随
+        # 「LLM 当导演」删掉（`film.plan` 不存在），留着就是 500。
         try:
-            if style == film.MODE_STORY:
-                got, calls = await film.plan_story(
-                    prompt, seconds=sec, aspect=asp, user_id=user_id,
-                    conversation_id=conv)
-            else:
-                got, calls = await film.plan(
-                    prompt, seconds=sec, aspect=asp, user_id=user_id,
-                    conversation_id=conv)
+            got, calls = await showrunner.plan(
+                prompt, seconds=sec, aspect=asp, user_id=user_id,
+                conversation_id=conv)
         except KernelError as exc:
             raise HTTPException(400, str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(502, f"分镜失败：{type(exc).__name__}: {exc}") from exc
-        return {"ok": True, "style": style, "calls": calls,
-                "shots": len(got.get("scenes") or []), "plan": got}
+        return {"ok": True, "calls": calls,
+                "shots": len(got.get("shots") or []), "plan": got}
 
     @app.get("/simple/job/{job_id}")
     async def job_view(job_id: str,

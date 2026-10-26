@@ -29,6 +29,7 @@ from typing import Any
 from ..identity import current_identity
 from ..tool import Tool
 from storyline_server.simple import deliver, edit, export, facts, film, kernel, project
+from storyline_server.simple import showrunner
 
 #: 秒数上下限。上限由**结构**决定，不是拍脑袋：
 #:   动效：镜数 ≤ `film.MAX_SHOTS`(56) × `film.MAX_SHOT_SEC`(5.2) = 291 秒
@@ -392,28 +393,26 @@ class PlanShortFilmTool(Tool):
         asp = kernel.norm_aspect(aspect)
         user_id, conv_id = _ident()
         await kernel.ensure_storage()
-        mode = await film.pick_style(text, seconds=sec, user_id=user_id,
-                                     conversation_id=conv_id)
+        # 2026-10-26：不再分片种。原来这里先 `pick_style` 再二选一调 `plan` /
+        # `plan_story`，而那条 explainer 分镜已经随「LLM 当导演」删了——
+        # 留着就会 AttributeError（`film.plan` 不存在）。现在统一走 `showrunner.plan`，
+        # 它给的正是 `make_short_video` 要吃的那份分镜（`shots[{sec,text,plan}]`）。
         try:
-            if mode == film.MODE_STORY:
-                got, calls = await film.plan_story(
-                    text, seconds=sec, aspect=asp, user_id=user_id,
-                    conversation_id=conv_id)
-            else:
-                got, calls = await film.plan(
-                    text, seconds=sec, aspect=asp, user_id=user_id,
-                    conversation_id=conv_id)
+            got, calls = await showrunner.plan(
+                text, seconds=sec, aspect=asp, user_id=user_id,
+                conversation_id=conv_id)
         except kernel.KernelError as exc:
             return _json({"ok": False, "stage": exc.stage, "error": str(exc)})
         except Exception as exc:  # noqa: BLE001 —— 回喂给模型，别让整轮崩掉
             return _json({"ok": False, "stage": "plan",
                           "error": f"{type(exc).__name__}: {exc}"})
         return _json({
-            "ok": True, "style": mode, "calls": calls,
-            "shots": len(got.get("scenes") or []),
+            "ok": True, "calls": calls,
+            "shots": len(got.get("shots") or []),
+            "total_sec": round(sum(float(s["sec"]) for s in got.get("shots") or []), 2),
             "plan": got,
             "next": ("把 plan 原样传给 make_short_video 的 scenes 出片；"
-                     "用户要改就直接改 plan.scenes[i].text 再传"),
+                     "用户要改就直接改 plan.shots[i].text 或 .sec 再传"),
         })
 
 
