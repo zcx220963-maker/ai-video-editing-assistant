@@ -310,7 +310,9 @@ class MakeShortVideoTool(Tool):
             out["voice_error"] = vinfo.get("error") or "TTS 全部失败"
         elif vinfo:
             try:
-                from storyline_server.simple import voice as vo
+                from storyline_server.simple import pipeline as _pl
+
+                vo = _pl.voice
                 from .. import bgm as bgm_pick
                 track = vo.build_track(
                     [Path(p) if p else None for p in vinfo.get("files") or []],
@@ -628,7 +630,9 @@ class RenderShortFilmTool(Tool):
             track = project.dir_of(film_id) / audio
             if track.exists():
                 try:
-                    from storyline_server.simple import voice as vo
+                    from storyline_server.simple import pipeline as _pl
+
+                    vo = _pl.voice
                     final = vo.mux(path, track, kernel.out_dir() / f"{film_id}-av.mp4")
                     voice_state = "ok"
                 except Exception as exc:  # noqa: BLE001
