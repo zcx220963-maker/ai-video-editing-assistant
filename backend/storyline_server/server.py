@@ -194,10 +194,27 @@ class StorylineServer:
 
     # ---- 文档 wrapper/register 模板 ----
 
-    async def _make_state(self, session_id: str, artifact_id: str) -> NodeState:
+    @staticmethod
+    def _llm() -> Any:
+        """设计稿 wrapper 里的 `make_llm(mcp_ctx)`：返回一个带 `.complete` 的客户端。
+
+        拿不到就返回 None——节点照旧走 `self.providers.llm()`，不会因为这里失败而挂。
+        """
+        try:
+            from agent_framework.llm_openai import get_default_llm
+
+            return get_default_llm()
+        except Exception:  # noqa: BLE001 —— 没配模型不该让节点起不来
+            return None
+
+    async def _make_state(self, session_id: str, artifact_id: str,
+                          *, llm: Any = None, mcp_ctx: Any = None) -> NodeState:
         repo = self.storage.artifacts(session_id, artifact_id)
         store = await ArtifactStore.open(repo, session_id, artifact_id)
-        return NodeState(session_id=session_id, artifact_id=artifact_id, store=store)
+        # `llm` / `mcp_ctx` 是设计稿 wrapper 里那两个字段（R19）：节点可以照设计稿
+        # 读 `state.llm` / `state.mcp_ctx`；不传就是 None，老节点走 self.providers。
+        return NodeState(session_id=session_id, artifact_id=artifact_id, store=store,
+                         llm=llm, mcp_ctx=mcp_ctx)
 
     def _register_tools(self) -> None:
         for node in self.registry.all():
@@ -242,7 +259,11 @@ class StorylineServer:
                 base_art = str(args.get("base_artifact_id") or "")
                 if artifact_id in ("", "_default") or artifact_id == base_art:
                     artifact_id = new_patch_scope_id()
-            state = await server._make_state(sid, artifact_id)
+            # 设计稿的 wrapper 会把 llm 与 mcp_ctx 塞进 NodeState（R19）。
+            # llm 用全项目共享的主 LLM 客户端（带 .complete）；mcp_ctx 给需要读
+            # request / lifespan 的节点用。
+            state = await server._make_state(
+                sid, artifact_id, llm=server._llm(), mcp_ctx=ctx)
             state.user_request = str(args.get("user_request") or "")
             state.user_id = uid
             state.conversation_id = cid

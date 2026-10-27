@@ -4165,6 +4165,11 @@ def build_real_registry(settings: Settings, providers: Providers, storage: Stora
     name_to_cls = {cls.name: cls for cls in [
         *REAL_NODE_CLASSES, RenderWebNode,
         PlanShortFilmNode, WriteShortShotsNode, RenderShortFilmNode]}
+    # 白名单两种写法都收（2026-10-27，R19）：
+    #   工具名 `load_media`（产品 TOML 的写法）与类名 `LoadMediaNode`（设计稿的写法）。
+    # 设计稿的 available_nodes 写的是类名，直接拿类名去查 name_to_cls 会一个都
+    # 注册不上，而且 `keep_only` 会把扫包进来的全裁掉——**工具面上什么都剩不下**。
+    clsname_to_cls = {cls.__name__: cls for cls in name_to_cls.values()}
 
     def _factory(cls: type) -> Any:
         # 产品的构造签名是 cls(settings, providers, storage, registry=reg)，
@@ -4180,10 +4185,12 @@ def build_real_registry(settings: Settings, providers: Providers, storage: Stora
     for nm in (allowed or list(name_to_cls)):
         if nm in reg:
             continue                      # 扫包已经注册过（同一个类，不重复实例化）
-        cls = name_to_cls.get(nm)
+        cls = name_to_cls.get(nm) or clsname_to_cls.get(nm)
         if cls is not None:
             _factory(cls)
 
     # 白名单是**最终**权威：扫包会把整包节点都拉进来，这里按白名单裁掉其余。
-    reg.keep_only(allowed)
+    # 先把类名换成工具名再裁，否则写类名的白名单会把所有节点裁光。
+    reg.keep_only([clsname_to_cls[c].name if c in clsname_to_cls and c not in name_to_cls
+                   else c for c in (allowed or [])] or None)
     return reg

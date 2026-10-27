@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import re
-from abc import ABC, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
@@ -186,6 +186,20 @@ class NodeState:
     # 任一节点从客户端见过的参数在此留痕：拦截器补齐的依赖以默认入参执行，
     # 跨节点的显式开关（如 keep_original_audio）靠 flags 传达。
     flags: dict[str, Any] = field(default_factory=dict)
+    # ---- 设计稿里的两个字段（2026-10-27 补齐，R19）----
+    #
+    # 设计稿的 wrapper 写的是 `NodeState(..., llm=make_llm(mcp_ctx), mcp_ctx=mcp_ctx)`。
+    # 本仓原来两者都没有：节点调模型走 `self.providers.llm()`，MCP 上下文靠闭包。
+    # 现在补成**字段**，两条路都通——老节点不受影响，新节点可以照设计稿写。
+    #: 本节点的 LLM 客户端（带 `.complete(messages, **kw)`）。None = 用默认主 LLM。
+    llm: Any = None
+    #: MCP 请求上下文（取 request / lifespan 用）。None = 非 MCP 直调。
+    mcp_ctx: Any = None
+
+    @property
+    def node_summary(self) -> NodeSummary:
+        """设计稿的名字。代码里叫 ``summary``——两个都能读。"""
+        return self.summary
 
 
 # --------------------------------------------------------------------------
@@ -262,7 +276,50 @@ class NodeRegistry:
         return name in self._nodes
 
 
-class BaseNode(ABC):
+class _NodeMeta:
+    """设计稿里的 `NodeClass.meta`：name / display_name / description 的只读视图。
+
+    设计稿的注册函数写的是 `NodeClass.meta.name`，代码里是 `NodeClass.name`。
+    这里补一层只读视图，**两种写法都能读**——不改既有字段名（21 个节点、
+    契约、任务板、测试都按 `name` 写，重命名是纯破坏）。
+    """
+
+    __slots__ = ("name", "display_name", "description")
+
+    def __init__(self, name: str, display_name: str, description: str) -> None:
+        self.name = name
+        self.display_name = display_name
+        self.description = description
+
+    def __repr__(self) -> str:      # 日志里看得见是哪个节点
+        return f"NodeMeta(name={self.name!r})"
+
+
+class _NodeMetaType(ABCMeta):
+    """让 `NodeClass.meta.name` 在**类上**可读（设计稿正是这么用的）。"""
+
+    @property
+    def meta(cls) -> _NodeMeta:     # noqa: N805 —— 元类属性，cls 是类本身
+        return _NodeMeta(cls.name, cls.display_name, cls.description)
+
+
+def dep_name(dep: Any) -> str:
+    """依赖项的节点名。**类引用与名字字符串都收**（设计稿写的是类引用）。
+
+    设计稿：``requiredNodes = [FilterClipsNode]``
+    代码里历史上只收字符串。类引用在导入期就会形成环（A 依赖 B、B 依赖 A 的
+    模块级 import 直接炸），所以字符串是更安全的默认；但既然规范要求能写类，
+    这里统一归一，两种写法等价。
+    """
+    if isinstance(dep, str):
+        return dep
+    name = getattr(dep, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    raise TypeError(f"required_nodes 里只能是节点名或节点类，收到 {dep!r}")
+
+
+class BaseNode(ABC, metaclass=_NodeMetaType):
     """所有剪辑节点的基类。子类只需声明元信息并重写 process。
 
     元信息（可用类属性或构造参数覆盖）：
@@ -298,7 +355,8 @@ class BaseNode(ABC):
     @property
     def upstream(self) -> list[str]:
         """DAG 依赖 + 必须校验 artifact_meta 的上游种类（去重、保序）。"""
-        return list(dict.fromkeys([*self.required_nodes, *self.require_prior_kind]))
+        deps = [dep_name(d) for d in self.required_nodes]
+        return list(dict.fromkeys([*deps, *self.require_prior_kind]))
 
     @property
     def require_node(self) -> list[str]:
@@ -308,7 +366,12 @@ class BaseNode(ABC):
         21 个节点、契约、任务板、测试都按后者写，重命名是纯破坏。这里只提供只读别名，
         让「按设计读代码」的人不会以为这条约束不存在。
         """
-        return list(self.required_nodes)
+        return [dep_name(d) for d in self.required_nodes]
+
+    @property
+    def meta(self) -> _NodeMeta:
+        """实例侧的 `meta`（类上那份由元类提供）。两种写法同源。"""
+        return _NodeMeta(self.name, self.display_name, self.description)
 
     @property
     def write_keys(self) -> frozenset[str]:
@@ -386,7 +449,7 @@ class BaseNode(ABC):
     async def _parse_input(self, state: NodeState, inputs: dict[str, Any]) -> dict[str, Any]:
         """从 Store 读出前驱节点输出，拼进本节点入参（按节点名取，缺省不报错）。"""
         parsed: dict[str, Any] = {}
-        for dep in self.required_nodes:
+        for dep in (dep_name(d) for d in self.required_nodes):
             if await state.store.has(dep):
                 parsed[dep] = await state.store.get(dep)
         parsed.update(inputs)
@@ -406,7 +469,7 @@ def build_edges(registry: NodeRegistry) -> dict[str, list[str]]:
     """返回邻接表 dep -> [该依赖支撑的后继节点]。"""
     edges: dict[str, list[str]] = {n.name: [] for n in registry.all()}
     for node in registry.all():
-        for dep in node.required_nodes:
+        for dep in (dep_name(d) for d in node.required_nodes):
             if dep not in edges:
                 raise ValueError(f"节点 {node.name!r} 依赖了未注册的 {dep!r}")
             edges[dep].append(node.name)
@@ -418,7 +481,7 @@ def detect_cycle(registry: NodeRegistry) -> list[str] | None:
     indeg: dict[str, int] = {n.name: 0 for n in registry.all()}
     edges = build_edges(registry)
     for node in registry.all():
-        indeg[node.name] = len(node.required_nodes)
+        indeg[node.name] = len(list(node.required_nodes))
 
     queue = deque(name for name, d in indeg.items() if d == 0)
     seen = 0

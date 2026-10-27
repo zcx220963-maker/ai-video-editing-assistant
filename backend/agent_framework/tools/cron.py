@@ -32,6 +32,17 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _compute_next_run(schedule: "Schedule", now_ms: int) -> int | None:
+    """下一次该跑的时间（epoch 毫秒）。**单次任务没有下一次 → None**。
+
+    设计稿把这个动作叫 `_compute_next_run(job.schedule, _now_ms())`。
+    它是「单次 vs 周期」的唯一判据：返回 None 就说明这一轮跑完该禁用/删除。
+    """
+    if schedule.kind == "every" and schedule.every_ms:
+        return now_ms + schedule.every_ms
+    return None
+
+
 # --------------------------------------------------------------------------
 # 数据模型
 # --------------------------------------------------------------------------
@@ -275,29 +286,53 @@ class CronScheduler:
         """执行当前所有到期的 job；每个 job 先比较-交换领取，再触发 runner。"""
         fired = 0
         for row in await self._jobs.due(now):
-            job = CronJob.from_row(row)
-            if job.schedule.kind == "every":
-                next_ms, enabled, drop_after = now + (job.schedule.every_ms or 0), True, False
-            else:                       # 单次：领走即不再有下一轮
-                next_ms, enabled, drop_after = None, False, job.delete_after_run
-            state = JobState(next_run_at_ms=next_ms, last_run_at_ms=now)
-            claimed = await self._jobs.claim_run(job.id, job.state.to_dict(),
-                                                 new_state=state.to_dict(), enabled=enabled)
-            # 两种后端返回形状不同：PG 是行/None，文件是 True/False。
-            # 只判 `is None` 会把 False 当成「领到了」——文件后端于是照样执行，
-            # 还把 next_run 留在原地，下一 tick 再跑一遍。
-            if not claimed:
-                continue                     # 别的副本 / 另一份 store 已领走这一轮
-            job.state = state
-            fired += 1
-            self.executed.append((job.id, now))
-            if self._runner:
-                result = self._runner(job)
-                if asyncio.iscoroutine(result):
-                    await result
-            if drop_after:
-                await self._jobs.drop_id(job.id)
+            if await self._execute_job(CronJob.from_row(row), now):
+                fired += 1
         return fired
+
+    async def _execute_job(self, job: CronJob, now: int | None = None) -> bool:
+        """执行**一个** job：领取 → 触发 runner → 按 `delete_after_run` 收尾。
+
+        设计稿把它叫 `_execute_job(job)`。这里是真的执行单元，`_fire_due` 只是
+        对 `due(now)` 的循环——不是空壳别名。
+        """
+        now = _now_ms() if now is None else now
+        next_ms = _compute_next_run(job.schedule, now)
+        enabled = next_ms is not None
+        drop_after = next_ms is None and job.delete_after_run
+        state = JobState(next_run_at_ms=next_ms, last_run_at_ms=now)
+        claimed = await self._jobs.claim_run(job.id, job.state.to_dict(),
+                                             new_state=state.to_dict(), enabled=enabled)
+        # 两种后端返回形状不同：PG 是行/None，文件是 True/False。
+        # 只判 `is None` 会把 False 当成「领到了」——文件后端于是照样执行，
+        # 还把 next_run 留在原地，下一 tick 再跑一遍。
+        if not claimed:
+            return False                     # 别的副本 / 另一份 store 已领走这一轮
+        job.state = state
+        self.executed.append((job.id, now))
+        if self._runner:
+            result = self._runner(job)
+            if asyncio.iscoroutine(result):
+                await result
+        if drop_after:
+            await self._jobs.drop_id(job.id)
+        return True
+
+    # ---- 设计稿的方法名（R19）：与实现一一对应 ----
+
+    async def _get_next_wake_ms(self) -> int | None:
+        """所有启用任务里最早的那个 `next_run_at_ms`；没有就 None。"""
+        return await self._next_wake_ms()
+
+    def _arm_timer(self) -> None:
+        """重新排定时器：叫醒调度循环去按新的最近任务重算等待。"""
+        self._nudge()
+
+    async def _on_timer(self) -> None:
+        """到点了：执行所有到期 job，然后重新排下一次。"""
+        async with self._lock:
+            await self._fire_due(_now_ms())
+        self._arm_timer()
 
     # ---- 便捷：立即处理一批到期（测试 / 手动触发用）----
 
