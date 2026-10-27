@@ -292,20 +292,11 @@ class MakeShortVideoTool(Tool):
                 "**别把长链接直接贴成文字**，用图片语法。")
             return _json(out)
 
-        # 渲画面 → 合成音轨 → 合流 → 上传。音轨失败**不整条失败**：无声的片子仍是片子。
-        final = path = None
-        try:
-            path, res = await kernel.render(got["code"], seconds=got["total_sec"],
-                                            aspect=asp)
-        except kernel.KernelError as exc:
-            out.update(ok=False, stage=exc.stage, error=str(exc))
-            return _json(out)
-        except Exception as exc:  # noqa: BLE001
-            out.update(ok=False, stage="render", error=f"{type(exc).__name__}: {exc}")
-            return _json(out)
-
-        final = path
-        audio_name = ""
+        # 音轨先合成（旁白 concat + 配乐混音），再交给**唯一一份**渲染交付。
+        # 渲 + 合流 + 上传原来在这里、`render_short_film`、HTTP、节点里各抄了一遍，
+        # 改一处忘另一处（`media_url` 那次就是这么漏的）。现在只走
+        # `pipeline.render_and_publish`。
+        track = None
         vinfo = got.get("voice") or {}
         if vinfo.get("degraded"):
             out["voice"] = "none"
@@ -326,39 +317,38 @@ class MakeShortVideoTool(Tool):
                     total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm",
                     bgm_name=bgm)
                 out["bgm"] = (tune or {}).get("filename") or ""
-                # 音轨留在工程里：重渲时画面重做、音轨照用（旁白与镜长是一起定的）
-                audio_name = "audio.m4a"
-                shutil.copyfile(track, project.dir_of(fid) / audio_name)
-                final = vo.mux(path, track, kernel.out_dir() / f"{fid}-av.mp4")
                 out["voice"] = "ok"
                 out["voice_failed_shots"] = vinfo.get("failed") or []
                 out["voice_over_shots"] = vinfo.get("over") or []
             except Exception as exc:  # noqa: BLE001 —— 有声是加分项，不是前置条件
                 out["voice"] = "failed"
                 out["voice_error"] = f"{type(exc).__name__}: {exc}"
-                final = path
-                audio_name = ""
+                track = None
 
         try:
-            pub = await deliver.publish(final, storage=self._storage, user_id=user_id)
+            made = await pipeline.render_and_publish(
+                fid, storage=self._storage, user_id=user_id,
+                code=got["code"], track=track,
+                audio_name="audio.m4a" if track else "")
+        except kernel.KernelError as exc:
+            out.update(ok=False, stage=exc.stage, error=str(exc))
+            return _json(out)
         except Exception as exc:  # noqa: BLE001
-            out.update(ok=False, stage="save", error=f"{type(exc).__name__}: {exc}")
+            out.update(ok=False, stage="render", error=f"{type(exc).__name__}: {exc}")
             return _json(out)
 
-        project.update(fid, mp4_url=pub["url"], object_key=pub["object_key"],
-                       audio=audio_name)
-        out["mp4_url"] = pub["url"]
+        out["mp4_url"] = made["mp4_url"]
         # 成片回执要带**播放卡片契约**的两个键（2026-10-26 修）：
         #   `media_url` —— `MediaCardHook` 只认这个名字，它据此发一条 type=media 帧，
         #                  前端才渲染 `<video controls>` + 「下载成片」。
         #   `video`     —— 对象键（不是 presigned 直链），落进 qa.parts 当持久指针；
         #                  读历史时按它现签一条新链接，链接过期也不丢片子。
-        # 这条线原先只回 `mp4_url`，Hook 一个都不匹配，于是用户看到的是一串
-        # presigned 地址而不是能播的卡片（真机反馈）。两个键都要有，缺一个就残一半。
-        out["media_url"] = pub["url"]
-        out["video"] = pub["object_key"]
-        out["duration"] = round(float(got["total_sec"]), 1)
-        out["size_mb"] = round(pub["bytes"] / 1048576, 1)
+        out["media_url"] = made["mp4_url"]
+        out["video"] = made["object_key"]
+        out["duration"] = round(float(made["duration"]), 1)
+        out["size_mb"] = made["size_mb"]
+        if made.get("voice") == "ok":
+            out.setdefault("voice", "ok")
         out["render_ms"] = (kernel.describe_receipt(res).get("ms") or {}).get("render_ms")
         out["hint"] = ("成片卡片会**自动**出现在对话里（可播放、可下载）——"
                        "不要把这串 presigned 地址贴进回答，那是给程序用的，几百个字符没人看。"
@@ -600,54 +590,24 @@ class RenderShortFilmTool(Tool):
     async def execute(self, film_id: str) -> str:
         user_id, _ = _ident()
         try:
-            proj = project.load(str(film_id))
+            project.load(str(film_id))
         except FileNotFoundError as exc:
             return _json({"ok": False, "error": str(exc)})
 
-        code = (project.dir_of(film_id) / "film.tsx")
-        if not code.exists():
-            return _json({"ok": False, "error": "工程里没有 film.tsx，无法重渲"})
-        src = code.read_text(encoding="utf-8")
-
-        # 渲多长要按**这条片子实际的每镜秒数**算，不是按用户当初要的 `seconds`：
-        # 有旁白时镜长由语音决定，`seconds` 只是目标（实测要 180 秒、出来 123 秒）。
-        # 用错这个数，重渲出来会被截尾或补黑。
-        secs = [float(s) for s in proj.get("secs") or []]
-        total = round(sum(secs), 2) if secs else float(proj.get("seconds") or 30)
+        # 渲 + 合音轨 + 上传**只有一份实现**（`pipeline.render_and_publish`）：
+        # 重渲不传 track，用工程里存的那条——改一镜只该改画面，声音不该重生成一遍。
         try:
-            path, res = await kernel.render(
-                src, seconds=total,
-                aspect=kernel.norm_aspect(proj.get("aspect")))
+            made = await pipeline.render_and_publish(
+                str(film_id), storage=self._storage, user_id=user_id)
         except kernel.KernelError as exc:
             return _json({"ok": False, "stage": exc.stage, "error": str(exc),
                           "lint_errors": exc.lint_errors[:5]})
+        except FileNotFoundError as exc:
+            return _json({"ok": False, "error": str(exc)})
         except Exception as exc:  # noqa: BLE001
             return _json({"ok": False, "stage": "render",
                           "error": f"{type(exc).__name__}: {exc}"})
 
-        # 音轨照用：改一镜只该改画面，声音不该重生成一遍（旁白与镜长是一起定的）。
-        final, voice_state = path, "none"
-        audio = str(proj.get("audio") or "")
-        if audio:
-            track = project.dir_of(film_id) / audio
-            if track.exists():
-                try:
-                    from storyline_server.simple import pipeline as _pl
-
-                    vo = _pl.voice
-                    final = vo.mux(path, track, kernel.out_dir() / f"{film_id}-av.mp4")
-                    voice_state = "ok"
-                except Exception as exc:  # noqa: BLE001
-                    voice_state = f"failed: {type(exc).__name__}: {exc}"
-                    final = path
-
-        try:
-            pub = await deliver.publish(final, storage=self._storage, user_id=user_id)
-        except Exception as exc:  # noqa: BLE001
-            return _json({"ok": False, "stage": "save",
-                          "error": f"{type(exc).__name__}: {exc}"})
-
-        project.update(film_id, mp4_url=pub["url"], object_key=pub["object_key"])
         # 与 make_short_video 同一套播放卡片契约：`media_url` 给 MediaCardHook 发
         # type=media 帧（前端渲染 <video>），`video` 是对象键、落进 qa.parts 当持久
         # 指针。少了这两个键，重渲完用户只看到一串 presigned 地址——「改一镜」这条
@@ -655,13 +615,12 @@ class RenderShortFilmTool(Tool):
         return _json({
             "ok": True,
             "film_id": film_id,
-            "mp4_url": pub["url"],
-            "media_url": pub["url"],
-            "video": pub["object_key"],
-            "duration": total,
-            "size_mb": round(pub["bytes"] / 1048576, 1),
-            "voice": voice_state,
-            "render_ms": (kernel.describe_receipt(res).get("ms") or {}).get("render_ms"),
+            "mp4_url": made["mp4_url"],
+            "media_url": made["mp4_url"],
+            "video": made["object_key"],
+            "duration": made["duration"],
+            "size_mb": made["size_mb"],
+            "voice": made["voice"],
             "hint": ("成片卡片会自动出现在对话里（可播放、可下载）——"
                      "不要把 presigned 地址贴进回答。"),
         })

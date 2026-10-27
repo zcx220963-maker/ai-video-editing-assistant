@@ -41,7 +41,7 @@ from typing import Any
 
 from agent_framework.orchestration import BaseNode, NodeState
 
-from ..simple import deliver, kernel, project, showrunner
+from ..simple import deliver, kernel, pipeline, project, showrunner
 from .core_nodes import _obj
 
 #: 每镜抽帧比例（与 `showrunner.JUDGE_ROUNDS` 一起决定质检成本）。
@@ -232,49 +232,15 @@ class RenderShortFilmNode(_ShortFilmNode):
         if not film_id:
             raise ValueError("没有工程：先调 write_short_shots，或传 film_id")
         proj = project.load(film_id)
-
-        src_path = project.dir_of(film_id) / "film.tsx"
-        if not src_path.exists():
-            raise ValueError(f"工程 {film_id} 里没有 film.tsx，无法渲染")
-        src = src_path.read_text(encoding="utf-8")
-
-        # 渲多长按**这条片子实际的每镜秒数**算，不是按用户当初要的 seconds：
-        # 有旁白时镜长由语音决定，seconds 只是目标。用错这个数会截尾或补黑。
-        secs = [float(s) for s in proj.get("secs") or []]
-        total = round(sum(secs), 2) if secs else float(proj.get("seconds") or 30)
-        aspect = kernel.norm_aspect(proj.get("aspect"))
-
-        path, _res = await kernel.render(src, seconds=total, aspect=aspect)
-
-        # 音轨照用：画面重渲不该重生成旁白（旁白与镜长是一起定的）。
-        final, voice_state = path, "none"
-        audio = str(proj.get("audio") or "")
-        if audio:
-            track = project.dir_of(film_id) / audio
-            if track.exists():
-                from ..simple import voice as vo
-
-                final = vo.mux(path, track, kernel.out_dir() / f"{film_id}-av.mp4")
-                voice_state = "ok"
-
-        pub = await deliver.publish(final, storage=self.storage, user_id=user_id)
-        project.update(film_id, mp4_url=pub["url"], object_key=pub["object_key"])
+        # 渲 + 合音轨 + 上传**只有一份实现**（`pipeline.render_and_publish`）：
+        # 这段原来在 HTTP、原生工具、节点里各抄了一遍，改一处忘另一处。
+        got = await pipeline.render_and_publish(
+            film_id, storage=self.storage, user_id=user_id)
         return {
-            "mp4_url": pub["url"],
-            "object_key": pub["object_key"],
-            "film_id": film_id,
+            **got,
             "title": str((proj.get("plan") or {}).get("title") or ""),
-            "duration": total,
-            "shots": len(secs),
-            "voice": voice_state,
-            "size_mb": round(pub["bytes"] / 1048576, 1),
-            "__model_view__": {
-                "film_id": film_id,
-                "duration": total,
-                "shots": len(secs),
-                "voice": voice_state,
-                "size_mb": round(pub["bytes"] / 1048576, 1),
-            },
+            "__model_view__": {k: got[k] for k in
+                               ("film_id", "duration", "shots", "voice", "size_mb")},
         }
 
 

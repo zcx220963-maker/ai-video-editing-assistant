@@ -160,21 +160,12 @@ async def _run_film(job: dict[str, Any], *, storage: Any) -> None:
                        error=(f"{len(_b)}/{got['shots']} 镜是空帧或全黑，已停止渲染。"
                               f"镜号：{_b[:12]}。工程与 tsx 已存，重画这些镜即可。"))
             return
-        item = {"index": 0, "code": got["code"]}
         job["status"] = "rendering"
         job["stage"] = "render"
         t0 = time.time()
-        try:
-            path, res = await kernel.render(
-                item["code"], seconds=got["total_sec"], aspect=job["aspect"])
-        except KernelError as exc:
-            job.update(status="failed", stage=exc.stage, error=str(exc),
-                       lint_errors=exc.lint_errors)
-            return
 
-        # 音轨：旁白 → 加配乐（曲库）→ 存进工程 → 与画面合流。
-        # 失败不整条失败（无声仍是片子）。
-        audio_name = ""
+        # 音轨：旁白 → 加配乐（曲库）→ 交给统一渲染交付。失败不整条失败（无声仍是片子）。
+        track = None
         vinfo = got.get("voice") or {}
         if vinfo and not vinfo.get("degraded"):
             try:
@@ -193,36 +184,35 @@ async def _run_film(job: dict[str, Any], *, storage: Any) -> None:
                     total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm",
                     bgm_name=job.get("bgm") or "")
                 job["bgm"] = (tune or {}).get("filename") or ""
-                audio_name = "audio.m4a"
-                import shutil
-                shutil.copyfile(track, project.dir_of(job["id"]) / audio_name)
-                path = vo.mux(path, track, kernel.out_dir() / f"{job['id']}-av.mp4")
                 job["voice"] = "ok"
             except Exception as exc:  # noqa: BLE001
                 job["voice"] = f"failed: {type(exc).__name__}: {exc}"
+                track = None
         else:
             job["voice"] = "none"
 
+        # 渲 + 合流 + 上传**只有一份实现**（`pipeline.render_and_publish`）：
+        # 这段原来在 HTTP、原生工具、节点里各抄了一遍，改一处忘另一处。
         job["stage"] = "save"
         try:
-            from storyline_server.simple import deliver
-            pub = await deliver.publish(path, storage=storage, user_id=job["user_id"])
+            made = await pipeline.render_and_publish(
+                job["id"], storage=storage, user_id=job["user_id"],
+                code=got["code"], track=track,
+                audio_name="audio.m4a" if track else "")
+        except KernelError as exc:
+            job.update(status="failed", stage=exc.stage, error=str(exc),
+                       lint_errors=exc.lint_errors)
+            return
         except Exception as exc:  # noqa: BLE001
             job.update(status="failed", stage="save",
-                       error=f"成片存不进对象存储：{type(exc).__name__}: {exc}；"
-                             f"本地文件在 {path}")
+                       error=f"成片存不进对象存储：{type(exc).__name__}: {exc}")
             return
 
-        receipt = kernel.describe_receipt(res)
-        job.update(status="done", stage="done", mp4_url=pub["url"],
-                   object_key=pub["object_key"], receipt=receipt,
+        receipt = {"ms": {"render_ms": made.get("render_ms")}}
+        job.update(status="done", stage="done", mp4_url=made["mp4_url"],
+                   object_key=made["object_key"], receipt=receipt,
                    ms={**receipt.get("ms", {}),
                        "total_ms": int((time.time() - t0) * 1000)})
-        try:
-            project.update(job["id"], mp4_url=pub["url"], object_key=pub["object_key"],
-                           audio=audio_name)
-        except (OSError, FileNotFoundError):
-            pass
 
 
 async def _run_draft(job: dict[str, Any], *, storage: Any) -> None:
@@ -263,9 +253,12 @@ async def _render(job: dict[str, Any], item: dict[str, Any], *, storage: Any) ->
     job["status"] = "rendering"
     job["stage"] = "render"
     t0 = time.time()
+    # 候选渲染也走同一份「渲 + 上传」（`pipeline.render_code_and_publish`）：
+    # 它不落工程，所以用按代码那一层，不用按工程那一层。
     try:
-        path, res = await kernel.render(
-            item["code"], seconds=job["seconds"], aspect=job["aspect"])
+        made = await pipeline.render_code_and_publish(
+            item["code"], seconds=job["seconds"], aspect=job["aspect"],
+            storage=storage, user_id=job["user_id"], key=job["id"])
     except KernelError as exc:
         job.update(status="failed", stage=exc.stage, error=str(exc),
                    lint_errors=exc.lint_errors)
@@ -274,20 +267,9 @@ async def _render(job: dict[str, Any], item: dict[str, Any], *, storage: Any) ->
         job.update(status="failed", stage="render", error=f"{type(exc).__name__}: {exc}")
         return
 
-    job["stage"] = "save"
-    try:
-        from storyline_server.simple import deliver
-        got = await deliver.publish(path, storage=storage, user_id=job["user_id"])
-    except Exception as exc:  # noqa: BLE001
-        # 存不进对象存储时，本地文件还在——把路径交出去，至少不丢东西。
-        job.update(status="failed", stage="save",
-                   error=f"成片存不进对象存储：{type(exc).__name__}: {exc}；"
-                         f"本地文件在 {path}")
-        return
-
-    receipt = kernel.describe_receipt(res)
-    job.update(status="done", stage="done", mp4_url=got["url"],
-               object_key=got["object_key"], chosen=int(item["index"]),
+    receipt = {"ms": {"render_ms": made.get("render_ms")}}
+    job.update(status="done", stage="done", mp4_url=made["mp4_url"],
+               object_key=made["object_key"], chosen=int(item["index"]),
                receipt=receipt,
                ms={**receipt.get("ms", {}),
                    "total_ms": int((time.time() - t0) * 1000)})
