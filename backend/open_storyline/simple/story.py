@@ -97,8 +97,9 @@ async def write_scene_story_code(scene: dict[str, Any], *, index: int, total: in
            + (caption.drawn_brief(scene) if cap["mode"] == "drawn" else
               f"（这一镜的字幕是「{text}」——"
               f"**不要把它画进画面**，字幕由外层统一加。）\n")
-           + (f"**全片贯穿的一件东西**：{motif}。这一镜里它也要出现，"
-              f"大小/位置/明暗和别的镜不同（很小的一处也算；它是让十几镜连成一部片子的那根线）。\n"
+           + (f"**全片贯穿的一件东西**：{motif}。这一镜里**有它就画、没有就写 "
+              f"`MOTIF_AT = null`**——不必每镜都有，二十镜里有五六镜出现就够连成一部片子了；"
+              f"每镜都出现会变成「一个光一直在画面里」。有它的时候大小/位置/明暗和别的镜不同。\n"
               if motif and index >= 2 else "")
            + "\n**输出的第一行必须是这一句**（位置用归一化坐标 0~1，r 是半径占宽度比例）：\n"
              "`const MOTIF_AT = { x: <0~1>, y: <0~1>, r: <0.02~0.3> };`\n"
