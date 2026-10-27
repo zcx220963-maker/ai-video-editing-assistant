@@ -29,19 +29,19 @@ sys.stdout.reconfigure(encoding="utf-8")
 from agent_framework.orchestration import ArtifactStore, Interceptor, NodeState
 from agent_framework.storage import build_storage, new_id, ref_key, to_ref
 from agent_framework.storage.media import kind_of, mime_of, probe as probe_meta
-from storyline_server import mediaops
-from storyline_server.nodes.core_nodes import (
+from open_storyline import mediaops
+from open_storyline.nodes.core_nodes import (
     _parse_caption_list,
 
     build_real_registry,
     load_templates,
 )
-from storyline_server.providers import (
+from open_storyline.providers import (
     ProviderError,
     _filter_asr_hallucinations,
     build_providers,
 )
-from storyline_server.settings import Settings
+from open_storyline.settings import Settings
 
 FAILS = 0
 

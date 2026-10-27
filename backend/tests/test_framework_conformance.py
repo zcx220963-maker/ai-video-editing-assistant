@@ -105,12 +105,12 @@ async def main() -> None:
         check("dag_contract" in srv.get("available_nodes", []), f"R16 {name} 白名单缺 dag_contract")
 
     # ---- R18 simple 收口 ----
-    pipeline = BACKEND / "storyline_server" / "simple" / "pipeline.py"
+    pipeline = BACKEND / "open_storyline" / "simple" / "pipeline.py"
     check(pipeline.exists(), "R18 缺 simple/pipeline.py")
-    check((BACKEND / "storyline_server" / "nodes" / "simple_nodes.py").exists(),
+    check((BACKEND / "open_storyline" / "nodes" / "simple_nodes.py").exists(),
           "R18 缺 simple_nodes.py")
     sv = src("agent_framework/tools/short_video.py")
-    check("storyline_server.simple import" not in sv.replace("from storyline_server.simple import", ""),
+    check("open_storyline.simple import" not in sv.replace("from open_storyline.simple import", ""),
           "R18 short_video 仍直连 simple 子模块")
     for name in ("make_short_video", "plan_short_film", "reshoot_shot",
                  "render_short_film", "export_film", "list_short_films"):

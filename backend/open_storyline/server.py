@@ -6,7 +6,7 @@
 - 请求进入后先解析 session 身份（X-Storyline-Session-Id 头，缺省回落参数/默认会话），
   从 artifacts 表重建该会话的 Store（进程重启也能续上），再交给**服务端 Interceptor**
   ——即 agent_framework.orchestration.Interceptor——按 required_nodes 递归补齐依赖。
-- 运行：python -m storyline_server.server --config examples/storyline/config.toml
+- 运行：python -m open_storyline.server --config examples/storyline/config.toml
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ VOICE_PREVIEW_TEXT = "这是一段试听，用来比较不同音色朗读中文�
 
 #: 音色名的合规形状（与 `code_spec._VOICE_RE` 同一个形状）。这里再写一次而不是 import
 #: 那一份：那一份是**契约层**的（决定什么能进 spec），这一份是**试听口**的输入校验，
-#: 两者约束的是不同的东西，合并不划算。形状一致由 tests/test_storyline_server.py 断言。
+#: 两者约束的是不同的东西，合并不划算。形状一致由 tests/test_open_storyline.py 断言。
 _VOICE_RE = re.compile(r"^[a-z]{2}(-[A-Za-z]{2,})?-[A-Za-z]+Neural$")
 
 

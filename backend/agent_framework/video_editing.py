@@ -99,7 +99,7 @@ class CorrectTranscriptNode(BaseNode):
     require_explicit_call = True
 
     async def process(self, state, inputs):
-        # 与真节点同形状（storyline_server/nodes/core_nodes.py CorrectTranscriptNode）：
+        # 与真节点同形状（open_storyline/nodes/core_nodes.py CorrectTranscriptNode）：
         # 只换 text，id/clip/时间逐字保留；mock 不复制「可疑段」那套启发式，交空清单并写明。
         segs = inputs["asr"]["asr_segments"]
         corrections = inputs.get("corrections")
@@ -292,7 +292,7 @@ class RenderVideoNode(BaseNode):
     required_nodes = ["plan_timeline"]
 
     async def process(self, state, inputs):
-        # 与真节点（storyline_server/nodes/core_nodes.py RenderVideoNode）同形状的产物契约：
+        # 与真节点（open_storyline/nodes/core_nodes.py RenderVideoNode）同形状的产物契约：
         # 键集合必须一致，MediaCardHook 才能在「Storyline 连不上、走本地 mock 兜底」这条路上
         # 也捕获到 media_url 并投出可播卡片。但仍 strictly mock：不落盘、不写 MinIO——
         # video 用与会话产物作用域一致的对象键（渲染真发生时该键才承载字节），
@@ -329,7 +329,7 @@ class RenderWebNode(BaseNode):
     required_nodes = []
 
     async def process(self, state, inputs):
-        # 与真节点（storyline_server/nodes/web_nodes.py RenderWebNode）同形状的产物契约:
+        # 与真节点（open_storyline/nodes/web_nodes.py RenderWebNode）同形状的产物契约:
         # video 对象键 + duration/width/height/title + media_url。strictly mock:
         # 不截帧、不合成——离线只验「模型选了这条独立终点路径后拿到的是成片卡形状」。
         artifact = state.artifact_id or "_default"
@@ -352,7 +352,7 @@ class PlanMotionNode(BaseNode):
     required_nodes: list[str] = []
 
     async def process(self, state, inputs):
-        # 与真节点（storyline_server/nodes/motion_plan.py）同形状：motion_spec 是
+        # 与真节点（open_storyline/nodes/motion_plan.py）同形状：motion_spec 是
         # render_motion_code 的唯一入参来源。strictly mock——不跑校验器与估算，
         # 离线只验「分镜 → 出片」这两步在编排层是按依赖串起来的。
         spec = inputs.get("spec") or {}
@@ -374,7 +374,7 @@ class RenderCodeMotionVideoNode(BaseNode):
     required_nodes: list[str] = []
 
     async def process(self, state, inputs):
-        # 与真节点（storyline_server/nodes/motion_code_nodes.py）同形状的产物契约：
+        # 与真节点（open_storyline/nodes/motion_code_nodes.py）同形状的产物契约：
         # strictly mock——不连渲染容器、不跑 TTS、不烧像素，离线只验「模型选了这条独立
         # 终点路径后拿到的是同一张成片卡形状」，以及它在编排层/白名单里**与真注册表同名同
         # DAG**（少这一份 mock，mock 侧就少一个真注册表有的工具，对账只能靠人记）。
@@ -408,7 +408,7 @@ class PatchCodeMotionVideoNode(BaseNode):
     require_explicit_call = True
 
     async def process(self, state, inputs):
-        # 与真节点（storyline_server/nodes/motion_code_nodes.py PatchCodeMotionVideoNode）
+        # 与真节点（open_storyline/nodes/motion_code_nodes.py PatchCodeMotionVideoNode）
         # 同形状：strictly mock——不读编辑包、不复跑闸①、不烧像素，离线只验「代码镜链的
         # 局部改也在白名单里、且与真注册表**同名同 DAG**」（少这一份 mock，
         # mock 侧就少一个真注册表有的工具，对账只能靠人记）。
@@ -440,7 +440,7 @@ class PatchVideoNode(BaseNode):
     require_explicit_call = True
 
     async def process(self, state, inputs):
-        # 与真节点（storyline_server/nodes/core_nodes.py PatchVideoNode）同形状：
+        # 与真节点（open_storyline/nodes/core_nodes.py PatchVideoNode）同形状：
         # strictly mock——不读编辑包、不验指纹、不烧像素，离线只验「口播链的局部改也在白名单里、
         # 且不会被拦截器当成 render_video 的下游自动补齐」。
         artifact = state.artifact_id or "_default"
@@ -458,7 +458,7 @@ class PatchVideoNode(BaseNode):
 
 
 class SimpleFilmNode(BaseNode):
-    """离线替身：真节点在 `storyline_server/nodes/simple_nodes.py`（R18）。
+    """离线替身：真节点在 `open_storyline/nodes/simple_nodes.py`（R18）。
 
     离线测试不连 Remotion、不跑模型，所以这里只回一份同形状的产物；
     `test_video_editing.py` 用「白名单 ↔ 本地 mock 一一对应」守住两边不漂。
@@ -632,7 +632,7 @@ def storyline_available_nodes(cfg: dict[str, Any]) -> list[str]:
     return list(cfg.get("local_mcp_server", {}).get("available_nodes", []))
 
 
-def storyline_server_url(cfg: dict[str, Any]) -> str:
+def open_storyline_url(cfg: dict[str, Any]) -> str:
     s = cfg.get("local_mcp_server", {})
     scheme = s.get("url_scheme", "http")
     host = s.get("connect_host", "127.0.0.1")

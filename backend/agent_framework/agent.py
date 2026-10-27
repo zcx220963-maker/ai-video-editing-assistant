@@ -1034,7 +1034,7 @@ def _style_content_bits(items: Any) -> str:
     """零件内容清单 → 一句话；`values` 是能传的字面量，`reference` 只是参考片叫法。
 
     与 `shot_writer` 里那段同口径（两处都直接写进模型提示词，没有共享模块可以放：
-    `storyline_server/motion/*` 刻意不依赖 `agent_framework`）。
+    `open_storyline/motion/*` 刻意不依赖 `agent_framework`）。
     """
     bits: list[str] = []
     for c in (items or []):

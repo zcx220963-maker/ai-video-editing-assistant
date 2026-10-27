@@ -84,7 +84,7 @@ from .video_editing import (
     register_editing_tools,
     load_storyline_config,
     storyline_available_nodes,
-    storyline_server_url,
+    open_storyline_url,
     validate_dag,
 )
 from .editing_agent import (
@@ -270,7 +270,7 @@ __all__ = [
     "register_editing_tools",
     "load_storyline_config",
     "storyline_available_nodes",
-    "storyline_server_url",
+    "open_storyline_url",
     "validate_dag",
     "build_editing_agent",
     "plan_team_from_dag",

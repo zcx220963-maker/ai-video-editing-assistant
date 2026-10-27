@@ -79,7 +79,7 @@ FIVE_COLUMNS = ("subjects", "subject_share", "text_share", "grid_text", "grid_dr
 
 #: 帧通道的模块与入口（T31 的交付件）。名字写在这里而不是散在调用点：探测与调用必须问
 #: 同一个名字，否则会出现「探测说在、调用说没有」这种最难查的形状。
-FRAME_CHANNEL_MODULE = "storyline_server.motion.judge_channel"
+FRAME_CHANNEL_MODULE = "open_storyline.motion.judge_channel"
 FRAME_CHANNEL_ENTRY = "judge_frame"
 
 #: ⑲-b 的词族栏名（T31 往 schema 里加的镜级栏）。**今天它不在 schema 里**

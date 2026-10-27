@@ -39,7 +39,7 @@ def src(rel: str) -> str:
 
 def main() -> None:
     # ---- 1. pipeline 是唯一入口，且导出契约字段 ----
-    pipeline = BACKEND / "storyline_server" / "simple" / "pipeline.py"
+    pipeline = BACKEND / "open_storyline" / "simple" / "pipeline.py"
     check(pipeline.exists(), "存在 simple/pipeline.py")
     text = pipeline.read_text(encoding="utf-8")
     for name in ("def run(", "def receipt(", "OUTPUT_FIELDS"):
@@ -49,9 +49,9 @@ def main() -> None:
     tree = ast.parse(src("agent_framework/tools/short_video.py"))
     direct = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("storyline_server.simple"):
-            # 只允许 `from storyline_server.simple import pipeline`
-            if node.module == "storyline_server.simple":
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("open_storyline.simple"):
+            # 只允许 `from open_storyline.simple import pipeline`
+            if node.module == "open_storyline.simple":
                 names = {a.name for a in node.names}
                 if names - {"pipeline"}:
                     direct.append(sorted(names - {"pipeline"}))
@@ -69,7 +69,7 @@ def main() -> None:
     # 2026-10-27：原来这里只有一个黑盒 `simple_film`（内部调 pipeline.run 干完全程），
     # 设计 §21「流程原子化」没做到（差距登记在 §13 X1）。现在拆成
     # plan → write → render 三个节点，依赖用 required_nodes 声明。
-    from storyline_server.nodes.simple_nodes import (
+    from open_storyline.nodes.simple_nodes import (
         PlanShortFilmNode, RenderShortFilmNode, WriteShortShotsNode)
 
     check(PlanShortFilmNode.name == "plan_short_film", "分镜节点名 plan_short_film")
@@ -86,7 +86,7 @@ def main() -> None:
           "mp4_url 是 ephemeral：会过期的直链不进共享库")
 
     # ---- 4b. 渲染是分钟级，必须登记进 LONG_RUNNING_NODES ----
-    from storyline_server.server import LONG_RUNNING_NODES
+    from open_storyline.server import LONG_RUNNING_NODES
 
     check("render_short_film" in LONG_RUNNING_NODES,
           "render_short_film 在 LONG_RUNNING_NODES（走提交+轮询，不让一次往返等一部片子）")
@@ -110,8 +110,8 @@ def main() -> None:
 
     # ---- 6. HTTP 快线也走 pipeline ----
     api = src("agent_framework/simple_api.py")
-    check("from storyline_server.simple import pipeline" in api, "simple_api 从 pipeline 取能力")
-    check("from storyline_server.simple import film" not in api, "simple_api 不再直连 film 子模块")
+    check("from open_storyline.simple import pipeline" in api, "simple_api 从 pipeline 取能力")
+    check("from open_storyline.simple import film" not in api, "simple_api 不再直连 film 子模块")
 
     print(f"\n{_pass} 通过 / {_fail} 失败")
     if _fail:

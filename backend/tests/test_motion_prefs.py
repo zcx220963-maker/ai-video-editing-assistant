@@ -28,7 +28,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from agent_framework import motion_prefs as mp
 from agent_framework.render_gate import MOTION_KNOBS, MOTION_NODE
-from storyline_server.motion import code_spec as cs
+from open_storyline.motion import code_spec as cs
 
 _checks = 0
 _fails = 0

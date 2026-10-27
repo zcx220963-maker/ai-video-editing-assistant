@@ -35,8 +35,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 from agent_framework.orchestration import ArtifactStore, Interceptor, NodeState
 from agent_framework.storage import build_storage, new_id, ref_key, to_ref
 from agent_framework.storage.media import kind_of, mime_of, probe as probe_meta
-from storyline_server import mediaops
-from storyline_server.nodes.core_nodes import (
+from open_storyline import mediaops
+from open_storyline.nodes.core_nodes import (
     _find_font,
     _localize_timeline,
     _overlay_layers,
@@ -46,8 +46,8 @@ from storyline_server.nodes.core_nodes import (
     _subtitle_layers,
     build_real_registry,
 )
-from storyline_server.providers import build_providers
-from storyline_server.settings import Settings
+from open_storyline.providers import build_providers
+from open_storyline.settings import Settings
 
 FAILS = 0
 

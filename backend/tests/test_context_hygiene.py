@@ -82,7 +82,7 @@ def case_ledger_exists() -> None:
     实现前 `context_ledger` 在四个目录零命中（§5.4 的原话），所以这支那时必红。
     """
     print("\n① 账面排在代码里（`context_ledger` 四目录零命中 → 先红）")
-    hits = [p for d in ("agent_framework", "storyline_server", "tests")
+    hits = [p for d in ("agent_framework", "open_storyline", "tests")
             for p in (ROOT / d).rglob("*.py") if "context_ledger" in p.read_text(encoding="utf-8")]
     check((ROOT / "agent_framework" / "context.py") in hits,
           f"装配出口产 `context_ledger`（命中 {len(hits)} 个文件）")

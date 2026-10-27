@@ -1,4 +1,4 @@
-"""字幕样张（`storyline_server/motion/caption_preview.py`）——预览就是成片那一条链。
+"""字幕样张（`open_storyline/motion/caption_preview.py`）——预览就是成片那一条链。
 
 用户的诉求原话是「字幕类型也要支持预览啊，不然渲染完才知道什么样」。这一节守的正是
 那句「预览＝成片」，而不是「画得像」：
@@ -32,8 +32,8 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 from agent_framework.storage import build_storage
-from storyline_server.motion import caption_preview as cp
-from storyline_server.motion import code_spec as cs
+from open_storyline.motion import caption_preview as cp
+from open_storyline.motion import code_spec as cs
 
 _checks = 0
 _fails = 0

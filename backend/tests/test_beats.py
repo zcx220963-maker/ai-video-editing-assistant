@@ -11,8 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from storyline_server import mediaops                       # noqa: E402
-from storyline_server.motion import beats as bt             # noqa: E402
+from open_storyline import mediaops                       # noqa: E402
+from open_storyline.motion import beats as bt             # noqa: E402
 
 WORK = Path(__file__).resolve().parents[1] / ".tmp" / "beats_work"
 _checks = 0

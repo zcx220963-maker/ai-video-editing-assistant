@@ -35,7 +35,7 @@ from pathlib import Path
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.motion import code_spec as cs
+from open_storyline.motion import code_spec as cs
 
 _checks = 0
 _fails = 0

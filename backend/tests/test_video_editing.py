@@ -26,7 +26,7 @@ from agent_framework.video_editing import (
     build_node_registry,
     load_storyline_config,
     storyline_available_nodes,
-    storyline_server_url,
+    open_storyline_url,
     validate_dag,
 )
 from agent_framework.orchestration import NodeState
@@ -104,7 +104,7 @@ async def main() -> None:
     cfg = load_storyline_config(EXAMPLES / "storyline" / "config.toml")
     allowed = storyline_available_nodes(cfg)
     check("load_media" in allowed and "render_video" in allowed, "TOML 白名单含首尾节点")
-    check(storyline_server_url(cfg) == "http://127.0.0.1:8001/mcp", f"服务地址拼接：{storyline_server_url(cfg)}")
+    check(open_storyline_url(cfg) == "http://127.0.0.1:8001/mcp", f"服务地址拼接：{open_storyline_url(cfg)}")
     subset = build_node_registry(allowed=allowed)
     # 白名单里有两类名字**不该**在本地 mock 里出现，各自有各自的原因：
     #   控制面四件（读历史、轮询渲染、试听音色、看字幕样式样张）在服务端实现，

@@ -26,7 +26,7 @@ import sys as _s  # noqa: E402
 if hasattr(_s.stdout, "reconfigure"):
     _s.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.nodes.core_nodes import _build_original_timeline  # noqa: E402
+from open_storyline.nodes.core_nodes import _build_original_timeline  # noqa: E402
 
 _fails = 0
 _checks = 0
@@ -131,7 +131,7 @@ def main() -> int:
     # 它按「句子的镜头时间码」切画面、按「ASR 音频时间码」排声音，两套轴不重合，
     # 每个出镜段偏移各不相同（实测 −4.07 / +1.90 / −33.97 / +6.41 / −14.01 秒…）。
     # 修 builder 修不了这条路，所以渲染前必须再校准一次。
-    from storyline_server.nodes.core_nodes import (  # noqa: PLC0415
+    from open_storyline.nodes.core_nodes import (  # noqa: PLC0415
         resync_original_audio_timeline,
     )
 
@@ -177,7 +177,7 @@ def main() -> int:
     print("\n=== ⑥ 渲染前的同步闸：认不出的错位不许静默出片 ===")
     # 校准只**修**它认得出的；闸门负责**拦**它认不出的。缺这道闸，模型换一种写法
     # （真机烧了六次 40 轮预算那句「严格音画同步」）就能带着错位出片还自称同步。
-    from storyline_server.nodes.core_nodes import av_sync_check  # noqa: PLC0415
+    from open_storyline.nodes.core_nodes import av_sync_check  # noqa: PLC0415
 
     mis = copy.deepcopy(hand_misaligned)
     worst0, bad0 = av_sync_check(mis)
@@ -219,7 +219,7 @@ def main() -> int:
           f"builder 正常产物放行（最大偏差 {worst_b:.3f}s）")
 
     print("\n=== ⑦ 成片指纹：把「实际渲染的那一版」记进产物 ===")
-    from storyline_server.nodes.core_nodes import timeline_digest  # noqa: PLC0415
+    from open_storyline.nodes.core_nodes import timeline_digest  # noqa: PLC0415
 
     d1 = timeline_digest(tl, max_drift=worst_b, resynced=0)
     d2 = timeline_digest(tl, max_drift=worst_b, resynced=0)
@@ -233,7 +233,7 @@ def main() -> int:
           "最大偏差与校准段数入账（以后能核对，不用猜）")
 
     print("\n=== ⑧ 覆盖层锚点：盖画面认「哪句话」，不认手写的秒 ===")
-    from storyline_server.nodes.core_nodes import (  # noqa: PLC0415
+    from open_storyline.nodes.core_nodes import (  # noqa: PLC0415
         resolve_overlay_anchors,
     )
 

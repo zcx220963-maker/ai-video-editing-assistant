@@ -31,8 +31,8 @@ if __name__ != "__main__":
     import pytest
     pytest.skip("整份执行的独立脚本，仅 __main__ 下跑检查", allow_module_level=True)
 
-from storyline_server import timeline_edit as te            # noqa: E402
-from storyline_server.nodes.core_nodes import (             # noqa: E402
+from open_storyline import timeline_edit as te            # noqa: E402
+from open_storyline.nodes.core_nodes import (             # noqa: E402
     _fade_index_map, assign_segment_ids,
 )
 
@@ -557,7 +557,7 @@ check(te.subtitle_font_size(low, low["subtitles"][0]) == 200.0
 # ⑩ 手改段：同步闸与渲染前校准都要让路，并且这笔账要露出来（B6）
 # ---------------------------------------------------------------------------
 
-from storyline_server.nodes.core_nodes import (             # noqa: E402
+from open_storyline.nodes.core_nodes import (             # noqa: E402
     av_sync_check, evidence_ledger, manual_sync_notes,
     render_plan, resync_original_audio_timeline)
 

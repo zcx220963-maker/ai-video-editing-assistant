@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from storyline_server.simple import (  # noqa: E402
+from open_storyline.simple import (  # noqa: E402
     caption as cap_mod, film, morph, qa, scene, story, system, table as table_mod)
 
 _CHECKS = 0
@@ -201,7 +201,7 @@ def main() -> int:
           "空组件指纹全 0（不会因为没画东西而「看起来不同」）")
 
     print("\n⑨ 反屎山：出图通道已删，别再加回来")
-    simple_dir = Path(__file__).resolve().parents[1] / "storyline_server" / "simple"
+    simple_dir = Path(__file__).resolve().parents[1] / "open_storyline" / "simple"
     check(not (simple_dir / "plate.py").exists(),
           "`simple/plate.py` 不存在（那是误判「参考片是 AI 插画」时写的废代码）")
     check("Plate" not in system.SYSTEM_TSX,

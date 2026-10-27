@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.motion import code_render as cr   # noqa: E402
+from open_storyline.motion import code_render as cr   # noqa: E402
 
 _fails = 0
 _checks = 0
@@ -266,7 +266,7 @@ def main() -> int:
     miss = {"layout_warnings", "layout_unscanned"} - set(plan_support.OUTPUT_FIELD_NAMES)
     check(not miss,
           f"模型侧白名单收得下这两个键（缺 {sorted(miss)} 就是假告警：账上有、模型看不见）")
-    client = (BACKEND / "storyline_server" / "motion" / "remotion_client.py").read_text(encoding="utf-8")
+    client = (BACKEND / "open_storyline" / "motion" / "remotion_client.py").read_text(encoding="utf-8")
     check("layout_used" in client, "client 的响应契约里点名 layout_used（漏字段=静默 missing）")
     # 2026-10-25：原「节点层用同一份措辞」那条删了——它读 `nodes/motion_code_nodes.py`，
     # 而那个节点随图形科普链一起退役了。措辞的单源性仍由 `remotion_client` 那一侧守着。

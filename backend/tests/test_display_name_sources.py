@@ -49,7 +49,7 @@ from agent_framework.tools.mcp import MCPTool, register_mcp_tools
 from agent_framework.tools.runs import register_run_tools
 from agent_framework.tools.web import register_web_tools
 from agent_framework.orchestration import BaseNode, NodeState
-from storyline_server.nodes import core_nodes
+from open_storyline.nodes import core_nodes
 
 _checks = 0
 _fails = 0
@@ -97,7 +97,7 @@ def case_nodes() -> None:
     check(_Probe(display_name="探针节点").display_name == "探针节点",
           "display_name 可按实例覆盖")
     # 节点工具注册通路：title=node.display_name（源码级钉，避免起真服务）
-    src = (_Path(__file__).resolve().parent.parent / "storyline_server" / "server.py"
+    src = (_Path(__file__).resolve().parent.parent / "open_storyline" / "server.py"
            ).read_text(encoding="utf-8")
     check("title=node.display_name" in src,
           "Storyline 把节点中文名放进 MCP 的 title 字段")

@@ -8,7 +8,7 @@
    落进本轮 assistant 行的 ``qa.parts``（新增 type=media 片段）——刷新前这条链接已在库里；
 ② GET /convs/{id}/messages 读历史时把这条链接重放成与**实时 WS media 帧同形**的播放卡
    （media_url 现签、title/duration 随附），前端复用同一张卡片组件即可渲染；
-③ mock RenderVideoNode 的产物键集合与真节点（storyline_server/nodes/core_nodes.py
+③ mock RenderVideoNode 的产物键集合与真节点（open_storyline/nodes/core_nodes.py
    RenderVideoNode.process 返回的 video/media_url/duration/width/height/title）对齐，
    兜底路径也能产「形状正确」的可播卡片。
 外加一条回归：无渲染的普通轮次不回放进片卡，且跨轮 contextvar 残留会被 user 行清干净。
@@ -46,7 +46,7 @@ from agent_framework.storage import build_storage
 from agent_framework.tool import ToolRegistry
 from agent_framework.video_editing import build_agent_registry, build_node_registry
 
-# 真节点成片产物的**文档契约键**（对齐 storyline_server/nodes/core_nodes.py:1146-1151）。
+# 真节点成片产物的**文档契约键**（对齐 open_storyline/nodes/core_nodes.py:1146-1151）。
 REAL_NODE_CONTRACT_KEYS = {"video", "media_url", "duration", "width", "height", "title"}
 
 _checks = 0

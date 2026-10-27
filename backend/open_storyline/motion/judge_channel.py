@@ -2,7 +2,7 @@
 """T31 帧通道 + 层 D2 静帧审美评审：让「判断模型」看得见画面。
 
 **它填的是哪一个洞。** 闸㉖ 回看环（``review_loop.py``）从落地那天起就把
-``FRAME_CHANNEL_MODULE = "storyline_server.motion.judge_channel"`` 与
+``FRAME_CHANNEL_MODULE = "open_storyline.motion.judge_channel"`` 与
 ``FRAME_CHANNEL_ENTRY = "judge_frame"`` 写死在常量里，然后**探它**。探不到时的行为是
 Q113 那条——``undetermined`` **并阻断出片**。所以这个模块缺席的表现不是「少一个功能」，
 是**每一片有红镜的片子都出不来**。本模块把那个洞堵上。
@@ -55,7 +55,7 @@ GATE = "26"
 
 #: 本模块自己的名字与入口。``review_loop`` 的常量与这里**必须**逐字相等，
 #: ``test_motion_judge_channel.py`` ① 按此断言（探测问的名字 = 模块自己的名字）。
-MODULE_NAME = "storyline_server.motion.judge_channel"
+MODULE_NAME = "open_storyline.motion.judge_channel"
 ENTRY_NAME = "judge_frame"
 
 #: 判据正文（相对技能目录）。``aesthetic-rules.md`` 给 Q 组编号与规则句，

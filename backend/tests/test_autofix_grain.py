@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.motion.code_spec import (  # noqa: E402
+from open_storyline.motion.code_spec import (  # noqa: E402
     _grain_fix_code, autofix_film_grain,
 )
 

@@ -39,11 +39,11 @@ def check(cond: bool, label: str) -> None:
 def normalize(raw_custom):
     """直接调用生产代码里的归一函数。
 
-    不做「测试与生产各写一份」：从 storyline_server 里 import 同一个函数。
+    不做「测试与生产各写一份」：从 open_storyline 里 import 同一个函数。
     曾经试过用 inspect 抠 process 的源码片段再 exec——那既脆（缩进/结构一变就炸）
     又正是漂移的来源，所以改成把逻辑提成模块级函数、两边共用。
     """
-    from storyline_server.nodes.core_nodes import normalize_custom_script
+    from open_storyline.nodes.core_nodes import normalize_custom_script
 
     return normalize_custom_script(raw_custom)
 

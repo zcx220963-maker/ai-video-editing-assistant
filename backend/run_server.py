@@ -116,7 +116,7 @@ from agent_framework.tools.web import register_web_tools
 from agent_framework.video_editing import (
     load_storyline_config,
     storyline_available_nodes,
-    storyline_server_url,
+    open_storyline_url,
 )
 
 RUNTIME_DIR = Path(".runtime")
@@ -390,7 +390,7 @@ def build_runtime(
     register_fetch_media_tools(registry, storage=storage, policy=fetch_policy)
     # 图形科普短片（**一条链路**：一句话 → 分镜 → 逐镜代码 → 质检 → 一次渲完 → 链接）。
     # 这是"没有实拍素材"时唯一的出片通道；有素材的口播剪辑仍走上面的 Storyline 节点。
-    # 它与 `/studio` 共用同一份工程落盘（`storyline_server/simple/project.py`），
+    # 它与 `/studio` 共用同一份工程落盘（`open_storyline/simple/project.py`），
     # 所以对话里做的片子，网页里也能打开、也能改一镜。
     register_short_video_tools(registry, storage=storage)
     # rerun_from：从某节点回退并重跑（上游产物复用、产物作用域换新）
@@ -704,7 +704,7 @@ def build_runtime(
             sc = MCPServerConfig(
                 name="storyline",
                 type="streamableHttp",
-                url=storyline_server_url(cfg),
+                url=open_storyline_url(cfg),
                 enabled_tools=storyline_available_nodes(cfg) or ["*"],
                 tool_timeout=int(
                     cfg.get("local_mcp_server", {}).get("timeout", 600)),

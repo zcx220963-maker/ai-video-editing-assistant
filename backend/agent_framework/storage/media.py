@@ -4,7 +4,7 @@
 否则上传成功却插不进行。探测走系统 PATH 上的 ffprobe（spec §8 把 ffmpeg/ffprobe 列为
 「留在本地」项），阻塞调用一律经 `asyncio.to_thread`，不卡事件循环。
 
-与 `storyline_server/mediaops.py` 的关系：那一层是渲染原子的 ffprobe 封装（节点侧用），
+与 `open_storyline/mediaops.py` 的关系：那一层是渲染原子的 ffprobe 封装（节点侧用），
 本模块只管入库判定——主 Agent 侧不 import 节点包，依赖方向保持 storyline → agent_framework。
 """
 

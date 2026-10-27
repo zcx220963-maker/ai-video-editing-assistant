@@ -27,7 +27,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_framework import bgm  # noqa: E402
-from storyline_server.simple import mix  # noqa: E402
+from open_storyline.simple import mix  # noqa: E402
 
 _CHECKS = 0
 _FAILS = 0

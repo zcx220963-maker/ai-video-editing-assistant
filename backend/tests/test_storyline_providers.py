@@ -17,9 +17,9 @@ import types
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server import providers
-from storyline_server.providers import ProviderError, Providers
-from storyline_server.settings import Capabilities
+from open_storyline import providers
+from open_storyline.providers import ProviderError, Providers
+from open_storyline.settings import Capabilities
 
 FAILS = 0
 CALLS: list[dict] = []

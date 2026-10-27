@@ -1,7 +1,7 @@
 """对象存储抽象层：媒体字节与技能附件的唯一去处。
 
   - MinioObjectStore：线上用，官方 minio SDK（同步）经 asyncio.to_thread 下线程——
-    与 storyline_server「阻塞工作一律下线程」的约定一致，绝不卡事件循环。
+    与 open_storyline「阻塞工作一律下线程」的约定一致，绝不卡事件循环。
   - MemoryObjectStore：进程内替身，字节存字典，`localize` 仍写出真实文件，
     所以离线测试能拿它喂 ffmpeg/ffprobe。
 

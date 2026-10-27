@@ -28,9 +28,9 @@ if str(_BACKEND) not in sys.path:
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.motion import code_render as cr_render                # noqa: E402
-from storyline_server.motion import review_loop as rl_loop                  # noqa: E402
-from storyline_server.mediaops import MediaError                            # noqa: E402
+from open_storyline.motion import code_render as cr_render                # noqa: E402
+from open_storyline.motion import review_loop as rl_loop                  # noqa: E402
+from open_storyline.mediaops import MediaError                            # noqa: E402
 
 _fails = 0
 _checks = 0

@@ -43,7 +43,7 @@ from agent_framework.server import create_app
 from agent_framework.session import SessionManager
 from agent_framework.storage import build_storage
 from agent_framework.tool import Tool, ToolError, ToolRegistry
-from storyline_server.nodes.core_nodes import PatchVideoNode
+from open_storyline.nodes.core_nodes import PatchVideoNode
 
 _checks = 0
 _fails = 0

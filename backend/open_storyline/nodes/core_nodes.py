@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from agent_framework.orchestration import (
     ArtifactStore,
     BaseNode,
+    NodeConfig,
     NodeRegistry,
     NodeState,
     _safe,
@@ -135,13 +136,20 @@ def write_concat_list(path: Path, parts: list[Path]) -> Path:
 
 
 class StoryNode(BaseNode):
-    """真实节点基类：注入 Settings/Providers/Storage，提供会话工作目录。"""
+    """真实节点基类：注入 Settings/Providers/Storage，提供会话工作目录。
 
-    def __init__(self, settings: Settings, providers: Providers,
-                 storage: Storage, **kw: Any) -> None:
-        self.settings = settings
-        self.providers = providers
-        self.storage = storage
+    构造签名：``StoryNode(cfg)``（文档写法）或 ``StoryNode(settings, providers,
+    storage, ...)``（历史写法）——两种都收，见 R20。
+    """
+
+    def __init__(self, cfg: Any, *legacy: Any, **kw: Any) -> None:
+        if not isinstance(cfg, NodeConfig):
+            cfg = NodeConfig(cfg,
+                             legacy[0] if legacy else kw.pop("providers", None),
+                             legacy[1] if len(legacy) > 1 else kw.pop("storage", None))
+        self.settings = cfg.settings
+        self.providers = cfg.providers
+        self.storage = cfg.storage
         super().__init__(**kw)
 
     def _work(self, state: NodeState, *dirs: str) -> Path:
@@ -4152,7 +4160,7 @@ def build_real_registry(settings: Settings, providers: Providers, storage: Stora
     # **连同它们那一万行的图形科普链一起删了**（`motion/` 下 11 个模块 + `nodes/` 下 3 个）。
     # 之前只是把它们从白名单里摘掉——那时文件还在、注册表还 import 它们，
     # 于是"关掉"只是"模型看不见"，代码一天不删就得跟着每个改动一起维护。
-    # 要找回某一版：`git show 71616c7:backend/storyline_server/motion/shot_writer.py`。
+    # 要找回某一版：`git show 71616c7:backend/open_storyline/motion/shot_writer.py`。
     from .web_nodes import RenderWebNode
     # 简洁视频线：三个原子节点（2026-10-27 取代黑盒 simple_film）。
     from .simple_nodes import (PlanShortFilmNode, RenderShortFilmNode,
@@ -4171,11 +4179,12 @@ def build_real_registry(settings: Settings, providers: Providers, storage: Stora
     # 注册不上，而且 `keep_only` 会把扫包进来的全裁掉——**工具面上什么都剩不下**。
     clsname_to_cls = {cls.__name__: cls for cls in name_to_cls.values()}
 
+    node_cfg = NodeConfig(settings, providers, storage)
+
     def _factory(cls: type) -> Any:
-        # 产品的构造签名是 cls(settings, providers, storage, registry=reg)，
-        # 不是设计代码里的 NodeClass(cfg)。工厂留在这一层，scan_package 才不用
-        # 知道业务依赖（R16）。
-        return cls(settings, providers, storage, registry=reg)
+        # 文档写法：`NodeClass(cfg)`（R20）。加依赖时只改 NodeConfig，
+        # 不用动每个节点的构造调用点。
+        return cls(node_cfg, registry=reg)
 
     # 先按 TOML 的 available_node_pkgs 扫包（设计 §22 register 的第一步）。
     # 产品档把该键补进两份 TOML 后，这条路径才真正生效；没配 = 跳过，行为不变。

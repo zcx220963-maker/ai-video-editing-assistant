@@ -30,7 +30,7 @@ from typing import Any
 
 from ..identity import current_identity
 from ..tool import Tool
-from storyline_server.simple import pipeline
+from open_storyline.simple import pipeline
 
 # 六个工具只认 `pipeline` 这一个入口（R18）。下面这些名字是它的再导出，
 # **不是**各自去 import 子模块——`test_simple_node_contract.py` 的 AST 断言守这条。
@@ -303,7 +303,7 @@ class MakeShortVideoTool(Tool):
             out["voice_error"] = vinfo.get("error") or "TTS 全部失败"
         elif vinfo:
             try:
-                from storyline_server.simple import pipeline as _pl
+                from open_storyline.simple import pipeline as _pl
 
                 vo = _pl.voice
                 from .. import bgm as bgm_pick
@@ -726,7 +726,7 @@ def register_short_video_tools(registry, *, storage: Any = None) -> None:
     """注册简洁线的原生工具。
 
     **`PlanShortFilmTool` 与 `RenderShortFilmTool` 不再注册**（2026-10-27）：
-    它们改成了 MCP 节点（`storyline_server/nodes/simple_nodes.py` 的
+    它们改成了 MCP 节点（`open_storyline/nodes/simple_nodes.py` 的
     `plan_short_film` / `render_short_film`），进 DAG、产物进 Store。
 
     同一个名字只能有一个实现——MCP 工具是 `name_prefix=False` 注册的，

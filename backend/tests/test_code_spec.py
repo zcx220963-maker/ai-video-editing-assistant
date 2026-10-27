@@ -32,8 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.motion import code_render as cr  # noqa: E402
-from storyline_server.motion import code_spec as cs  # noqa: E402
+from open_storyline.motion import code_render as cr  # noqa: E402
+from open_storyline.motion import code_spec as cs  # noqa: E402
 
 _fails = 0
 _checks = 0
@@ -574,9 +574,9 @@ def main() -> int:
           "母版常量 ink 不在白名单里——闸⑤ 正是拿它比全片一致性")
 
     print("③ 枚举单源：旧链已删，这一份就是唯一出处；另一半在渲染侧的表上")
-    from storyline_server.motion import render as rd  # noqa: E402
+    from open_storyline.motion import render as rd  # noqa: E402
     legacy_spec = (Path(__file__).resolve().parents[1]
-                   / "storyline_server" / "motion" / "spec.py")
+                   / "open_storyline" / "motion" / "spec.py")
     check(not legacy_spec.exists(),
           "声明式那份契约文件不在树上了——同一批整片开关没有第二处可漂")
     check(cs.FPS_CHOICES == (10, 15, 24, 30),
@@ -1103,7 +1103,7 @@ def main() -> int:
           f"改走整片判据那一个出口（{v_errs[:1]}）")
     # —— 自检工具与老路**同一份读数**（计划 §8 第 2 条守卫）——
     #    两份对不上的表现是「工具说绿、闸说红」，而那种漂在离线用例里看不出来。
-    from storyline_server.motion import selfcheck as _sc
+    from open_storyline.motion import selfcheck as _sc
     _cf = _sc.check_film(_spec7["shots"])
     check(_cf["errors"] == _f7[0] and _cf["warnings"] == _f7[1]
           and _cf["undetermined"] == _f7[2],

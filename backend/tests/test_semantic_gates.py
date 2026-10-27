@@ -24,8 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.motion import code_spec as cs                 # noqa: E402
-from storyline_server.motion import code_render as cr               # noqa: E402
+from open_storyline.motion import code_spec as cs                 # noqa: E402
+from open_storyline.motion import code_render as cr               # noqa: E402
 
 _fails = 0
 _checks = 0
@@ -521,7 +521,7 @@ def main() -> int:
     check("motion_anchors" in cr.META_FIELDS and "motion_anchor_frames" in cr.META_FIELDS,
           "㉑ 的两个读数在 META_FIELDS 里：命中缓存的镜不重跑 TTS，旁白词表只能从缓存还原"
           "——少了它就等于把字幕锚全记成假未判")
-    render_src = (_HERE.parents[1] / "storyline_server" / "motion" / "code_render.py"
+    render_src = (_HERE.parents[1] / "open_storyline" / "motion" / "code_render.py"
                   ).read_text("utf-8")
     check(render_src.count("cspec.check_motion_windows") == 2,
           "㉑ 的判据在渲染层出现**两次**：现渲那一路、以及命中缓存那一路（同一份判据、"
@@ -540,9 +540,9 @@ def main() -> int:
 
     # =================================================================
     print("\n〔单源与结构闸〕判据的数字与「谁算主体件」都只有一处")
-    src_spec = (_HERE.parents[1] / "storyline_server" / "motion" / "code_spec.py"
+    src_spec = (_HERE.parents[1] / "open_storyline" / "motion" / "code_spec.py"
                 ).read_text("utf-8")
-    src_render = (_HERE.parents[1] / "storyline_server" / "motion" / "code_render.py"
+    src_render = (_HERE.parents[1] / "open_storyline" / "motion" / "code_render.py"
                   ).read_text("utf-8")
     check(src_render.count("cspec.SUBJECT_MIN_BBOX") == 1
           and src_render.count("cspec.TEXT_DOMINANT_SHARE") == 1

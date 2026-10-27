@@ -39,7 +39,7 @@ from agent_framework.orchestration import ArtifactStore, NodeState, NodeRegistry
 from agent_framework.storage import build_storage
 from agent_framework.video_editing import ALL_NODE_CLASSES
 from agent_framework.video_editing import CorrectTranscriptNode as MockCorrect
-from storyline_server.nodes.core_nodes import (
+from open_storyline.nodes.core_nodes import (
     CorrectTranscriptNode, SpeechRoughCutNode, _suspect, _unit_count,
     resolve_overlay_anchors,
 )

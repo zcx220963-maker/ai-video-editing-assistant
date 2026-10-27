@@ -28,9 +28,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from agent_framework.orchestration import ArtifactStore, NodeRegistry, NodeState
 from agent_framework.storage import build_storage
-from storyline_server.nodes import web_nodes
-from storyline_server.nodes.core_nodes import build_real_registry
-from storyline_server.nodes.web_nodes import RenderWebNode, _run
+from open_storyline.nodes import web_nodes
+from open_storyline.nodes.core_nodes import build_real_registry
+from open_storyline.nodes.web_nodes import RenderWebNode, _run
 
 _checks = 0
 _fails = 0

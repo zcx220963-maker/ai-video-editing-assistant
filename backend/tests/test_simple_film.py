@@ -19,8 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.simple import film, kernel, system  # noqa: E402
-from storyline_server.simple import voice as vo  # noqa: E402
+from open_storyline.simple import film, kernel, system  # noqa: E402
+from open_storyline.simple import voice as vo  # noqa: E402
 
 _CHECKS = 0
 _FAILS = 0

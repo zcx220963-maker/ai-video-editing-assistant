@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.motion import code_spec as cs  # noqa: E402
+from open_storyline.motion import code_spec as cs  # noqa: E402
 
 FAIL: list[str] = []
 

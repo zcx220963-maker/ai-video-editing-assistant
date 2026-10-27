@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_framework.agent import _last_render_failed                 # noqa: E402
 from agent_framework.skill import Skill, SkillLoader                  # noqa: E402
-from storyline_server.motion import code_spec as cs                   # noqa: E402
+from open_storyline.motion import code_spec as cs                   # noqa: E402
 
 _checks = 0
 _fails = 0

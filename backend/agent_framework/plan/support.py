@@ -17,7 +17,7 @@ CUSTOM_MAX_CHARS = 200         # 单条自定义诉求长度
 
 # 节点**产出**的字段名：模型在 why/expectation 里引用上游产物字段是正常表达，
 # 不是「臆造工具名」。真机实测它连写三次「引用了不存在的名字「asr_segments」」，
-# 卡连着两轮出不来。这些名字逐条对着 storyline_server 各节点的返回键抄；
+# 卡连着两轮出不来。这些名字逐条对着 open_storyline 各节点的返回键抄；
 # 只用于放行文案，不参与执行判定（写多了也不会放宽别的东西）。
 OUTPUT_FIELD_NAMES = frozenset({
     "media", "clips", "asr_segments", "clip_captions", "rough_clips", "groups",
@@ -100,7 +100,7 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 一次性出片（make_short_video / SimpleFilmNode）的回执键：mp4_url 是成片直链，
     # sources_note 是出处对账那句话，numbers_without_source 是「哪几镜的数字没标出处」。
     # 三者只活在返回体里（`tools/short_video.py:259-267`、
-    # `storyline_server/simple/pipeline.py:OUTPUT_FIELDS`），技能正文按它们教模型
+    # `open_storyline/simple/pipeline.py:OUTPUT_FIELDS`），技能正文按它们教模型
     # 「把链接原样贴出来、没出处的数字如实点名」，schema 扫不出来，不收就是假告警。
     "mp4_url", "sources_note", "numbers_without_source",
 })

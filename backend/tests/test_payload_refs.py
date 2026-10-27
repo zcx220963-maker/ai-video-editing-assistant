@@ -40,10 +40,10 @@ from agent_framework.storage import (
 )
 from agent_framework.storage.media import kind_of, mime_of, probe as probe_meta
 from agent_framework.storage.object_store import REF_PREFIX, scoped_dir
-from storyline_server import mediaops
-from storyline_server.nodes.core_nodes import _localize_timeline, build_real_registry
-from storyline_server.providers import build_providers
-from storyline_server.settings import Settings
+from open_storyline import mediaops
+from open_storyline.nodes.core_nodes import _localize_timeline, build_real_registry
+from open_storyline.providers import build_providers
+from open_storyline.settings import Settings
 
 FAILS = 0
 USER = "u_ref"

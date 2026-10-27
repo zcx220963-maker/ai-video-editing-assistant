@@ -153,7 +153,7 @@ async def mix_into(track: Path, dst: Path, *, storage: Any, user_id: str,
     降级：曲库（materials.origin=bgm） → 本地目录（SIMPLE_BGM_DIR） → 不加。
     任何一级失败都只是"这条片子没配乐"，不抛。
     """
-    from storyline_server.simple import mix as mx
+    from open_storyline.simple import mix as mx
 
     name = str(bgm_name or "").strip()
     if not name:

@@ -47,7 +47,7 @@ from ..editing_contract import EditingContract, NodeContract
 from ..identity import current_identity
 from ..tool import Tool
 
-#: 剪辑服务端从请求头读会话作用域（`storyline_server/server.py::SESSION_HEADER`）。
+#: 剪辑服务端从请求头读会话作用域（`open_storyline/server.py::SESSION_HEADER`）。
 STORYLINE_SESSION_HEADER = "X-Storyline-Session-Id"
 
 

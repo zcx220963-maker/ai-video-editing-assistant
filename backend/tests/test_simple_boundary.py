@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 BACKEND = Path(__file__).resolve().parents[1]
-SIMPLE = BACKEND / "storyline_server" / "simple"
+SIMPLE = BACKEND / "open_storyline" / "simple"
 API = BACKEND / "agent_framework" / "simple_api.py"
 
 #: 内核三件的行数预算。2026-10-25 实测 301 行，给到 500 是留足余量。
@@ -95,7 +95,7 @@ CORE_LINE_BUDGET = 510
 PACKAGE_LINE_BUDGET = 4160
 
 #: 不许出现在 import 里的东西。
-BANNED = ("code_spec", "storyline_server.nodes", "storage.repositories",
+BANNED = ("code_spec", "open_storyline.nodes", "storage.repositories",
           "review_loop", "design_review", "judge_channel", "art_director")
 
 _CHECKS = 0
@@ -191,7 +191,7 @@ def main() -> int:
 
     print("\n[3b] 设计系统的清单与实现必须一致")
     sys.path.insert(0, str(BACKEND))
-    from storyline_server.simple import system as sysmod
+    from open_storyline.simple import system as sysmod
     names = [m["name"] for m in sysmod.MANIFEST]
     missing = [n for n in names
                if f"const {n} =" not in sysmod.SYSTEM_TSX]
@@ -203,7 +203,7 @@ def main() -> int:
     src = API.read_text(encoding="utf-8", errors="replace")
     mods = imported_modules(src)
     check(not any("code_spec" in m for m in mods), "simple_api 不 import code_spec")
-    check(not any("storyline_server.nodes" in m for m in mods),
+    check(not any("open_storyline.nodes" in m for m in mods),
           "simple_api 不 import 节点层")
     joined = src + "".join(p.read_text(encoding="utf-8", errors="replace") for p in files)
     for mod, why in (("remotion_client", "渲染走现有容器"),

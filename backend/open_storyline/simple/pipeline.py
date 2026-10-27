@@ -2,7 +2,7 @@
 
 在这之前，同一套 `simple` 能力有**两个调用面、零 Node**：
 `POST /simple/video` 直接调 `film.make_film`，`tools/short_video.py` 的六个工具
-各自 `from storyline_server.simple import ...` 再各自调。两边都会漂移。
+各自 `from open_storyline.simple import ...` 再各自调。两边都会漂移。
 
 现在所有调用方（HTTP、六个 Agent 工具、`simple_film` Node）只认这一个模块：
 它把 `film / edit / export / project / deliver / facts / kernel / showrunner`

@@ -19,9 +19,9 @@ from pathlib import Path
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-import storyline_server.providers as P  # noqa: E402
-from storyline_server.providers import ProviderError  # noqa: E402
-from storyline_server.settings import Capabilities, Settings  # noqa: E402
+import open_storyline.providers as P  # noqa: E402
+from open_storyline.providers import ProviderError  # noqa: E402
+from open_storyline.settings import Capabilities, Settings  # noqa: E402
 
 ENV = "OPENAI_API_KEY"
 ENV_KEY = "sk-from-env-ENVVALUE123"

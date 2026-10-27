@@ -28,7 +28,7 @@ import tempfile  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from agent_framework.storage import build_storage  # noqa: E402
-from storyline_server.render_jobs import (TERMINAL, RenderDispatcher,  # noqa: E402
+from open_storyline.render_jobs import (TERMINAL, RenderDispatcher,  # noqa: E402
                                           tool_view)
 
 sys.stdout.reconfigure(encoding="utf-8")

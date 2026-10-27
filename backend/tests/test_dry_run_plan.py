@@ -25,7 +25,7 @@ if hasattr(_s.stdout, "reconfigure"):
     _s.stdout.reconfigure(encoding="utf-8")
 
 from agent_framework.render_gate import ungated_render_nodes  # noqa: E402
-from storyline_server.nodes.core_nodes import (  # noqa: E402
+from open_storyline.nodes.core_nodes import (  # noqa: E402
     EVIDENCE_LEVELS, SYNC_TOLERANCE_SEC, _flag_on, _overlay_window_issues,
     evidence_ledger, render_plan,
 )

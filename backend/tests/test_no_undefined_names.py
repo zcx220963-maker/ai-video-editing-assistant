@@ -24,15 +24,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = [
-    "storyline_server/nodes/motion_plan.py",
-    "storyline_server/motion/shot_writer.py",
-    "storyline_server/motion/recipe_index.py",
-    "storyline_server/motion/code_spec.py",
-    "storyline_server/motion/art_director.py",
-    "storyline_server/motion/design_review.py",
-    "storyline_server/motion/selfcheck.py",
-    "storyline_server/motion/code_render.py",
-    "storyline_server/server.py",
+    "open_storyline/nodes/motion_plan.py",
+    "open_storyline/motion/shot_writer.py",
+    "open_storyline/motion/recipe_index.py",
+    "open_storyline/motion/code_spec.py",
+    "open_storyline/motion/art_director.py",
+    "open_storyline/motion/design_review.py",
+    "open_storyline/motion/selfcheck.py",
+    "open_storyline/motion/code_render.py",
+    "open_storyline/server.py",
     # 2026-10-24：`_env_kb` 用了 `os.environ` 但没 import os，app 起不来。
     # 这一层同样要焊住——`py_compile` 只查语法。
     "agent_framework/agent.py",

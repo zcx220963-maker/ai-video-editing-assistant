@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from storyline_server.simple import facts  # noqa: E402
+from open_storyline.simple import facts  # noqa: E402
 
 _CHECKS = 0
 _FAILS = 0

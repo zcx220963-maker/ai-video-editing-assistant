@@ -95,9 +95,9 @@ def main() -> int:
         check(hasattr(CronScheduler, m), f"CronScheduler.{m}")
 
     print("\n⑥ 白名单收类名")
-    from storyline_server.nodes.core_nodes import build_real_registry  # noqa: PLC0415
-    from storyline_server.providers import build_providers  # noqa: PLC0415
-    from storyline_server.settings import Settings  # noqa: PLC0415
+    from open_storyline.nodes.core_nodes import build_real_registry  # noqa: PLC0415
+    from open_storyline.providers import build_providers  # noqa: PLC0415
+    from open_storyline.settings import Settings  # noqa: PLC0415
 
     try:
         cfg = Settings()

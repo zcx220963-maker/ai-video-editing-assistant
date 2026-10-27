@@ -16,8 +16,8 @@ if sys.platform == "win32":
 import argparse
 from pathlib import Path
 
-from storyline_server.server import make_server
-from storyline_server.settings import Settings
+from open_storyline.server import make_server
+from open_storyline.settings import Settings
 
 
 def main() -> None:

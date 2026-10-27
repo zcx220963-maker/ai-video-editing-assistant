@@ -35,7 +35,7 @@ for _p in (_HERE.parents[1], _HERE.parents[2] / "backend"):
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.motion import code_spec as cs  # noqa: E402
+from open_storyline.motion import code_spec as cs  # noqa: E402
 
 _fails = 0
 _checks = 0

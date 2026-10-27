@@ -21,9 +21,9 @@ from agent_framework.video_editing import (ALL_NODE_CLASSES, load_storyline_conf
                                            storyline_available_nodes)
 from agent_framework.storage import build_storage, new_id
 from agent_framework.storage.media import kind_of, mime_of
-from storyline_server import mediaops
-from storyline_server.server import SESSION_HEADER, StorylineServer, make_server
-from storyline_server.settings import Settings
+from open_storyline import mediaops
+from open_storyline.server import SESSION_HEADER, StorylineServer, make_server
+from open_storyline.settings import Settings
 
 FAILS = 0
 
@@ -132,7 +132,7 @@ async def main() -> None:
     # 下面三条守的就是那一跳：①集合掰成有序列表且往返无损；②真不认识的类型照旧抛
     # （兜底不是「什么都别报」）；③**走真 handler** 拿到的文本能 `json.loads`
     # ——这条才是「真机不会再炸」的判据，因为那就是 MCP 交出去的那个函数。
-    from storyline_server.server import tool_json, _json_default
+    from open_storyline.server import tool_json, _json_default
     check(tool_json({"a": {"b": {"z", "a"}}}) == '{"a": {"b": ["a", "z"]}}'
           and json.loads(tool_json({"a": {3, 1}})) == {"a": ["1", "3"]},
           "出口把集合掰成**排序后**的列表（顺序稳定、两次调用可比）")
@@ -386,7 +386,7 @@ async def main() -> None:
           "裸本地路径（无 scheme）不再被当成可回放媒体")
 
     # ---------- 渲染改成「提交 + 轮询」：一次调用不再等一部片子 ----------
-    from storyline_server.render_jobs import RenderDispatcher, tool_view
+    from open_storyline.render_jobs import RenderDispatcher, tool_view
 
     rv_props = by_name["render_video"].inputSchema["properties"]
     check("render_video" in by_name and "render_status" in by_name,

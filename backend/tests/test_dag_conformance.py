@@ -31,7 +31,7 @@ def check(ok: bool, msg: str) -> None:
 def main() -> None:
     # ---- 扫包：只收有 name 的子类 ----
     reg = NodeRegistry()
-    found = reg.scan_package("storyline_server.nodes.core_nodes", _factory)
+    found = reg.scan_package("open_storyline.nodes.core_nodes", _factory)
     check(found >= 20, f"扫出 20+ 个节点（实际 {found}）")
     check(all(reg.get(n) is not None for n in reg.names()), "扫出来的都能取到实例")
 
@@ -42,9 +42,9 @@ def main() -> None:
 
     # ---- 重复注册不覆盖 ----
     reg2 = NodeRegistry()
-    reg2.scan_package("storyline_server.nodes.core_nodes", _factory)
+    reg2.scan_package("open_storyline.nodes.core_nodes", _factory)
     before = reg2.get("load_media")
-    again = reg2.scan_package("storyline_server.nodes.core_nodes", _factory)
+    again = reg2.scan_package("open_storyline.nodes.core_nodes", _factory)
     check(again == 0 and reg2.get("load_media") is before, "重复扫包不重复实例化")
 
     # ---- require_node 只读别名 ----
@@ -89,7 +89,7 @@ def main() -> None:
     import httpx
     from agent_framework.identity import use_identity
     from agent_framework.tools.mcp import STORYLINE_SESSION_HEADER, _StorylineSessionAuth
-    from storyline_server.server import SESSION_HEADER
+    from open_storyline.server import SESSION_HEADER
 
     check(STORYLINE_SESSION_HEADER == SESSION_HEADER, "客户端与服务端用同一个头名")
     with use_identity("u9", "c9"):
@@ -104,7 +104,7 @@ def main() -> None:
     check(STORYLINE_SESSION_HEADER not in anon.headers, "离线直调（无身份）不发头")
 
     # ---- design_baseline 恰好 18 项且不含 plan_timeline ----
-    from storyline_server.nodes.core_nodes import DESIGN_BASELINE_NODES
+    from open_storyline.nodes.core_nodes import DESIGN_BASELINE_NODES
 
     check(len(DESIGN_BASELINE_NODES) == 18, f"baseline 18 项（{len(DESIGN_BASELINE_NODES)}）")
     check("plan_timeline" not in DESIGN_BASELINE_NODES, "baseline 不含 plan_timeline")
@@ -112,7 +112,7 @@ def main() -> None:
     # ---- NODE_PROFILE 生效 ----
     os.environ["NODE_PROFILE"] = "design_baseline"
     try:
-        from storyline_server.nodes.core_nodes import build_real_registry
+        from open_storyline.nodes.core_nodes import build_real_registry
         check(callable(build_real_registry), "build_real_registry 可用（档位由环境变量选）")
     finally:
         os.environ.pop("NODE_PROFILE", None)

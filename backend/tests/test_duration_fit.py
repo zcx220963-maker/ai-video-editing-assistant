@@ -11,8 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from storyline_server.motion import code_spec as cs            # noqa: E402
-from storyline_server.motion import render as rpipe            # noqa: E402
+from open_storyline.motion import code_spec as cs            # noqa: E402
+from open_storyline.motion import render as rpipe            # noqa: E402
 
 _checks = 0
 _fails = 0

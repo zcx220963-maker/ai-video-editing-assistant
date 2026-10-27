@@ -19,37 +19,37 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-# ``storyline_server`` 的导入**必须在函数里**：`storyline_server.providers` 会回头
+# ``open_storyline`` 的导入**必须在函数里**：`open_storyline.providers` 会回头
 # 导入 `agent_framework.llm_openai`，而后者在 `agent_framework/__init__` 里、与
 # `server.py`（本模块的调用方）同一条导入链上。写在文件顶部就是一个循环导入——
 # 2026-10-21 重建容器时 editor 起不来，报的正是
 # `cannot import name 'Providers' from partially initialized module`。
-# 与本仓 `agent.py` 里那处 ``from storyline_server.motion.shot_writer import …``
+# 与本仓 `agent.py` 里那处 ``from open_storyline.motion.shot_writer import …``
 # 同一写法：真正用到的那一刻才导入。
 
 
 def _cspec():
-    from storyline_server.motion import code_spec as m
+    from open_storyline.motion import code_spec as m
     return m
 
 
 def _crender():
-    from storyline_server.motion import code_render as m
+    from open_storyline.motion import code_render as m
     return m
 
 
 def _rrender():
-    from storyline_server.motion import render as m
+    from open_storyline.motion import render as m
     return m
 
 
 def _mediaops():
-    from storyline_server import mediaops as m
+    from open_storyline import mediaops as m
     return m
 
 
 def _rclient():
-    from storyline_server.motion import remotion_client as m
+    from open_storyline.motion import remotion_client as m
     return m
 
 

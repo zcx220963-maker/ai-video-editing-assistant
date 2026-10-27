@@ -35,9 +35,9 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 from agent_framework.storage import build_storage  # noqa: E402
-from storyline_server.render_jobs import RenderDispatcher  # noqa: E402
-from storyline_server.server import StorylineServer  # noqa: E402
-from storyline_server.settings import Settings  # noqa: E402
+from open_storyline.render_jobs import RenderDispatcher  # noqa: E402
+from open_storyline.server import StorylineServer  # noqa: E402
+from open_storyline.settings import Settings  # noqa: E402
 
 _fails = 0
 _checks = 0

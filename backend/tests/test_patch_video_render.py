@@ -29,8 +29,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from agent_framework.orchestration import Interceptor, NodeState  # noqa: E402
 from agent_framework.storage import build_storage, to_ref          # noqa: E402
-from storyline_server import mediaops                                  # noqa: E402
-from storyline_server import timeline_edit as te                   # noqa: E402
+from open_storyline import mediaops                                  # noqa: E402
+from open_storyline import timeline_edit as te                   # noqa: E402
 
 # 出片链的现场搭建（假素材、内存替身存储、假 providers）与管线专测共用一套，
 # 这里只加「渲染完之后还能不能选着改」这一段。
@@ -297,7 +297,7 @@ async def main() -> None:
     # 前面几段都用 artifact_id="" 走「换新号」那条路。这条最容易漏的输入是
     # 「接着改这一版」：前端把基线换成 A 之后，state.artifact_id 就是 A 自己的号，
     # 沿用即覆盖 A——而 A 那一版字节是这次改动唯一的退路。两条链在这里必须同规则。
-    from storyline_server.nodes.core_nodes import PatchVideoNode
+    from open_storyline.nodes.core_nodes import PatchVideoNode
 
     v1_row_before = await storage.render_jobs.get(sess, "v1")
     st5 = NodeState(session_id=sess, artifact_id="v1", user_request="接着改 v1",
@@ -434,7 +434,7 @@ async def main() -> None:
 
 
 def fake_registry(settings, storage):
-    from storyline_server.nodes.core_nodes import build_real_registry
+    from open_storyline.nodes.core_nodes import build_real_registry
     return build_real_registry(settings, fake_providers(), storage)
 
 

@@ -44,8 +44,8 @@ from agent_framework.tools.web import KEYED_SEARCH_PROVIDERS as KEYED
 from agent_framework.session import Session, SessionManager
 from agent_framework.storage import build_storage
 from agent_framework.tool import ToolRegistry
-from storyline_server.providers import ProviderError, build_providers
-from storyline_server.settings import Capabilities
+from open_storyline.providers import ProviderError, build_providers
+from open_storyline.settings import Capabilities
 
 ENV = "OPENAI_API_KEY"
 PG_KEY = "sk-from-app-secrets-PG0001"

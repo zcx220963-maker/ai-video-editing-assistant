@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""T31 帧通道（``storyline_server.motion.judge_channel``）的离线用例。
+"""T31 帧通道（``open_storyline.motion.judge_channel``）的离线用例。
 
 **这份文件判的是一件「本来悬空」的事。** 闸㉖ 回看环（``review_loop.py``）从落地那天起
-就把两个名字写在常量里——``FRAME_CHANNEL_MODULE = "storyline_server.motion.judge_channel"``
+就把两个名字写在常量里——``FRAME_CHANNEL_MODULE = "open_storyline.motion.judge_channel"``
 与 ``FRAME_CHANNEL_ENTRY = "judge_frame"``——然后**探它**。探不到时的行为是 Q113 那条
 （``undetermined`` 并阻断出片），所以这个模块缺席的表现不是「少一个功能」，是
 **每一片有红镜的片子都出不来**。这一份把那个洞堵上，并把它堵成什么样钉死。
@@ -58,9 +58,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.motion import code_render as cr            # noqa: E402
-from storyline_server.motion import judge_channel as jc          # noqa: E402
-from storyline_server.motion import review_loop as rl            # noqa: E402
+from open_storyline.motion import code_render as cr            # noqa: E402
+from open_storyline.motion import judge_channel as jc          # noqa: E402
+from open_storyline.motion import review_loop as rl            # noqa: E402
 
 _fails = 0
 _checks = 0

@@ -37,8 +37,8 @@ from agent_framework import cost                                     # noqa: E40
 from agent_framework.compress import ToolResultGate                  # noqa: E402
 from agent_framework.render_gate import motion_summary               # noqa: E402
 from agent_framework.run_state import RunState                       # noqa: E402
-from storyline_server.motion import code_render as cr                # noqa: E402
-from storyline_server.motion import code_spec as cs                  # noqa: E402
+from open_storyline.motion import code_render as cr                # noqa: E402
+from open_storyline.motion import code_spec as cs                  # noqa: E402
 
 _fails = 0
 _checks = 0
@@ -579,7 +579,7 @@ def case_style_review() -> None:
     print("⑩ 风格对照：带图模型逐镜看预览，不像的点名带改法；花费记进账")
     import asyncio
     import tempfile
-    from storyline_server.motion import selfcheck
+    from open_storyline.motion import selfcheck
 
     replies = {
         "s01": '{"fits": false, "why": "霓虹灯管大字", "fix": "换成衬线大标题加细栏线"}',

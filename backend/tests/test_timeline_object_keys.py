@@ -28,7 +28,7 @@ import sys as _s  # noqa: E402
 if hasattr(_s.stdout, "reconfigure"):
     _s.stdout.reconfigure(encoding="utf-8")
 
-from storyline_server.nodes.core_nodes import (  # noqa: E402
+from open_storyline.nodes.core_nodes import (  # noqa: E402
     _object_keys_in, validate_timeline_objects,
 )
 

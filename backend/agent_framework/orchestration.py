@@ -319,6 +319,28 @@ def dep_name(dep: Any) -> str:
     raise TypeError(f"required_nodes 里只能是节点名或节点类，收到 {dep!r}")
 
 
+class NodeConfig:
+    """设计稿里的 `cfg`：构造一个节点只需要**一个**配置对象（R20）。
+
+    文档的注册函数写的是 ``node_instance = NodeClass(cfg)``。把三个依赖收进
+    一个对象后：加依赖不用改每个调用点，节点也不用记参数顺序。
+
+    历史写法 ``cls(settings, providers, storage, registry=reg)`` 仍然收——
+    25 个节点、契约、脚本都还按老的调，两边等价。
+    """
+
+    __slots__ = ("settings", "providers", "storage")
+
+    def __init__(self, settings: Any = None, providers: Any = None,
+                 storage: Any = None) -> None:
+        self.settings = settings
+        self.providers = providers
+        self.storage = storage
+
+    def __repr__(self) -> str:      # 日志里看得见带的是哪份配置
+        return f"NodeConfig(settings={type(self.settings).__name__})"
+
+
 class BaseNode(ABC, metaclass=_NodeMetaType):
     """所有剪辑节点的基类。子类只需声明元信息并重写 process。
 

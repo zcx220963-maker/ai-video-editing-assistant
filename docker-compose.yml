@@ -176,7 +176,7 @@ services:
       # 只挂这几个目录，不挂整个 `/app`：镜像里那几份 remotion 源码副本（离线对账
       # 用的哨兵）要留着。前端产物仍在镜像里，改前端依旧要重建。
       - ./backend/agent_framework:/app/agent_framework
-      - ./backend/storyline_server:/app/storyline_server
+      - ./backend/open_storyline:/app/open_storyline
       - ./backend/examples:/app/examples
       - ./backend/prompts:/app/prompts
     depends_on:
@@ -240,7 +240,7 @@ services:
       - app-runtime:/app/.runtime
       # 与 editor 同一档：后端代码与技能正文挂仓库，改完重启即可（见 editor 那段注释）。
       - ./backend/agent_framework:/app/agent_framework
-      - ./backend/storyline_server:/app/storyline_server
+      - ./backend/open_storyline:/app/open_storyline
       - ./backend/examples:/app/examples
       - ./backend/prompts:/app/prompts
     depends_on:

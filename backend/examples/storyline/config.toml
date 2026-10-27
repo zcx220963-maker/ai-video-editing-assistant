@@ -22,9 +22,9 @@ timeout = 2700
 # 节点包扫描（R16）：先扫出包内所有有 `name` 的 BaseNode 子类，再按 available_nodes 裁。
 # 缺这个键 = 不扫包，只按下面的显式白名单注册（旧行为）。两份 TOML 必须同步。
 available_node_pkgs = [
-    "storyline_server.nodes.core_nodes",
-    "storyline_server.nodes.web_nodes",
-    "storyline_server.nodes.simple_nodes",
+    "open_storyline.nodes.core_nodes",
+    "open_storyline.nodes.web_nodes",
+    "open_storyline.nodes.simple_nodes",
 ]
 
 # 暴露给 Agent 的剪辑节点白名单（这里用工具名，与 Node.name 对齐；对应流程图节点全集）。
@@ -44,7 +44,7 @@ available_nodes = [
     # 已被简洁线替掉——同样一条 60 秒片子：那边 201 次调用 / 56.4 分钟，
     # 这边 24 次 / 15 分钟，而且产物是**可改的工程**（改一镜只重写一镜）。
     # 摘白名单而不是删代码：「模型能看见谁」由这张表决定，摘一行立刻生效、
-    # 加回去也只需一行。代码留在 `storyline_server/motion/`，等第 8 周再移 attic。
+    # 加回去也只需一行。代码留在 `open_storyline/motion/`，等第 8 周再移 attic。
     # 素材供给那三个工具（`search_illustration` / `select_illustration` / `imagegen`）
     # 2026-10-16 摘了：图形片的画面只有一路——模型逐镜写代码画（闸⑦「每镜必画」）。
     # 白名单里留一行不存在的工具，真机表现是「模型能看见它、点了必失败」；节点类与
@@ -58,7 +58,7 @@ available_nodes = [
     # 三个自检工具（非 DAG 节点，**不带契约**）：建模在交活**之前**自己跑一遍判据——
     # ① 这一段 TSX 过不过闸①；② 整片九道闸怎么判；③ 这一镜渲出来长什么样。
     # 它们没有 `require_node`，但必须在白名单里：这张表同时决定主服务注册表里有谁，
-    # 少一行模型就调不到（`storyline_server/server.py::_register_selfcheck`）。
+    # 少一行模型就调不到（`open_storyline/server.py::_register_selfcheck`）。
     # 不带契约决定的是「会不会被按计划裁」——这三个不带，所以规划轮与执行轮都在。
     "check_shot_code", "check_film", "preview_shot",
     # DAG 契约本身（`_register_dag_contract`）：**这是模型看全图的唯一一条路**。

@@ -25,7 +25,7 @@ if hasattr(sys.stdout, "reconfigure"):
 from agent_framework.render_gate import (  # noqa: E402
     ADJUST_OPTION, CONFIRM_OPTION, build_render_ask, motion_storyboard,
 )
-from storyline_server.motion.code_render import (  # noqa: E402
+from open_storyline.motion.code_render import (  # noqa: E402
     _preview_fail_note, preview_failure_kind,
 )
 

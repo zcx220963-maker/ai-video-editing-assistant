@@ -28,8 +28,8 @@ from typing import Any
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from storyline_server.simple import pipeline
-from storyline_server.simple.kernel import KernelError
+from open_storyline.simple import pipeline
+from open_storyline.simple.kernel import KernelError
 
 # HTTP 快线只是传输适配：能力统一从 `pipeline` 取（R18）。
 film = pipeline.film
@@ -129,7 +129,7 @@ async def _run_film(job: dict[str, Any], *, storage: Any) -> None:
                    calls=got["calls"], secs=got["secs"], plan=got["plan"],
                    coverage=got.get("coverage") or {})
         # 出处账：不拦片，只在报告里如实写（见 `simple/facts.py`）。
-        from storyline_server.simple import facts as facts_mod
+        from open_storyline.simple import facts as facts_mod
         src = facts_mod.audit_sources(got["plan"])
         job["sources"] = src["sources"]
         job["sources_note"] = src["note"]
@@ -170,7 +170,7 @@ async def _run_film(job: dict[str, Any], *, storage: Any) -> None:
         if vinfo and not vinfo.get("degraded"):
             try:
                 from pathlib import Path
-                from storyline_server.simple import voice as vo
+                from open_storyline.simple import voice as vo
                 from . import bgm as bgm_pick
                 track = vo.build_track(
                     [Path(p) if p else None for p in vinfo.get("files") or []],
@@ -391,7 +391,7 @@ def register(app: Any, *, storage: Any, auth: Any) -> None:
         if job.get("object_key") and job["status"] == "done":
             # presigned URL 会过期，每次读都重签一次（比再传一遍便宜得多）。
             try:
-                from storyline_server.simple import deliver
+                from open_storyline.simple import deliver
                 job["mp4_url"] = await deliver.republish(job["object_key"], storage=storage)
             except Exception:  # noqa: BLE001 —— 签不出来就交上一次的链接
                 pass

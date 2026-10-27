@@ -168,7 +168,7 @@ def preview_summary(preview: Mapping[str, Any] | None) -> dict[str, str]:
     return out
 
 
-#: 图形科普片在计划卡上的开关（名单与 ``storyline_server/motion/code_spec.py`` 的
+#: 图形科普片在计划卡上的开关（名单与 ``open_storyline/motion/code_spec.py`` 的
 #: ``KNOB_FIELDS`` 同源；两份名单漂移由 tests/test_code_spec.py 拦下）。
 #: 为什么不在这里 import 那个模块：主服务不装配剪辑服务端的实现，而这里读错的后果
 #: 只是摘要少显示一个字段——它不参与任何执行判定。

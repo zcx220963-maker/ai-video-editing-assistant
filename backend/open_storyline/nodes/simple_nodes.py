@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_framework.orchestration import BaseNode, NodeState
+from agent_framework.orchestration import BaseNode, NodeConfig, NodeState
 
 from ..simple import deliver, kernel, pipeline, project, showrunner
 from .core_nodes import _obj
@@ -56,14 +56,20 @@ class _ShortFilmNode(BaseNode):
     构造签名与 `build_real_registry` 的工厂对齐：`cls(settings, providers, storage, registry=reg)`。
     """
 
-    def __init__(self, settings: Any = None, providers: Any = None,
-                 storage: Any = None, *, registry: Any = None, **_: Any) -> None:
+    def __init__(self, cfg: Any = None, *legacy: Any, registry: Any = None,
+                 **_: Any) -> None:
         # `registry` 必须转交给 BaseNode：吞掉它，节点建了却没进注册表，
         # 白名单里有、MCP 工具面上永远没有（TestServer 的「白名单 ↔ 实现」等式会抓）。
         super().__init__(registry=registry)
-        self.settings = settings
-        self.providers = providers
-        self.storage = storage
+        # 两种构造都收：`_ShortFilmNode(cfg)`（文档写法）与
+        # `_ShortFilmNode(settings, providers, storage, ...)`（历史写法）。
+        if not isinstance(cfg, NodeConfig):
+            cfg = NodeConfig(cfg,
+                             legacy[0] if legacy else None,
+                             legacy[1] if len(legacy) > 1 else None)
+        self.settings = cfg.settings
+        self.providers = cfg.providers
+        self.storage = cfg.storage
         self.registry = registry
 
     # 三个节点都用同一条「默认主 LLM + 显式身份」的路：`kernel._complete` 内部

@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent_framework.tool import ToolRegistry  # noqa: E402
 from agent_framework.tools.short_video import (  # noqa: E402
     MIN_SEC, MAX_SEC, _clamp_seconds, register_short_video_tools)
-from storyline_server.simple import edit, film, kernel, project  # noqa: E402
+from open_storyline.simple import edit, film, kernel, project  # noqa: E402
 
 _CHECKS = 0
 _FAILS = 0
@@ -88,7 +88,7 @@ def main() -> int:
     kernel.out_dir = lambda: tmp          # type: ignore[assignment]
     # `film.safe_scene`（动效那套兜底）随旧路径一起删了；叙事兜底还在，
     # 而且它才是现在唯一的兜底，用它造一个合法的 body 来跑工程往返。
-    from storyline_server.simple.scene import safe_story_scene
+    from open_storyline.simple.scene import safe_story_scene
     body = safe_story_scene({"text": "测试字幕"}, index=0)
     try:
         code, tl = film.assemble([body, body], [3.0, 3.0], ["slide"])
