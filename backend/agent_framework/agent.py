@@ -1197,7 +1197,10 @@ def declines_plan(text: Any) -> bool:
 
 @dataclass
 class AgentConfig:
-    max_iterations: int = 10
+    # R4：与运行期对齐。原来是 10，而 `run_server` 一直传 200——
+    # 「配置默认值」和「真跑的值」差 20 倍，任何直接用 AgentConfig() 的路径
+    # （子 Agent、离线脚本）都会在第十轮被截断，且看不出是被默认值截的。
+    max_iterations: int = 200
     # 「渲染未达终态不许收尾」的预算：模型收到 queued/running 后不续查时，本循环自己
     # 按 render_poll_sec 轮询 render_status，最多再等 render_follow_max_sec 秒。
     render_follow_max_sec: float = 1800.0
