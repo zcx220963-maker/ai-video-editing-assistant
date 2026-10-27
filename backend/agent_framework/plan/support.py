@@ -97,6 +97,12 @@ OUTPUT_FIELD_NAMES = frozenset({
     # 与指针交叉核对的段号。两者都不是入参键也不是工具名，不收就是假告警——
     # 技能正文教模型「照 segment_cache 那份账说话」，被拦下来读者反而看不到真字段名。
     "segment_cache", "segment_id",
+    # 一次性出片（make_short_video / SimpleFilmNode）的回执键：mp4_url 是成片直链，
+    # sources_note 是出处对账那句话，numbers_without_source 是「哪几镜的数字没标出处」。
+    # 三者只活在返回体里（`tools/short_video.py:259-267`、
+    # `storyline_server/simple/pipeline.py:OUTPUT_FIELDS`），技能正文按它们教模型
+    # 「把链接原样贴出来、没出处的数字如实点名」，schema 扫不出来，不收就是假告警。
+    "mp4_url", "sources_note", "numbers_without_source",
 })
 
 MCP_PREFIX = "storyline_"

@@ -211,7 +211,8 @@ def case_assembled_registry() -> None:
         registry.register(make_spawn_tool(ScriptedLLM([]), []))
         register_skill_tools(registry, SkillLoader(storage))
         register_memory_tools(registry, MemoryStore(storage))
-        register_team_tools(registry, llm=ScriptedLLM([]), storage=storage)
+        register_team_tools(registry, llm=ScriptedLLM([]), storage=storage,
+                            team_root=str(Path(td) / "team"))
 
         async def _runner(job) -> None:  # 只为构造 scheduler
             return None

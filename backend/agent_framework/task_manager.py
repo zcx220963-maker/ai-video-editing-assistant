@@ -3,7 +3,7 @@
 对应设计文档「Agent Team —— Task Manager」：
 - 一行任务一条记录（``tasks`` 表），id 取自 ``task_seq`` 序列（spec §3.9，
   取代「文件名反推 id」）；作用域 = ``{user}:{conv}``，不同会话各有一块任务板。
-- 状态流转：pending → claimed → completed。
+- 状态流转：pending → on_progress → completed（设计 §24 原文口径）。
 - 依赖：``task_edges`` 表存单向边（task_id → depends_on）。blockedBy = 本任务的上游，
   blocks = 下游，二者是同一批边的正/反向视图，读取时现算，不再靠读-改-写维护两份副本。
   边一旦写下不随完成而删除 —— 「还被谁阻塞」由状态算出来（``open_deps``）。
@@ -22,11 +22,10 @@ from typing import Any, Iterable
 from .identity import current_identity_or
 
 PENDING = "pending"
-CLAIMED = "claimed"
-#: 设计 §24 的状态词是 `on_progress`，代码里存的是 `claimed`（同一件事：已认领、在做）。
-#: 不把列值改掉：已有行、`claim` 的原子条件、前端文案都按 `claimed` 写；改列值是纯破坏。
-#: 需要按设计口径展示时用这个别名，别在库里造第二种值。
-ON_PROGRESS = CLAIMED
+#: 设计 §24 的状态词。老库里的 `claimed` 在读取时归一成它（见 team_files._norm_status），
+#: 写入一律用新词；`CLAIMED` 只保留给还没改完的调用点，新代码不要再用。
+ON_PROGRESS = "on_progress"
+CLAIMED = ON_PROGRESS
 COMPLETED = "completed"
 
 
@@ -64,11 +63,18 @@ def topo_order(node_required: dict[str, list[str]]) -> list[str]:
 # --------------------------------------------------------------------------
 
 class TaskManager:
-    """任务总线：拆解、认领、完成、依赖解锁与清单渲染，全部落在 ``tasks``/``task_edges``。"""
+    """任务总线：拆解、认领、完成、依赖解锁与清单渲染。
+
+    默认后端是文件（``tasks/{scope}/task_*.json``，设计 §24）；``TEAM_STORE=pg``
+    切到 ``tasks``/``task_edges`` 表，供多副本使用。
+    """
 
     def __init__(self, storage: Any, *, user_id: str = "default",
-                 conversation_id: str = "default") -> None:
-        self._tasks = storage.tasks
+                 conversation_id: str = "default", board: Any | None = None,
+                 store: str | None = None, root: str | None = None) -> None:
+        from .team_files import select_team_store
+
+        self._tasks = board or select_team_store(storage, store=store, root=root)[1]
         self.storage = storage
         self.default_user_id = user_id
         self.default_conversation_id = conversation_id
@@ -85,7 +91,7 @@ class TaskManager:
                                         blocked_by=list(blocked_by))
 
     async def get(self, task_id: int) -> dict[str, Any] | None:
-        row = await self._tasks.get(int(task_id))
+        row = await self._tasks.get(int(task_id), self.scope)
         if row is None or row["scope"] != self.scope:
             return None
         return await self._with_open_deps(row)
@@ -98,9 +104,9 @@ class TaskManager:
         return [self._fill_open_deps(t, done) for t in rows]
 
     async def _done_ids(self) -> set[int]:
-        """本 scope 内已完成的任务 id 集合。"""
-        return {int(r["id"]) for r in await self.storage.db.select(
-            "tasks", where={"scope": self.scope, "status": COMPLETED})}
+        """本 scope 内已完成的任务 id 集合（后端无关）。"""
+        return {int(r["id"]) for r in await self._tasks.list_all(self.scope)
+                if r["status"] == COMPLETED}
 
     @staticmethod
     def _fill_open_deps(task: dict[str, Any], done: set[int]) -> dict[str, Any]:
@@ -117,7 +123,9 @@ class TaskManager:
         task = await self._require(task_id)
         if task["status"] == COMPLETED:
             raise TaskError(f"任务 #{task_id} 已完成，无法认领")
-        if task["status"] == CLAIMED and task["owner"] not in (None, "", owner):
+        if task["status"] == ON_PROGRESS:
+            if task["owner"] == owner:
+                return task          # 同一 owner 重复认领：幂等，不报「抢先」
             raise TaskError(f"任务 #{task_id} 已被 {task['owner']} 认领")
         if task["open_deps"]:
             raise TaskError(f"任务 #{task_id} 仍被 {task['open_deps']} 阻塞，暂不可认领")
@@ -181,6 +189,25 @@ class TaskManager:
         ``await self.get(nid)``，而 ``get`` 内部又查一次已完成集合——每节点两次查询，
         整张图走下来是 O(V·查询)。闭包是高频操作（认领前判断、任务板渲染都要走）。
         """
+        raw = getattr(self._tasks, "raw_edges", None)
+        if raw is not None:
+            # 文件后端：blockedBy 完成后会被清空，闭包必须沿原始边。
+            deps: dict[int, list[int]] = {}
+            children: dict[int, list[int]] = {}
+            for task, dep in await raw(self.scope):
+                deps.setdefault(int(task), []).append(int(dep))
+                children.setdefault(int(dep), []).append(int(task))
+            adj = children if edge == "blocks" else deps
+            seen: set[int] = set()
+            q = deque(adj.get(int(task_id), ()))
+            while q:
+                nid = int(q.popleft())
+                if nid in seen:
+                    continue
+                seen.add(nid)
+                q.extend(adj.get(nid, ()))
+            return sorted(seen)
+
         all_rows = {int(t["id"]): t for t in await self._tasks.list_all(self.scope)}
         root = all_rows.get(int(task_id))
         seen: set[int] = set()

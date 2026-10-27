@@ -245,7 +245,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   name          text NOT NULL,
   description   text NOT NULL DEFAULT '',
   status        text NOT NULL DEFAULT 'pending'
-                CHECK (status IN ('pending','claimed','completed')),
+                CHECK (status IN ('pending','on_progress','completed')),
   owner         text NOT NULL DEFAULT '',
   created_at    timestamptz NOT NULL DEFAULT now()
 );

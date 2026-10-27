@@ -4154,13 +4154,17 @@ def build_real_registry(settings: Settings, providers: Providers, storage: Stora
     # 于是"关掉"只是"模型看不见"，代码一天不删就得跟着每个改动一起维护。
     # 要找回某一版：`git show 71616c7:backend/storyline_server/motion/shot_writer.py`。
     from .web_nodes import RenderWebNode
-    from .simple_nodes import SimpleFilmNode
+    # 简洁视频线：三个原子节点（2026-10-27 取代黑盒 simple_film）。
+    from .simple_nodes import (PlanShortFilmNode, RenderShortFilmNode,
+                               WriteShortShotsNode)
     reg = NodeRegistry()
     # 节点档位（R16）：design_baseline = 严格按设计的 18 项（验收用）；product = 产品全量。
     # 显式传入的 allowed（TOML 白名单）优先，档位只在没给白名单时兜底。
     if allowed is None and os.getenv("NODE_PROFILE", "product") == "design_baseline":
         allowed = list(DESIGN_BASELINE_NODES)
-    name_to_cls = {cls.name: cls for cls in [*REAL_NODE_CLASSES, RenderWebNode, SimpleFilmNode]}
+    name_to_cls = {cls.name: cls for cls in [
+        *REAL_NODE_CLASSES, RenderWebNode,
+        PlanShortFilmNode, WriteShortShotsNode, RenderShortFilmNode]}
 
     def _factory(cls: type) -> Any:
         # 产品的构造签名是 cls(settings, providers, storage, registry=reg)，

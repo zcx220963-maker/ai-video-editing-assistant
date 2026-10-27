@@ -80,60 +80,17 @@ _SKILL_NOT_TOOLS = frozenset({
     #   material_id  —— search_media 结果里的素材 id（load_media 的入参叫 material_ids）
     "asr_segments", "material_id", "clip_captions", "shot_count", "kept_sec",
     "rough_clips", "group_scripts", "transitions", "text_effects", "voiceover",
-    # 技能正文里被当作**回执栏位 / 栏位取值**点名、但不是可调用工具的名字。
-    # 2026-10-14 真机启动日志把 R11 部件档那两节正文里的一整批名字报成「技能正文
-    # 点名了不存在的工具」，逐条对着 SKILL.md 读，**没有一个是让模型去调的东西**：
-    # 全是回执里的栏位名、栏位取值，或一个带点的常量路径。技能正文是教模型
-    # 「照这份回执说话」的自然语言
-    # 文档（本模块开篇那句话），里面的名字只要不是工具就该在这里收下。
+    # 2026-10-14 真机启动日志把图形科普技能正文里的一整批回执栏位名/取值报成
+    # 「技能正文点名了不存在的工具」（`subject_boxes`、`subject_terms`、`qc_warnings`、
+    # `autofix_notes`、`narration_for`、`overlap_subject`、`judge_identity`、
+    # `original_shots`）。当时把它们收进这份豁免集——但**那一整份正文随图形科普链
+    # 在 2026-10-25 退役**（`examples/skills/motion_explainer` → `examples/retired/`，
+    # 且退役技能会从库里删掉，见 `skill.py` 的 `retired` 那一段），今天启动检查扫不到
+    # 任何一份含这些名字的正文。
     #
-    # 为什么收在**这一份**而不是 `plan.support.OUTPUT_FIELD_NAMES`：那一份会经
-    # `plan/vocab.py:301` 进计划文案的词表，收进来等于放宽「卡面 why/expectation 里
-    # 引用了不存在的名字」这条提醒——而下面第三个（`subject_terms`）恰恰是正文
-    # 明令**别写**的栏（SKILL.md 两处都写了「今天 schema 里没有这一栏，别写」）。
-    # 把它放进计划侧白名单会与那两句话打架：**文案层的豁免范围要按份分开，
-    # 技能正文说得出、不等于计划卡里引用得到。**
-    #
-    # **这一份要跟着正文一起缩**（2026-10-16）：取材那三条路拆掉时，凡是只在被删
-    # 的正文里出现过的名字，一律从这里摘掉——`test_consistency_check.py:③b` 逐个
-    # 断言这些名字**真的还在正文里**，就是为了不让这份豁免集悄悄涨成一张谁都记不清
-    # 的旧账（留着的名字越多，将来一条真告警被这里吃掉的可能性越大）。
-    #
-    #   闸㉕ 打回时与 `band` 一起摆出来的逐件盒。那一节的正文整块删了，这个读数名
-    #   活了下来：闸还在判，闸表的 ㉕ 那一行把四个读数写在纸上（SKILL.md 拼接前那一节）。
-    "subject_boxes",
-    #   正文**明令别写**的栏：`subject_terms`（「今天 schema 里没有这一栏」）。
-    #   进这份表不是「可以用」，是「不是工具名」——正文为了说「别写它」而点名它，
-    #   不该挂成臆造工具告警。
-    "subject_terms",
-    #   R19 闸⑳ 的出片回执栏（`style_facts["original_shots"]`）：正文教模型
-    #   「走了原创哨兵的那几镜由回执如实报出」，点的是**读数栏位名**不是工具名。
-    #   `style_facts` 另外那几栏（`palettes` / `bleed_shots` / `textures`）今天没进正文，
-    #   真进了就一起收——这条豁免的口径是「回执栏位」，不是「正文里出现过的词」。
-    "original_shots",
-    #   出片回执里预览质检档的体检栏（`render_motion_code` 结果的 `qc_warnings`）：正文教模型
-    #   「照实转告、别据此自己重渲」，点的是读数栏位名，与 `original_shots` 同一口径。
-    "qc_warnings",
-    #   分镜回执里系统自动修字色的说明栏（`plan_motion` 结果的 `autofix_notes`），同一口径。
-    "autofix_notes",
-    #   闸注册表两张表（§「闸在哪个时刻判」）里的**渲染客户端内部函数名**：
-    #   ``narration_for``（闸② 按 TTS 实测算帧，code_render.py:179）。正文拿它当
-    #   **判据的代码出处**点名，模型调不到——真机启动日志 2026-10-15 把它报成
-    #   「技能正文点名了不存在的工具」。改正文措辞治不了：`_TOOLISH` 不认反引号，按词扫。
-    #   （同批的 ``stage_asset`` 随闸⑱ 一起删了，名字跟着下架。）
-    "narration_for",
-    #   闸⑧ 版面回读里 finding 的**类别取值**（``overlap`` 那一族的第四个：2026-10-17
-    #   加的 `overlap_subject`，「一块字被画出来的图形压住」）。正文「字不许压在图上」
-    #   那一节要教模型「什么时候会被打回」，就得点名这个取值——它与上面的读数栏位同一
-    #   口径：**回执里的取值/栏位名**，不是可调用的东西。
-    #   （同族的 `overlap`/`clipped`/`dangling` 早就进了正文，只是它们没带下划线，
-    #   `_TOOLISH` 认不出来，所以从来没挂过告警。）
-    "overlap_subject",
-    #   ⑲-b 身份判据（2026-10-17）的**代码出处**：`judge_channel.judge_identity`。
-    #   正文「⑲-b：还有一只眼在问『画面上那个东西，是它吗』」那一节点名它，是告诉模型
-    #   「这条判据长什么样、照它写代码」——它不是模型能调的东西（模型调不到判断模型，
-    #   那一趟跑在渲染链里）。与上面的 `narration_for` 同一口径：**判据的代码出处**。
-    "judge_identity",
+    # 2026-10-27 按这份表自己的口径下架：**豁免集要跟着正文一起缩**。名字留在表里不会
+    # 报错（它照样放行），只会在将来吃掉一条真告警。`test_consistency_check.py:③b`
+    # 的「已下架」那一列现在逐个盯着它们不许回表。
 })
 
 # 明确不是工具名的**形态**（技能正文里大量出现，属正常内容）：

@@ -34,7 +34,14 @@ RUN apt-get update -o Acquire::Retries=3 \
 
 WORKDIR /app
 COPY backend/requirements.txt backend/requirements-storyline.txt ./
-RUN pip install --no-cache-dir -r requirements.txt -r requirements-storyline.txt
+# 可选镜像源：本机代理对 pypi.org 的大索引响应会截断（2026-10-27 实跑：
+# `pip install` 报 JSONDecodeError: Unterminated string）。换源再建：
+#   docker build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple .
+# 留空 = 官方 PyPI，交付默认不变（只多一个可选口，不改解析结果）。
+ARG PIP_INDEX_URL=
+RUN pip install --no-cache-dir \
+        ${PIP_INDEX_URL:+--index-url=$PIP_INDEX_URL} \
+        -r requirements.txt -r requirements-storyline.txt
 
 # chromium:图形科普片(motion)与网页出片(render_web)都靠 headless 逐帧截图。
 # 放在 pip 层之后——它同样吃网络丢包,所以同样装三遍(理由见上面 ffmpeg 层),

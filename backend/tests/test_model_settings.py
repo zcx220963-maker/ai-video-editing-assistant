@@ -300,6 +300,9 @@ class FakeClient:
 class Resp:
     content = "好的"
     tool_calls = []
+    #: `complete()` 读完解析结果会读 `usage`（计价按这次实际用的模型写进去）。
+    #: 替身必须同形，否则一处真实读数就把用例打成「调用 3 次重试均失败」。
+    usage = None
 
 
 def case_llm_uses_pg_key() -> None:

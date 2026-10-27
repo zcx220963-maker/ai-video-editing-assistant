@@ -22,7 +22,7 @@ tags: [writing, style-transfer, video-production, creative]
    - **如果用户已提供样本**：进入第二步。
 
 ## 第二步：获取素材与分析 (Context & Analysis)
-1. **读取视频理解**：读取 `understand_clips` 的历史结果，获取当前视频素材的画面描述、氛围和关键动作。
+1. **读取视频理解**：用 `read_node_history` 读取 `understand_clips` 的历史结果，获取当前视频素材的画面描述、氛围和关键动作。
 2. **风格解构**：分析 `style_reference_text` 的句式特征、修辞习惯、情感基调。
 
 ## 第三步：风格化创作 (Creative Generation)

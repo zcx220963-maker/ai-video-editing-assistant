@@ -307,20 +307,22 @@ def case_real_skill_bodies() -> None:
     # 2026-10-16 缩到两个：`scale_safe`/`scale_note`/`no_match`/`source_not_available`/
     # `text_share`/`code_spec`/`contrast_ratio` 只活在取材那几节正文里，那几节整块删了，
     # 豁免跟着下架（下面那条「真的在正文里」正是逼着这一步的那根钉子）。
-    nine = ["subject_boxes", "subject_terms"]
-    for tok in nine:
-        check(C._looks_like_non_tool(tok, ()), f"「{tok}」被放行（不是工具名）")
-
-    # 而且这些名字**真的在正文里**：判据的输入不是空气，这条用例才不会随着正文改动
-    # 悄悄变成空转（一个只查常量集合的断言，删掉正文也照样绿）。
+    # 2026-10-27 连剩下那两个也下架了：它们（连同 `qc_warnings` / `autofix_notes` /
+    # `narration_for` / `overlap_subject` / `judge_identity` / `original_shots`）只活在
+    # 图形科普技能的正文里，而那份技能已随旧链退役、并从库里删掉。今天没有一份
+    # **会被加载**的正文点名它们——留一份「正文里存在」正向断言已经找不到输入，
+    # 所以这一向改成「豁免集里仍有名字被真正文用到」，保证本段不会空转。
     joined = "\n".join(bodies.values())
-    for tok in nine:
-        check(tok in joined, f"「{tok}」确实出现在正文里（判据的输入不是空气）")
+    exercised = sorted(t for t in C._SKILL_NOT_TOOLS if t in joined)
+    check(bool(exercised), f"豁免集仍被真实正文用到（{exercised}）")
+
     # 反面：豁免集里**已经没有**只在被删正文里活过的名字。漏摘一个不会报错（它照样
     # 放行），只会在将来吃掉一条真告警——所以这一向得有一条判据盯着，否则「跟着正文
-    # 一起缩」只是句注释。
+    # 一起缩」只是句注释。退役的那八个也一起盯，防止它们被重新加回表里。
     gone = ["scale_safe", "scale_note", "no_match", "source_not_available",
-            "text_share", "code_spec", "contrast_ratio", "supply_order", "stage_asset"]
+            "text_share", "code_spec", "contrast_ratio", "supply_order", "stage_asset",
+            "subject_boxes", "subject_terms", "qc_warnings", "autofix_notes",
+            "narration_for", "overlap_subject", "judge_identity", "original_shots"]
     for tok in gone:
         check(tok not in joined,
               f"「{tok}」已随取材正文一起下架（今天正文里不该再有它）")

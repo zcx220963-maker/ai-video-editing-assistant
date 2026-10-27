@@ -46,7 +46,7 @@ async def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         storage = build_storage("memory")
         await storage.start()
-        tm = TaskManager(storage, user_id="u1", conversation_id="c1")
+        tm = TaskManager(storage, user_id="u1", conversation_id="c1", store="pg")
 
         # 文档生命周期示例：#3 依赖 #1、#2；#4、#5 依赖 #3。id 由 task_seq 取号。
         t1 = await tm.create("整理原始素材并分类")
@@ -138,7 +138,7 @@ async def main() -> None:
         check("[ ] #5: 调色和最终导出" in rendered, "解锁后的 pending 任务渲染为 [ ]")
 
         # ---- 跨会话隔离：另一块任务板看不到本板任务 ----
-        tm_other = TaskManager(storage, user_id="u2", conversation_id="c9")
+        tm_other = TaskManager(storage, user_id="u2", conversation_id="c9", store="pg")
         check(await tm_other.list_all() == [], "不同 用户:会话 各一块任务板")
         check(await tm_other.get(1) is None, "跨作用域按 id 取他人任务返回 None")
         # 身份 contextvar 覆盖构造缺省
@@ -157,7 +157,7 @@ async def main() -> None:
         })
         check(order == ["load_media", "split_shots", "understand_clips", "group_clips"],
               f"topo_order 给出拓扑序：{order}")
-        tm2 = TaskManager(storage2, user_id="u9", conversation_id="c9")
+        tm2 = TaskManager(storage2, user_id="u9", conversation_id="c9", store="pg")
         ids: dict[str, int] = {}
         for name in order:
             req = {"split_shots": ["load_media"], "understand_clips": ["split_shots"],

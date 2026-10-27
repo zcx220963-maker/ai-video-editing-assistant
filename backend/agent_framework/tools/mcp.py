@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Mapping, Protocol, Sequence
 
+import httpx
 from pydantic import BaseModel, Field, field_validator
 
 # 官方 MCP 客户端（R10-T44）。**这三个传输入口就是「协议侧不再手写」的全部依据**：
@@ -45,6 +46,9 @@ from mcp.types import Implementation
 from ..editing_contract import EditingContract, NodeContract
 from ..identity import current_identity
 from ..tool import Tool
+
+#: 剪辑服务端从请求头读会话作用域（`storyline_server/server.py::SESSION_HEADER`）。
+STORYLINE_SESSION_HEADER = "X-Storyline-Session-Id"
 
 
 # --------------------------------------------------------------------------
@@ -453,6 +457,21 @@ def _result_dict(result: Any) -> dict[str, Any]:
     return result.model_dump(by_alias=True, exclude_none=True)
 
 
+class _StorylineSessionAuth(httpx.Auth):
+    """每个请求现取当前 run 的身份，写进 ``X-Storyline-Session-Id``（R16-c）。
+
+    连接期的固定 headers 做不到这件事：MCP client 是进程级单例，而会话作用域随
+    run 变。剪辑服务端 ``_register_one`` 优先读这个头来决定 Store 作用域；
+    没有身份（离线直调/stdio）时不发，服务端回落到参数/缺省作用域。
+    """
+
+    def auth_flow(self, request: httpx.Request):
+        ident = current_identity()
+        if ident is not None:
+            request.headers[STORYLINE_SESSION_HEADER] = ident.storyline_session
+        yield request
+
+
 class _SDKTransport:
     """三种 type 共用的骨架：一个长驻任务自持 SDK 会话，外面只调 ``session.*``。
 
@@ -636,7 +655,7 @@ class StreamableHttpTransport(_SDKTransport):
     @contextlib.asynccontextmanager
     async def _connector(self) -> AsyncIterator[Any]:
         async with streamablehttp_client(
-            self._url, headers=self._header_map(),
+            self._url, headers=self._header_map(), auth=_StorylineSessionAuth(),
             timeout=self._timeout, sse_read_timeout=STREAM_READ_TIMEOUT,
         ) as (read, write, _get_session_id):
             # 第三个回值才是取 mcp-session-id 的函数。迁移前我们自己存这个 id、每个请求
@@ -664,6 +683,7 @@ class SseTransport(_SDKTransport):
     @contextlib.asynccontextmanager
     async def _connector(self) -> AsyncIterator[Any]:
         async with sse_client(self._url, headers=self._header_map(),
+                              auth=_StorylineSessionAuth(),
                               timeout=self._timeout,
                               sse_read_timeout=STREAM_READ_TIMEOUT) as (read, write):
             yield read, write

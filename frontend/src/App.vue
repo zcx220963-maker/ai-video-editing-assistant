@@ -2897,9 +2897,22 @@ function ensureSocket(cid) {
       reloadAfterReconnect(cid);
     }
   };
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     connected[cid] = false;
     delete socks[cid];
+    // 4403：服务端 accept 之后做的归属校验没过（这条会话属于另一个登录身份）。
+    // 它和「网络断了」是两件事：重连一百次也还是 4403，所以要停下并说清楚——
+    // 否则界面会一直重试，用户只看到「连接已断开」而不知道要换回哪个账号。
+    if (ev && ev.code === 4403) {
+      _reconnectAttempts[cid] = 0;
+      if (streamCur[cid]) { streamCur[cid].state = "done"; streamCur[cid] = null; }
+      busy[cid] = null;
+      msgs(cid).push({
+        role: "assistant", state: "error",
+        text: "这个会话属于另一个登录身份，当前账号无权接入。请换回创建它的账号后刷新页面。",
+      });
+      return;
+    }
     // 不在这里 forgetToken：连不上可能是服务重启中，不是 token 失效。
     // token 真无效时 whoami 返回 401 会处理。
     if (busy[cid]) {

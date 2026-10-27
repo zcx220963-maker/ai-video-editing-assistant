@@ -96,14 +96,42 @@ class FileCronStore:
                 out.append(row)
         return out
 
-    async def claim_run(self, job_id: str, state: dict[str, Any], **_kw: Any) -> bool:
-        """单进程内天然互斥（同一个 scheduler）；这里只负责把 state 落盘。
+    async def claim_run(self, job_id: str, expect_state: dict[str, Any], *,
+                        new_state: dict[str, Any] | None = None,
+                        enabled: bool = True, **_kw: Any) -> bool:
+        """比较-交换领取（与 PG 同一份合同）：state 没被别人动过才写入新一轮。
 
-        多副本时两个进程会各自读到同一个 due job——这正是 X3 记的「文件模式
-        跨主机没有原子 claim」，用 `--cron-store pg` 才有 CAS。
+        早先这里把 ``expect_state`` 当新状态写回、且恒返回 True——文件后端于是
+        既没做 CAS，也没把 ``next_run_at_ms`` 推进/关掉单次任务：到期任务每个
+        调度 tick 都会再触发一次。这一层必须与 `QuotaRequest` 那类 CAS 同口径：
+        **状态没变过**才认领，新状态由调用方给。
+
+        跨主机仍不成立（两个进程各自的 threading.Lock 管不到对方）——那是 X3
+        记的边界，要跨副本请用 `--cron-store pg`；但同机多实例与「先读 due 再
+        领取之间被别人插进来」这两种，这里就能挡住。
         """
-        await self.set_state(job_id, state)
-        return True
+        new = dict(new_state if new_state is not None else expect_state)
+
+        def _norm(d: Any) -> dict[str, Any]:
+            # 老文件里可能只写了 next_run_at_ms：缺键补 None 再比，
+            # 否则与 JobState.to_dict() 的完整两键永远不相等，CAS 恒失败。
+            got = dict(d or {})
+            return {k: got.get(k) for k in ("next_run_at_ms", "last_run_at_ms")}
+
+        with self._lock:
+            data = self._read()
+            for row in data.get("jobs", []):
+                if row.get("id") != job_id:
+                    continue
+                if not row.get("enabled"):
+                    return False
+                if _norm(row.get("state")) != _norm(expect_state):
+                    return False
+                row["state"] = new
+                row["enabled"] = bool(enabled)
+                self._write(data)
+                return True
+        return False
 
 
 class CronFileStorage:

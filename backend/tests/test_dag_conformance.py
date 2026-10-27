@@ -71,11 +71,37 @@ def main() -> None:
     check(tried or "plan_timeline" in inter2.order_trace,
           "没预置时照常补依赖（会真跑上游）")
 
-    # ---- 两份 TOML 都有 available_node_pkgs ----
+    # ---- pkg_scan（R16-e）：两份 TOML 都有 available_node_pkgs，扫出的类 ≥ 22，白名单仍生效 ----
     for name in ("config.toml", "config.docker.toml"):
         cfg = tomllib.loads((BACKEND / "examples/storyline" / name).read_text(encoding="utf-8"))
         srv = cfg["local_mcp_server"]
-        check(bool(srv.get("available_node_pkgs")), f"{name} 有 available_node_pkgs")
+        pkgs = srv.get("available_node_pkgs")
+        check(isinstance(pkgs, list) and bool(pkgs), f"{name} 有非空 available_node_pkgs")
+        scanned = NodeRegistry()
+        count = sum(scanned.scan_package(pkg, _factory) for pkg in pkgs or [])
+        check(count >= 22, f"{name} 扫包得到 ≥22 个节点类（实际 {count}）")
+        allowed = [n for n in (srv.get("available_nodes") or []) if scanned.get(n) is not None]
+        scanned.keep_only(allowed)
+        check(sorted(scanned.names()) == sorted(allowed) and bool(allowed),
+              f"{name} 白名单仍生效（{len(scanned.names())} 项）")
+
+    # ---- session_header（R16-c）：主服务每个请求现取身份发头，服务端读同名头 ----
+    import httpx
+    from agent_framework.identity import use_identity
+    from agent_framework.tools.mcp import STORYLINE_SESSION_HEADER, _StorylineSessionAuth
+    from storyline_server.server import SESSION_HEADER
+
+    check(STORYLINE_SESSION_HEADER == SESSION_HEADER, "客户端与服务端用同一个头名")
+    with use_identity("u9", "c9"):
+        req = httpx.Request("POST", "http://127.0.0.1:8001/mcp")
+        for _ in _StorylineSessionAuth().auth_flow(req):
+            pass
+        sent = req.headers.get(STORYLINE_SESSION_HEADER)
+    check(sent == "u:u9:c:c9", f"有身份时发出剪辑会话作用域（实际 {sent}）")
+    anon = httpx.Request("POST", "http://127.0.0.1:8001/mcp")
+    for _ in _StorylineSessionAuth().auth_flow(anon):
+        pass
+    check(STORYLINE_SESSION_HEADER not in anon.headers, "离线直调（无身份）不发头")
 
     # ---- design_baseline 恰好 18 项且不含 plan_timeline ----
     from storyline_server.nodes.core_nodes import DESIGN_BASELINE_NODES

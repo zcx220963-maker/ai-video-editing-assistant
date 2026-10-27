@@ -295,6 +295,11 @@ class SkillBodyTool(Tool):
     真机（run ``c364585634f2``，2026-10-15「已达最大迭代次数 40」）里 26 份参数各不相同的
     load_skill 一枪都没失败，参数级那两条闸结构上接不到它。这一份替身如实复刻：
     窗口不同就文本不同（所以「逐字相同」也不响），并记下真打过的页键供断言。
+
+    整份读（不带 offset/limit）回的是**目录**，与 ``skill.py`` 对超过
+    ``_WHOLE_BODY_MAX_BYTES`` 的技能所做的事一致（``INDEX_ONLY_NOTE``）：正文没有随附，
+    所以之后的窗口读是正当的——否则第一条「1 行起整份」会被当成覆盖了全文，
+    后面每一枪都会被「这一页已经给过」拒掉。
     """
 
     def __init__(self, name: str = "load_skill") -> None:
@@ -326,7 +331,11 @@ class SkillBodyTool(Tool):
         self.calls += 1
         key = f"{path or 'SKILL.md'}@{offset}x{limit}"
         self.pages.append(key)
-        return f"[skill:{name} {key}] 第 {self.calls} 份正文"
+        head = f"[skill:{name} {key}] 第 {self.calls} 份正文"
+        if path is None and offset is None and limit is None:
+            from agent_framework.skill import INDEX_ONLY_NOTE
+            return f"{head}\n{INDEX_ONLY_NOTE}"
+        return head
 
 
 class WholeServeDemoTool(Tool):
@@ -451,6 +460,25 @@ def build_agent(steps: list[Any], *, tools: list[Tool]) -> AgentOnceRun:
         hooks=CompositeHook([]),
         config=AgentConfig(max_iterations=8),
     )
+
+
+class _RaiseReadCaps:
+    """把「整 run 的 load_skill 总枪数」两档抬到打不满。
+
+    家族级判据（正文窗口 / shot 卡）今天排在总枪数之后：``_MAX_SKILL_READS_HARD``
+    （20）比正文硬线（32）、读卡硬线（60）都小，正常配置下先撞总枪数。⑮⑯⑳ 要钉的是
+    那两条专项判据本身，所以在用例里把总枪数抬走——与 ⑩ 抬重复闸阈值同一个手法。
+    """
+
+    def __enter__(self) -> None:
+        import agent_framework.agent as m
+        self._saved = (m._MAX_SKILL_READS, m._MAX_SKILL_READS_HARD)
+        m._MAX_SKILL_READS = 999
+        m._MAX_SKILL_READS_HARD = 999
+
+    def __exit__(self, *exc: Any) -> None:
+        import agent_framework.agent as m
+        m._MAX_SKILL_READS, m._MAX_SKILL_READS_HARD = self._saved
 
 
 def chain_violations(messages: list[Message]) -> list[str]:
@@ -604,7 +632,9 @@ async def case_f_feedback_neither_adds_nor_clears() -> None:
     # 第一次真失败、第二次反馈、随后三次真失败。反馈那次既不该被数成一次失败
     # （否则念的是 3/4/5），也不该把计数清零（否则第一次真失败作废、只念 2/3）。
     tool = ScriptedFailureTool("asr", [True, False, True, True, True])
-    agent = build_agent([("tool", "asr", {})] * 5 + [("answer", "说明卡在哪")],
+    # 参数逐次不同：这不是同参重试（那条归重复闸管），而是「读清单改一次、再试一次」。
+    agent = build_agent([("tool", "asr", {"v": i}) for i in range(5)]
+                        + [("answer", "说明卡在哪")],
                         tools=[tool])
     await agent.run(Session(user_id="u", conversation_id="c_guard_f"), "跑一下")
     last = agent.llm.calls[-1]
@@ -697,25 +727,28 @@ async def case_i_guard_alone_is_blind_to_success() -> None:
         tools=[probe])
     agent.config.max_iterations = 10
     # 把新闸的阈值抬到打不满（等价于「这条修复没写」），看老守卫能不能兜住。
-    # 三把闸一起抬：重复闸两条 + 无进展检测（`_STALL_ROUNDS`，2026-10-17 加的
-    # 第六族——它按「整轮有没有新动作」判，同参重发八枪正是它要接的形状）。
+    # 四把闸一起抬：重复闸三条（逐字相同 / 同参次数 / 滑动窗口）+ 无进展检测
+    # （`_STALL_ROUNDS`，2026-10-17 加的第六族——它按「整轮有没有新动作」判，
+    # 同参重发八枪正是它要接的形状）。
     import agent_framework.agent as agent_mod
     saved = (agent_mod._MAX_SAME_RESULT_REPEATS, agent_mod._MAX_SAME_ARGS_ATTEMPTS,
-             agent_mod._STALL_ROUNDS)
+             agent_mod._REPEAT_WINDOW_LIMIT, agent_mod._STALL_ROUNDS)
     agent_mod._MAX_SAME_RESULT_REPEATS = 99
     agent_mod._MAX_SAME_ARGS_ATTEMPTS = 99
+    agent_mod._REPEAT_WINDOW_LIMIT = 99
     agent_mod._STALL_ROUNDS = 999
     try:
         await agent.run(Session(user_id="u", conversation_id="c_rep_i"), "查一下")
     finally:
         (agent_mod._MAX_SAME_RESULT_REPEATS, agent_mod._MAX_SAME_ARGS_ATTEMPTS,
-         agent_mod._STALL_ROUNDS) = saved
+         agent_mod._REPEAT_WINDOW_LIMIT, agent_mod._STALL_ROUNDS) = saved
     check(probe.calls == 8,
           f"⑩ 摘掉新闸：八次全真打到后端、一次都没被拦（老守卫全盲）：{probe.calls} 次")
 
 
 async def case_j_polling_is_not_blocked() -> None:
     print("\n=== ⑪ 同参数但结果在变（轮询）：闸不误杀 ===")
+    import agent_framework.agent as agent_mod
     from agent_framework.agent import _MAX_SAME_ARGS_ATTEMPTS
     probe = ProgressTool("render_status_like")
     agent = build_agent(
@@ -723,7 +756,14 @@ async def case_j_polling_is_not_blocked() -> None:
         + [("answer", "好了")],
         tools=[probe])
     agent.config.max_iterations = 10
-    await agent.run(Session(user_id="u", conversation_id="c_rep_j"), "查进度")
+    # 滑动窗口闸（最近 16 次里同签名 ≤5 次）与同参次数闸同档，先抬走它，
+    # 好让这里判的是「结果在变，同参次数是唯一的线」。
+    saved = agent_mod._REPEAT_WINDOW_LIMIT
+    agent_mod._REPEAT_WINDOW_LIMIT = 99
+    try:
+        await agent.run(Session(user_id="u", conversation_id="c_rep_j"), "查进度")
+    finally:
+        agent_mod._REPEAT_WINDOW_LIMIT = saved
     last = agent.llm.calls[-1]
     check(probe.calls == _MAX_SAME_ARGS_ATTEMPTS,
           f"⑪ 外部状态在变 → 结果字节在变：{probe.calls} 次全真打（没被误杀）")
@@ -806,10 +846,13 @@ async def case_m_same_batch_identical_call() -> None:
           f"⑭ 第二条回执说的是「同一次回复里出现了两次」：{len(dup)} 条")
 
 
-#: 真机 run ``c364585634f2`` 的 26 枪 load_skill（从 ``checkpoint_entries`` 里该 run 的
-#: **distinct** 参数原样取出）：19 枪打在 motion_explainer 的 SKILL.md 上、窗口彼此重叠
-#: （220 取了三遍、531 先 190 行再 180 行、715/720/721 与 895/896 各差一两行），
-#: 7 枪取附件（INDEX.md ×6、final-review.md ×1）。
+#: 形状照真机 run ``c364585634f2``：26 枪 load_skill，19 枪打在 motion_explainer 的
+#: SKILL.md 上、7 枪取附件（INDEX.md ×6、final-review.md ×1），每枪参数都不同。
+#:
+#: 窗口按**互不重叠**摆开——真机那 26 枪里有大量互相包含的窗口（220 取了三遍、
+#: 531 先 190 行再 180 行），那种形状归 ``_page_covered`` 那条闸管（它自己有一条
+#: 判据）。⑮ 要量的是**页数**软线：只有 17 个以上互不重叠的窗口才能走到那里，
+#: 用重叠窗口会让重叠闸先拦掉一半，页数永远到不了软线。
 def _body(offset=None, limit=None):
     args: dict[str, Any] = {"name": "motion_explainer_skill"}
     if offset is not None:
@@ -831,30 +874,30 @@ def _attach(path, offset=None, limit=None):
 REAL_RUN_CALLS: list[Any] = [
     ("tool", "load_skill", _body()),
     ("tool", "load_skill", _attach("shots/INDEX.md")),
-    ("tool", "load_skill", _body(1, 220)),
-    ("tool", "load_skill", _body(22, 200)),
     ("tool", "load_skill", _attach("shots/INDEX.md", 1, 60)),
-    ("tool", "load_skill", _body(220, 180)),
-    ("tool", "load_skill", _body(220, 60)),
-    ("tool", "load_skill", _body(222, 58)),
-    ("tool", "load_skill", _body(280, 80)),
-    ("tool", "load_skill", _body(360, 175)),
-    ("tool", "load_skill", _body(361, 170)),
-    ("tool", "load_skill", _attach("shots/INDEX.md", 60, 120)),
     ("tool", "load_skill", _attach("shots/INDEX.md", 61, 60)),
-    ("tool", "load_skill", _body(520, 200)),
-    ("tool", "load_skill", _body(531, 190)),
-    ("tool", "load_skill", _body(531, 180)),
-    ("tool", "load_skill", _body(535, 180)),
-    ("tool", "load_skill", _attach("shots/INDEX.md", 120, 40)),
-    ("tool", "load_skill", _attach("shots/INDEX.md", 121, 57)),
-    ("tool", "load_skill", _body(715, 180)),
-    ("tool", "load_skill", _body(720, 300)),
-    ("tool", "load_skill", _body(721, 175)),
-    ("tool", "load_skill", _body(895, 125)),
-    ("tool", "load_skill", _body(896, 120)),
+    ("tool", "load_skill", _attach("shots/INDEX.md", 121, 60)),
+    ("tool", "load_skill", _attach("shots/INDEX.md", 181, 60)),
+    ("tool", "load_skill", _attach("shots/INDEX.md", 241, 60)),
     ("tool", "load_skill", _attach("final-review.md")),
-    ("tool", "load_skill", _body(220, 300)),
+    ("tool", "load_skill", _body(1, 100)),
+    ("tool", "load_skill", _body(101, 100)),
+    ("tool", "load_skill", _body(201, 100)),
+    ("tool", "load_skill", _body(301, 100)),
+    ("tool", "load_skill", _body(401, 100)),
+    ("tool", "load_skill", _body(501, 100)),
+    ("tool", "load_skill", _body(601, 100)),
+    ("tool", "load_skill", _body(701, 100)),
+    ("tool", "load_skill", _body(801, 100)),
+    ("tool", "load_skill", _body(901, 100)),
+    ("tool", "load_skill", _body(1001, 100)),
+    ("tool", "load_skill", _body(1101, 100)),
+    ("tool", "load_skill", _body(1201, 100)),
+    ("tool", "load_skill", _body(1301, 100)),
+    ("tool", "load_skill", _body(1401, 100)),
+    ("tool", "load_skill", _body(1501, 100)),
+    ("tool", "load_skill", _body(1601, 100)),
+    ("tool", "load_skill", _body(1701, 100)),
 ]
 
 
@@ -865,7 +908,8 @@ async def case_n_body_window_cap_replays_the_real_run() -> None:
     probe = SkillBodyTool()
     agent = build_agent(REAL_RUN_CALLS + [("answer", "交计划")], tools=[probe])
     agent.config.max_iterations = len(REAL_RUN_CALLS) + 3
-    out = await agent.run(Session(user_id="u", conversation_id="c_body_n"), "做一条片")
+    with _RaiseReadCaps():
+        out = await agent.run(Session(user_id="u", conversation_id="c_body_n"), "做一条片")
     last: list[Message] = agent.llm.calls[-1]
 
     body_called = [p for p in probe.pages if p.startswith("SKILL.md@")]
@@ -918,7 +962,8 @@ async def case_o_body_hard_line_still_refuses() -> None:
     probe = SkillBodyTool()
     agent = build_agent(steps + [("answer", "交计划")], tools=[probe])
     agent.config.max_iterations = n + 3
-    await agent.run(Session(user_id="u", conversation_id="c_body_o"), "做一条片")
+    with _RaiseReadCaps():
+        await agent.run(Session(user_id="u", conversation_id="c_body_o"), "做一条片")
     last: list[Message] = agent.llm.calls[-1]
     check(probe.calls == _MAX_SKILL_BODY_PAGES_HARD,
           f"⑯ {n} 个窗口里真打到第 {_MAX_SKILL_BODY_PAGES_HARD} 个为止：{probe.calls} 枪")
@@ -940,7 +985,8 @@ async def case_o_body_hard_line_still_refuses() -> None:
     saved = agent_mod._MAX_SKILL_BODY_PAGES_HARD
     agent_mod._MAX_SKILL_BODY_PAGES_HARD = 999
     try:
-        await agent2.run(Session(user_id="u", conversation_id="c_body_o2"), "做一条片")
+        with _RaiseReadCaps():
+            await agent2.run(Session(user_id="u", conversation_id="c_body_o2"), "做一条片")
     finally:
         agent_mod._MAX_SKILL_BODY_PAGES_HARD = saved
     check(probe2.calls == n,
@@ -987,7 +1033,8 @@ async def case_s_card_cap_has_been_untested() -> None:
     steps = _cards(n)
     agent = build_agent(steps + [("answer", "交计划")], tools=[probe])
     agent.config.max_iterations = len(steps) + 3
-    await agent.run(Session(user_id="u", conversation_id="c_card_s"), "做一条片")
+    with _RaiseReadCaps():
+        await agent.run(Session(user_id="u", conversation_id="c_card_s"), "做一条片")
     last: list[Message] = agent.llm.calls[-1]
 
     check(probe.calls == n,
@@ -1010,7 +1057,8 @@ async def case_s_card_cap_has_been_untested() -> None:
     steps2 = _cards(hard_n)
     agent2 = build_agent(steps2 + [("answer", "交计划")], tools=[probe2])
     agent2.config.max_iterations = len(steps2) + 3
-    await agent2.run(Session(user_id="u", conversation_id="c_card_s2"), "做一条片")
+    with _RaiseReadCaps():
+        await agent2.run(Session(user_id="u", conversation_id="c_card_s2"), "做一条片")
     last2: list[Message] = agent2.llm.calls[-1]
 
     check(probe2.calls == _MAX_SHOT_CARDS_HARD,
@@ -1390,9 +1438,10 @@ async def case_x_fold_hands_back_one_recovery_read() -> None:
     """
     D = "demos/opening/spotlight-hero-card/SpotlightHeroCard.tsx"
     O = [f"demos/other/O{i}.tsx" for i in range(3)]
-    # 每枪 ≈96KB、进链时按单条上限截到 ≈60KB；五枪后合计 ≈300KB > fold_at(208KB)，
-    # 下一次一致点折走 D 的两条回执（受保护尾部按条数/字节截在 O0 之后）——
-    # D 的账上出现「folded」标记。
+    # 每枪 ≈96KB、进链时按单条上限截到 ≈60KB；五枪合计 ≈300KB。
+    # 折叠门槛的**缺省值是 1MB**（`compress.DEFAULT_FOLD_AT_BYTES`），这条用例要的是
+    # 「五枪就折」的形状，所以在闸上把门槛压到 200KB（`keep_recent=3` → 可折的就是
+    # 最旧的两条 D 回执，O0 之后的保护尾部仍是原件）。
     probe = WholeServeDemoTool(pad=96_000)
     steps: list[Any] = [
         ("tool", "load_skill", _attach(D)),
@@ -1406,6 +1455,8 @@ async def case_x_fold_hands_back_one_recovery_read() -> None:
         ("answer", "交计划"),
     ]
     agent = build_agent(steps, tools=[probe])
+    agent.tool_gate.fold_at_bytes = 200_000
+    agent.tool_gate.fold_to_bytes = 100_000
     agent.config.max_iterations = len(steps) + 3
     out = await agent.run(Session(user_id="u", conversation_id="c_fold_x"), "做一条片")
     last: list[Message] = agent.llm.calls[-1]
@@ -1419,7 +1470,7 @@ async def case_x_fold_hands_back_one_recovery_read() -> None:
                           f"{D}@NonexNone"],
           f"㉔ 折叠之后那一枪真执行（不执行就是死锁），下一枪没再折就拦住：{probe.calls}")
     refused = [t for t in tool_msgs if "这次不再执行" in t]
-    check(len(refused) == 1 and "给过你两次" in refused[0] and "逐字相同" in refused[0],
+    check(len(refused) == 1 and "逐字相同" in refused[0] and "这一份参数" in refused[0],
           f"㉔ 只拦没再折的那一枪，文案照旧是文件级实话：{len(refused)} 条")
     check(chain_violations(last) == [], f"㉔ 链子收口：{chain_violations(last)}")
 

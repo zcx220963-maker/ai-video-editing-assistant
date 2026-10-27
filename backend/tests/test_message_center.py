@@ -41,7 +41,7 @@ async def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         storage = build_storage("memory")
         await storage.start()
-        mc = MessageCenter(storage, user_id="u1", conversation_id="c1")
+        mc = MessageCenter(storage, user_id="u1", conversation_id="c1", store="pg")
 
         # ---- send：一行消息进收件人 Box，路由列 + jsonb 正文 ----
         ack = await mc.send("main_agent", "sub_agent_a", "请完成 id=3 的 Task")
@@ -60,7 +60,7 @@ async def main() -> None:
         check(row["consumed_at"] is None, "未消费的行 consumed_at 为空")
 
         # ---- 跨作用域隔离：另一用户/会话的同名 Box 看不到消息 ----
-        mc_other = MessageCenter(storage, user_id="u2", conversation_id="c9")
+        mc_other = MessageCenter(storage, user_id="u2", conversation_id="c9", store="pg")
         check(await mc_other.read_inbox("sub_agent_a") == [], "不同用户/会话的消息空间相互隔离")
         # 身份 contextvar 优先于构造缺省：同一次 run 内的工具不必自带会话参数
         with use_identity("u3", "c3"):

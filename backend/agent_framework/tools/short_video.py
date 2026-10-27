@@ -5,9 +5,11 @@
 用户在对话里说"帮我做个讲瑞利散射的片子"时，Agent 手上没有任何工具能接住这句话。
 
 为什么是"阻塞式"而不是"提交作业再轮询"：
-主链的 `plan_motion` 本来就是一次 56 分钟的工具调用（`_TOOL_CALL_TIMEOUTS` 给它 2700 秒）。
+这条线本身就要 10~40 分钟（写分镜 + 逐镜出码 + 质检 + 纯 CPU 逐帧渲染），
+所以它是**一次长工具调用**，并在 `_TOOL_CALL_TIMEOUTS` 里各有自己的档位（3600s / 900s）。
 在这套产品里，"长任务 = 一次长工具调用"是既有约定；再引入一套作业轮询，
 就多了一条"任务跑到一半 Agent 轮次结束了"的失败路径。
+（2026-10-25 之前主链还有一个 `plan_motion`，那条图形科普链已整条删除，不再是这里的参照。）
 
 三个工具的分工，对应"改一镜"这件事的三个粒度：
 
@@ -646,14 +648,22 @@ class RenderShortFilmTool(Tool):
                           "error": f"{type(exc).__name__}: {exc}"})
 
         project.update(film_id, mp4_url=pub["url"], object_key=pub["object_key"])
+        # 与 make_short_video 同一套播放卡片契约：`media_url` 给 MediaCardHook 发
+        # type=media 帧（前端渲染 <video>），`video` 是对象键、落进 qa.parts 当持久
+        # 指针。少了这两个键，重渲完用户只看到一串 presigned 地址——「改一镜」这条
+        # 路就走了半截。
         return _json({
             "ok": True,
             "film_id": film_id,
             "mp4_url": pub["url"],
+            "media_url": pub["url"],
+            "video": pub["object_key"],
+            "duration": total,
             "size_mb": round(pub["bytes"] / 1048576, 1),
             "voice": voice_state,
             "render_ms": (kernel.describe_receipt(res).get("ms") or {}).get("render_ms"),
-            "hint": "把 mp4_url 直接发给用户。",
+            "hint": ("成片卡片会自动出现在对话里（可播放、可下载）——"
+                     "不要把 presigned 地址贴进回答。"),
         })
 
 
@@ -754,10 +764,18 @@ class ListShortFilmsTool(Tool):
 
 
 def register_short_video_tools(registry, *, storage: Any = None) -> None:
-    registry.register(PlanShortFilmTool(storage=storage))
+    """注册简洁线的原生工具。
+
+    **`PlanShortFilmTool` 与 `RenderShortFilmTool` 不再注册**（2026-10-27）：
+    它们改成了 MCP 节点（`storyline_server/nodes/simple_nodes.py` 的
+    `plan_short_film` / `render_short_film`），进 DAG、产物进 Store。
+
+    同一个名字只能有一个实现——MCP 工具是 `name_prefix=False` 注册的，
+    两边同名时 `registry.register` 会「后注册的悄悄盖掉前一个」，
+    出事时看不出跑的是哪一份。类还留着（`__init__.py` 有引用），但不上工具面。
+    """
     registry.register(MakeShortVideoTool(storage=storage))
     registry.register(ReshootShotTool(storage=storage))
-    registry.register(RenderShortFilmTool(storage=storage))
     registry.register(ExportFilmTool(storage=storage))
     registry.register(ListShortFilmsTool())
 

@@ -32,7 +32,9 @@ def check(cond: bool, label: str) -> None:
 
 
 def shots(*secs: float) -> dict:
-    return {"title": "T", "tone": "近黑底", "motif": "蓝点",
+    # `tone` 要 ≥12 字（底色/主色/构图/笔触都写清）：这是整片唯一的画法载体，
+    # 空/太短的会判「每镜各画各的」而不合格。夹具给一份合格的。
+    return {"title": "T", "tone": "近黑底、冷蓝主色，居中构图，细线笔触", "motif": "蓝点",
             "shots": [{"sec": s, "text": f"第{i + 1}句", "plan": f"第{i + 1}镜画什么"}
                       for i, s in enumerate(secs)]}
 
@@ -50,9 +52,10 @@ def main() -> int:
           "6 镜 × 2 秒 = 12 秒 → 合格（镜数由内容定，不套公式）")
 
     print("\n② 归一化：导演写的 `plan` 要变成写手认的 `plate`")
-    got = sr.normalize(shots(4, 5))
+    src = shots(4, 5)
+    got = sr.normalize(src)
     check(got["shots"][0]["plate"] == "第1镜画什么", f"plan → plate（{got['shots'][0]}）")
-    check(got["tone"] == "近黑底" and got["motif"] == "蓝点", "tone / motif 保留")
+    check(got["tone"] == src["tone"] and got["motif"] == src["motif"], "tone / motif 保留")
     check(len(got["shots"]) == 2, "两镜都在")
 
     print("\n③ 外部给的分镜：list 与 dict 都收，且不丢 tone/motif/sources")
@@ -87,7 +90,9 @@ def main() -> int:
         calls.append(messages[-1]["content"])
         if len(calls) == 1:
             return "这不是 JSON"
-        return '{"title":"T","tone":"冷","shots":[' \
+        # `tone` 有长度下限（≥12 字：底色/主色/构图/笔触都要写清），这里给一份合格的。
+        return '{"title":"T","tone":"深蓝底、赭石主色，低机位大特写，颗粒笔触",' \
+               '"shots":[' \
                '{"sec":4,"text":"a","plan":"p"},{"sec":4,"text":"b","plan":"q"},' \
                '{"sec":4,"text":"c","plan":"r"}]}'
 

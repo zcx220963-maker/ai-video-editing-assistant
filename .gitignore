@@ -176,7 +176,9 @@ openchatcut-src/
 # 文档：README 之外的设计文档本地保留
 /docs/
 # 素材入库与巡检脚本、素材供给探活记录：运行时代码与镜像都不用它们
-/scripts/
+/scripts/*
+# 例外：框架对账脚本是验收门（R20），克隆后要能直接跑
+!/scripts/conformance.py
 /assets/
 # remotion 示例镜头：后端用的是技能语料里那一份（backend/examples/skills/motion_explainer/demos），
 # 渲染时镜头代码只能经别名引到 _fixtures/、lib/、themes/——其余 demo 目录运行时一个都不读

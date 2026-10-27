@@ -974,8 +974,10 @@ class TasksRepo(_Repo):
             await self.db.upsert("task_edges", {"task_id": tid, "depends_on": dep})
         return row
 
-    async def get(self, task_id: int) -> dict[str, Any] | None:
+    async def get(self, task_id: int, scope: str | None = None) -> dict[str, Any] | None:
         row = await self.db.get_by_pk(self.table, {"id": task_id})
+        if row and scope is not None and row["scope"] != scope:
+            return None
         if row:
             row["blockedBy"] = [e["depends_on"] for e in await self.db.select(
                 "task_edges", where={"task_id": task_id}, order_by=["depends_on"])]
@@ -992,7 +994,7 @@ class TasksRepo(_Repo):
         unlocked = [r["id"] for r in await self.ready(scope)]
         if not unlocked:
             return None
-        got = await self.db.claim(self.table, {"status": "claimed", "owner": owner},
+        got = await self.db.claim(self.table, {"status": "on_progress", "owner": owner},
                                   where={"scope": scope, "status": "pending",
                                          "id": in_(unlocked)},
                                   order_by=["id"], limit=1)
@@ -1000,20 +1002,20 @@ class TasksRepo(_Repo):
 
     async def claim_one(self, scope: str, owner: str, task_id: int) -> dict[str, Any] | None:
         """认领指定任务：仅当它属于本 scope 且仍是 pending 时原子改写，抢不到返回 None。"""
-        got = await self.db.claim(self.table, {"status": "claimed", "owner": owner},
+        got = await self.db.claim(self.table, {"status": "on_progress", "owner": owner},
                                   where={"scope": scope, "id": task_id, "status": "pending"},
                                   order_by=["id"], limit=1)
         return await self.get(task_id) if got else None
 
     async def complete(self, scope: str, task_id: int, *,
                        owner: str | None = None) -> dict[str, Any] | None:
-        """完成任务。owner 给定时走原子条件改写：只有「claimed 且 owner 匹配」的行
+        """完成任务。owner 给定时走原子条件改写：只有「on_progress 且 owner 匹配」的行
         能被置 completed——认领者才能交付；抢不到（他人已交付/非认领状态）返回 None，
         由上层区分精确错误。owner=None 保留无条件路径，仅供内部收尾使用。"""
         if owner is not None:
             got = await self.db.claim(self.table, {"status": "completed"},
                                       where={"scope": scope, "id": task_id,
-                                             "status": "claimed", "owner": owner},
+                                             "status": "on_progress", "owner": owner},
                                       order_by=["id"], limit=1)
             if not got:
                 return None

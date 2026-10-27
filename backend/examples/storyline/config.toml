@@ -23,6 +23,8 @@ timeout = 2700
 # 缺这个键 = 不扫包，只按下面的显式白名单注册（旧行为）。两份 TOML 必须同步。
 available_node_pkgs = [
     "storyline_server.nodes.core_nodes",
+    "storyline_server.nodes.web_nodes",
+    "storyline_server.nodes.simple_nodes",
 ]
 
 # 暴露给 Agent 的剪辑节点白名单（这里用工具名，与 Node.name 对齐；对应流程图节点全集）。
@@ -68,9 +70,11 @@ available_nodes = [
     # 不存在的工具，正是 `consistency.WATCHED` 那条检查存在的理由；名字已一并收进
     # 那份清单，下次再被静默摘掉启动就报。
     "dag_contract",
-    # 简洁视频线的 Node 外壳（R18）：一句话出片。它与六个原生工具共用
-    # `simple/pipeline.py` 这一份实现，只是多了一条「Agent 按 DAG 规则调用」的路。
-    "simple_film",
+    # 简洁视频线：拆成三个原子节点（2026-10-27），替代原来的黑盒 simple_film。
+    #   plan_short_film  →  write_short_shots  →  render_short_film
+    # 依赖用 required_nodes 声明，拦截器递归补齐；render 是分钟级，已登记进
+    # server.LONG_RUNNING_NODES，走「提交 + 轮询 render_status」。
+    "plan_short_film", "write_short_shots", "render_short_film",
 ]
 
 # ---------------------------------------------------------------------------

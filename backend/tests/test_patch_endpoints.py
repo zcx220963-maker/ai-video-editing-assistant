@@ -82,11 +82,26 @@ class _StubPatch(Tool):
 
     @property
     def parameters(self) -> dict:
-        # 只声明路由必定会拼的两栏；其余键在 registry 里按「未声明原样透传」处理，
-        # 正好用来断言「body 里有什么就转过去什么」。
+        # 注册表对**未知键**是严格的（R5：模型自创键名会被拦下，表现成「工具没反应」）。
+        # 所以替身必须像真节点一样把会收到的键全部声明出来——真节点那边由服务端
+        # ``_signature_for`` 统一给每个节点补 user_id / conversation_id / artifact_id，
+        # 下面这组就是它实际收到的形状。
         return {"type": "object", "properties": {
             "base_artifact_id": {"type": "string"},
+            "user_id": {"type": "string"},
+            "conversation_id": {"type": "string"},
+            "artifact_id": {"type": "string"},
             "wait_sec": {"type": "number"},
+            "edits": {"type": "array"},
+            "shot_sets": {"type": "array"},
+            "remove_shots": {"type": "array"},
+            "reorder": {"type": "array"},
+            "bgm": {"type": "string"},
+            "bgm_volume": {"type": "number"},
+            "bgm_duck": {"type": "boolean"},
+            "texture": {"type": "string"},
+            "film": {"type": "object"},
+            "target_duration_sec": {"type": "number"},
         }, "required": ["base_artifact_id"]}
 
     async def execute(self, **kwargs) -> dict:

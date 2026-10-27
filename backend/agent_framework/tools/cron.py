@@ -283,8 +283,11 @@ class CronScheduler:
             state = JobState(next_run_at_ms=next_ms, last_run_at_ms=now)
             claimed = await self._jobs.claim_run(job.id, job.state.to_dict(),
                                                  new_state=state.to_dict(), enabled=enabled)
-            if claimed is None:
-                continue                     # 别的副本已领走这一轮
+            # 两种后端返回形状不同：PG 是行/None，文件是 True/False。
+            # 只判 `is None` 会把 False 当成「领到了」——文件后端于是照样执行，
+            # 还把 next_run 留在原地，下一 tick 再跑一遍。
+            if not claimed:
+                continue                     # 别的副本 / 另一份 store 已领走这一轮
             job.state = state
             fired += 1
             self.executed.append((job.id, now))

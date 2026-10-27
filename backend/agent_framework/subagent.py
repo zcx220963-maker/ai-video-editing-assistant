@@ -6,10 +6,10 @@
 - 关键约束：SubAgent 不能再派生 SubAgent —— 子 Agent 的工具注册表里【不含 SpawnTool】，
   从结构上杜绝无限递归。这条今天由 ``tests/test_team_wiring.py`` 的断言守着
   （原来只有 ``_build_child_registry`` 上面那句注释在守，注释不构成判据）。
-- **本工具是同步等待**（Q65）：``SpawnTool.execute`` 直接 await 子 Agent 跑完，
-  子结论作为本次工具回执进入本轮消息序列，父计划在它回来之前不许收尾。
-  骨架说「异步派生」，本仓在这一点上**不同但更强**（回调语义因此成立）；
-  真正要「派出去就不等」的活，走 ``subagent_manager.py`` 的常驻 WORK/IDLE 腿。
+- **默认异步**（设计 §15 / R7）：``SpawnTool.execute`` 默认立刻返回 ``task_id``，
+  子 Agent 在后台跑，结论通过 Message Center 回投主 Agent 的收件箱；
+  短任务要「一次调用拿结论」时显式传 ``wait=true``。
+  真正要「派出去就不等」的常驻实例，走 ``subagent_manager.py`` 的 WORK/IDLE 腿。
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ class SubAgentRunner:
         llm: LLMClient,
         child_tool_registrars: list[ToolRegistrar],
         *,
-        max_iterations: int = 6,
+        max_iterations: int = 10,
         child_system_prompt: str | None = None,
         hooks: AgentHook | None = None,
         trace_mq: MessageQueue | None = None,
@@ -112,6 +112,9 @@ class SpawnTool(Tool):
 
     def __init__(self, runner: SubAgentRunner) -> None:
         self._runner = runner
+        # 后台任务必须留强引用：只 create_task 不持有，事件循环可能把它回收掉，
+        # 表现为「派发了但结论永远不回投」。
+        self._bg_tasks: set[asyncio.Task] = set()
 
     @property
     def name(self) -> str:
@@ -123,23 +126,19 @@ class SpawnTool(Tool):
 
     @property
     def description(self) -> str:
-        # 描述必须与**实现**一致（T49/Q65）。这里此前写的是「要多路子任务同时跑就在
-        # 同一次回复里一起调用（系统会并发执行）」——**这句不成立**：SpawnTool 声明
-        # read_only=False 且没有读写集，`concurrency_safe` 恒为 False，
-        # `tool.plan_batches` 会给每个 spawn 各开一批，实际是**串行**。
-        # 描述撒谎的代价不是慢，是**计划错**：模型据此认为「同时发几个就能同时跑」，
-        # 于是把「先等 A 的结果再决定怎么发 B」这种本当串行的活也一股脑发出来。
-        # 所以这里如实写「一次只跑一个」，并把真正的并行腿指出来（常驻子 Agent 那条，
-        # 它才是真并发的）。
         return (
-            "派生一个子 Agent 去完成一个可独立处理的子任务，并**同步等待它结束**，"
-            "把子 Agent 的最终结论作为本次工具调用的结果返回。"
-            "适合把大任务拆成子步骤（如检索+汇总、分文件处理）。"
+            "派生一个子 Agent 去完成一个可独立处理的子任务。**默认异步**：立刻返回 task_id，"
+            "子 Agent 在后台跑，结论稍后以消息形式回投；你可以在等待期间继续做别的步骤。"
+            "只有任务很短、必须拿到结论才能继续时，传 wait=true 让它同步返回结论。"
+            # 能力边界写在**前面**：真机里模型据此派过「执行 build_spec.py」这类必败的活。
+            "**能力边界**：它没有 shell，不能执行任何命令；也拿不到只有主 Agent 才有的"
+            "节点工具。适合 ≤5 个文件的小任务；上限 10 轮，超了会带着过程摘要停下"
+            "（中间结果不会自动交付）。"
             "注意：本工具**一次只跑一个**——同一条回复里写多个调用**不会**让它们同时跑，"
             "子 Agent 可能写文件或联网，本来就得串行观察。"
             "需要真正并行的后台子 Agent，用工具面里的 start_subagent"
-            "（那条腿是派出去就返回、各自在后台跑）。"
-            "子 Agent 不能再派生孙 Agent。"
+            "（那条腿是常驻实例、各自在后台跑）。"
+            "它不会派生孙 Agent（工具表里没有派生口）。"
         )
 
     @property
@@ -151,8 +150,8 @@ class SpawnTool(Tool):
                 "context": {"type": "string", "description": "子任务所需的必要背景信息（可选）"},
                 "wait": {
                     "type": "boolean",
-                    "description": "true=等子 Agent 跑完直接给结论（默认）；"
-                                   "false=立刻返回 task_id，结果稍后回投（长任务用）",
+                    "description": "false=立刻返回 task_id、结果稍后回投（默认）；"
+                                   "true=等子 Agent 跑完直接给结论（只用于短任务）",
                 },
             },
             "required": ["task"],
@@ -165,13 +164,12 @@ class SpawnTool(Tool):
 
     async def execute(
         self, task: str, context: str = "", session_id: str = "",
-        wait: bool = True,
+        wait: bool = False,
     ) -> str:
-        """派生子 Agent。``wait=False`` 时立刻返回 `task_id`，结果回投收件箱（R7）。
+        """派生子 Agent。默认异步：立刻返回 `task_id`，结果回投收件箱（设计 §15 / R7）。
 
-        设计 §15 要的是「异步启动 SubAgent，结果回传主 Agent」；旧实现是同步等待，
-        长任务会把主 Agent 的一次工具调用挂十几分钟。默认仍是 ``wait=True``——
-        既有提示词与技能都按「一次调用拿结论」写，改默认值等于静默改语义。
+        设计要的是「异步启动 SubAgent，结果回传主 Agent」；同步等待会让主 Agent 的
+        一次工具调用挂十几分钟。短任务确需结论时显式 ``wait=True``（保留旧语义）。
         """
         prompt = f"{task}\n\n背景：{context}" if context else task
         ctx = _current_hook_ctx.get()
@@ -187,9 +185,16 @@ class SpawnTool(Tool):
                     out = await self._runner.run(prompt, parent_session_id=session_id)
                 except Exception as exc:  # noqa: BLE001  异步分支不能把异常吞成静默
                     out = f"Error: 子 Agent 失败：{type(exc).__name__}: {exc}"
+                if ctx is not None and hooks is not None:
+                    try:
+                        await hooks.on_subagent_end(ctx, task, out)
+                    except Exception:  # noqa: BLE001  钩子失败不该影响回投
+                        logger.exception("子 Agent 收尾钩子失败：%s", task_id)
                 await self._notify(task_id, task, out)
 
-            asyncio.create_task(_bg())
+            bg = asyncio.create_task(_bg())
+            self._bg_tasks.add(bg)
+            bg.add_done_callback(self._bg_tasks.discard)
             return (f"[已派发] task_id={task_id}。子 Agent 在后台跑，"
                     "结果会以消息形式回投；不要立刻重复派同一个任务。")
 
@@ -215,7 +220,7 @@ def make_spawn_tool(
     llm: LLMClient,
     child_tool_registrars: list[ToolRegistrar],
     *,
-    max_iterations: int = 6,
+    max_iterations: int = 10,
     hooks: AgentHook | None = None,
     trace_mq: MessageQueue | None = None,
 ) -> SpawnTool:

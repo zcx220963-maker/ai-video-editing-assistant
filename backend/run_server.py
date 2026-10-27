@@ -278,6 +278,8 @@ def build_runtime(
     max_concurrent_sessions: int = 32,               # 同时活跃的会话数上限（R1/D17）
     cron_store: str = "pg",                          # R14：file=文件为真相；pg=既有行为
     cron_root: str = ".runtime/cron",                # 文件版 CronJob 的落点
+    team_store: str = "file",                        # R19：file=任务板/收件箱/子 Agent 文件真相
+    team_root: str = ".runtime/team",                # 文件版团队三件套的落点
     storage_backend: str = "memory",                 # 生产用 "pg_minio"；"memory" 是离线替身
     storage: Storage | None = None,                  # 已构造的句柄（测试注入），优先于 storage_backend
     cache_root: str | Path | None = None,            # localize 内容缓存根（可删光）
@@ -287,6 +289,8 @@ def build_runtime(
     topic: str = CHAT_TOPIC,
     skills_dir: str | Path | bool | None = None,     # 导入源目录；False=关闭技能系统
     use_memory: bool = True,                         # 长期记忆存 PG memories 表
+    # 记忆每轮刷新（设计「每次与 LLM 交互都携带记忆」）：默认开；关掉只保留装配期那次。
+    memory_every_iteration: bool = True,
     # 提示词目录（prompts/*.md）；None = 用仓库自带的 prompts/，False = 关闭（全走内联）
     prompts_dir: str | Path | bool | None = None,
     use_checkpoint: bool = True,                       # False = 关闭崩溃恢复快照
@@ -455,10 +459,12 @@ def build_runtime(
         # `storage`，所以这一段不能挪到上面跟文件工具一起注册。
         register_run_tool(registry, file_root, skill_loader)
     memory_store: MemoryStore | None = None
+    memory_source: MemoryContextSource | None = None
     if use_memory:
         memory_store = MemoryStore(storage)
         register_memory_tools(registry, memory_store)
-        context_sources.append(MemoryContextSource(memory_store))
+        memory_source = MemoryContextSource(memory_store)
+        context_sources.append(memory_source)
 
     # ---- 计划门（块 B）：规划轮的唯一出口 + 执行帧的服务端校验 ----
     # 依赖全是引用（注册表与契约要到 _startup 才填齐），所以在这里构造就够了：
@@ -511,8 +517,12 @@ def build_runtime(
     if observability:
         hook_list += [LoggingHook(), MetricsHook()]
     hooks = CompositeHook(hook_list)
-    # R12：每轮注入记忆（默认关闭，MEMORY_EVERY_ITERATION=1 才挂）。
-    _mem_hook = make_iteration_hook(storage) if use_memory else None
+    # R12：每轮刷新记忆（默认开启，设计原文「每次与 LLM 交互都会携带记忆内容」）。
+    # 与装配期共用同一个 source，所以刷新是**原地替换**那段 <memory>，不新增系统消息、
+    # 也不绕过 §5.4.1 的字节预算。--no-memory-iteration / MEMORY_EVERY_ITERATION=0 关闭。
+    _mem_hook = (make_iteration_hook(storage, source=memory_source,
+                                     enabled=memory_every_iteration)
+                 if use_memory else None)
     if _mem_hook is not None:
         hooks.add(_mem_hook)
     agent = Agent(
@@ -529,7 +539,8 @@ def build_runtime(
         memory_store=memory_store,
     )
 
-    # ---- Agent Team：消息中心 / 任务板 / 常驻子 Agent 池（状态在 PG 协作三表）----
+    # ---- Agent Team：消息中心 / 任务板 / 常驻子 Agent 池 ----
+    # 默认文件真相（tasks/、messages/、agents/）；TEAM_STORE=pg 才走协作三表（多副本）。
     team_obj: Team | None = None
     if use_team:
         team_obj = register_team_tools(
@@ -539,6 +550,8 @@ def build_runtime(
             node_deps=editing_contract.required_map,
             hooks=hooks,
             max_iterations=max_iterations,
+            team_store=team_store,
+            team_root=team_root,
         )
 
     # Cron 工具需要已构造的 scheduler；scheduler 的 runner 需要 mq —— 先建 scheduler 再注册。
@@ -939,6 +952,12 @@ def parse_args() -> argparse.Namespace:
                    choices=["file", "pg"],
                    help="定时任务落点（R14）：file=文件为真相（单机/共享卷）；"
                         "pg=多副本（跨主机文件没有原子 claim）")
+    p.add_argument("--team-store", default=os.getenv("TEAM_STORE", "file"),
+                   choices=["file", "pg"],
+                   help="Agent Team 落点（R19）：file=任务板/收件箱/子 Agent 文件为真相；"
+                        "pg=协作三表（多副本必须选它）")
+    p.add_argument("--team-root", default=os.getenv("TEAM_ROOT", ".runtime/team"),
+                   help="文件版团队三件套的根目录（tasks/ messages/ agents/ 在其下）")
     p.add_argument("--instance-id", default=os.getenv("INSTANCE_ID", ""),
                    help="本实例唯一名（OutBound 消费组用，R2）。留空=hostname:pid")
     p.add_argument("--storage", default=os.getenv("STORAGE_BACKEND", "pg_minio"),
@@ -965,12 +984,14 @@ def parse_args() -> argparse.Namespace:
                    help="技能导入源目录（默认 examples/skills；启动时刷进 PG skills 表 + MinIO 附件）")
     p.add_argument("--no-skills", action="store_true", help="禁用技能系统")
     p.add_argument("--no-memory", action="store_true",
-                   help="禁用长期记忆（默认启用，内容在 PG memories 表按用户归属）")
+                   help="禁用长期记忆（默认启用，内容在 PG memories 表按用户归属；"
+                        "记忆工具与注入都不挂）")
+    p.add_argument("--no-memory-iteration", action="store_true",
+                   help="只在装配期注入记忆，不在每轮 LLM 调用前刷新"
+                        "（默认每轮刷新；环境变量 MEMORY_EVERY_ITERATION=0 同效）")
     p.add_argument("--no-checkpoint", action="store_true",
                    help="禁用崩溃恢复 checkpoint（一致点快照存 PG checkpoints 表）")
     p.add_argument("--no-resume", action="store_true", help="启动时不自动恢复未完成执行")
-    p.add_argument("--instance-id", default=None,
-                   help="本实例标识（多副本崩溃恢复认领权用）；默认 hostname-pid")
     p.add_argument("--approve-tools", default="",
                    help="执行前需人工审批的工具名（逗号分隔，HITL 断点）；空=不启用")
     p.add_argument("--quota-limit", type=int,
@@ -1035,6 +1056,8 @@ def main() -> None:
         bootstrap_servers=args.bootstrap_servers,
         max_concurrent_sessions=args.max_concurrent_sessions,
         cron_store=args.cron_store,
+        team_store=args.team_store,
+        team_root=args.team_root,
         storage_backend=args.storage,
         cache_root=args.cache_root or None,
         workspace_root=args.workspace_root or None,
@@ -1042,6 +1065,7 @@ def main() -> None:
         workspace_ttl_sec=args.workspace_ttl_sec,
         skills_dir=False if args.no_skills else args.skills_dir,
         use_memory=not args.no_memory,
+        memory_every_iteration=not args.no_memory_iteration,
         use_checkpoint=not args.no_checkpoint,
         auto_resume=not args.no_resume,
         instance_id=args.instance_id,

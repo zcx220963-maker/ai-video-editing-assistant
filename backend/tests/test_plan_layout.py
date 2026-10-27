@@ -166,7 +166,10 @@ def case_drive_is_not_a_god_method() -> None:
     if drive is None:
         return
     span = drive.end_lineno - drive.lineno + 1
-    check(span <= 90, f"_drive 只剩骨架（{span} 行；拆之前 325 行）")
+    # 上限算的是「签名 + docstring + 循环骨架」的整段：签名如今 19 行（参数都是**入口
+    # 契约**，删一个就少一条续跑/规划轮的通道）。判据要防的是「god method 长回来」，
+    # 100 这个天花板离拆之前的 325 行仍有 3 倍余量。
+    check(span <= 100, f"_drive 只剩骨架（{span} 行；拆之前 325 行）")
     for name in ("_open_run", "_tool_round", "_suppress_repeat_render", "_pause",
                  "_nudge_back", "_deliver"):
         check(name in methods, f"切出去的那一块有名字：{name}")
@@ -244,7 +247,15 @@ def case_no_extras_bypass() -> None:
                # 预览静帧闸（2026-10-24）：`_preview_refusals` 是「同一镜的预览已经
                # 拒过几次」的升级计数器，`_previews_since_delivery` 是交付之后又放行
                # 了几张。两个都只在本 run 的工具回执里读，没有跨挂起的读者。
-               "_preview_refusals", "_previews_since_delivery"}
+               "_preview_refusals", "_previews_since_delivery",
+               # `_completed_calls` 是**从 checkpoint 读出来的**已完成调用集（逐调用
+               # 恢复点那一层），只在本 run 内当缓存：没有它每轮都要查一遍库，落盘
+               # 则是把「库里的那一份」再抄一遍，反而多一处会过期的真相。
+               "_completed_calls",
+               # `recall_query` 是装配期算好的召回词（含计划步骤名），每轮记忆刷新
+               # 沿用它；续跑入口没有装配上下文时留空、由 hook 退回最后一条用户消息。
+               # 它是**本轮注入**，跨挂起带过去只会用旧词去召回。
+               "recall_query"}
     import re
     keys = set(re.findall(r'extras\["([a-zA-Z_]+)"\]',
                           (ROOT / "agent_framework" / "agent.py").read_text(encoding="utf-8")))

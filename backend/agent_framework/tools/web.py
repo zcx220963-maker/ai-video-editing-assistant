@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Callable
 
-from ..tool import Tool
+from ..tool import Tool, ToolError
 
 USER_AGENT = "Mozilla/5.0 (compatible; AgentFramework/0.1)"
 
@@ -418,6 +418,17 @@ class FetchTool(Tool):
             fetched = await asyncio.to_thread(self._transport, url, max_bytes, self.timeout)
         except Exception as e:  # noqa: BLE001 - 网络异常回喂给 LLM
             return f"Error: 抓取失败 {url}: {e}"
+
+        # 404/410 是**结论**，不是「有内容没读到」：把错误页的导航正文回喂给模型，
+        # 它会当成一次没读全，对着同一个死链接一枪接一枪。真机 run f5031cbe1163
+        #（2026-10-17）不存在的维基条目被同一 URL 抓了 150+ 次，一路打到熔断。
+        # 按 ``counts_as_failure=False`` 抛：这条错误本身是可执行的结论（换源 / 判死），
+        # 不该计入「工具坏了」的连续失败账。
+        if fetched.status in (404, 410):
+            raise ToolError(self.name,
+                            f"地址不存在（HTTP {fetched.status}）：{url}——这个地址没有内容，"
+                            f"同一个 URL 重试永远不会成功；换一个来源，或改用检索找现存页面。",
+                            counts_as_failure=False)
 
         ctype = fetched.content_type.lower()
         is_html = "html" in ctype or fetched.body.lstrip()[:15].lower().startswith(b"<!doctype html")

@@ -3,10 +3,10 @@
 对应设计文档「Agent Team —— SubAgent Manager」，四个关键设计：
 1. 子 Agent 有【独立且收敛为父集子集】的工具集（权限收敛）——由外部传入裁剪后的 registry。
 2. 除 working 外还有 idle / shutdown 状态；idle 常驻内存（线程池式），避免反复创建进程。
-3. 子 Agent 的 prompt 与工作状态持久化 —— 落在 PG ``subagents`` 表
-   （spec §3.10，取代 ``subagents.json`` 整文件覆写），主键 ``(scope, name)``，
-   scope = ``{user}:{conv}``；working 行带 ``lease_expires_at`` 租约，进程被 kill 后
-   租约到期即由 ``reset_expired`` 归位 idle，不再谎报「还在干」。
+3. 子 Agent 的 prompt 与工作状态持久化 —— 默认落 ``agents/{scope}/{name}.json``
+   （设计 §24）；``TEAM_STORE=pg`` 时落 ``subagents`` 表（多副本）。working 行带
+   ``lease_expires_at`` 租约，进程被 kill 后租约到期即由 ``reset_expired`` 归位 idle，
+   不再谎报「还在干」。
 4. idle 有两种唤醒方式：
    - 主动：经 Message Center 得知自己被分配了任务（读到收件箱消息）；
    - 被动：自驱扫描 Task Manager，发现有 pending、无 owner、无阻塞的可认领任务。
@@ -59,8 +59,12 @@ class SubAgentManager:
     """管理一组常驻子 Agent 的状态与生命周期；状态与租约落在 ``subagents`` 表。"""
 
     def __init__(self, storage: Any, *, user_id: str = "default",
-                 conversation_id: str = "default", lease_sec: float = 600) -> None:
-        self._repo = storage.subagents
+                 conversation_id: str = "default", lease_sec: float = 600,
+                 repo: Any | None = None, store: str | None = None,
+                 root: str | None = None) -> None:
+        from .team_files import select_team_store
+
+        self._repo = repo or select_team_store(storage, store=store, root=root)[2]
         self.default_user_id = user_id
         self.default_conversation_id = conversation_id
         self.lease_sec = lease_sec

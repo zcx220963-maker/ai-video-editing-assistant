@@ -64,13 +64,17 @@ def main() -> int:
           "给的是画法（path/polygon/渐变），不是件名")
     check("≥ 38/255" in sysmsg and "≥ 40" in sysmsg,
           "给了可核对的亮度数字（模型对「亮多少」没有直觉，必须给数）")
-    check("ChapterMark" in sysmsg and "不要写" in sysmsg,
-          "明说文字层不要自己画（否则成片上两个章节号）")
+    check("ChapterMark" in sysmsg and "<AbsoluteFill>" in sysmsg and "外层不再插手" in sysmsg,
+          "文字层可以用，但用了就自己写 `<AbsoluteFill>`（外层让位，不会两边各画一遍）")
 
-    print("\n③ 外层包装：Camera 运镜 + 三件文字层，由外层统一加")
+    print("\n③ 外层包装：Camera 运镜必加；文字层只在分镜点名 overlay 时加")
     inner = ('const Scene = ({ dur }: { dur: number }) => { const t = 0;\n'
              '  return (<><svg viewBox="0 0 1 1"><path d="M0 0 L1 1" /></svg></>);\n};')
-    wrapped = film.wrap_story_scene(inner, SCENE, index=2)
+    # 2026-10-26 起字幕默认 `drawn`（文字由画面写手画进画面），外层只给
+    # **点名 overlay 的镜**补文字层。③ 这一节量的是"外层补出来的那三件"，
+    # 所以显式点名 overlay；默认档的行为在 ③b 里单独钉。
+    overlay = {**SCENE, "caption": {"mode": "overlay"}}
+    wrapped = film.wrap_story_scene(inner, overlay, index=2)
     check("const Inner03" in wrapped, "模型画的场景改名成 Inner03（不撞外层 Scene）")
     check(wrapped.count("const Scene") == 1, "整段只有一个 `const Scene`")
     check("<Camera " in wrapped and "<Inner03 dur={dur} />" in wrapped, "外层套运镜")
@@ -86,19 +90,22 @@ def main() -> int:
           < wrapped.index("<RichCaption"),
           "提亮层在画面之上、文字之下（文字不该被一起洗白）")
 
-    print("\n③b 字幕三层：外层保可读性 / 分镜给版式 / drawn 时模型自己画")
-    # 判据只有一条：分镜说 drawn 就不加，没说就兜底。这是"灵活但不屎山"的关键——
-    # 不判断"画得好不好"，也不加闸。
+    print("\n③b 字幕三层：外层保可读性 / 分镜给版式 / 默认 drawn 由模型自己画")
+    # 判据只有一条：分镜点名 overlay 才由外层补，其余（默认/ drawn / none）一个字不加。
     drawn = film.wrap_story_scene(inner, {**SCENE, "caption": {"mode": "drawn"}}, index=0)
     check("<RichCaption" not in drawn,
           "mode=drawn → 外层一个字不加（字幕由画面写手画进画面）")
     none = film.wrap_story_scene(inner, {**SCENE, "caption": {"mode": "none"}}, index=0)
     check("<RichCaption" not in none, "mode=none → 这镜不要字幕（纯画面）")
-    check("<RichCaption" in wrapped, "不写 caption → 默认 overlay（老片子行为不变）")
+    default = film.wrap_story_scene(inner, SCENE, index=0)
+    check("<RichCaption" not in default,
+          "不写 caption → 默认 drawn（2026-10-26 起外层不再统一贴字幕）")
     # 位置五档：只变 2~3 档是有意的，位置每镜都变观众跟不住。
-    ups = film.wrap_story_scene(inner, {**SCENE, "caption": {"at": "upper"}}, index=0)
+    ups = film.wrap_story_scene(inner, {**SCENE, "caption": {"mode": "overlay", "at": "upper"}},
+                                index=0)
     check("bottom={0.62}" in ups, f"at=upper → 底边 0.62（{cap_mod.CAPTION_AT['upper']}）")
-    left = film.wrap_story_scene(inner, {**SCENE, "caption": {"at": "left"}}, index=0)
+    left = film.wrap_story_scene(inner, {**SCENE, "caption": {"mode": "overlay", "at": "left"}},
+                                 index=0)
     check('align="left"' in left, "at=left → 左对齐")
     # 字号按**短边**：原来按宽度算，同一个 0.038 在 1920/1280/720 上差三倍。
     check(cap_mod.fit("短句") > cap_mod.fit("这" * 40),
@@ -142,9 +149,14 @@ def main() -> int:
           "组件清单与实现都在（清单写错模型就调不到）")
 
     print("\n④ 高亮词必须是正文子串")
-    bad = film.wrap_story_scene(inner, {"text": "换你守在 1379 号站", "hi": "警告"}, index=0)
+    # 高亮只活在外层字幕里（`hi` 是 `RichCaption` 的参数），所以这里点名 overlay；
+    # 默认 drawn 时高亮由写手自己画，外层不读它。
+    _ov = {"mode": "overlay"}
+    bad = film.wrap_story_scene(inner, {"text": "换你守在 1379 号站", "hi": "警告",
+                                        "caption": _ov}, index=0)
     check('hi=""' in bad, "hi 不在 text 里 → 置空")
-    good = film.wrap_story_scene(inner, {"text": "上报，还是警告？", "hi": "警告"}, index=0)
+    good = film.wrap_story_scene(inner, {"text": "上报，还是警告？", "hi": "警告",
+                                         "caption": _ov}, index=0)
     check('hi="警告"' in good, "是子串 → 保留")
 
     print("\n⑤ 转场：叙事片只 cut / fade")
@@ -172,7 +184,11 @@ def main() -> int:
     used = set(system.used_components(fb))
     check("Ribbon" not in used and "ScanGrid" not in used,
           f"兜底里没有信息图零件（{sorted(used)}）")
-    check({"Sky", "Horizon"} <= used, "兜底用的是天空/地平线这一套")
+    # 2026-10-26 起兜底不再是手写三套插画（Sky/Horizon 那套件已删），改成按镜号推的
+    # 纯 SVG 几何：三段底色 + 一处径向光 + 一个主体 + 一条地平线。判据跟着量这三样。
+    check("<svg" in fb and "<radialGradient" in fb and "<circle" in fb,
+          "兜底是纯 SVG 几何（底色 + 径向光 + 主体），不是件名拼装")
+    check("MOTIF_AT" in fb, "兜底也带锚点（跨镜接力不会在兜底镜断掉）")
     check(film._looks_complete(fb), "兜底本身是完整组件")
 
     print("\n⑧ 画法指纹：能分开不同画法（variety 不是恒等于 1 的假指标）")
@@ -200,7 +216,9 @@ def main() -> int:
     # NameError，然后被兜底静默盖住（整片 15 镜全成兜底，日志上只看到「质检 1.0」）。
     # 这一条就是为了让那种错**在测试里就红**：用假的模型回话走一遍真实函数。
     import asyncio  # noqa: PLC0415
-    canned = "```tsx\n" + scene._STORY_SAFE_BODIES[0] + "\n```"
+    # 兜底镜的几何体就是一份「形状一定合法」的场景代码——原来这里读的是
+    # `_STORY_SAFE_BODIES`（手写三套插画，已删），现在按镜号推（`_fallback_body`）。
+    canned = "```tsx\n" + scene._fallback_body(0) + "\n```"
     orig = film.kernel._complete
 
     async def fake(messages, **kw):  # noqa: ANN001, ANN003
@@ -208,8 +226,11 @@ def main() -> int:
 
     film.kernel._complete = fake
     try:
+        # 默认 `drawn` 会要求"字幕真的画进画面"，而这里的罐头体是纯几何（没有字）。
+        # 点名 overlay：外层补字幕，函数只验它自己的那条路（拆文件后的全局名都在）。
         got = asyncio.run(story.write_scene_story_code(
-            SCENE, index=0, total=1, seconds=7.0, aspect="landscape"))
+            {**SCENE, "caption": {"mode": "overlay"}},
+            index=0, total=1, seconds=7.0, aspect="landscape"))
         check("const Scene" in got,
               "能拿到场景体（说明 SCENE_HEADER / _looks_complete 这些全局名都在）")
     except Exception as exc:  # noqa: BLE001

@@ -86,7 +86,7 @@ async def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         storage = build_storage("memory")
         await storage.start()
-        mgr = SubAgentManager(storage, user_id="u1", conversation_id="c1")
+        mgr = SubAgentManager(storage, user_id="u1", conversation_id="c1", store="pg")
 
         # ---- 权限收敛：子 Agent 工具集 = 父集白名单子集 ----
         parent = ToolRegistry()
@@ -103,7 +103,7 @@ async def main() -> None:
               f"子 Agent 登记进 subagents 表并带作用域/prompt：{rows}")
         check(rows[0]["status"] == IDLE and rows[0]["lease_expires_at"] is None,
               "idle 行无租约（只有 working 才需要证明自己还活着）")
-        reloaded = SubAgentManager(storage, user_id="u1", conversation_id="c1")
+        reloaded = SubAgentManager(storage, user_id="u1", conversation_id="c1", store="pg")
         check(await reloaded.get_status("sub_a") == IDLE, "重启后可读回 prompt/状态")
         check({"sub_a"} <= {r["name"] for r in await reloaded.list_agents()},
               "list_agents 含登记的成员")
@@ -113,7 +113,7 @@ async def main() -> None:
         r = (await storage.db.select("subagents", where={"name": "sub_a"}, limit=1))[0]
         check(r["lease_expires_at"] is not None, "working 行带租约到期时间")
         check(await mgr.reset_expired() == 0, "租约未到期时不动它")
-        expired = SubAgentManager(storage, user_id="u1", conversation_id="c1", lease_sec=-1)
+        expired = SubAgentManager(storage, user_id="u1", conversation_id="c1", store="pg", lease_sec=-1)
         await expired.set_status("sub_a", WORKING)
         check(await mgr.reset_expired() == 1, "租约到期的 working 被 reset_expired 归位")
         check(await mgr.get_status("sub_a") == IDLE, "对账后状态是 idle")
@@ -121,14 +121,14 @@ async def main() -> None:
               == "负责粗剪", "改状态只改状态列，登记的 prompt 不被覆写")
 
         # ---- 作用域隔离：别的会话看不到本会话的队友 ----
-        other = SubAgentManager(storage, user_id="u2", conversation_id="c9")
+        other = SubAgentManager(storage, user_id="u2", conversation_id="c9", store="pg")
         check(await other.list_agents() == [], "不同 用户:会话 各一组队友")
         with use_identity("u3", "c3"):
             check(await mgr.list_agents() == [], "run 内取的是当前身份那组，不是实例缺省")
 
         # ---- 双唤醒生命周期 ----
-        mc = MessageCenter(storage, user_id="u1", conversation_id="c1")
-        tm = TaskManager(storage, user_id="u1", conversation_id="c1")
+        mc = MessageCenter(storage, user_id="u1", conversation_id="c1", store="pg")
+        tm = TaskManager(storage, user_id="u1", conversation_id="c1", store="pg")
         head = await tm.create("链首任务：整理素材")  # pending、无依赖 → 可认领（被动唤醒源）
 
         agent = _mk_agent([("answer", "粗剪完成"), ("answer", "配音完成"), ("answer", "导出完成")])
@@ -171,8 +171,8 @@ async def main() -> None:
         check(await mgr.get_status("sub_c") == SHUTDOWN, "异常 shutdown 状态入表")
 
         # ---- 纯超时：无任何唤醒源 → 一轮 WORK 后 idle 轮询耗尽 → shutdown ----
-        mc2 = MessageCenter(storage, user_id="u9", conversation_id="c9")
-        tm2 = TaskManager(storage, user_id="u9", conversation_id="c9")  # 空，无可认领任务
+        mc2 = MessageCenter(storage, user_id="u9", conversation_id="c9", store="pg")
+        tm2 = TaskManager(storage, user_id="u9", conversation_id="c9", store="pg")  # 空，无可认领任务
         idle_only = ManagedSubAgent(
             "sub_d", _mk_agent([("answer", "完成")]),
             mgr, message_center=mc2, task_manager=tm2,

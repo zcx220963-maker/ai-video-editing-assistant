@@ -9,9 +9,9 @@
 这里钉三件事：
 
 ① 软线（``_PREVIEW_SOFT``）只提醒一句，不封路；
-② 硬线（``_PREVIEW_HARD``）起 ``preview_shot`` 不再执行，回执给出路（交给 ``plan_motion``）；
-③ 交付调用（``plan_motion`` / ``render_motion_code`` / ``submit_plan``）把计数清零——
-   下一镜/下一轮重新拥有完整的预览额度。
+② 硬线（``_PREVIEW_HARD``）起 ``preview_shot`` 不再执行，回执给出路（交给片子的下一步）；
+③ 交付调用（``submit_plan``）把计数清零——下一镜/下一轮重新拥有完整的预览额度。
+   零素材与剪辑两条线的「交出去」都发生在 ``submit_plan`` 之后，所以清零只认它。
 
 跑法：``cd backend && python tests/test_preview_delivery_gate.py``
 """
@@ -87,7 +87,7 @@ async def case_a_hard_line() -> int:
     n = _PREVIEW_HARD + 4
     probe = OkStub("preview_shot")
     steps = [("tool", "preview_shot", {"v": f"v{i}"}) for i in range(n)]
-    agent = build_agent(steps + [("answer", "交给 plan_motion")], tools=[probe])
+    agent = build_agent(steps + [("answer", "交给 reshoot_shot")], tools=[probe])
     agent.config.max_iterations = n + 3
     await agent.run(Session(user_id="u", conversation_id="c_prev_a"), "做一镜")
     last = agent.llm.calls[-1]
@@ -98,8 +98,8 @@ async def case_a_hard_line() -> int:
     refused = [t for t in receipts if "这次不再渲静帧" in t]
     check(len(refused) == n - _PREVIEW_HARD,
           f"① 超出的每一枪都收到拒绝回执：{len(refused)}/{n - _PREVIEW_HARD}")
-    check(all("plan_motion" in t and "render_motion_code" in t for t in refused),
-          "① 拒绝回执给出路：交给 plan_motion / 全部齐了再 render_motion_code")
+    check(all("reshoot_shot" in t and "render_short_film" in t for t in refused),
+          "① 拒绝回执给出路：零素材线用 reshoot_shot 改一镜 / render_short_film 重渲")
     notes = [t for t in _system_msgs(last) if "已经连续预览了" in t]
     check(len(notes) == 1,
           f"① 软线只说**一句** system 提醒：{len(notes)} 条")
@@ -115,9 +115,9 @@ async def case_a_hard_line() -> int:
 async def case_b_delivery_resets() -> int:
     print("\n=== ② 交付调用清零：交一镜之后重新拥有完整额度 ===")
     probe = OkStub("preview_shot")
-    plan = OkStub("plan_motion")
+    plan = OkStub("submit_plan")
     steps = ([("tool", "preview_shot", {"v": f"a{i}"}) for i in range(_PREVIEW_SOFT + 1)]
-             + [("tool", "plan_motion", {"v": "s01"})]
+             + [("tool", "submit_plan", {"v": "s01"})]
              + [("tool", "preview_shot", {"v": f"b{i}"}) for i in range(_PREVIEW_SOFT + 1)]
              + [("answer", "完成")])
     agent = build_agent(steps, tools=[probe, plan])

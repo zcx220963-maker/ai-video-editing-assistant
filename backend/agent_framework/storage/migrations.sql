@@ -137,3 +137,10 @@ ALTER TABLE conversations ADD COLUMN IF NOT EXISTS prefs jsonb NOT NULL DEFAULT 
 ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS cache_hit_tokens integer;
 ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS cache_miss_tokens integer;
 ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS cost_yuan double precision;
+
+-- R19：任务状态改设计原文口径（pending → on_progress → completed）。
+-- 老库的行是 claimed；约束先删再改再加，与本文件其他 DROP+ADD 同规，可反复执行。
+ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
+UPDATE tasks SET status = 'on_progress' WHERE status = 'claimed';
+ALTER TABLE tasks ADD CONSTRAINT tasks_status_check
+  CHECK (status IN ('pending','on_progress','completed'));

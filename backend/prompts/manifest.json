@@ -90,16 +90,6 @@
       "referenced_by": ["assembly"], "fixed": false, "max_bytes": 560,
       "desc": "执行轮把方案写成正文、等用户打字确认时的打回：直接执行，渲染前统一弹确认卡。"
     },
-    "motion_render_nudge": {
-      "file": "motion_render_nudge.md", "phase": "guard", "kind": "conditional",
-      "referenced_by": ["plan_motion"], "fixed": false, "max_bytes": 1200,
-      "desc": "自动入口分镜已入库却用文字收尾、没调 render_motion_code 时的打回：出片确认卡才带逐镜静帧。"
-    },
-    "motion_render_note": {
-      "file": "motion_render_note.md", "phase": "guard", "kind": "conditional",
-      "referenced_by": ["plan_motion"], "fixed": false, "max_bytes": 500,
-      "desc": "同上，打回用尽后的兜底说明（附在终答末尾，如实告诉用户出片还没开始）。"
-    },
     "polish_system": {
       "file": "polish_system.md", "phase": "skill_flow", "kind": "on_demand",
       "referenced_by": ["POST /skills/from_run"], "fixed": false, "max_bytes": 1177,

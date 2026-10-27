@@ -63,8 +63,10 @@ async def part1_team_tools(tmp: Path) -> None:
     # 子 Agent 的 IDLE 窗口显式收紧：生产默认是「常驻等几十秒再接活」（避免每任务重建），
     # 而本用例要的是在秒级内走完 WORK→IDLE→SHUTDOWN 全生命周期，所以给它一个短窗口。
     # 这不是放松断言——下面照样校验它确实收到了收件箱消息并完成两轮，最后落到 shutdown。
+    team1_root = tmp / "team1"
     team = register_team_tools(reg, llm=llm, storage=st1,
                                node_deps=lambda: node_required_map(build_node_registry()),
+                               team_root=str(team1_root),
                                idle_window_sec=0.2, idle_poll_sec=0.01)
 
     need = {
@@ -81,7 +83,9 @@ async def part1_team_tools(tmp: Path) -> None:
     N_TASKS = 26
     check(len(plan["created_tasks"]) == N_TASKS,
           f"DAG 自动组队 → {N_TASKS} 个任务（实际 {len(plan['created_tasks'])}）")
-    check(await st1.db.count("tasks") == N_TASKS, f"{N_TASKS} 行任务进了 PG tasks 表（不落本地目录）")
+    board_files = list((team1_root / "tasks" / "default" / "default").glob("task_*.json"))
+    check(len(board_files) == N_TASKS and await st1.db.count("tasks") == 0,
+          f"{N_TASKS} 个任务落文件真相，PG 不留拷贝")
     tasks = json.loads(await reg.execute("list_tasks", {}))
     check(len(tasks) == N_TASKS and all(t["status"] == PENDING for t in tasks),
           f"任务板 {N_TASKS} 个 pending")
@@ -98,15 +102,18 @@ async def part1_team_tools(tmp: Path) -> None:
     check(first not in downstream_ready, "已完成任务不再出现在可认领列表")
     status = json.loads(await reg.execute("team_status", {}))
     check(len(status["tasks"]) == N_TASKS, "team_status 能看到任务板")
-    edges = await st1.db.select("task_edges")
+    edges = json.loads((team1_root / "tasks" / "default" / "default" / "edges.json")
+                       .read_text(encoding="utf-8"))
     check(len(edges) == sum(len(t["blockedBy"]) for t in tasks),
-          f"依赖边一Edge一行落在 task_edges：{len(edges)} 行")
+          f"依赖边落 edges.json：{len(edges)} 行")
 
     # 常驻子 Agent：用全新空任务板的 team，唤醒只能来自收件箱 → 轮数确定
     llm2 = ScriptedLLM([("answer", "第一轮完成"), ("answer", "第二轮完成")])
     reg2 = ToolRegistry()
     st2 = build_storage("memory")
+    team2_root = tmp / "team2"
     team2 = register_team_tools(reg2, llm=llm2, storage=st2,
+                                team_root=str(team2_root),
                                 idle_window_sec=0.2, idle_poll_sec=0.01)
     declined = json.loads(await reg2.execute("plan_editing_team", {}))
     check(declined["created_tasks"] == [] and "error" in declined,
@@ -121,9 +128,11 @@ async def part1_team_tools(tmp: Path) -> None:
     check(result["worked_rounds"] == 2, f"WORK 两轮（收件箱消息唤醒第二轮）：{result['worked_rounds']}")
     check(result["replies"] == ["第一轮完成", "第二轮完成"], "两轮答复与脚本一致")
     check(await team2.subagent_manager.get_status("worker") == "shutdown", "无新消息后走 SHUTDOWN 释放")
-    srow = (await st2.db.select("subagents", where={"name": "worker"}, limit=1))[0]
-    check(srow["prompt"] == "完成第一件任务" and srow["status"] == "shutdown",
-          f"子 Agent 档案在 PG subagents 表：{ {k: srow[k] for k in ('scope','status')} }")
+    srow = json.loads((team2_root / "agents" / "default" / "default" / "worker.json")
+                      .read_text(encoding="utf-8"))
+    check(srow["prompt"] == "完成第一件任务" and srow["status"] == "shutdown"
+          and await st2.db.count("subagents") == 0,
+          f"子 Agent 档案落 agents/{{scope}}/{{name}}.json：{ {k: srow[k] for k in ('scope','status')} }")
     status2 = json.loads(await reg2.execute("team_status", {}))
     check(any(a["name"] == "worker" for a in status2["agents"]), "team_status 可见 worker 档案")
     # 团队会话历史同样只在 PG：子 Agent 的两轮 QA 写进 messages 表
@@ -331,8 +340,10 @@ async def part4_spawn_no_recursion() -> None:
     check(outer.has("spawn_subagent") and not child.has("spawn_subagent"),
           "同一时刻：主注册表有 spawn、子注册表没有（两边真的分开了）")
     desc = spawn.description
-    check("同步等待" in desc, "工具描述如实写「同步等待」（Q65：描述与行为一致）")
-    check("异步" not in desc, "描述里不再出现「异步」这种与行为不符的说法")
+    check("默认异步" in desc and "task_id" in desc,
+          "工具描述如实写「默认异步、立即回 task_id」（Q65：描述与行为一致）")
+    check("wait=true" in desc and "同步返回" in desc,
+          "描述给出同步等待的入口（wait=true），与行为一致")
 
 
 async def part5_spawn_child_toolset(tmp: Path) -> None:

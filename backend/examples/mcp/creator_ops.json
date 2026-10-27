@@ -1,0 +1,12 @@
+{
+  "_comment": "创作者存量服务 MCP 配置样例（设计 §17）。command/args 指向本仓库的 stdio mock；接真实服务时换成真实端点（type=sse/streamableHttp + url + headers），工具面不变。",
+  "mcp_servers": {
+    "creator_ops": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["examples/mcp/creator_ops_server.py"],
+      "enabledTools": ["*"],
+      "toolTimeout": 30
+    }
+  }
+}

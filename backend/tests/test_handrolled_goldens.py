@@ -2,18 +2,21 @@
 
 这四处（JWT HS256 + PBKDF2、YAML 子集、frontmatter、CJK token 计数）经逐条定价后
 **决定不换库**，理由写在开发指南 §3.6：换 pyjwt 会打开**算法协商面**（现实现只认
-HS256）、换 PyYAML 会扩大**解析面**（现在故意不支持锚点/多文档/任意对象构造）、
-换 bcrypt 要重做历史口令兼容、换 tiktoken 会让 `65536` 这条**跨模型**预算变成
-按模型分词器各算一套。
+HS256）、换 bcrypt 要重做历史口令兼容、换 tiktoken 会让 `65536` 这条**跨模型**预算
+变成按模型分词器各算一套。
+
+**frontmatter 是唯一的例外**（R13）：它改成优先 `yaml.safe_load`（`requirements.txt`
+已声明 PyYAML），极简 `key: value` 只作无依赖兜底；MCP 配置那份 YAML 子集仍是自写
+解析器。所以 [3] 一节现在把**两条路径**都钉住。
 
 不换库的代价是「谁改坏了没人知道」，所以这里的判据是 **不改行为、只锁行为**：
 每个输入都带一条**当前实现的真实输出**（金样），改了就会红。金样里刻意包含边界
 （Q66 点名的四类）：无 `Authorization` 头 / 过期 / 错签名、`${ENV}` 未定义、
 多行 `description`、纯 CJK 与中英混排。
 
-**金样不是"正确性证明"**：其中几条记的是当前实现的**已知粗糙处**（比如多行
-`description` 只留第一行、没带 `:` 的续行会被丢掉）。把它们如实锁住，是为了让
-「想改它的人」看得见自己在改什么——而不是假装它们不存在。
+**金样不是"正确性证明"**：其中几条记的是当前实现的**已知粗糙处**（比如无 PyYAML 的
+回退路径上，多行 `description` 只留第一行、没带 `:` 的续行会被丢掉）。把它们如实
+锁住，是为了让「想改它的人」看得见自己在改什么——而不是假装它们不存在。
 
 运行：  python tests/test_handrolled_goldens.py
 """
@@ -37,6 +40,7 @@ from agent_framework.tools.mcp import parse_simple_yaml
 
 _checks = 0
 _fails = 0
+_MISSING = object()
 
 
 def check(cond: bool, label: str) -> None:
@@ -171,13 +175,32 @@ def part3_frontmatter() -> None:
     eq(meta["requires"], "CLI: curl, ENV: KEY", "值里的冒号不被当分隔符切开（按第一个 : 切）")
     eq(body, "正文第一行\n正文第二行", "正文 = 收尾 --- 之后的全部内容（两端 strip）")
 
-    # 多行 description：这是**当前实现的已知粗糙处**，如实锁住。
-    # 解析器是极简的逐行 `key: value`；续行没有冒号 → 被丢弃，正文也从第一个 `---` 之后算。
-    meta2, body2 = _parse_frontmatter(
-        "---\nname: multi\ndescription: 第一行\n  第二行\n---\n正文\n")
-    eq(meta2["description"], "第一行", "多行 description 只留第一行（续行静默丢弃——已知且锁住）")
+    # 多行 description：**两条路径都要钉**。R13 起 frontmatter 优先 PyYAML
+    #（`requirements.txt` 已声明），续行按 YAML 折成一行；没有 PyYAML 时回退的极简
+    # `key: value` 解析只留第一行（续行静默丢弃）。形状不同，但都不许把续行变成
+    # meta 里的一个**键**——那是两条路共同的下限。
+    src = "---\nname: multi\ndescription: 第一行\n  第二行\n---\n正文\n"
+    meta2, body2 = _parse_frontmatter(src)
+    eq(meta2["description"], "第一行 第二行",
+       "多行 description 按 YAML 折叠成一行（PyYAML 路径）")
     eq(body2, "正文", "正文不受续行影响")
-    check("第二行" not in str(meta2), "续行没有变成任何键（它落不进 meta）")
+    check("第二行" not in meta2, "续行没有变成任何键（它落不进 meta）")
+
+    # 无 PyYAML 的回退路径：续行丢弃，只留第一行（这是 `_parse_frontmatter` 的
+    # 兜底语义，容器里装了 PyYAML 也要能钉住它）。把 sys.modules["yaml"] 置 None
+    # 即可让 `import yaml` 抛 ImportError，无需卸载依赖。
+    saved = sys.modules.get("yaml", _MISSING)
+    sys.modules["yaml"] = None
+    try:
+        meta_fb, body_fb = _parse_frontmatter(src)
+    finally:
+        if saved is _MISSING:
+            del sys.modules["yaml"]
+        else:
+            sys.modules["yaml"] = saved
+    eq(meta_fb["description"], "第一行",
+       "无 PyYAML 回退路径只留第一行（续行丢弃——已知且锁住）")
+    eq(body_fb, "正文", "回退路径的正文同样不受续行影响")
 
     meta3, body3 = _parse_frontmatter("没有 frontmatter 的正文\n第二行")
     eq(meta3, {}, "不以 --- 开头 → 空 meta")

@@ -150,6 +150,21 @@ cd ../frontend && npm install && npm run build                    # 前端产物
 剪辑能力（视觉理解模型、ASR 模型、TTS 音色、场景切分阈值等）在 `backend/examples/storyline/config.toml`（本机）
 与 `config.docker.toml`（容器）中配置，两份文件的节点白名单需保持一致。主服务的启动参数见 `python run_server.py --help`。
 
+### 启动开关：真相存在哪
+
+下面几项决定「单机能不能跑、多副本要不要换后端」。默认值都是可单机跑的那一档；多副本部署要逐项切换。
+
+| 开关 | 可选值 | 默认 | 说明 |
+|---|---|---|---|
+| `--mq`（或 `MQ_BACKEND`） | `kafka` / `memory` | `kafka` | 生产走 Kafka；本地单进程或离线测试显式 `--mq memory`。broker 不可达时 `AgentWorker` 快速失败，不会假装在跑 |
+| `--bootstrap-servers` | 地址 | `localhost:9092` | Kafka broker |
+| `--cron-store` | `file` / `pg` | `file` | 定时任务：文件为真相（单机或共享卷）。跨主机必须 `pg`——文件没有原子 claim |
+| `--team-store` | `file` / `pg` | `file` | Agent Team 的任务板 / 收件箱 / 子 Agent 落点。多副本必须 `pg` |
+| `--team-root` | 目录 | `.runtime/team` | 文件版团队三件套的根目录（`tasks/` `messages/` `agents/`） |
+| `NODE_PROFILE`（**环境变量，不是 CLI 参数**） | `product` / `design_baseline` | `product` | `design_baseline` 只暴露设计 §22 的 18 项节点，用于对齐验收；产品档是全集 |
+| `--no-memory-iteration` | 开关 | 关（默认每轮刷新） | 默认除装配期注入外，每次 LLM 调用前按当前记忆原地刷新 `<memory>` 块；加此开关退回「只在装配期注入一次」 |
+| `--no-memory` | 开关 | 关 | 整条记忆能力关闭（不读、不写、不注入） |
+
 ### 公网部署
 
 1. 在 `.env` 中设置强密码（`PG_PASSWORD`、`MINIO_SECRET_KEY` 及对应的连接串）、`JWT_SECRET`，并设 `REGISTER_OPEN=0` 与 `QUOTA_LIMIT`；

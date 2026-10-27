@@ -55,6 +55,11 @@ WHITELIST: dict[str, str] = {
                "本仓直接 import 它反而是绑死驱动实现",
     "greenlet": "SQLAlchemy 异步上下文切换的运行时依赖（它 import 它，不是我们）；"
                 "声明它是为了把版本钉住，缺了 sqlalchemy 的 async engine 会当场报错",
+    "playwright": "**外部技能**的执行期依赖：xilo-opus-video 这类技能包自带 render.py，"
+                  "用 playwright.sync_api 逐帧截图出片；技能脚本是运行时从技能库取出来"
+                  "跑的子进程，不是 backend/ 的 import。本仓源码只有 "
+                  "`tools/skill_deps.py` 把它列进预检清单（字符串，不是 import），"
+                  "那正是「声明在环境里、由别处的代码用」这一档",
 }
 
 #: §3.6 登记为「本仓自持」的手写件：金样测试文件里必须有对应标记。

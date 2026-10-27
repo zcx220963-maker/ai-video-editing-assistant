@@ -96,9 +96,16 @@ async def main() -> None:
 
     tools = await srv.mcp.list_tools()
     by_name = {t.name: t for t in tools}
-    mock_names = [n.name for n in ALL_NODE_CLASSES]
+    # 2026-10-25 图形科普链整条删除（`plan_motion` / `render_motion_code` /
+    # `patch_motion_code`）。离线夹具 `ALL_NODE_CLASSES` 里还留着那三个 mock 节点
+    # （它是编排层的离线图，不跟真服务同步删），所以「真实节点」要先把它们摘掉，
+    # 再断言真服务里**确实没有**——否则删没删干净没人管，测试只会报一个 KeyError。
+    retired = {"plan_motion", "render_motion_code", "patch_motion_code"}
+    mock_names = [n.name for n in ALL_NODE_CLASSES if n.name not in retired]
     check(all(n in by_name for n in mock_names),
           f"{len(mock_names)} 个真实节点全部注册为 MCP 工具（与 mock 同名同 DAG）")
+    check(not (retired & set(by_name)),
+          f"已删除的图形科普三节点不在真实注册表里（残留 {sorted(retired & set(by_name))}）")
     check("read_node_history" in by_name, "服务端 read_node_history 工具在册")
     # T15b：守卫的意义是抓「注册了但不可达」，不是抓数字变化——旧断言把总数钉成
     # `len(mock_names)+3` 这个**常数**，于是每加一个真节点都要来改一次测试，改的

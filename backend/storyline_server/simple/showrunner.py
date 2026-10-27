@@ -149,18 +149,22 @@ def parse_json(text: str) -> dict[str, Any] | None:
 def plan_problems(obj: dict[str, Any] | None, seconds: float) -> list[str]:
     """校验导演给的 plan。返回问题列表（空 = 合格）。名字里没有 `check_`（边界测试禁止）。
     **只做物理校验，不替它改值**：越界就让它重给——钳过的镜长会让"节奏由内容定"失效。
+
+    **问题一次列全**（不撞到第一条就返回）：重问只有三次，每次只报一条等于把
+    「tone 太短」和「第 3 镜 0.3 秒」拆成两轮，而那两处本来可以一并改掉。
     """
     if not isinstance(obj, dict):
         return ["没有回合法 JSON"]
+    bad: list[str] = []
     # `tone` 是整片唯一的画法载体。空的就等于 23 个写手各画各的，必散。
     if len(str(obj.get("tone") or "").strip()) < 12:
-        return ["`tone` 太短——整片唯一的画法基调，要写清底色/主色/构图/笔触，否则每镜各画各的"]
+        bad.append("`tone` 太短——整片唯一的画法基调，要写清底色/主色/构图/笔触，"
+                   "否则每镜各画各的")
     shots = obj.get("shots")
     if not isinstance(shots, list) or not shots:
-        return ["`shots` 不是非空数组"]
+        return bad + ["`shots` 不是非空数组"]
     if not (MIN_SHOTS <= len(shots) <= MAX_SHOTS):
-        return [f"镜数 {len(shots)} 不在 {MIN_SHOTS}~{MAX_SHOTS} 之间"]
-    bad: list[str] = []
+        bad.append(f"镜数 {len(shots)} 不在 {MIN_SHOTS}~{MAX_SHOTS} 之间")
     total = 0.0
     for i, s in enumerate(shots):
         if not isinstance(s, dict):

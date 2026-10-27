@@ -62,10 +62,14 @@ async def main() -> None:
         child_runner = SubAgentRunner(child_llm, [child_files])
         spawn_tool = SpawnTool(child_runner)
 
-        # 主 LLM：先派生子任务，拿到结论后整合成最终答复
+        # 主 LLM：先派生子任务，拿到结论后整合成最终答复。
+        # `wait=True` 是这里的契约：默认异步只返回 task_id，结论走消息回投（见单元 2b），
+        # 「一次调用拿结论」这条腿必须显式要。
         main_llm = ScriptedLLM(
             steps=[
-                ("tool", "spawn_subagent", {"task": "把结果写入 note.txt", "context": "目标目录是工作区根"}),
+                ("tool", "spawn_subagent", {"task": "把结果写入 note.txt",
+                                            "context": "目标目录是工作区根",
+                                            "wait": True}),
                 ("answer", "主 Agent 收到子结论并完成汇总。"),
             ]
         )
@@ -96,6 +100,19 @@ async def main() -> None:
             ),
             "子结论以 tool 结果回喂主 Agent",
         )
+
+        # ---- 单元 2b：默认异步——立刻回 task_id，结论不走这一轮的工具结果 ----
+        async_spawn = SpawnTool(SubAgentRunner(ScriptedLLM([("answer", "子任务完成")]),
+                                              [child_files]))
+        immediate = await async_spawn.execute(task="随便做点小事")
+        check(immediate.startswith("[已派发]") and "task_id=" in immediate,
+              f"默认异步：立刻回 task_id（实得 {immediate[:24]!r}）")
+        check("子 Agent 结论" not in immediate,
+              "默认异步不把结论塞回工具结果（结论走消息回投，等它只会白占一轮）")
+        # 后台任务跑完再走，否则会与后面的用例抢工作区。
+        pending = list(async_spawn._bg_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
         # ---- 单元 3：P5（2026-10-17 真机片）上限 10、描述说事实、撞限留摘要 ----
         from agent_framework.agent import _limit_summary

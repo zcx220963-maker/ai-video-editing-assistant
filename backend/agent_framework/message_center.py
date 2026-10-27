@@ -26,12 +26,13 @@ class MessageCenter:
     """一条 A2A 总线：会话作用域内每个 Agent 一个收件箱（``agent`` 列）。"""
 
     def __init__(self, storage: Any, *, user_id: str = "default",
-                 conversation_id: str = "default") -> None:
-        # R19：TEAM_STORE=file 时收件箱是 {scope}/{agent}.jsonl（已读即删）；
-        # 默认仍是 PG（行为不变）。任务板/子 Agent 登记仍是 PG，见文档 X3。
-        from .team_files import inbox_from_env
+                 conversation_id: str = "default", store: str | None = None,
+                 root: str | None = None) -> None:
+        # 默认文件真相：messages/{scope}/{name}.jsonl，read 后清空（设计 §24）。
+        # 多副本必须显式 TEAM_STORE=pg（文件给不了跨主机原子消费）。
+        from .team_files import select_team_store
 
-        self._inbox = inbox_from_env(storage)
+        self._inbox = select_team_store(storage, store=store, root=root)[0]
         self.default_user_id = user_id
         self.default_conversation_id = conversation_id
 
@@ -70,6 +71,10 @@ class MessageCenter:
             content = row.get("content")
             item = dict(content) if isinstance(content, dict) else {"body": content}
             item["_id"] = row.get("id")
+            # 两个后端的幂等键落点不同：PG 塞进 content._dedup，文件后端是行上的列。
+            # 读出去都归一成 _dedup，调用方不必猜自己跑在哪个后端上。
+            if item.get("_dedup") is None and row.get("dedup_key") is not None:
+                item["_dedup"] = row["dedup_key"]
             out.append(item)
         return out
 

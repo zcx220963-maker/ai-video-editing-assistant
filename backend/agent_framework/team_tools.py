@@ -275,6 +275,8 @@ def register_team_tools(
     max_iterations: int = 8,
     idle_window_sec: float | None = None,
     idle_poll_sec: float | None = None,
+    team_store: str | None = None,
+    team_root: str | None = None,
 ) -> Team:
     """构造团队组件并把 7 个协作工具注册进 registry，返回 Team（含 shutdown）。
 
@@ -284,9 +286,9 @@ def register_team_tools(
     ``idle_window_sec`` 控制子 Agent 干完一轮后**在内存里等多久**才 shutdown。
     不给就用模块默认（常驻复用，别每任务重建）；生命周期测试给个短值即可。
     """
-    center = MessageCenter(storage)
-    tasks = TaskManager(storage)
-    sub_manager = SubAgentManager(storage)
+    center = MessageCenter(storage, store=team_store, root=team_root)
+    tasks = TaskManager(storage, store=team_store, root=team_root)
+    sub_manager = SubAgentManager(storage, store=team_store, root=team_root)
     session_manager = SessionManager(storage)
 
     team = Team(

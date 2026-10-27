@@ -107,7 +107,11 @@ async def main() -> None:
               "Checkpoint 记录本轮并最终 completed（无待恢复项）")
         cp_row = await storage.db.get_by_pk("checkpoints", {"run_id": "run-A"})
         cp_msgs = await storage.checkpoints.load_entries("run-A")
-        body = [m for e in cp_msgs for m in (e.get("payload") or [])]
+        # 一致点里现在混着两种 payload：消息数组（full/delta）与逐调用对账对象
+        # （``{"call_id": ...}``，见 checkpoint.py 的 per_call）。展平前先按下标形状筛，
+        # 否则对 dict 做 `for m in payload` 拿到的是键名（字符串），不是消息。
+        body = [m for e in cp_msgs if isinstance(e.get("payload"), list)
+                for m in e["payload"] if isinstance(m, dict)]
         check(cp_row is not None and cp_row["status"] == "completed"
               and any(m.get("role") == "tool" for m in body),
               f"checkpoints 留有 run-A 的收尾指针行 + {len(cp_msgs)} 个一致点")
@@ -129,12 +133,15 @@ async def main() -> None:
         node_reg = build_node_registry()
         storage = build_storage("memory")
         await storage.start()
-        tm = TaskManager(storage, user_id="u", conversation_id="team")
+        team_root = t / "team"
+        tm = TaskManager(storage, user_id="u", conversation_id="team", root=str(team_root))
         ids = await plan_team_from_dag(node_required_map(node_reg), tm)
 
         check(len(ids) == len(node_reg.names()), "DAG 每个节点映射为一个任务")
         by_name = {t_["name"]: t_ for t_ in await tm.list_all()}
-        check(await storage.db.count("tasks") == len(ids), "任务板就是 tasks 表，没有本地文件")
+        board_files = sorted((team_root / "tasks" / "u" / "team").glob("task_*.json"))
+        check(len(board_files) == len(ids) and await storage.db.count("tasks") == 0,
+              f"任务板落文件真相 tasks/{{scope}}/task_*.json（{len(board_files)} 个），PG 不留拷贝")
         check(list(ids) == sorted(ids), "任务按拓扑序插入，id 递增即依赖递增")
         check(by_name["render_video"]["id"] > by_name["plan_timeline"]["id"],
               "下游节点编号大于其上游（拓扑序落进 id 段）")
@@ -193,9 +200,9 @@ async def main() -> None:
               "认领记录留在任务板上（谁干的查得到）")
 
         # SubAgent 被动唤醒认领 DAG 任务（协作层 × 编排层打通）。
-        mc = MessageCenter(storage, user_id="u2", conversation_id="team2")
-        mgr = SubAgentManager(storage, user_id="u2", conversation_id="team2")
-        tm2 = TaskManager(storage, user_id="u2", conversation_id="team2")
+        mc = MessageCenter(storage, user_id="u2", conversation_id="team2", root=str(team_root))
+        mgr = SubAgentManager(storage, user_id="u2", conversation_id="team2", root=str(team_root))
+        tm2 = TaskManager(storage, user_id="u2", conversation_id="team2", root=str(team_root))
         await plan_team_from_dag(node_required_map(node_reg), tm2)  # 载入一批 DAG 任务，含可认领的链首
         boom_agent = AgentOnceRun(
             ScriptedLLM([("answer", "done")]),
@@ -212,7 +219,8 @@ async def main() -> None:
         check(wake_prompt is not None and len(claimed) == 1,
               f"SubAgent 被动扫描并认领了一个 DAG 任务：{wake_prompt}")
         # 另一会话的任务板/队友互不可见
-        check(await TaskManager(storage, user_id="u", conversation_id="team").ready() == [],
+        check(await TaskManager(storage, user_id="u", conversation_id="team",
+                                root=str(team_root)).ready() == [],
               "两个会话的任务板互不串台")
 
     print(f"\n通过 {_checks - _fails}/{_checks}" + ("" if _fails == 0 else f"，失败 {_fails}"))

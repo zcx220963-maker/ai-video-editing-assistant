@@ -64,21 +64,49 @@ def main() -> None:
     for name in SIX:
         check(name in sv, f"工具名 {name} 仍在")
 
-    # ---- 4. Node 存在且无依赖 ----
-    from storyline_server.nodes.simple_nodes import SimpleFilmNode
+    # ---- 4. 三个原子节点存在，依赖链正确 ----
+    #
+    # 2026-10-27：原来这里只有一个黑盒 `simple_film`（内部调 pipeline.run 干完全程），
+    # 设计 §21「流程原子化」没做到（差距登记在 §13 X1）。现在拆成
+    # plan → write → render 三个节点，依赖用 required_nodes 声明。
+    from storyline_server.nodes.simple_nodes import (
+        PlanShortFilmNode, RenderShortFilmNode, WriteShortShotsNode)
 
-    check(SimpleFilmNode.name == "simple_film", "Node 名是 simple_film")
-    check(list(SimpleFilmNode.required_nodes) == [], "simple_film 无 required_nodes")
-    check("mp4_url" in tuple(SimpleFilmNode.output_keys), "声明了 output_keys（预置产物可跳过）")
+    check(PlanShortFilmNode.name == "plan_short_film", "分镜节点名 plan_short_film")
+    check(list(PlanShortFilmNode.required_nodes) == [], "分镜是起点：无 required_nodes")
+    check(WriteShortShotsNode.name == "write_short_shots", "写镜节点名 write_short_shots")
+    check(list(WriteShortShotsNode.required_nodes) == ["plan_short_film"],
+          f"写镜依赖分镜（{WriteShortShotsNode.required_nodes}）")
+    check(RenderShortFilmNode.name == "render_short_film", "渲染节点名 render_short_film")
+    check(list(RenderShortFilmNode.required_nodes) == ["write_short_shots"],
+          f"渲染依赖写镜（{RenderShortFilmNode.required_nodes}）")
+    check("mp4_url" in tuple(RenderShortFilmNode.output_keys),
+          "渲染声明 output_keys（预置产物可跳过）")
+    check("mp4_url" in tuple(RenderShortFilmNode.ephemeral),
+          "mp4_url 是 ephemeral：会过期的直链不进共享库")
 
-    # ---- 5. 两份 TOML 都暴露了 simple_film，且逐项相同 ----
+    # ---- 4b. 渲染是分钟级，必须登记进 LONG_RUNNING_NODES ----
+    from storyline_server.server import LONG_RUNNING_NODES
+
+    check("render_short_film" in LONG_RUNNING_NODES,
+          "render_short_film 在 LONG_RUNNING_NODES（走提交+轮询，不让一次往返等一部片子）")
+
+    # ---- 5. 两份 TOML 都暴露了三个节点，且逐项相同 ----
     sets = {}
     for name in ("config.toml", "config.docker.toml"):
         cfg = tomllib.loads(src(f"examples/storyline/{name}"))
         nodes = cfg["local_mcp_server"]["available_nodes"]
         sets[name] = set(nodes)
-        check("simple_film" in nodes, f"{name} 白名单含 simple_film")
+        for n in ("plan_short_film", "write_short_shots", "render_short_film"):
+            check(n in nodes, f"{name} 白名单含 {n}")
+        check("simple_film" not in nodes, f"{name} 不再有黑盒 simple_film")
     check(sets["config.toml"] == sets["config.docker.toml"], "两份白名单逐项相同")
+
+    # ---- 5b. 同名只能有一个实现：原生工具不再注册这两个名字 ----
+    check("registry.register(PlanShortFilmTool" not in sv,
+          "plan_short_film 只由节点提供（原生工具不再注册）")
+    check("registry.register(RenderShortFilmTool" not in sv,
+          "render_short_film 只由节点提供（原生工具不再注册）")
 
     # ---- 6. HTTP 快线也走 pipeline ----
     api = src("agent_framework/simple_api.py")

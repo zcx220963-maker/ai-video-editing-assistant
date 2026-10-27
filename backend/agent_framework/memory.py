@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 from .hooks import AgentHook
@@ -174,53 +175,91 @@ class MemoryStore:
 
 
 class MemoryIterationHook(AgentHook):
-    """每轮把记忆重新注入 system（R12）。
+    """每次 LLM 调用前把记忆刷新进 system（R12 / 设计「每次与 LLM 交互都携带记忆」）。
 
-    **默认不启用**（`MEMORY_EVERY_ITERATION=1` 才挂）：注入点从「每 run 一次」变成
-    「每轮一次」，会改 prompt 形状与 token 账，不能静默切换。
+    **默认启用**（``MEMORY_EVERY_ITERATION=0`` 或启动参数 ``--no-memory-iteration`` 关闭）。
 
-    幂等：靠一个标记注释定位并**原地替换**，不会每轮堆一条 system 消息。
+    与装配期的 :class:`MemoryContextSource` **共用同一段正文与同一套预算**：这里不做
+    自己的「全量 dump」，而是用同一个 source 以同一个 query 重渲染，再**原地替换**
+    首条 system 里的 ``<memory>…</memory>``。所以：
+
+    * 不新增系统消息、不产生第二份「账外字节」——刷新后的正文仍受每类 700 B /
+      合计 1400 B 约束，落在 §5.4.1 给 ``memory`` 的断值之内；
+    * 按相关度召回的口径不会被「每轮全量」换掉（§5.7 第④条）；
+    * 内容没变就直接返回（幂等、零改写）。
+
+    为什么需要每轮刷新：一次 run 里有几十轮 LLM 调用，模型在中间用 update_memory
+    写下的偏好/教训，下一轮就该看见。只在装配期注入一次的话，这些改动要等下一次
+    run 才进上下文。
     """
 
-    MARKER = "<!--memory:auto-->"
+    _BLOCK_RE = re.compile(r"<memory>.*?</memory>", re.S)
 
-    def __init__(self, store: MemoryStore, categories: list[str] | None = None,
-                 max_chars: int = 1200) -> None:
-        self.store = store
-        self.categories = list(categories or CATEGORIES)
-        self.max_chars = max_chars
-        self._last = ""
+    def __init__(self, source: "MemoryContextSource", *, max_bytes: int = 4096) -> None:
+        self.source = source
+        # source 自己把正文卡在 1400 B 内；这个上限只兜「有人把 source 的上限放开」，
+        # 不让刷新变成绕过预算的旁路。
+        self.max_bytes = max_bytes
+
+    @staticmethod
+    def _query(context: Any) -> str:
+        """召回词：优先用装配期那一份（含计划步骤名），续跑时退回最后一条用户消息。"""
+        q = str((getattr(context, "extras", {}) or {}).get("recall_query") or "")
+        if q:
+            return q
+        for m in reversed(list(getattr(context, "messages", None) or [])):
+            if m.get("role") == "user":
+                return str(m.get("content") or "")
+        return ""
 
     async def before_iteration(self, context: Any) -> None:
-        parts: list[str] = []
-        for cat in self.categories:
-            try:
-                text = await self.store.read(cat)
-            except Exception:  # noqa: BLE001  读记忆失败不该打断这一轮
-                continue
-            if str(text or "").strip():
-                parts.append(f"[{cat}]\n{str(text).strip()}")
-        block = "\n\n".join(parts)[: self.max_chars]
-        if not block or block == self._last:
-            return
         messages = getattr(context, "messages", None)
         if not messages:
             return
-        self._last = block
-        msg = {"role": "system",
-               "content": f"{self.MARKER}\n<memory>\n{block}\n</memory>"}
-        for i, m in enumerate(messages):
-            if m.get("role") == "system" and self.MARKER in str(m.get("content") or ""):
-                messages[i] = msg
-                return
-        messages.insert(1 if messages[0].get("role") == "system" else 0, msg)
+        idx = next((i for i, m in enumerate(messages)
+                    if m.get("role") == "system"), None)
+        if idx is None:
+            return
+        try:
+            body = await self.source.render(self._query(context))
+        except Exception:  # noqa: BLE001  读记忆失败不该打断这一轮
+            return
+        body = str(body or "").strip()
+        block = f"<memory>\n{body}\n</memory>" if body else ""
+        if block and len(block.encode("utf-8")) > self.max_bytes:
+            return
+        content = str(messages[idx].get("content") or "")
+        if self._BLOCK_RE.search(content):
+            new_content = self._BLOCK_RE.sub(lambda _m: block, content, count=1)
+        elif block:
+            new_content = f"{content}\n\n{block}" if content.strip() else block
+        else:
+            return                      # 装配期就没有、这一轮也没有：什么都不用做
+        if new_content == content:
+            return
+        updated = dict(messages[idx])
+        updated["content"] = new_content
+        messages[idx] = updated
 
 
-def make_iteration_hook(storage: Any) -> MemoryIterationHook | None:
-    """按环境变量决定要不要挂（默认不挂，行为不变）。"""
-    if os.getenv("MEMORY_EVERY_ITERATION", "") not in ("1", "true", "yes"):
+def make_iteration_hook(storage: Any = None, *,
+                        source: "MemoryContextSource | None" = None,
+                        enabled: bool | None = None) -> MemoryIterationHook | None:
+    """按开关决定要不要挂每轮刷新（默认挂）。
+
+    设计原文：「每次与 LLM 交互都会携带记忆内容」。装配期那次注入只覆盖第一次调用，
+    中间的几十轮靠这个 hook 跟上；默认关会让这句话只在首轮成立。
+    """
+    if enabled is None:
+        enabled = os.getenv("MEMORY_EVERY_ITERATION", "1").strip().lower() not in (
+            "0", "false", "no", "off")
+    if not enabled:
         return None
-    return MemoryIterationHook(MemoryStore(storage))
+    if source is None:
+        if storage is None:
+            return None
+        source = MemoryContextSource(MemoryStore(storage))
+    return MemoryIterationHook(source)
 
 
 class MemoryContextSource:

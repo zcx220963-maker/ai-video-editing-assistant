@@ -14,7 +14,9 @@ from __future__ import annotations
 import sys as _sys; from pathlib import Path as _Path; _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 
 import asyncio
+import os
 import sys
+import tempfile
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -106,7 +108,8 @@ async def part3_inbox_dedup() -> None:
 
     msgs = await mc.read_inbox("sub_a")
     check(len(msgs) == 1, f"收件箱里只有一条（{len(msgs)}）")
-    check(msgs[0].get("_dedup") == "assign-3" and isinstance(msgs[0].get("_id"), int),
+    # _id 的形态随后端而异（PG 行号 int / 文件后端 uuid 串），这里只钉「带得出来」。
+    check(msgs[0].get("_dedup") == "assign-3" and bool(msgs[0].get("_id")),
           f"消息带 _dedup 与 _id：{msgs[0].get('_dedup')}, id={msgs[0].get('_id')}")
     check(await mc.read_inbox("sub_a") == [], "消费后清空")
 
@@ -160,11 +163,14 @@ async def part5_tool_default_owner() -> None:
 
 
 async def main() -> None:
-    await part1_claim_lock()
-    await part2_complete_discipline()
-    await part3_inbox_dedup()
-    await part4_inbox_exactly_once()
-    await part5_tool_default_owner()
+    # 默认后端是文件真相（设计 §24）：给一个临时根，避免把用例数据写进工作树的 .runtime。
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["TEAM_ROOT"] = td
+        await part1_claim_lock()
+        await part2_complete_discipline()
+        await part3_inbox_dedup()
+        await part4_inbox_exactly_once()
+        await part5_tool_default_owner()
     print(f"\n==== {_checks} 项检查，{_fails} 项失败 ====")
     if _fails:
         sys.exit(1)

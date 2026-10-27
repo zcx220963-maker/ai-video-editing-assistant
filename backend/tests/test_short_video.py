@@ -35,20 +35,19 @@ def check(cond: bool, label: str) -> None:
 
 
 def main() -> int:
-    print("\n① 六个工具：装得上、名字与参数对")
+    print("\n① 原生工具：装得上、名字与参数对")
+    # 2026-10-27：`plan_short_film` 与 `render_short_film` 改成了 MCP 节点
+    # （`nodes/simple_nodes.py`），原生侧不再注册——同名两套实现会互相盖。
+    # 这里只验剩下四个原生工具。
     reg = ToolRegistry()
     register_short_video_tools(reg, storage=None)
-    check(reg.tool_names == ["plan_short_film", "make_short_video", "reshoot_shot",
-                             "render_short_film", "export_film_project",
-                             "list_short_films"],
-          f"注册表里正好这六个（{reg.tool_names}）")
+    check(reg.tool_names == ["make_short_video", "reshoot_shot",
+                             "export_film_project", "list_short_films"],
+          f"注册表里正好这四个（{reg.tool_names}）")
     defs = {d["function"]["name"]: d["function"] for d in reg.get_definitions()}
-    check(set(defs["plan_short_film"]["parameters"]["properties"])
-          == {"prompt", "seconds", "aspect"},
-          "plan_short_film 只要 prompt/seconds/aspect——分镜是它的产出，不是输入")
     check(set(defs["make_short_video"]["parameters"]["properties"])
           == {"prompt", "seconds", "aspect", "style", "render", "voice", "bgm", "scenes"},
-          "make_short_video 的参数含 scenes（把 plan_short_film 的 plan 传回来）")
+          "make_short_video 的参数含 scenes（把分镜节点的 plan 传回来）")
     check(defs["make_short_video"]["parameters"]["required"] == ["prompt"],
           "只有 prompt 必填（其余都有缺省，模型不必猜）")
     check(set(defs["reshoot_shot"]["parameters"]["properties"])
@@ -59,10 +58,10 @@ def main() -> int:
     check(defs["list_short_films"]["parameters"]["properties"] == {},
           "list_short_films 无参数")
 
-    print("\n② 工具属性：只读的那件能并发，会写的那三件不能")
+    print("\n② 工具属性：只读的那件能并发，会写的那两件不能")
     check(reg.get("list_short_films").read_only, "list_short_films 声明只读")
     check(reg.get("list_short_films").concurrency_safe, "只读 → 可与别的调用同批")
-    for name in ("make_short_video", "reshoot_shot", "render_short_film"):
+    for name in ("make_short_video", "reshoot_shot"):
         t = reg.get(name)
         check(not t.read_only and not t.concurrency_safe,
               f"{name} 会写状态且未声明读写集 → 独占一批")
@@ -76,8 +75,6 @@ def main() -> int:
     check("不要用 make_short_video 重做整条" in rs,
           "reshoot_shot 明确禁止「重做整条」")
     check("原样" in rs, "note 要求填用户原话（不翻译成术语）")
-    check("不花钱" in defs["render_short_film"]["description"],
-          "render_short_film 说清「不再调模型、不花钱」")
 
     print("\n④ 秒数夹紧：8~60，非法值退回 30")
     check(_clamp_seconds(12) == 12 and _clamp_seconds(30) == 30, "正常值原样")
@@ -151,6 +148,57 @@ def main() -> int:
           "两份白名单仍逐项相同（只改一份等于真机上没改）")
     check("render_video" in lists["config.toml"],
           "口播那条链（render_video）仍在——摘的是图形科普那三个，不是全部")
+
+    print("\n⑨ 重渲回执带播放卡片契约（media_url + video），前端才渲染得出来")
+    import asyncio
+
+    from agent_framework.hooks import _find_media
+    from agent_framework.tools import short_video as sv
+
+    tmp2 = Path(tempfile.mkdtemp(prefix="film-render-"))
+    real_out2 = kernel.out_dir
+    real_render, real_publish = sv.kernel.render, sv.deliver.publish
+    seen: dict = {}
+
+    async def fake_render(src, *, seconds, aspect):  # noqa: ANN001
+        seen["seconds"], seen["aspect"] = seconds, aspect
+        path = tmp2 / "render.mp4"
+        path.write_bytes(b"x")
+        return path, {"timings": {"render_ms": 1234}}
+
+    async def fake_publish(path, *, storage=None, user_id=""):  # noqa: ANN001
+        return {"url": "https://minio.local/renders/final.mp4?sig=1",
+                "object_key": "renders/final.mp4", "bytes": 2048}
+
+    kernel.out_dir = lambda: tmp2          # type: ignore[assignment]
+    sv.kernel.render = fake_render         # type: ignore[assignment]
+    sv.deliver.publish = fake_publish      # type: ignore[assignment]
+    try:
+        rid = project.new_id()
+        project.save(rid, code="<Film />", prompt="重渲", seconds=30.0,
+                     aspect="portrait", fps=30, plan={"title": "重渲片"}, secs=[3.0, 3.0],
+                     kinds=["slide"], bodies=["<A />", "<B />"], audit={}, coverage={})
+        out = json.loads(asyncio.run(
+            # 类还在但不再上工具面（2026-10-27 起 `render_short_film` 由 MCP 节点提供）。
+            # 这里直接调类，验的是「按工程重渲」这段逻辑本身；节点侧的契约由
+            # `test_simple_node_contract.py` 守着。
+            sv.RenderShortFilmTool(storage=None).execute(film_id=rid)))
+        check(out.get("ok") is True, "重渲成功")
+        check(out.get("media_url") == out.get("mp4_url")
+              and "://" in str(out.get("media_url")),
+              "media_url 与 mp4_url 同源且是链接（MediaCardHook 只认 media_url）")
+        check(out.get("video") == "renders/final.mp4",
+              "video 是对象键（读历史时按它现签，链接过期不丢片子）")
+        check(out.get("duration") == 6.0,
+              "时长按每镜秒数求和（3+3），不是用户当初要的 30 秒")
+        check(_find_media(out) is not None,
+              "MediaCardHook._find_media 能从回执里抓到卡片")
+        check(seen == {"seconds": 6.0, "aspect": "portrait"},
+              f"重渲入参用工程自己的秒数与画幅（{seen}）")
+    finally:
+        sv.kernel.render = real_render      # type: ignore[assignment]
+        sv.deliver.publish = real_publish   # type: ignore[assignment]
+        kernel.out_dir = real_out2          # type: ignore[assignment]
 
     print(f"\n{_CHECKS - _FAILS}/{_CHECKS} 通过")
     return 0 if _FAILS == 0 else 1

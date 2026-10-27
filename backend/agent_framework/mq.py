@@ -168,21 +168,27 @@ class _Watermark:
     只提交到**最小的未完成 offset**；死信与拒收也必须 ack，否则水位会永久钉在那里。
     """
 
-    __slots__ = ("pending", "next_offset", "dirty")
+    __slots__ = ("pending", "next_offset", "dirty", "version")
 
     def __init__(self) -> None:
         self.pending: set[int] = set()
         self.next_offset = 0
         self.dirty = False
+        #: 每次 track/ack 自增。提交是异步的：`await commit()` 期间新到的 ack 会被
+        #: 「提交成功后无条件 `dirty = False`」吞掉，表现是每个分区永远差最后一条
+        #: （真 broker 实测：内存水位 3/5，组里只到 2/4）。版本没变才清脏。
+        self.version = 0
 
     def track(self, offset: int) -> None:
         self.pending.add(offset)
         self.next_offset = max(self.next_offset, offset + 1)
         self.dirty = True
+        self.version += 1
 
     def ack(self, offset: int) -> None:
         self.pending.discard(offset)
         self.dirty = True
+        self.version += 1
 
     def commit_offset(self) -> int:
         return min(self.pending) if self.pending else self.next_offset
@@ -234,7 +240,16 @@ class KafkaMessageQueue(MessageQueue):
         from aiokafka import AIOKafkaProducer
 
         self._producer = AIOKafkaProducer(bootstrap_servers=self.bootstrap_servers)
-        await self._producer.start()
+        try:
+            await self._producer.start()
+        except Exception:
+            # 连不上时 aiokafka 的 producer 已经建了一半：收掉再抛，别留下
+            # 「Unclosed AIOKafkaProducer」这类噪音掩盖真正的启动失败原因。
+            try:
+                await self._producer.stop()
+            finally:
+                self._producer = None
+            raise
         self._running = True
         for topic, group, handler in self._subs:
             self._tasks.append(asyncio.create_task(self._consume(topic, group, handler)))
@@ -292,21 +307,48 @@ class KafkaMessageQueue(MessageQueue):
             wm.ack(offset)
 
     async def _commit(self, consumer: Any) -> None:
-        """按分区水位提交；没有变化就不提交（省一次 round-trip）。"""
+        """按分区水位提交；没有变化就不提交（省一次 round-trip）。
+
+        **只能提交这个 consumer 自己分配到的分区**：水位表按 ``(topic, partition)``
+        全局共享，而同一个 MQ 上通常挂着两个 consumer（chat 与 outbound 各一个组）。
+        2026-10-27 用真 broker 跑时抓到的：原实现把两个 topic 的分区一起塞进
+        ``commit()``，aiokafka 回 ``IllegalStateError: Partition ... is not assigned``
+        ——**整个提交失败，两个 topic 的 offset 都永远不前进**，重启后从 earliest
+        全量重放。单副本（默认形态）必踩，因为 chat 与 outbound 都订阅在同一个 MQ 上。
+
+        rebalance 期间 ``assignment()`` 为空：这一轮直接跳过；失败也不清 ``dirty``，
+        下一轮重试——清了就等于「这一次提交失败，这条 offset 再没人提」。
+        """
         from aiokafka import OffsetAndMetadata, TopicPartition
 
+        try:
+            assigned = set(consumer.assignment())
+        except Exception:  # noqa: BLE001  刚 start/正在 rebalance：没有分配就是没有
+            assigned = set()
+        if not assigned:
+            return
+
         offsets = {}
+        snapshots: dict[Any, int] = {}
         for (topic, partition), wm in self._watermarks.items():
             if not wm.dirty:
                 continue
-            offsets[TopicPartition(topic, partition)] = OffsetAndMetadata(
-                wm.commit_offset(), "")
-            wm.dirty = False
-        if offsets:
-            try:
-                await consumer.commit(offsets)
-            except Exception:  # noqa: BLE001  rebalance 期间提交失败是常态
-                log.warning("offset 提交失败（下一轮重试）", exc_info=True)
+            tp = TopicPartition(topic, partition)
+            if tp not in assigned:
+                continue
+            offsets[tp] = OffsetAndMetadata(wm.commit_offset(), "")
+            snapshots[tp] = wm.version
+        if not offsets:
+            return
+        try:
+            await consumer.commit(offsets)
+        except Exception:  # noqa: BLE001  rebalance 期间提交失败是常态
+            log.warning("offset 提交失败（下一轮重试）", exc_info=True)
+            return
+        for tp, ver in snapshots.items():
+            wm = self._watermarks.get((tp.topic, tp.partition))
+            if wm is not None and wm.version == ver:
+                wm.dirty = False
 
     async def _backpressure(self, consumer: Any, tp: Any, wm: _Watermark) -> None:
         """未完成数超阈值就 pause 这个分区，降到一半再 resume。

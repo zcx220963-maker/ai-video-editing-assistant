@@ -209,7 +209,8 @@ async def test_schema_static() -> None:
     # 放宽已存在对象的约束只能放 migrations.sql（DROP 不允许进 schema.sql）
     mig = read_migrations_sql()
     mig_stmts = split_statements(mig)
-    check(all(s.upper().startswith(("ALTER TABLE ", "CREATE INDEX ", "CREATE UNIQUE INDEX ", "DO ")) for s in mig_stmts),
+    check(all(s.upper().startswith(("ALTER TABLE ", "CREATE INDEX ", "CREATE UNIQUE INDEX ",
+                                    "DO ", "UPDATE ")) for s in mig_stmts),
           f"migrations 只含放宽/补列/一次性变换（实得 {mig_stmts[:1]}）")
     check(sum(s.upper().startswith("DO ") for s in mig_stmts) == 1,
           "有状态的一次性变换用 DO 块表达：条件不成立时整块跳过，仍可无条件重跑")
@@ -263,11 +264,13 @@ async def test_schema_static() -> None:
              "materials.origin": ("upload", "library", "bgm", "url", "render", "art"),
              "render_jobs.status": ("queued", "running", "done", "failed"),
              "checkpoints.status": ("running", "completed", "failed", "superseded", "awaiting_approval"),
-             # `summary` 是 R10-T47 的压缩摘要行（`summary_store.SUMMARY_KIND`），
-             # 由 `migrations.sql:118-120` 放宽进来；`schema.sql:206` 与它同口径。
-             # 这一栏原先只写 ("delta","full")，那份期望在迁移落地那天就过期了。
-             "checkpoint_entries.kind": ("delta", "full", "summary"),
-             "tasks.status": ("pending", "claimed", "completed"),
+             # `summary` 是 R10-T47 的压缩摘要行（`summary_store.SUMMARY_KIND`）、
+             # `tool_call` / `tool_result` 是 R10 的逐调用恢复点，由 `migrations.sql:14-19`
+             # 放宽进来；`schema.sql:217` 与它同口径。
+             "checkpoint_entries.kind": ("delta", "full", "summary", "tool_call", "tool_result"),
+             # R19 任务状态改回设计原文的三态（pending → on_progress → completed），
+             # `migrations.sql:141-146` 把老库的 'claimed' 一次性转成 'on_progress'。
+             "tasks.status": ("pending", "on_progress", "completed"),
              "subagents.status": ("idle", "working", "shutdown"),
              "memories.category": ("user", "tool")}
     bad = {k: tables[k.split(".")[0]].column(k.split(".")[1]).enum for k in enums

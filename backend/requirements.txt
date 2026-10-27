@@ -4,8 +4,10 @@
 # --- 消息队列（R1：生产默认 Kafka，内存队列只做测试/本地单进程）---
 aiokafka>=0.14        # mq.KafkaMessageQueue：手动提交 + 分区水位 + 死信
 
-# --- 文件系统持久化（R14/R19：Cron / Message Center / Task Board 的单机互斥）---
-filelock>=3.13        # 文件版存储的跨进程锁（共享卷上仍只保证单机互斥）
+# --- 文件系统持久化（R14/R19：Cron / Message Center / Task Board）---
+# 不声明 filelock：文件后端的互斥是**进程内** threading.Lock + `os.replace` 原子写
+# （见 cron_store.py / memory_file.py 的首段约束），多副本一律显式切 `--cron-store pg`
+# / `MEMORY_STORE=pg`。声明一个没人 import 的跨进程锁只会让「装了锁」变成错觉。
 PyYAML>=6.0           # R15：MCP 配置的 YAML 解析（保留自写最小子集作无依赖兜底）
 
 # --- 模型与协议 ---

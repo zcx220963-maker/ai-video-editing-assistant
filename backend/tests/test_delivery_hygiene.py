@@ -156,8 +156,12 @@ _OSS_LICENSES = {"MIT", "ISC", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause",
                  "0BSD", "Unlicense", "CC0-1.0"}
 # @remotion/* 的「SEE LICENSE IN LICENSE.md」指向 Remotion License（自订许可，
 # 免费资格按人头，见 §3.5）——只在 @remotion 命名空间下放行，别处一律拒。
+# `UNLICENSED` 也是同一档：`@remotion/effects` 与 `@remotion/transitions`（4.0.534
+# 与 4.0.539 都一样）的 package.json 只写这一句、且 tarball 里**没有** LICENSE.md，
+# 落到仓库根的 LICENSE.md = Remotion License。它**不是**「随便用」：商用门槛按人头
+# （≤3 员工免费，超过要买公司许可），这条白名单只说明「我们知道它是哪一档」。
 _REMOTION_LICENSES = {"SEE LICENSE IN LICENSE.md", "Remotion License",
-                       "Remotion License https://remotion.dev/license"}
+                       "Remotion License https://remotion.dev/license", "UNLICENSED"}
 
 
 # MIT 的正文里**不出现「MIT」这三个字母**——它的判据是那句授权语。所以兜底识别必须
