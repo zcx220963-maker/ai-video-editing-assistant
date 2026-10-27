@@ -54,6 +54,7 @@ PLAN_SYSTEM = """你是这部短片的导演。只做一件事：把用户那句
   "title": "片名（≤12 字）",
   "tone": "整片的画法基调。**必须写清四件**：① 底色（给色值）② 主色两个（给色值）③ 构图习惯（满/空、对称/偏心、地平线高低）④ 笔触（矢量平涂/剪纸/手绘/3D/照片拼贴）。这四件决定十几镜像不像同一部片子；含糊一句，每镜就会各画各的",
   "motif": "贯穿全片的那一件东西（≤8 字，没有就空串）",
+  "motif_bridge": false,
   "caption": {"size": 0.045, "at": "lower", "color": "#F2F5F8", "scrim": 0},
   "fx": ["grain", "vignette"],
   "shots": [
@@ -71,6 +72,10 @@ PLAN_SYSTEM = """你是这部短片的导演。只做一件事：把用户那句
 `breath`（整片亮度呼吸）、`flash`（切点白闪）、`sweep`（每 5 秒斜向扫光）、`scanline`（滚动扫描线）。
 **缺省只给 grain + vignette**。`sweep` / `scanline` / `flash` 是最显眼的模板感——
 只有在"监控/仪器/档案"这类题材里才点它们，别的题材点了会让每部片子长得一样。
+
+`motif_bridge` 决定那个贯穿物件要不要在**切点上滑过去**。**默认 false**：
+开着的时候它会在画面两端之间移动，整片看起来是"一个光在左右扫"，模板感极强。
+只有你确实要"一个小点一路长成地球"那种叙事时才开。
 
 `tone` 是**你对这个题材的审美判断**，不是填空题：先想三个方向（各一句"长什么样 + 为什么
 适合这题材"），挑最贴的那一个写进 `tone`。**避开偷懒答案**——暗底加一个光点、深蓝科技感、
@@ -217,6 +222,9 @@ def normalize(obj: dict[str, Any]) -> dict[str, Any]:
         "title": str(obj.get("title") or "").strip()[:24],
         "tone": str(obj.get("tone") or "").strip()[:200],
         "motif": str(obj.get("motif") or "").strip()[:20],
+        # 跨镜接力：那个贯穿物件要不要在切点上**滑过去**。默认关——
+        # 开着的时候整片看起来像"一个光在左右扫"，模板感最强的一件事。
+        "motif_bridge": bool(obj.get("motif_bridge")),
         "sources": obj.get("sources") if isinstance(obj.get("sources"), list) else [],
         # `fx` 是全片质感层（颗粒/暗角/扫光…）。白名单过滤：模型写错词就忽略，
         # 不要因为一个拼错的特效名让整片退回默认。
@@ -576,7 +584,8 @@ async def make(prompt: str, *, seconds: float = 60.0,
         """拼装一次。**每次都重新读 motif 锚点**——重写过的镜位置会变。"""
         return assemble(bodies, secs, kinds, fps=fps,
                         motifs=[parse_motif_at(b) for b in bodies],
-                        fx=plan_obj.get("fx"))
+                        fx=plan_obj.get("fx"),
+                        bridge=bool(plan_obj.get("motif_bridge")))
 
     code, tl = rebuild()
 

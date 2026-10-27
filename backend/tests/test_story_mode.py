@@ -245,9 +245,15 @@ def main() -> int:
     check(film.shared_hops(tl, [None] * 4, 4) == [], "全都没锚点 → 一次都不接")
     check(film.shared_hops(tl, None, 4) == [], "没给 motifs → 空（老行为不变）")
 
+    # 2026-10-27：接力**默认关**。开着的时候那个光点会在切点上从一端滑到另一端，
+    # 整片看起来是"一个光在左右扫"——模板感最强的一件事。要它得显式 `bridge=True`。
+    _m = [(0.2, 0.3, 0.05), (0.6, 0.5, 0.08), None]
+    code_off, _ = film.assemble([inner, inner, inner], [4.0] * 3, ["cut", "cut"],
+                                motifs=_m)
+    check("<SharedMorph" not in code_off, "默认不接力（光点不会左右滑）")
     code2, _tl2 = film.assemble([inner, inner, inner], [4.0] * 3, ["cut", "cut"],
-                                motifs=[(0.2, 0.3, 0.05), (0.6, 0.5, 0.08), None])
-    check("<SharedMorph hops={" in code2, "拼装时把接力层写进了模块")
+                                motifs=_m, bridge=True)
+    check("<SharedMorph hops={" in code2, "bridge=True 时把接力层写进了模块")
     check(code2.count("<SharedMorph") == 1, "只有一层接力（不是每镜一个）")
     check("const SharedMorph" in system.SYSTEM_TSX, "组件实现在设计系统里")
 

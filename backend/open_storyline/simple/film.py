@@ -272,6 +272,7 @@ def assemble(bodies: list[str], secs: list[float], kinds: list[str], *,
              fps: int = kernel.DEFAULT_FPS,
              motifs: list[tuple[float, float, float] | None] | None = None,
              fx: list[str] | None = None,
+             bridge: bool = False,
              ) -> tuple[str, dict[str, Any]]:
     """N 段组件体 → 一个模块：统一 import + 设计系统 + `TransitionSeries` + 全局层。
 
@@ -323,7 +324,10 @@ def assemble(bodies: list[str], secs: list[float], kinds: list[str], *,
                  f" fx={{[{', '.join(chr(39) + x + chr(39) for x in fx)}]}} />")
 
     # ---- 跨镜接力：相邻两镜都声明了贯穿物件的位置，就在切点上接一次 ----
-    hops = shared_hops(tl, motifs, n)
+    # **默认不接**（2026-10-27）。接力会把那个光点从一个位置**滑到**另一个位置，
+    # 而写手给的位置经常在画面两端，于是整片看起来是"一个光在左右扫过"——
+    # 那是模板感最强的一件事。导演明确要"小点一路变成地球"那种叙事时才开。
+    hops = shared_hops(tl, motifs, n) if bridge else []
     if hops:
         rows = ", ".join(
             "{at: %d, dur: %d, from: [%g, %g, %g], to: [%g, %g, %g], hue: '%s'}"

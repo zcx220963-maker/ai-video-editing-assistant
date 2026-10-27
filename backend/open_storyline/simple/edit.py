@@ -88,7 +88,8 @@ async def reshoot(proj: dict[str, Any], shot_no: int, *, note: str = "",
         """
         return assemble(bodies, secs, kinds, fps=fps,
                         motifs=[parse_motif_at(b) for b in bodies],
-                        fx=plan.get("fx"))
+                        fx=plan.get("fx"),
+                        bridge=bool(plan.get("motif_bridge")))
 
     async def check() -> tuple[str, dict[str, Any], dict[str, Any]]:
         code, tl = rebuild()
