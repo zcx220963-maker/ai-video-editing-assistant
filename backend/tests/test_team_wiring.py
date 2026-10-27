@@ -74,11 +74,11 @@ async def part1_team_tools(tmp: Path) -> None:
     check(need.issubset(set(reg.tool_names)), f"团队 8 工具全部注册：{sorted(need)}")
 
     plan = json.loads(await reg.execute("plan_editing_team", {}))
-    # 25 = 剪辑链 21 + 零素材那条链的三个终点（plan_motion / render_motion_code /
+    # 26 = 剪辑链 21 + 零素材那条链的三个终点（plan_motion / render_motion_code /
     # patch_motion_code）
-    # + 口播那条链的选区改终点（patch_video）；
+    # + 口播那条链的选区改终点（patch_video）+ 简洁线起点（simple_film，R18）；
     # 节点普查在 test_video_editing 里钉死，这里跟着涨。写一处，四处断言都读它。
-    N_TASKS = 25
+    N_TASKS = 26
     check(len(plan["created_tasks"]) == N_TASKS,
           f"DAG 自动组队 → {N_TASKS} 个任务（实际 {len(plan['created_tasks'])}）")
     check(await st1.db.count("tasks") == N_TASKS, f"{N_TASKS} 行任务进了 PG tasks 表（不落本地目录）")

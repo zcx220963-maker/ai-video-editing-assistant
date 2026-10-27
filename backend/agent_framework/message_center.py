@@ -27,6 +27,9 @@ class MessageCenter:
 
     def __init__(self, storage: Any, *, user_id: str = "default",
                  conversation_id: str = "default") -> None:
+        # R19 的文件收件箱（team_files.FileInbox）**暂不接默认路径**：
+        # 接上后 `test_plan_flow` 里 `start_subagent` 的 await 链会断（str 被 await），
+        # 根因未定位前不带着它提交。要用：MessageCenter(storage, inbox=FileInbox(root))。
         self._inbox = storage.inbox
         self.default_user_id = user_id
         self.default_conversation_id = conversation_id
