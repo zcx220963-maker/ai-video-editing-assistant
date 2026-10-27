@@ -214,7 +214,7 @@ CREATE TABLE IF NOT EXISTS checkpoint_entries (
   run_id        text NOT NULL,
   seq           integer NOT NULL,
   parent_seq    integer,
-  kind          text NOT NULL DEFAULT 'delta' CHECK (kind IN ('delta','full','summary')),
+  kind          text NOT NULL DEFAULT 'delta' CHECK (kind IN ('delta','full','summary','tool_call','tool_result')),
   payload       jsonb NOT NULL,
   iteration     integer NOT NULL DEFAULT 0,
   created_at_ms bigint NOT NULL,

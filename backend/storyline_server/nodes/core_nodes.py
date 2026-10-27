@@ -1601,6 +1601,10 @@ class PlanTimelineNode(StoryNode):
     description = "基础时间线规划：把片段/文案/配音/BGM 组织成时间线（固定步骤；支持 keep_original_audio 原声混剪）"
     required_nodes = ["speech_rough_cut", "group_clips", "generate_script",
                       "generate_voiceover", "select_BGM"]
+    # 调用方直接传 `timeline` = 这一步的产物已经有了 → 拦截器跳过本节点（R16）。
+    # 与工具描述里「可直接传 timeline 跳过规划工具」那句话对齐；以前描述这么说、
+    # 实现照样补跑 plan_timeline，属于描述与实现不符。
+    output_keys = ("timeline",)
     input_schema = _obj("时间线规划", _TIMELINE_PROPS)
 
     async def process(self, state, inputs):
@@ -1621,6 +1625,7 @@ class PlanTimelineProNode(StoryNode):
     description = "规划时间轴-专业版：在基础时间线上并入推荐的转场与花字/字幕样式（同样支持原声混剪）"
     required_nodes = ["speech_rough_cut", "group_clips", "generate_script",
                       "generate_voiceover", "select_BGM", "transition_rec", "text_rec"]
+    output_keys = ("timeline", "timeline_pro")
     input_schema = _obj("时间线规划（专业版）", _TIMELINE_PROPS)
 
     async def process(self, state, inputs):
@@ -1643,6 +1648,7 @@ class PlanTimelineAITransitionNode(StoryNode):
     description = "含 AI 转场的时间线规划：把 AI 生成的转场并入时间线（与 plan_timeline 平行的另一条创作路径；同样支持原声混剪）"
     required_nodes = ["speech_rough_cut", "group_clips", "generate_script",
                       "generate_voiceover", "select_BGM", "generate_ai_transition"]
+    output_keys = ("timeline", "timeline_ai")
     input_schema = _obj("时间线规划（AI 转场）", _TIMELINE_PROPS)
 
     async def process(self, state, inputs):
@@ -4134,10 +4140,28 @@ def build_real_registry(settings: Settings, providers: Providers, storage: Stora
     # 于是"关掉"只是"模型看不见"，代码一天不删就得跟着每个改动一起维护。
     # 要找回某一版：`git show 71616c7:backend/storyline_server/motion/shot_writer.py`。
     from .web_nodes import RenderWebNode
+    from .simple_nodes import SimpleFilmNode
     reg = NodeRegistry()
-    name_to_cls = {cls.name: cls for cls in [*REAL_NODE_CLASSES, RenderWebNode]}
+    name_to_cls = {cls.name: cls for cls in [*REAL_NODE_CLASSES, RenderWebNode, SimpleFilmNode]}
+
+    def _factory(cls: type) -> Any:
+        # 产品的构造签名是 cls(settings, providers, storage, registry=reg)，
+        # 不是设计代码里的 NodeClass(cfg)。工厂留在这一层，scan_package 才不用
+        # 知道业务依赖（R16）。
+        return cls(settings, providers, storage, registry=reg)
+
+    # 先按 TOML 的 available_node_pkgs 扫包（设计 §22 register 的第一步）。
+    # 产品档把该键补进两份 TOML 后，这条路径才真正生效；没配 = 跳过，行为不变。
+    for pkg in (getattr(settings, "available_node_pkgs", None) or []):
+        reg.scan_package(pkg, _factory)
+
     for nm in (allowed or list(name_to_cls)):
+        if nm in reg:
+            continue                      # 扫包已经注册过（同一个类，不重复实例化）
         cls = name_to_cls.get(nm)
         if cls is not None:
-            cls(settings, providers, storage, registry=reg)
+            _factory(cls)
+
+    # 白名单是**最终**权威：扫包会把整包节点都拉进来，这里按白名单裁掉其余。
+    reg.keep_only(allowed)
     return reg

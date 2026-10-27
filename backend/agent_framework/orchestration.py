@@ -20,7 +20,7 @@ import re
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 # --------------------------------------------------------------------------
 # Store：按会话隔离的节点输出总线
@@ -203,6 +203,52 @@ class NodeRegistry:
         self._nodes[node.name] = node
         return node
 
+    def unregister(self, name: str) -> None:
+        self._nodes.pop(name, None)
+
+    def keep_only(self, names: Iterable[str] | None) -> None:
+        """白名单裁剪：只留这些（None = 全留）。
+
+        扫包会把整个包里的 Node 都注册进来，白名单是**最终**权威——
+        少了这一步，「白名单」就退化成「额外允许」。
+        """
+        if names is None:
+            return
+        keep = set(names)
+        for nm in list(self._nodes):
+            if nm not in keep:
+                self._nodes.pop(nm, None)
+
+    def scan_package(self, pkg: str, factory: Callable[[type], Any]) -> int:
+        """导入包，把其中所有**有 name 的** BaseNode 子类注册进来（设计 §22 register）。
+
+        与 Java 的 `@Component` 包扫描同义。两个必须的细节：
+
+        * ``factory(cls)`` 负责构造——产品的节点签名是
+          ``cls(settings, providers, storage, registry=reg)``，不是设计代码里的
+          ``NodeClass(cfg)``；把构造留在调用方，这个函数才不用知道业务依赖。
+        * 没有 ``name`` 的基类/中间类跳过：`StoryNode` 这类只是共用实现，
+          注册进去会得到一个空名工具。
+
+        返回新注册的个数（同名的已存在则跳过，不覆盖显式注册的那份）。
+        """
+        import importlib
+        import inspect
+
+        module = importlib.import_module(pkg)
+        found = 0
+        for _, cls in inspect.getmembers(module, inspect.isclass):
+            if cls is BaseNode or not issubclass(cls, BaseNode):
+                continue
+            if inspect.isabstract(cls):
+                continue
+            name = str(getattr(cls, "name", "") or "")
+            if not name or name in self._nodes:
+                continue
+            self.register(factory(cls))
+            found += 1
+        return found
+
     def get(self, name: str) -> "BaseNode | None":
         return self._nodes.get(name)
 
@@ -236,6 +282,10 @@ class BaseNode(ABC):
     required_nodes: list[str] = []
     require_prior_kind: list[str] = []
     require_explicit_call: bool = False
+    #: 本节点产物的**入参键名**（如时间线规划节点的 ``("timeline",)``）。
+    #: 调用方直接把这个键传进来时，拦截器视同「该节点已执行」——这就是
+    #: 设计里「可以跳过节点，但必须提供它的产物」的那条路（见 `_ensure_deps`）。
+    output_keys: tuple[str, ...] = ()
     # 本节点产物写总线时的合并语义：默认独占一份（后写覆盖），
     # 累积型产物（如逐镜理解结果）声明 "append"。
     reducer: str = "last_write_wins"
@@ -249,6 +299,16 @@ class BaseNode(ABC):
     def upstream(self) -> list[str]:
         """DAG 依赖 + 必须校验 artifact_meta 的上游种类（去重、保序）。"""
         return list(dict.fromkeys([*self.required_nodes, *self.require_prior_kind]))
+
+    @property
+    def require_node(self) -> list[str]:
+        """设计里的名字（只读别名，R16）。
+
+        设计文档写的是 ``require_node``，代码里是 ``required_nodes``。**不改字段名**：
+        21 个节点、契约、任务板、测试都按后者写，重命名是纯破坏。这里只提供只读别名，
+        让「按设计读代码」的人不会以为这条约束不存在。
+        """
+        return list(self.required_nodes)
 
     @property
     def write_keys(self) -> frozenset[str]:
@@ -426,6 +486,10 @@ class Interceptor:
         #: 每次 invoke 开头清空，结束时由 ``_annotate`` 写进回执——模型因此看得见
         #: 哪几步不是自己定的。**它是一份观测，不是一份状态**：不落库、不进产物。
         self.filled_by_default: list[dict[str, str]] = []
+        #: 本次 invoke 里「靠调用方直接给了产物而跳过」的节点（见 `_ensure_deps`）。
+        #: 与 `order_trace` 分开记：跳过的节点**没有执行**，混进执行顺序会让
+        #: 「谁跑过」这件事失真。
+        self.presupplied: list[str] = []
 
     def _require(self, name: str) -> BaseNode:
         node = self.registry.get(name)
@@ -454,6 +518,7 @@ class Interceptor:
         """
         # 客户端参数先留痕：依赖补齐以默认入参执行，跨节点开关靠 state.flags 传达
         self.filled_by_default = []
+        self.presupplied = []
         state.flags.update(params)
         args = await self.inject_media_content_before(name, state, dict(params))
         node = self._require(name)
@@ -493,7 +558,7 @@ class Interceptor:
         self, name: str, state: NodeState, request_args: dict[str, Any]
     ) -> dict[str, Any]:
         """请求拦截：补齐依赖 → 注入上游 payload → 合并 artifact_id/lang。"""
-        await self._ensure_deps(name, state, path=[])
+        await self._ensure_deps(name, state, path=[], provided=set(request_args))
         node = self._require(name)
         for dep in self._upstream(node):  # ② 上游产物注入请求参数
             if await state.store.has(dep):
@@ -506,7 +571,10 @@ class Interceptor:
         """响应拦截：把节点产出持久化进 Store（内存版为 no-op，表版写 artifacts 行）。"""
         await state.store.persist(name)
 
-    async def _ensure_deps(self, name: str, state: NodeState, path: list[str]) -> None:
+    async def _ensure_deps(
+        self, name: str, state: NodeState, path: list[str],
+        provided: set[str] | None = None,
+    ) -> None:
         if name in path:
             raise ValueError(f"依赖成环: {' -> '.join([*path, name])}")
         node = self._require(name)
@@ -514,6 +582,13 @@ class Interceptor:
             if await state.store.has(dep):
                 continue  # 依赖已执行，无需重复
             dep_node = self._require(dep)
+            # 预置产物：调用方直接把这一步的产物传进来了（如给 render_video 传
+            # `timeline` 就是替 plan_timeline 干了活）。这时**不执行**该节点，
+            # 只记一笔——设计里「可以在任意位置终止/跳过」靠的就是这条路。
+            keys = tuple(getattr(dep_node, "output_keys", ()) or ())
+            if keys and provided and any(k in provided for k in keys):
+                self.presupplied.append(dep)
+                continue
             await self._ensure_deps(dep, state, path=[*path, name])  # 递归执行上游节点
             await dep_node(state)  # 以默认入参补齐前置
             self.order_trace.append(dep)

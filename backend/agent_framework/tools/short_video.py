@@ -28,8 +28,19 @@ from typing import Any
 
 from ..identity import current_identity
 from ..tool import Tool
-from storyline_server.simple import deliver, edit, export, facts, film, kernel, project
-from storyline_server.simple import showrunner
+from storyline_server.simple import pipeline
+
+# 六个工具只认 `pipeline` 这一个入口（R18）。下面这些名字是它的再导出，
+# **不是**各自去 import 子模块——`test_simple_node_contract.py` 的 AST 断言守这条。
+# 这样「HTTP 快线」与「Agent 工具」共用同一份实现，不会再各自漂移。
+deliver = pipeline.deliver
+edit = pipeline.edit
+export = pipeline.export
+facts = pipeline.facts
+film = pipeline.film
+kernel = pipeline.kernel
+project = pipeline.project
+showrunner = pipeline.showrunner
 
 #: 秒数上下限。上限由**结构**决定，不是拍脑袋：
 #:   动效：镜数 ≤ `film.MAX_SHOTS`(56) × `film.MAX_SHOT_SEC`(5.2) = 291 秒

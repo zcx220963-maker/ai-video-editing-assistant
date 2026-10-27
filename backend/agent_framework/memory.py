@@ -46,7 +46,11 @@ class MemoryStore:
 
     def __init__(self, storage: Any, *, user_id: str | None = None,
                  compactor: MemoryCompactor | None = None) -> None:
-        self._mem = storage.memories
+        # R12：MEMORY_STORE=file 时以 memory/{user}/*.md 为 canonical，PG 只做投影。
+        # 默认 pg —— 既有部署不用改环境变量。
+        from .memory_file import backend_from_env
+
+        self._mem = backend_from_env(storage)
         self._fixed_user = user_id
         #: 存储侧压缩器（阈值 + 判决）。装配点可以按机器换阈值；不换就是默认的那套。
         self.compactor = compactor or MemoryCompactor()

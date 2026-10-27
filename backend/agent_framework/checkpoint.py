@@ -206,6 +206,41 @@ class CheckpointManager:
         )
         return await self.save(cp)
 
+    # ---- 逐调用条目（R10）----
+    #
+    # 迭代边界的一致性点只保证「消息链正确」；崩溃时**在途的工具**仍会被重放。
+    # 这两条写口把粒度降到「每一次 Tool Call / Tool Result」，恢复时按 call_id
+    # 跳过已完成的调用。payload 是对象而不是消息数组，`rebuild()` 会按
+    # 「payload 不是 list 就跳过」自动忽略它们——不需要改重建逻辑。
+
+    async def record_tool_call(self, run_id: str, *, call_id: str, name: str,
+                               arguments: Any = None, iteration: int = 0) -> None:
+        await self._repo.append_entry(
+            run_id, kind="tool_call",
+            payload={"call_id": call_id, "name": name,
+                     "arguments": arguments or {}, "status": "started"},
+            iteration=iteration, parent_seq=None)
+
+    async def record_tool_result(self, run_id: str, *, call_id: str, name: str,
+                                 status: str = "ok", result_ref: str = "",
+                                 iteration: int = 0) -> None:
+        await self._repo.append_entry(
+            run_id, kind="tool_result",
+            payload={"call_id": call_id, "name": name, "status": status,
+                     "result_ref": result_ref},
+            iteration=iteration, parent_seq=None)
+
+    async def completed_calls(self, run_id: str) -> set[str]:
+        """这个 run 里**已经有结果**的 call_id 集合。"""
+        done: set[str] = set()
+        for entry in await self._repo.load_entries(run_id):
+            if entry.get("kind") != "tool_result":
+                continue
+            payload = entry.get("payload")
+            if isinstance(payload, dict) and payload.get("call_id"):
+                done.add(str(payload["call_id"]))
+        return done
+
     async def save_progress(self, cp: Checkpoint, *, iteration: int,
                             messages: list[Message]) -> None:
         cp.iteration = iteration

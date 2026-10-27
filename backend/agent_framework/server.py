@@ -875,7 +875,9 @@ def create_app(
     entry_mode: str = "auto",              # 消息默认入口（auto 直接执行 / plan 先出计划卡）
 ) -> FastAPI:
     consumer = SessionConsumer(agent, mq, topic=topic, default_entry=entry_mode)
-    connections = ConnectionManager(mq)
+    # 每实例唯一消费组（R2）：固定组在多副本下会让同一帧只到一个实例，
+    # 其余实例的 socket 永远收不到。实例名由 --instance-id / INSTANCE_ID 给。
+    connections = ConnectionManager(mq, instance_id=os.getenv("INSTANCE_ID") or None)
     broadcaster = (
         OutboundBroadcaster(
             mq,
@@ -2923,6 +2925,15 @@ def create_app(
         if user_id is None:
             return                      # 握手已被拒绝，不 accept
         await websocket.accept()
+        # 归属校验（R3）：`/chat` 早就 claim 过，但 WS 以前只验 token——拿 B 的
+        # token 打开 A 的 conversation_id 就能收到 A 的流式回投（串话 + 越权）。
+        # 只拦「已有行且属于别人」；未建行的 UUID 按原语义放行（首条 `/chat` 才落归属）。
+        # 先 accept 再 close(4403)：握手期直接 close 只会变成 HTTP 403，
+        # 浏览器拿不到 4403 这个可判定的码。
+        owned = await storage.conversations.is_owned(user_id, conversation_id)
+        if owned is False:
+            await websocket.close(code=4403)
+            return
         sid = session_key(user_id, conversation_id)
         connections.connect(sid, websocket)
         try:

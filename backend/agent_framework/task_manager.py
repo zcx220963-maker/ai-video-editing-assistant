@@ -23,6 +23,10 @@ from .identity import current_identity_or
 
 PENDING = "pending"
 CLAIMED = "claimed"
+#: 设计 §24 的状态词是 `on_progress`，代码里存的是 `claimed`（同一件事：已认领、在做）。
+#: 不把列值改掉：已有行、`claim` 的原子条件、前端文案都按 `claimed` 写；改列值是纯破坏。
+#: 需要按设计口径展示时用这个别名，别在库里造第二种值。
+ON_PROGRESS = CLAIMED
 COMPLETED = "completed"
 
 

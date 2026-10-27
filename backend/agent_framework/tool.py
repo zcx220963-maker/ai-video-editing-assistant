@@ -73,6 +73,50 @@ def is_tool_error(result: Any) -> bool:
     return isinstance(result, ToolError)
 
 
+def with_hint(text: str) -> str:
+    """给失败回执追加「换个思路」提示，**只追加一次**。
+
+    以前 `prepare_call` 拼一遍、`execute` 又拼一遍，同一句提示在回执里出现两次；
+    模型看到重复句会当成「上一次没读进去」，于是重试同一个调用（真机烧过预算）。
+    """
+    return text if _HINT in text else text + _HINT
+
+
+def validate_params(tool: "Tool", params: dict[str, Any]) -> str | None:
+    """JSON Schema 子集的保守校验，返回错误串或 None。
+
+    只做四条能给出**可执行改法**的判据：required（调用方先判）、类型（强转时判）、
+    enum、未知键。不做 ``$ref`` / ``oneOf`` / ``pattern``——现有工具的 schema 里没有
+    这些，硬校验只会把合法调用挡在门外。
+
+    未知键为什么值得拦：模型自创键名（``file_path`` 写成 ``path``）时，旧实现把多余键
+    原样透传给 ``**kwargs``，工具要么抛 TypeError、要么静默忽略，两种都表现为
+    「工具没反应」，模型于是换个键名再试，一路把迭代预算烧完。
+    """
+    schema = tool.parameters or {}
+    props: dict[str, Any] = schema.get("properties") or {}
+    if not props:
+        # schema 没声明属性（``{"type": "object"}``）：这时拦未知键等于什么都不许传。
+        return None
+
+    if getattr(tool, "strict_params", True) and schema.get("additionalProperties") is not True:
+        unknown = [k for k in params if k not in props and not str(k).startswith("_")]
+        if unknown:
+            allowed = ", ".join(sorted(props)[:12])
+            more = "" if len(props) <= 12 else f" 等 {len(props)} 个"
+            return (f"Error: 参数里有多余的键 {unknown}；这个工具只接受 {allowed}{more}。"
+                    "去掉多余的键再调一次，别自创键名。")
+
+    for key, spec in props.items():
+        if key not in params or not isinstance(spec, dict):
+            continue
+        enum = spec.get("enum")
+        if isinstance(enum, list) and enum and params[key] not in enum:
+            return (f"Error: param '{key}' 只能是 {enum} 之一，收到 {params[key]!r}。"
+                    f"按其中之一重填后重试。")
+    return None
+
+
 def _keys(values: Iterable[str] | None) -> frozenset[str]:
     return frozenset(v for v in (values or ()) if v)
 
@@ -119,6 +163,11 @@ class Tool(ABC):
     def exclusive(self) -> bool:
         """即便开启并发也需独占执行。"""
         return False
+
+    #: 是否对**未知参数键**做严格校验（R5）。默认 True；只有「schema 是动态拼的、
+    #: 无法穷举属性」的工具才该置 False——放宽的代价是模型传错键名时静默丢掉参数，
+    #: 表现成「工具没反应」，比报错难查得多。
+    strict_params: bool = True
 
     # ---- 状态键读写集（并发调度的确定依据）----
 
@@ -252,8 +301,13 @@ class ToolRegistry:
             return None
         return tool
 
-    def has(self, name: str) -> bool:
-        return name in self._tools
+    def has(self, name: str, *, user_id: str | None = None) -> bool:
+        """该工具对指定用户是否**可见**（与 ``get`` / ``get_definitions`` 同一口径）。
+
+        以前只看名字在不在表里：个人工具对别人也 `has` 得 True，于是「查一下有没有」
+        和「真去调」给出两个答案。现在两处同源，`user_id=None` 只看见系统工具。
+        """
+        return self.get(name, user_id=user_id) is not None
 
     def needs_approval(self, name: str) -> bool:
         """该工具执行前是否要先挂起等人工审批（工具自声明 或 --approve-tools 覆盖）。"""
@@ -316,6 +370,10 @@ class ToolRegistry:
                         "（只交一个方案、去掉可选开关）后再交一次。")
             return tool, params, tool.missing_params_error(missing, params)
 
+        problem = validate_params(tool, params)
+        if problem:
+            return tool, params, problem
+
         casted: dict[str, Any] = {}
         for key, value in params.items():
             spec = props.get(key)
@@ -342,8 +400,8 @@ class ToolRegistry:
         tool, params, error = self.prepare_call(name, params)
         if error:
             # 「工具不存在」与「参数不对」都算失败，但只有前者意味着调用从未发生。
-            return (UnknownToolError(name, error + _HINT) if tool is None
-                    else ToolError(name, error + _HINT))
+            return (UnknownToolError(name, with_hint(error)) if tool is None
+                    else ToolError(name, with_hint(error)))
         assert tool is not None  # guarded by prepare_call()
         try:
             result = tool.execute(**params)
@@ -356,14 +414,16 @@ class ToolRegistry:
         if result is None:
             return ToolError(name, f"Error executing {name}: 工具返回空值")
         if isinstance(result, str) and result.startswith("Error"):
-            return ToolError(name, result + _HINT)
+            return ToolError(name, with_hint(result))
         return result
 
     def __len__(self) -> int:
         return len(self._tools)
 
     def __contains__(self, name: str) -> bool:
-        return name in self._tools
+        # 与 `has()` 同口径（无 user 上下文 = 只看系统工具），避免
+        # 「`in` 说在、`get` 说看不见」这种两套答案。
+        return self.has(name)
 
 
 # --------------------------------------------------------------------------

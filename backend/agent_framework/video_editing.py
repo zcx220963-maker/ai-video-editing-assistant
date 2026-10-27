@@ -457,6 +457,26 @@ class PatchVideoNode(BaseNode):
         }
 
 
+class SimpleFilmNode(BaseNode):
+    """离线替身：真节点在 `storyline_server/nodes/simple_nodes.py`（R18）。
+
+    离线测试不连 Remotion、不跑模型，所以这里只回一份同形状的产物；
+    `test_video_editing.py` 用「白名单 ↔ 本地 mock 一一对应」守住两边不漂。
+    """
+
+    name = "simple_film"
+    display_name = "一句话出片"
+    description = "离线 mock：一句话出片（真实现走 simple/pipeline.run）"
+    required_nodes: list[str] = []
+    output_keys = ("mp4_url",)
+    input_schema = {"type": "object", "properties": {"prompt": {"type": "string"}},
+                    "required": ["prompt"]}
+
+    async def process(self, state: Any, inputs: dict[str, Any]) -> dict[str, Any]:
+        return {"mp4_url": "mock://simple_film",
+                "title": str(inputs.get("prompt") or "")}
+
+
 ALL_NODE_CLASSES = [
     # 输入阶段 → 素材处理层 → 逻辑与脚本层 → 时间轴规划层 → 最终输出
     SearchMediaNode, LoadMediaNode,
@@ -467,6 +487,7 @@ ALL_NODE_CLASSES = [
     PlanTimelineNode, PlanTimelineProNode, PlanTimelineAITransitionNode,
     RenderVideoNode, RenderWebNode, PlanMotionNode,
     RenderCodeMotionVideoNode, PatchCodeMotionVideoNode, PatchVideoNode,
+    SimpleFilmNode,
 ]
 
 

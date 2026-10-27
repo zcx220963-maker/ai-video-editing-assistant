@@ -493,6 +493,10 @@ def check_tools_budget(box: Mapping[str, Any]) -> None:
 
 
 class ContextBuilder:
+    #: Bootstrap Files 目录（R8）。默认 None = 不启用；装配方在构造后挂上即可，
+    #: 不必改构造函数签名（三处装配与测试都按现签名写）。
+    bootstrap_dir: str | None = None
+
     def __init__(
         self,
         system_prompt: str | None = None,
@@ -585,6 +589,16 @@ class ContextBuilder:
 
         _add(Section(name="system_prompt", text=self.system_prompt,
                      kind="always", condition_key=None, referenced_by=ASSEMBLY_REF))
+
+        # Bootstrap Files（R8）：身份 / 工作规矩 / 视频规矩，每轮都在。
+        # 装配方把目录挂在 `builder.bootstrap_dir` 上（默认 None = 不启用）。
+        if self.bootstrap_dir:
+            from .bootstrap import load_bootstrap
+
+            text = load_bootstrap(self.bootstrap_dir)
+            if text:
+                _add(Section(name="bootstrap", text=text, kind="always",
+                             condition_key=None, referenced_by=ASSEMBLY_REF))
 
         if self.runtime_context:
             rt = self.runtime_context()

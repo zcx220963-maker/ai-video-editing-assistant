@@ -1,6 +1,13 @@
 ﻿# 主框架依赖（Storyline 真实节点的增量见 requirements-storyline.txt）
 # 安装：pip install -r requirements.txt
 
+# --- 消息队列（R1：生产默认 Kafka，内存队列只做测试/本地单进程）---
+aiokafka>=0.14        # mq.KafkaMessageQueue：手动提交 + 分区水位 + 死信
+
+# --- 文件系统持久化（R14/R19：Cron / Message Center / Task Board 的单机互斥）---
+filelock>=3.13        # 文件版存储的跨进程锁（共享卷上仍只保证单机互斥）
+PyYAML>=6.0           # R15：MCP 配置的 YAML 解析（保留自写最小子集作无依赖兜底）
+
 # --- 模型与协议 ---
 openai>=2.38          # DeepSeek 走 OpenAI 兼容接口（agent_framework/llm_openai.py）
 mcp>=1.28,<2          # MCP 客户端 + StreamableHttp 传输（2.x API 不兼容，暂锁定 1.x）

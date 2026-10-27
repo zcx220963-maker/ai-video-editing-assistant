@@ -50,7 +50,13 @@ def default_requirement_checker(token: str) -> tuple[bool, str]:
         return shutil.which(arg) is not None, f"CLI: {arg}"
     if prefix == "ENV":
         return bool(os.getenv(arg)), f"ENV: {arg}"
-    return True, t  # 未知前缀按满足处理，避免误杀
+    # 未知前缀按**不满足**处理（R13 fail-closed）。
+    # 以前是 True：装了带 `MCP: xxx` / `PY: foo` 这类写法的技能时，「检查不了」
+    # 被当成「检查通过」，技能带着没装好的依赖被注入正文，真机表现是模型照着
+    # 说明书调一个根本不存在的工具。宁可少注入一份技能（日志里有原因），
+    # 也不要让它带着假前提开工。
+    logger.warning("技能依赖前缀不认识，按不可用处理：%s", t)
+    return False, f"未知依赖类型: {t}"
 
 
 #: 常驻清单里**每个技能**那一行摘要的字节上限。

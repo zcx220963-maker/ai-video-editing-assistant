@@ -38,6 +38,23 @@ from .mq import MessageQueue
 
 OUTBOUND_TOPIC = "outbound"
 CONNECTION_GROUP = "connection-manager"
+
+
+def instance_group(instance_id: str | None = None) -> str:
+    """OutBound 的消费组名：**每个 Web 实例一个组**（R2）。
+
+    Kafka 的消费组是「分片」不是「广播」：所有实例用同一个组，同一帧只会投给其中
+    一个实例，其余实例的 socket 永远收不到。连接管理器必须看到**每一帧**才能按本地
+    socket 投递，所以组名必须按实例区分。
+
+    不传 instance_id 时退回 ``hostname:pid``——同机多进程也是两个实例，不会互相吞帧。
+    """
+    if instance_id:
+        return f"conn-{instance_id}"
+    import os
+    import socket
+
+    return f"conn-{socket.gethostname()}-{os.getpid()}"
 _DEFAULT_BUFFER_SIZE = 200
 # 观测计数：测试与「这一路到底投了什么」的现场勘查用。以前是 list、每帧永久追加一份
 # （帧里带整段工具结果与媒体载荷），长跑必漏；现在只留最近这些条。
@@ -54,7 +71,8 @@ class ConnectionManager:
         mq: MessageQueue,
         *,
         topic: str = OUTBOUND_TOPIC,
-        group: str = CONNECTION_GROUP,
+        group: str | None = None,
+        instance_id: str | None = None,
         buffer_size: int = _DEFAULT_BUFFER_SIZE,
         shadow_sessions: int = _DEFAULT_SHADOW_SESSIONS,
         shadow_frames: int = _DEFAULT_SHADOW_FRAMES,
@@ -62,7 +80,8 @@ class ConnectionManager:
     ) -> None:
         self.mq = mq
         self.topic = topic
-        self.group = group
+        # 默认每实例唯一组（R2）：固定组在多副本下会让「同一帧只到一个实例」。
+        self.group = group or instance_group(instance_id)
         self._sockets: dict[str, set[Any]] = {}
         self.sent: deque[dict[str, Any]] = deque(maxlen=max(0, obs_limit))  # 观测 / 测试
         self._subscribed = False

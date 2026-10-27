@@ -130,6 +130,10 @@ class CompositeHook(AgentHook):
 
     def __init__(self, hooks: list[AgentHook]) -> None:
         self._hooks = list(hooks)
+        # `finalize_content` 是同步链式调用：单个 Hook 抛错以前会中断整条收尾链，
+        # 让「排在它后面那个改文案的 Hook」直接不执行（R9）。这里逐项兜住并计数，
+        # 计数供排障用——静默吞掉异常比抛出去更难查。
+        self._finalize_failures = 0
 
     def add(self, hook: AgentHook) -> None:
         self._hooks.append(hook)

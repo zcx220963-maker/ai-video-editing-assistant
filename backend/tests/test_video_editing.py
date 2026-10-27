@@ -66,11 +66,14 @@ async def main() -> None:
         "plan_timeline_pro", "plan_timeline_ai_transition", "render_video",
         "render_web", "plan_motion", "render_motion_code",
         "patch_motion_code", "patch_video",
+        # R18：简洁视频线的 Node 外壳（一句话出片），与六个原生工具共用 pipeline。
+        "simple_film",
     }
-    check(len(doc_nodes) == 25,
-          "流程图白名单共 25 个节点（零素材那条链：plan_motion → 代码镜出片 "
+    check(len(doc_nodes) == 26,
+          "流程图白名单共 26 个节点（零素材那条链：plan_motion → 代码镜出片 "
           "render_motion_code → 选区改 patch_motion_code；"
-          "口播那条链的选区改：render_video → patch_video）")
+          "口播那条链的选区改：render_video → patch_video；"
+          "简洁线出片：simple_film）")
     registered = set(reg.names())
     check(registered == doc_nodes,
           f"节点全集已注册（白名单里没注册 {sorted(doc_nodes - registered)}，"

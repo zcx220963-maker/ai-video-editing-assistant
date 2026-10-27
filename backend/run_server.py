@@ -92,6 +92,7 @@ from agent_framework.team_tools import (
 )
 from agent_framework.tool import ToolRegistry
 from agent_framework.tools.cron import CronScheduler, register_cron_tools
+from agent_framework.cron_store import CronFileStorage
 from agent_framework.tools.file import register_file_tools, session_workspace_root
 from agent_framework.tools.run import register_run_tool
 from agent_framework.mcp_manager import McpManager
@@ -273,6 +274,9 @@ def build_runtime(
     llm: LLMClient | None = None,
     mq_backend: str = "memory",
     bootstrap_servers: str = "localhost:9092",
+    max_concurrent_sessions: int = 32,               # 同时活跃的会话数上限（R1/D17）
+    cron_store: str = "pg",                          # R14：file=文件为真相；pg=既有行为
+    cron_root: str = ".runtime/cron",                # 文件版 CronJob 的落点
     storage_backend: str = "memory",                 # 生产用 "pg_minio"；"memory" 是离线替身
     storage: Storage | None = None,                  # 已构造的句柄（测试注入），优先于 storage_backend
     cache_root: str | Path | None = None,            # localize 内容缓存根（可删光）
@@ -347,7 +351,18 @@ def build_runtime(
     # 所以在这里刷一次就覆盖了后续所有创建
     refresh_team_subagent_prompt(prompt_library)
 
-    mq = build_message_queue(mq_backend, bootstrap_servers=bootstrap_servers)
+    # 实例名要给 ConnectionManager 用（OutBound 消费组按实例区分，R2）；
+    # 它由 server.register 在装配时读环境变量，这里把已解析的值落一次
+    # （显式环境变量优先，不覆盖）。
+    if instance_id:
+        os.environ.setdefault("INSTANCE_ID", instance_id)
+
+    mq = build_message_queue(
+        mq_backend,
+        bootstrap_servers=bootstrap_servers,
+        max_concurrent_sessions=max_concurrent_sessions,
+        instance_id=instance_id or "",
+    )
     if storage is None:
         inject = {"cache_root": cache_root, "workspace_root": workspace_root}
         storage = build_storage(storage_backend,
@@ -473,6 +488,10 @@ def build_runtime(
         compressor=compressor,
         prompt_library=prompt_library,
     )
+    # Bootstrap Files（R8）：prompts/bootstrap/*.md 每轮进 system。
+    # 目录不存在时 load_bootstrap 返回空串，等于没启用——不用开关。
+    _boot = Path(prompts_dir) / "bootstrap" if prompts_dir not in (None, False) else None
+    context_builder.bootstrap_dir = str(_boot) if _boot else None
 
     # OutboundStreamHook 是功能链路（LLM delta → on_stream → MQ OutBound），
     # MediaCardHook 是成片回投（render_video 结果 → after_execute_tools → 播放卡片），
@@ -538,7 +557,9 @@ def build_runtime(
             },
         )
 
-    scheduler = CronScheduler(storage, runner=_runner)
+    scheduler = CronScheduler(
+        CronFileStorage(Path(cron_root) / "jobs.json") if cron_store == "file" else storage,
+        runner=_runner)
     register_cron_tools(registry, scheduler)
 
     # 本地工具此刻已注册齐；远程节点要到 _startup 才进来，届时再补一次。
@@ -902,8 +923,19 @@ def build_runtime(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="智能创作助手 · 服务层装配（FastAPI + MQ + Heartbeat）")
-    p.add_argument("--mq", default=os.getenv("MQ_BACKEND", "memory"), choices=["memory", "kafka"])
+    # 生产默认走 Kafka（R1/D1）：内存队列只是测试与本地单进程的替身，
+    # 必须显式 --mq memory 才用。broker 不可达时由 AgentWorker 快速失败。
+    p.add_argument("--mq", default=os.getenv("MQ_BACKEND", "kafka"), choices=["memory", "kafka"])
     p.add_argument("--bootstrap-servers", default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
+    p.add_argument("--max-concurrent-sessions", type=int,
+                   default=int(os.getenv("MAX_CONCURRENT_SESSIONS", "32")),
+                   help="同时活跃的会话数上限（R1/D17）。这不是线程数：再高只会把上游打到限流")
+    p.add_argument("--cron-store", default=os.getenv("CRON_STORE", "file"),
+                   choices=["file", "pg"],
+                   help="定时任务落点（R14）：file=文件为真相（单机/共享卷）；"
+                        "pg=多副本（跨主机文件没有原子 claim）")
+    p.add_argument("--instance-id", default=os.getenv("INSTANCE_ID", ""),
+                   help="本实例唯一名（OutBound 消费组用，R2）。留空=hostname:pid")
     p.add_argument("--storage", default=os.getenv("STORAGE_BACKEND", "pg_minio"),
                    choices=["pg_minio", "memory"],
                    help="pg_minio=上线存储层（PG 元数据 + MinIO 媒体字节，读 .env 五项配置）；"
@@ -996,6 +1028,8 @@ def main() -> None:
     runtime = build_runtime(
         mq_backend=args.mq,
         bootstrap_servers=args.bootstrap_servers,
+        max_concurrent_sessions=args.max_concurrent_sessions,
+        cron_store=args.cron_store,
         storage_backend=args.storage,
         cache_root=args.cache_root or None,
         workspace_root=args.workspace_root or None,

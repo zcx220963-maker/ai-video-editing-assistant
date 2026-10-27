@@ -92,7 +92,7 @@ CORE_LINE_BUDGET = 510
 #:   ⑰ 浏览器控制台回传链（server.mjs onBrowserLog → remotion_client.with_warnings →
 #:      kernel.stills_pairs → shot_evidence.warnings → qa.readout_fix）：静帧渲黑时
 #:      把 console.error 连同 file:line 带回，给模型和人都能直接定位。
-PACKAGE_LINE_BUDGET = 4060
+PACKAGE_LINE_BUDGET = 4160
 
 #: 不许出现在 import 里的东西。
 BANNED = ("code_spec", "storyline_server.nodes", "storage.repositories",

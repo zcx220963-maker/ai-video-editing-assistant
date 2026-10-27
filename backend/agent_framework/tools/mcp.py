@@ -29,7 +29,9 @@ import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Mapping, Protocol, Sequence
+from typing import Any, AsyncIterator, Literal, Mapping, Protocol, Sequence
+
+from pydantic import BaseModel, Field, field_validator
 
 # 官方 MCP 客户端（R10-T44）。**这三个传输入口就是「协议侧不再手写」的全部依据**：
 # 报文、SSE 解析、会话头都在它们肚子里。
@@ -49,19 +51,41 @@ from ..tool import Tool
 # 配置模型（对应文档代码块 1：MCPServerConfig）
 # --------------------------------------------------------------------------
 
-@dataclass
-class MCPServerConfig:
-    """单个 MCP Server 的连接与筛选信息。字段含义见设计文档表格。"""
+class MCPServerConfig(BaseModel):
+    """单个 MCP Server 的连接与筛选信息（R15：Pydantic 模型）。
+
+    改成模型是为了**在装配期就报错**：以前是 dataclass，`type: "websocket"`
+    这种写错的值会一路带到连接阶段，表现成「这个 server 连不上」而不是
+    「配置写错了」。`enabledTools` / `toolTimeout` 的 camelCase 兼容与
+    `${ENV}` 展开是既有能力（`from_dict` + `_expand_env`），这里原样保留。
+    """
+
+    model_config = {"extra": "ignore"}
 
     name: str = ""
-    type: str | None = None            # "stdio" | "sse" | "streamableHttp"
+    type: Literal["stdio", "sse", "streamableHttp"] | None = None
     command: str = ""                  # stdio：执行的命令，如 "npx"
-    args: list[str] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
     url: str = ""                      # HTTP/SSE：服务端 URL
-    headers: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
     tool_timeout: int = 30             # 工具调用超时（秒）
-    enabled_tools: list[str] = field(default_factory=lambda: ["*"])
+    enabled_tools: list[str] = Field(default_factory=lambda: ["*"])
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def _norm_type(cls, v: Any) -> Any:
+        """把历史写法归一；真正不认识的值仍然拒绝（不是静默 None）。
+
+        旧配置里出现过 `streamable_http` / `http` 两种写法，直接按 Literal 校验
+        会让它们启动失败——那是把「写法不同」当成「配错了」。
+        """
+        if v is None or v == "":
+            return None
+        s = str(v).strip()
+        alias = {"streamable_http": "streamableHttp", "http": "streamableHttp",
+                 "streamablehttp": "streamableHttp", "stdio": "stdio", "sse": "sse"}
+        return alias.get(s.lower(), s)
 
     @classmethod
     def from_dict(cls, name: str, d: dict[str, Any]) -> "MCPServerConfig":

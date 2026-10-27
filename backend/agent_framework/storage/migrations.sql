@@ -11,6 +11,13 @@ ALTER TABLE materials DROP CONSTRAINT IF EXISTS materials_origin_check;
 ALTER TABLE materials ADD CONSTRAINT materials_origin_check
   CHECK (origin IN ('upload','library','bgm','url','render','art'));
 
+-- checkpoint_entries 增 'tool_call' / 'tool_result'（R10：逐调用恢复点）。
+-- 老库的 CHECK 只允许 delta/full/summary，不放宽的话写逐调用条目会直接约束违例。
+-- 必须与 schema.sql 的建表期 CHECK 逐项相等（新库/老库两条口径）。
+ALTER TABLE checkpoint_entries DROP CONSTRAINT IF EXISTS checkpoint_entries_kind_check;
+ALTER TABLE checkpoint_entries ADD CONSTRAINT checkpoint_entries_kind_check
+  CHECK (kind IN ('delta','full','summary','tool_call','tool_result'));
+
 -- render_jobs 增 result jsonb：渲染改成「提交 + 轮询」后，终态产物要能在任意实例、
 -- 进程重启之后照样重建出来（此前它只活在一次阻塞调用的返回值里）。
 ALTER TABLE render_jobs ADD COLUMN IF NOT EXISTS result jsonb;

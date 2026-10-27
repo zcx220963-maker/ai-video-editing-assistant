@@ -149,6 +149,18 @@ class ConversationsRepo(_Repo):
         if got and got["user_id"] != user_id:
             raise IntegrityConflict(f"会话 {conv_id} 已属于其他用户")
 
+    async def is_owned(self, user_id: str, conv_id: str) -> bool | None:
+        """只读归属查询：True=归本人，False=归别人，None=还没建行。
+
+        给 WS 握手用，与 `claim` 的区别是**不抛异常**：WS 要把「别人的」映射成
+        4403、把「还没建行的」按原语义放行，两者混成一个 False 就会把新会话
+        一起挡在门外（见 R3-c 防回退用例）。
+        """
+        got = await self.get(conv_id)
+        if got is None:
+            return None
+        return got["user_id"] == user_id
+
     async def list_for(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
         return await self.db.select(self.table, where={"user_id": user_id},
                                     order_by=["-updated_at"], limit=limit)

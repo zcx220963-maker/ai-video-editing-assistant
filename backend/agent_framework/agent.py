@@ -34,7 +34,7 @@ from .checkpoint import Checkpoint, CheckpointManager
 from .catalog import get_catalog
 from .compress import (DEFAULT_FOLD_AT_BYTES, DEFAULT_KEEP_RECENT_RESULTS,
                        DEFAULT_RESULT_MAX_BYTES, FOLD_MARKER, ToolResultGate,
-                       _repair_orphans)
+                       _repair_orphans, fold_tool_schemas)
 from .skill import INDEX_ONLY_NOTE
 from .context import (ContextBuilder, LEDGER_ENTRY_TYPE, Section,
                       check_tools_budget, tools_box)
@@ -117,6 +117,13 @@ _MAX_CONSECUTIVE_FAILURES = 4
 #: 白烧 ¥0.24、一张计划卡都没出。把选项拿掉，它只能换工具或交卡。
 #: 这几个永远保留：规划轮的出口不能被摘，否则模型无处交付。
 _NEVER_HIDE_TOOLS = frozenset({"submit_plan", "ask_user"})
+
+#: 工具面 schema 的字节预算（R11 第一级：工具元信息折叠）。
+#:
+#: 超预算时，**没在本轮用过、也不在计划里**的工具只留一行描述（参数结构不动，
+#: 否则模型不知道该传什么）。0 = 关闭折叠，永远发全量。
+#: 兜底出口：`get_definitions(user_id=...)` / `GET /tools` / 剪辑侧 `dag_contract`。
+_TOOL_SCHEMA_MAX_BYTES = int(os.getenv("TOOL_SCHEMA_MAX_BYTES", "60000"))
 
 #: 原地打转停跑之前，给「摘掉死工具、强制交付」留几轮。
 #:
@@ -1644,13 +1651,19 @@ class AgentOnceRun:
         （见 `_visible_tool_definitions`）。让位轮只留出口（`_NEVER_HIDE_TOOLS`），
         逼它交付；执行完即清（见 `_MAX_STALL_RESCUES`）。
         """
-        return _visible_tool_definitions(
+        defs = _visible_tool_definitions(
             r.reg, user_id=r.ctx.session.user_id,
             fail_counts=r.ctx.extras.get("_fail_counts") or {},
             only=_NEVER_HIDE_TOOLS if r.rescue_pending else None,
             # motion 流程里把写文件工具从 schema 里摘掉：镜头代码由 plan_motion 内部的
             # 逐镜写手生成，主对话手写 shots/*.tsx 只会打转（见 `_MOTION_HIDE_TOOLS`）。
             hide=(_MOTION_HIDE_TOOLS if _motion_task(r.state, r.messages) else None))
+        # 第一级压缩：工具元信息折叠（R11）。只压描述、不动参数结构；
+        # 「本轮已经用过 / 计划里点名 / 出口工具」保持完整，其余压成一行。
+        # 兜底出口：真要全量 schema 走 get_definitions / GET /tools / dag_contract。
+        keep = set(_NEVER_HIDE_TOOLS) | {
+            str(n) for n in (r.ctx.extras.get("_executed_nodes") or ())}
+        return fold_tool_schemas(defs, keep=keep, max_bytes=_TOOL_SCHEMA_MAX_BYTES)
 
     async def _answer_round(self, r: "_Round", stream: bool, resuming: bool) -> str | None:
         """叫一次模型并按它的回答分流：要调工具 → 工具轮；否则 → 收尾前的硬保证。
@@ -2664,6 +2677,17 @@ class AgentOnceRun:
         不再靠「这批里出现过被依赖的节点名就整批串行」那种一次性推理。
         """
         reg = registry if registry is not None else self.registry
+        # 逐调用恢复点（R10）：本轮开始前取出这个 run 里「已经有结果」的 call_id。
+        # 崩溃恢复时它非空——已完成的调用直接跳过，在途的那些才会重放。
+        cp_mgr = getattr(self, "checkpoint", None)
+        cp_run_id = str(getattr(ctx, "run_id", "") or "")
+        done_ids: set[str] = ctx.extras.get("_completed_calls") or set()
+        if not done_ids and cp_mgr is not None and cp_run_id:
+            try:
+                done_ids = await cp_mgr.completed_calls(cp_run_id)
+            except Exception:  # noqa: BLE001  读不到就按「都没完成」，不能因此不干活
+                logger.warning("读取已完成调用失败，按未完成处理", exc_info=True)
+            ctx.extras["_completed_calls"] = done_ids
         fail_counts: dict[str, int] = ctx.extras.setdefault("_fail_counts", {})
         # 本 run 的重复调用账：key → {n, same, last, refused}。
         # n=同参数真跑次数，same=连续逐字相同结果的次数，last=上次结果的字节摘要。
@@ -3138,6 +3162,9 @@ class AgentOnceRun:
                     "这一步不做，片子永远不会开始渲染。")
 
         async def _exec_one(tc: ToolCall) -> Any:
+            if tc.id in done_ids:
+                # 崩溃前已经跑完并落了结果：不再执行，也不再记一次。
+                return f"[已执行过] 这一步在中断前已完成，直接沿用当时的结果（call_id={tc.id}）。"
             await self.hooks.before_tool_call(ctx, tc.name, tc.arguments, call_id=tc.id)
             t0 = time.monotonic()
             if fail_counts.get(tc.name, 0) >= _MAX_CONSECUTIVE_FAILURES:
@@ -3172,6 +3199,14 @@ class AgentOnceRun:
                 return blocked
             try:
                 call_timeout = _TOOL_CALL_TIMEOUTS.get(tc.name, _TOOL_CALL_TIMEOUT)
+                if cp_mgr is not None and cp_run_id:
+                    try:
+                        await cp_mgr.record_tool_call(
+                            cp_run_id, call_id=tc.id, name=tc.name,
+                            arguments=tc.arguments,
+                            iteration=int(getattr(ctx, "iteration", 0) or 0))
+                    except Exception:  # noqa: BLE001  恢复点写失败不该拦工具
+                        logger.warning("写 tool_call 恢复点失败", exc_info=True)
                 r = await asyncio.wait_for(
                     reg.execute(tc.name, tc.arguments), timeout=call_timeout)
             except TimeoutError:
@@ -3185,6 +3220,14 @@ class AgentOnceRun:
             except Exception as e:  # noqa: BLE001 - Registry 之外再兜一层，循环不该炸
                 r = ToolError(tc.name, f"Error executing {tc.name}: {e}")
             err = r if is_tool_error(r) else None
+            if cp_mgr is not None and cp_run_id:
+                try:
+                    await cp_mgr.record_tool_result(
+                        cp_run_id, call_id=tc.id, name=tc.name,
+                        status="error" if err else "ok",
+                        iteration=int(getattr(ctx, "iteration", 0) or 0))
+                except Exception:  # noqa: BLE001
+                    logger.warning("写 tool_result 恢复点失败", exc_info=True)
             # 「这一页已经给过」只在正文**真发出去**之后才算数。正文窗口闸得在调用前
             # 记账（它要先判这一枪执不执行），两种结果必须当场撤销：
             # ① 调用出错（越界等）——一页都没出去；
@@ -3229,8 +3272,18 @@ class AgentOnceRun:
         results: dict[str, object] = {}
         _uid = ctx.session.user_id
         for batch in plan_batches(tool_calls, lambda n: reg.get(n, user_id=_uid)):
-            gathered = await asyncio.gather(*(_exec_one(tc) for tc in batch))
-            results.update({tc.id: r for tc, r in zip(batch, gathered)})
+            # 一批并发里任何一个工具抛错，都不能取消同批的其他工具（R6）。
+            # `_exec_one` 内部已经兜了 Registry 与超时，这里再兜一层是为了
+            # 钩子（before/after_tool_call）与闸函数本身抛错的情况——
+            # 那些异常以前会让 gather 直接取消整批，同批工具连结果都拿不到。
+            gathered = await asyncio.gather(
+                *(_exec_one(tc) for tc in batch), return_exceptions=True)
+            for tc, r in zip(batch, gathered):
+                if isinstance(r, BaseException):
+                    logger.exception(
+                        "工具 %s 抛出未捕获异常，按失败回执继续", tc.name, exc_info=r)
+                    r = ToolError(tc.name, f"Error executing {tc.name}: {r}")
+                results[tc.id] = r
         # 记下本 run 已执行过的节点：下一轮的 _expand_ready_siblings 据此判断
         # 「谁的产物已经有了」，从而决定还能并谁。
         done = ctx.extras.setdefault("_executed_nodes", set())

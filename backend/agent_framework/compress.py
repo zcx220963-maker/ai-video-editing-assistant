@@ -379,12 +379,23 @@ class ContextCompressor:
         token_counter: TokenCounter | None = None,
         summarizer: Summarizer | None = None,
         summaries: SummaryStore | None = None,
+        drop_at_tokens: int | None = None,
+        summary_at_tokens: int | None = None,
+        tool_schema_max_bytes: int = 60_000,
     ) -> None:
         self.max_tokens = max_tokens
         self.keep_recent_tool_results = keep_recent_tool_results
         self.fold_preview = fold_preview
         self.count = token_counter or default_token_counter
         self.summarizer = summarizer or default_summarizer
+        # 三级独立阈值（R11）。缺省都等于 max_tokens = 今天的行为；
+        # 分开之后才有「先做便宜的那一级」的余地：
+        #   tool_schema_max_bytes → 工具元信息折叠（在 agent 侧，不在本类里）
+        #   drop_at_tokens        → 丢旧消息（零成本）
+        #   summary_at_tokens     → 丢 + 摘要（一次模型调用）
+        self.drop_at_tokens = int(drop_at_tokens or max_tokens)
+        self.summary_at_tokens = int(summary_at_tokens or self.drop_at_tokens)
+        self.tool_schema_max_bytes = int(tool_schema_max_bytes)
         # 摘要的持久化口（R10-T47）。传 None = 今天的行为：每轮重算、不落库。
         # 它**不影响压缩结果**，只影响「同一段前缀第二次要不要再花一次模型调用」，
         # 所以没有存储的调用方（单测、离线脚本）什么都不用改。
@@ -437,15 +448,17 @@ class ContextCompressor:
     # ---- 第二级：从最早的 body 消息开始淘汰，保留能塞进预算的近期消息 ----
 
     def _split_to_fit(
-        self, system: list[Message], body: list[Message], reserve: int
+        self, system: list[Message], body: list[Message], reserve: int,
+        *, budget: int | None = None,
     ) -> tuple[list[Message], list[Message]]:
         """返回 (dropped, kept)：从后往前尽量多保留近期消息；至少保留最后一条。"""
+        cap = self.max_tokens if budget is None else budget
         running = self.estimate(system) + reserve
         split = 0  # body[split:] 保留，body[:split] 淘汰
         for i in range(len(body) - 1, -1, -1):
             cost = self.count(body[i])
             # 最后一条（当前输入）无条件保留，不触发切分
-            if i < len(body) - 1 and running + cost > self.max_tokens:
+            if i < len(body) - 1 and running + cost > cap:
                 split = i + 1
                 break
             running += cost
@@ -462,16 +475,17 @@ class ContextCompressor:
         else:
             system, body = [], list(messages)
 
-        # 第一级：折叠工具信息
+        # 第 0 级：折叠工具结果（便宜、无损语义）
         body = self._fold_tool_info(body)
-        if self.estimate(system + body) <= self.max_tokens:
+        total = self.estimate(system + body)
+        if total <= self.drop_at_tokens:
             return system + body
 
-        # 预留一条摘要消息的空间，再做第二/三级
-        reserve = 32
-        dropped, kept = self._split_to_fit(system, body, reserve)
+        # 第二级：丢旧消息（零成本）；第三级：再叠一次摘要（一次模型调用）。
+        # 两个阈值分开，才能做到「先丢，丢不动了才摘要」。
+        dropped, kept = self._split_to_fit(system, body, 32, budget=self.drop_at_tokens)
 
-        if dropped:
+        if dropped and total >= self.summary_at_tokens:
             summary = await self._summarize(dropped)
             summary_msg: Message = {
                 "role": "system",
@@ -507,6 +521,56 @@ class ContextCompressor:
         if self.summaries is not None and self._scope and summary.strip():
             await self.summaries.put(self._scope, key, summary, covered=len(dropped))
         return summary
+
+
+def fold_tool_schemas(
+    defs: list[dict[str, Any]], *, keep: Iterable[str] = (), max_bytes: int = 60_000,
+) -> list[dict[str, Any]]:
+    """第一级压缩：工具**元信息**折叠（R11）。
+
+    与「折叠工具结果」是两件事：结果折叠动的是历史消息，这里动的是**本轮发给模型的
+    schema 本身**。做法是只压描述、**不动 parameters 的结构**——把 parameters 清空
+    会让模型根本不知道该传什么，那不是压缩，是关掉这个工具。
+
+    ``keep`` 里的工具（本轮计划用到的、最近调过的、出口工具）保持完整。
+    兜底出口不在这里：要全量 schema 走 ``get_definitions`` / ``GET /tools`` /
+    剪辑侧 ``dag_contract``，别在本函数里开第二套发现机制。
+    """
+    if max_bytes <= 0 or not defs:
+        return defs
+    size = sum(len(json.dumps(d, ensure_ascii=False)) for d in defs)
+    if size <= max_bytes:
+        return defs
+
+    keep_set = {str(k) for k in keep}
+    out: list[dict[str, Any]] = []
+    for d in defs:
+        fn = d.get("function") if isinstance(d, dict) else None
+        name = str((fn or {}).get("name") or "")
+        if not isinstance(fn, dict) or name in keep_set:
+            out.append(d)
+            continue
+        f2 = dict(fn)
+        desc = str(f2.get("description") or "").strip()
+        if desc:
+            first = desc.splitlines()[0]
+            f2["description"] = first[:100] + ("…" if len(first) > 100 else "")
+        params = f2.get("parameters")
+        if isinstance(params, dict) and isinstance(params.get("properties"), dict):
+            props: dict[str, Any] = {}
+            for key, spec in params["properties"].items():
+                if isinstance(spec, dict) and isinstance(spec.get("description"), str):
+                    spec = dict(spec)
+                    if len(spec["description"]) > 60:
+                        spec["description"] = spec["description"][:60] + "…"
+                props[key] = spec
+            params = dict(params)
+            params["properties"] = props
+            f2["parameters"] = params
+        folded = dict(d)
+        folded["function"] = f2
+        out.append(folded)
+    return out
 
 
 def _repair_orphans(messages: list[Message],

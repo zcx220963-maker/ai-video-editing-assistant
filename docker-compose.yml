@@ -57,6 +57,39 @@ services:
       retries: 20
 
 
+  # 生产 MQ（R1）。单节点 KRaft，无 ZooKeeper。
+  # 为什么它必须和 app 一起起：`run_server.py` 的 `--mq` 缺省已改成 kafka，
+  # broker 不在时启动会快速失败（这是设计要的：不再有「生产形态用内存队列」的兜底）。
+  # 本地不想起它：`--mq memory` 显式覆盖。
+  kafka:
+    image: ${KAFKA_IMAGE:-apache/kafka:3.9.0}
+    container_name: creation-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      # 容器内通告名用服务名：app 用 kafka:9092 连，宿主机用 127.0.0.1:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: ${KAFKA_NUM_PARTITIONS:-8}
+    ports:
+      - "127.0.0.1:9092:9092"   # 只绑本机：宿主机上的测试脚本要连
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+    profiles: ["app"]
+
   editor:
     build: .
     image: creation-app:latest
@@ -71,6 +104,13 @@ services:
       timeout: 5s
       retries: 24
     environment: &app-env
+      # 生产 MQ（R1/D1）：缺省走 Kafka；本地单进程用 --mq memory 覆盖。
+      MQ_BACKEND: ${MQ_BACKEND:-kafka}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      # 同时活跃的会话数上限（D17）。不是线程数：再高只会把上游打到限流。
+      MAX_CONCURRENT_SESSIONS: ${MAX_CONCURRENT_SESSIONS:-32}
+      # OutBound 消费组的实例名（R2）。多副本时每个实例必须不同。
+      INSTANCE_ID: ${INSTANCE_ID:-app-1}
       PG_DSN: postgresql://${PG_USER:-creation}:${PG_PASSWORD:-creation_dev_pw}@postgres:5432/${PG_DB:-creation}
       MINIO_ENDPOINT: minio:9000
       # 直链签名用浏览器解析得到的地址：容器里的 minio:9000 宿主看不见，而 presigned URL
@@ -210,6 +250,8 @@ services:
         condition: service_healthy
       editor:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"]
@@ -237,6 +279,7 @@ services:
 volumes:
   pgdata:
   miniodata:
+  kafkadata:        # Kafka KRaft 日志与 topic 数据
   template-store:   # 用户沉淀的模板源码缓存（真相在 PG）
   whisper-cache:   # faster-whisper 模型缓存(容器化部署时,首次下载持久化)
   caddy-data:      # Caddy 证书与配置

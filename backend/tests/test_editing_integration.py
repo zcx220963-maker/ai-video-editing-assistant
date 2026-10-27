@@ -148,7 +148,9 @@ async def main() -> None:
         first_ready = {r["name"] for r in await tm.ready()}
         check(first_ready == {"load_media", "search_media", "render_web",
                               "plan_motion", "render_motion_code",
-                              "patch_motion_code", "patch_video"},
+                              "patch_motion_code", "patch_video",
+                              # R18：一句话出片是独立起点，没有上游依赖。
+                              "simple_film"},
               f"链首无依赖节点先可认领：{first_ready}")
         # render_video 对应任务初始被阻塞。
         rv = by_name["render_video"]["id"]

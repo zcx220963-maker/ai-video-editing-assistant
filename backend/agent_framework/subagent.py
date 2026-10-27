@@ -16,6 +16,10 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+import asyncio
+import logging
+import uuid
+
 from .agent import AgentConfig, AgentOnceRun
 from .context import ContextBuilder
 from .hooks import AgentHook, CompositeHook, ToolTraceHook, _current_hook_ctx, _current_hooks
@@ -24,6 +28,8 @@ from .mq import MessageQueue
 from .prompts import read_prompts_file
 from .session import Session
 from .tool import Tool, ToolRegistry
+
+logger = logging.getLogger("agent.subagent")
 
 # 子 Agent 工具装配器：往传入的 registry 里注册一批工具（不含 spawn）。
 ToolRegistrar = Callable[[ToolRegistry], None]
@@ -143,6 +149,11 @@ class SpawnTool(Tool):
             "properties": {
                 "task": {"type": "string", "description": "交给子 Agent 的具体子任务描述"},
                 "context": {"type": "string", "description": "子任务所需的必要背景信息（可选）"},
+                "wait": {
+                    "type": "boolean",
+                    "description": "true=等子 Agent 跑完直接给结论（默认）；"
+                                   "false=立刻返回 task_id，结果稍后回投（长任务用）",
+                },
             },
             "required": ["task"],
         }
@@ -152,16 +163,52 @@ class SpawnTool(Tool):
     def read_only(self) -> bool:
         return False
 
-    async def execute(self, task: str, context: str = "", session_id: str = "") -> str:
+    async def execute(
+        self, task: str, context: str = "", session_id: str = "",
+        wait: bool = True,
+    ) -> str:
+        """派生子 Agent。``wait=False`` 时立刻返回 `task_id`，结果回投收件箱（R7）。
+
+        设计 §15 要的是「异步启动 SubAgent，结果回传主 Agent」；旧实现是同步等待，
+        长任务会把主 Agent 的一次工具调用挂十几分钟。默认仍是 ``wait=True``——
+        既有提示词与技能都按「一次调用拿结论」写，改默认值等于静默改语义。
+        """
         prompt = f"{task}\n\n背景：{context}" if context else task
         ctx = _current_hook_ctx.get()
         hooks = _current_hooks.get()
         if ctx is not None and hooks is not None:
             await hooks.on_subagent_spawn(ctx, task)
+
+        if not wait:
+            task_id = f"sub-{uuid.uuid4().hex[:8]}"
+
+            async def _bg() -> None:
+                try:
+                    out = await self._runner.run(prompt, parent_session_id=session_id)
+                except Exception as exc:  # noqa: BLE001  异步分支不能把异常吞成静默
+                    out = f"Error: 子 Agent 失败：{type(exc).__name__}: {exc}"
+                await self._notify(task_id, task, out)
+
+            asyncio.create_task(_bg())
+            return (f"[已派发] task_id={task_id}。子 Agent 在后台跑，"
+                    "结果会以消息形式回投；不要立刻重复派同一个任务。")
+
         result = await self._runner.run(prompt, parent_session_id=session_id)
         if ctx is not None and hooks is not None:
             await hooks.on_subagent_end(ctx, task, result)
         return f"[子 Agent 结论]\n{result}"
+
+    async def _notify(self, task_id: str, task: str, result: str) -> None:
+        """异步结果回投：有 MessageCenter 就投，没有就只记日志。"""
+        center = getattr(self._runner, "message_center", None)
+        text = f"[子 Agent 完成] task_id={task_id}\n任务：{task}\n结论：{result}"
+        if center is None:
+            logger.info(text)
+            return
+        try:
+            await center.send("subagent", "main_agent", text)
+        except Exception:  # noqa: BLE001  回投失败不该让后台任务崩掉
+            logger.exception("子 Agent 结果回投失败：%s", task_id)
 
 
 def make_spawn_tool(

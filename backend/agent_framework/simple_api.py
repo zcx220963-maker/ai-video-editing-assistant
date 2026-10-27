@@ -28,8 +28,15 @@ from typing import Any
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from storyline_server.simple import film, kernel, project, showrunner, takes
+from storyline_server.simple import pipeline
 from storyline_server.simple.kernel import KernelError
+
+# HTTP 快线只是传输适配：能力统一从 `pipeline` 取（R18）。
+film = pipeline.film
+kernel = pipeline.kernel
+project = pipeline.project
+showrunner = pipeline.showrunner
+takes = pipeline.takes
 
 #: 同时在跑的作业数上限。渲染容器自己是串行的，这个数只防「连点十次」。
 MAX_JOBS = int(os.environ.get("SIMPLE_MAX_JOBS", "3") or 3)
