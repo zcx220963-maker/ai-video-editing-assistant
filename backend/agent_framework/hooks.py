@@ -161,6 +161,21 @@ class CompositeHook(AgentHook):
             except Exception:  # noqa: BLE001
                 logger.exception("AgentHook.on_stream_end error in %s", type(h).__name__)
 
+    def finalize_content(
+        self, context: AgentHookContext, content: str | None
+    ) -> str | None:
+        """串接每个 Hook 的输出；**单个 Hook 抛错只记录，不中断收尾链**（R9）。"""
+        for h in self._hooks:
+            try:
+                got = h.finalize_content(context, content)
+            except Exception:  # noqa: BLE001  收尾链不能被一个 Hook 打断
+                self._finalize_failures += 1
+                logger.exception("AgentHook.finalize_content error in %s",
+                                 type(h).__name__)
+                continue
+            content = got
+        return content
+
     async def after_execute_tools(self, context: AgentHookContext) -> None:
         for h in self._hooks:
             try:
@@ -229,8 +244,17 @@ class CompositeHook(AgentHook):
         self, context: AgentHookContext, content: str | None
     ) -> str | None:
         # 唯一可改内容的节点：串接每个 Hook 的输出。
+        # **单个 Hook 抛错只记录，不中断收尾链**（R9）——以前这里没有 try，
+        # 排在前面的 Hook 一炸，后面「改文案」的 Hook 就永远不执行。
         for h in self._hooks:
-            content = h.finalize_content(context, content)
+            try:
+                got = h.finalize_content(context, content)
+            except Exception:  # noqa: BLE001
+                self._finalize_failures += 1
+                logger.exception("AgentHook.finalize_content error in %s",
+                                 type(h).__name__)
+                continue
+            content = got
         return content
 
 

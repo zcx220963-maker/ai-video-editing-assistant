@@ -400,8 +400,10 @@ class ToolRegistry:
         tool, params, error = self.prepare_call(name, params)
         if error:
             # 「工具不存在」与「参数不对」都算失败，但只有前者意味着调用从未发生。
-            return (UnknownToolError(name, with_hint(error)) if tool is None
-                    else ToolError(name, with_hint(error)))
+            # 不再在这里拼 `_HINT`：`ToolError.__str__` 已经追加一次，
+            # 两边都拼会让模型看到两遍同一句提示（真机会当成「上次没读进去」而重试）。
+            return (UnknownToolError(name, error) if tool is None
+                    else ToolError(name, error))
         assert tool is not None  # guarded by prepare_call()
         try:
             result = tool.execute(**params)

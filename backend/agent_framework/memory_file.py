@@ -33,7 +33,9 @@ class FileMemoryBackend:
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
-        self._lock = threading.Lock()
+        # RLock 而不是 Lock：`replace_if` 持锁期间会调 `write`（同一个锁），
+        # 普通 Lock 会在这里自死锁——测试里表现成「进程卡住、什么都不打印」。
+        self._lock = threading.RLock()
 
     def _path(self, user_id: str, category: str) -> Path:
         name = _NAMES.get(category, f"{category}.md")
