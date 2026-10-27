@@ -379,7 +379,11 @@ class MakeShortVideoTool(Tool):
         out["size_mb"] = made["size_mb"]
         if made.get("voice") == "ok":
             out.setdefault("voice", "ok")
-        out["render_ms"] = (kernel.describe_receipt(res).get("ms") or {}).get("render_ms")
+        # `render_and_publish` 已经把 `render_ms` 一起算好了（R18 收口时它接过了
+        # `kernel.render` 的返回值）。这里原来还写着 `res`——那个变量在收口时就没了，
+        # 于是整条链跑完、片子也上传了，**回执却在这一行抛 NameError**，
+        # 用户拿不到链接（2026-10-27 真机踩到）。
+        out["render_ms"] = made.get("render_ms")
         out["hint"] = ("成片卡片会**自动**出现在对话里（可播放、可下载）——"
                        "不要把这串 presigned 地址贴进回答，那是给程序用的，几百个字符没人看。"
                        "用户要改某一镜就用 "
