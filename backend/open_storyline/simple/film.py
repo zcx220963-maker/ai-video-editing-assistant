@@ -103,6 +103,14 @@ STORY_MAX_SHOTS = 24
 #: 转场长度（帧）。8 帧 @30fps ≈ 0.27 秒——够看清是"过渡"而不是"跳帧"，
 #: 又不至于把 4 秒一镜的节奏吃掉。再长就该加镜数了，不是加转场。
 TRANS_FRAMES = 8
+
+#: **全片质感层**的合法取值。以前这七层写死在 `GLOBAL_FX_TSX` 里、无条件全开，
+#: 于是"扫光每 5 秒扫一遍、每个切点白闪 32%"成了每部片子的共同脸——
+#: 这才是"看着都一个样"的真正来源（比提示词里的模板更硬，因为它不看 tone）。
+FX_CHOICES = ("grain", "vignette", "breath", "flash", "sweep", "scanline")
+#: 缺省只留两层**几乎看不见**的：颗粒 + 暗角。它们不会让人感到"有个光在动"。
+DEFAULT_FX = ("grain", "vignette")
+
 #: plan 里 `transition` 的取值 → TSX 表达式。`cut` 不出 Transition 元素（硬切）。
 TRANS_TSX = {
     "slide": "slide({ direction: 'from-right' })",
@@ -263,6 +271,7 @@ def timeline(secs: list[float], kinds: list[str], *,
 def assemble(bodies: list[str], secs: list[float], kinds: list[str], *,
              fps: int = kernel.DEFAULT_FPS,
              motifs: list[tuple[float, float, float] | None] | None = None,
+             fx: list[str] | None = None,
              ) -> tuple[str, dict[str, Any]]:
     """N 段组件体 → 一个模块：统一 import + 设计系统 + `TransitionSeries` + 全局层。
 
@@ -273,7 +282,12 @@ def assemble(bodies: list[str], secs: list[float], kinds: list[str], *,
     给了它，相邻两镜都有位置的切点就会生成一次"接力"（`SharedMorph`）——
     这是参考片那个"小点一路变成地球"的做法：元素在 `TransitionSeries` **外面**
     被驱动，所以切镜时它不会跟着上一镜一起卸载。
+
+    `fx` 是**全片质感层**（2026-10-27 改）：以前七层特效写死在 `GLOBAL_FX_TSX` 里、
+    无条件加到每部片上，于是"扫光每 5 秒扫一遍、每个切点白闪"成了所有片子的共同脸。
+    现在由导演在 plan 里点名，缺省只留 `grain` + `vignette`（几乎看不见的那两层）。
     """
+    fx = [str(x) for x in (fx if fx is not None else DEFAULT_FX)]
     parts = [SCENE_HEADER, system.SYSTEM_TSX, ""]
     for i, body in enumerate(bodies):
         body = _fix_svg_frame(_fix_rects(_fix_fonts(_fix_div_bg(body))))
@@ -305,7 +319,8 @@ def assemble(bodies: list[str], secs: list[float], kinds: list[str], *,
                          f" timing={{linearTiming({{ durationInFrames: {TRANS_FRAMES} }})}} />")
     parts.append("      </TransitionSeries>")
     parts.append("    </Drift>")
-    parts.append(f"    <GlobalFX cuts={{[{', '.join(str(c) for c in tl['cuts'])}]}} />")
+    parts.append(f"    <GlobalFX cuts={{[{', '.join(str(c) for c in tl['cuts'])}]}}"
+                 f" fx={{[{', '.join(chr(39) + x + chr(39) for x in fx)}]}} />")
 
     # ---- 跨镜接力：相邻两镜都声明了贯穿物件的位置，就在切点上接一次 ----
     hops = shared_hops(tl, motifs, n)

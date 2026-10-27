@@ -1018,16 +1018,23 @@ MANIFEST: list[dict[str, str]] = [
 
 #: 全局层：叠在**整片**之上（不是每镜）。七层一次渲完才有资格做这件事。
 #:
-#: 1 手持微动（整片轻推） 2 扫光 3 快门闪（切点白闪） 4 暗场呼吸
-#: 5 颗粒 6 暗角 7 扫描线
+#: 1 手持微动（整片轻推，在 `CAMERA_DRIFT_TSX` 里）2 扫光 3 快门闪（切点白闪）
+#: 4 暗场呼吸 5 颗粒 6 暗角 7 扫描线
+#:
+#: **每一层都要导演点名才开**（2026-10-27 改）。以前这里是全开的，后果是
+#: 所有片子都有"一个光每 5 秒左右扫过"和"每个切点白闪"——那是最显眼的模板感，
+#: 而且它不看 `tone`，比提示词里的模板更硬。缺省只给 grain + vignette。
 GLOBAL_FX_TSX = r"""
-const GlobalFX: React.FC<{ cuts?: number[] }> = ({ cuts = [] }) => {
+const GlobalFX: React.FC<{ cuts?: number[]; fx?: string[] }> = ({
+  cuts = [], fx = ['grain', 'vignette'],
+}) => {
   const frame = useCurrentFrame();
   const { durationInFrames, width, height } = useVideoConfig();
   const t = durationInFrames > 0 ? frame / durationInFrames : 0;
+  const on = (k: string) => fx.indexOf(k) >= 0;
 
   // 3 快门闪：切点前后 1 帧白闪，模拟剪辑点
-  const nearCut = cuts.some((c) => Math.abs(frame - c) <= 1);
+  const nearCut = on('flash') && cuts.some((c) => Math.abs(frame - c) <= 1);
   // 4 暗场呼吸：整片亮度缓慢起伏
   const breath = 0.03 + 0.03 * Math.sin(t * Math.PI * 6);
   // 2 扫光：每 150 帧斜向扫过一次
@@ -1036,27 +1043,33 @@ const GlobalFX: React.FC<{ cuts?: number[] }> = ({ cuts = [] }) => {
   return (
     <>
       {/* 2 扫光 */}
-      <div style={{
-        position: 'absolute', inset: 0, pointerEvents: 'none',
-        backgroundImage: `linear-gradient(115deg, rgba(255,255,255,0) ${sweepPos * 100}%, rgba(255,255,255,0.055) ${sweepPos * 100 + 8}%, rgba(255,255,255,0) ${sweepPos * 100 + 16}%)`,
-      }} />
+      {on('sweep') ? (
+        <div style={{
+          position: 'absolute', inset: 0, pointerEvents: 'none',
+          backgroundImage: `linear-gradient(115deg, rgba(255,255,255,0) ${sweepPos * 100}%, rgba(255,255,255,0.055) ${sweepPos * 100 + 8}%, rgba(255,255,255,0) ${sweepPos * 100 + 16}%)`,
+        }} />
+      ) : null}
       {/* 4 暗场呼吸 */}
-      <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none',
-                    backgroundImage: `linear-gradient(rgba(0,0,0,${Math.max(0, breath)}), rgba(0,0,0,${Math.max(0, breath)}))` }} />
+      {on('breath') ? (
+        <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none',
+                      backgroundImage: `linear-gradient(rgba(0,0,0,${Math.max(0, breath)}), rgba(0,0,0,${Math.max(0, breath)}))` }} />
+      ) : null}
       {/* 3 快门闪 */}
       {nearCut ? (
         <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none',
                       backgroundImage: 'linear-gradient(rgba(255,255,255,0.32), rgba(255,255,255,0.32))' }} />
       ) : null}
       {/* 5 颗粒 + 6 暗角 */}
-      <Grain opacity={0.05} seed={11} />
-      <Vignette strength={0.48} />
+      {on('grain') ? <Grain opacity={0.05} seed={11} /> : null}
+      {on('vignette') ? <Vignette strength={0.48} /> : null}
       {/* 7 扫描线 */}
-      <svg viewBox={`0 0 ${width} ${height}`} width={width} height={height}
-           style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
-        <rect x={0} y={(t * 130) % 100 * height / 100} width={width} height={2}
-              fill="#22D3EE" opacity={0.05} />
-      </svg>
+      {on('scanline') ? (
+        <svg viewBox={`0 0 ${width} ${height}`} width={width} height={height}
+             style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
+          <rect x={0} y={(t * 130) % 100 * height / 100} width={width} height={2}
+                fill="#22D3EE" opacity={0.05} />
+        </svg>
+      ) : null}
     </>
   );
 };

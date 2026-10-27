@@ -55,6 +55,7 @@ PLAN_SYSTEM = """你是这部短片的导演。只做一件事：把用户那句
   "tone": "整片的画法基调。**必须写清四件**：① 底色（给色值）② 主色两个（给色值）③ 构图习惯（满/空、对称/偏心、地平线高低）④ 笔触（矢量平涂/剪纸/手绘/3D/照片拼贴）。这四件决定十几镜像不像同一部片子；含糊一句，每镜就会各画各的",
   "motif": "贯穿全片的那一件东西（≤8 字，没有就空串）",
   "caption": {"size": 0.045, "at": "lower", "color": "#F2F5F8", "scrim": 0},
+  "fx": ["grain", "vignette"],
   "shots": [
     {"sec": 3.2, "text": "这一镜的字幕（≤20 字）", "plan": "画什么、怎么动、用什么技术",
      "transition": "cut"}
@@ -65,6 +66,11 @@ PLAN_SYSTEM = """你是这部短片的导演。只做一件事：把用户那句
 
 `caption` 是**全片一套的字幕规格**——字幕由写手逐镜画进画面，只有这一份能让 23 镜的字一样：
 `size` 字号占短边 0.03~0.06、`at` 位置 bottom/lower/center/upper/left、`color` 字色、`scrim` 底衬 0~0.4。
+
+`fx` 是**全片质感层**，从这六个里挑 0~3 个：`grain`（颗粒）、`vignette`（暗角）、
+`breath`（整片亮度呼吸）、`flash`（切点白闪）、`sweep`（每 5 秒斜向扫光）、`scanline`（滚动扫描线）。
+**缺省只给 grain + vignette**。`sweep` / `scanline` / `flash` 是最显眼的模板感——
+只有在"监控/仪器/档案"这类题材里才点它们，别的题材点了会让每部片子长得一样。
 
 `tone` 是**你对这个题材的审美判断**，不是填空题：先想三个方向（各一句"长什么样 + 为什么
 适合这题材"），挑最贴的那一个写进 `tone`。**避开偷懒答案**——暗底加一个光点、深蓝科技感、
@@ -212,6 +218,10 @@ def normalize(obj: dict[str, Any]) -> dict[str, Any]:
         "tone": str(obj.get("tone") or "").strip()[:200],
         "motif": str(obj.get("motif") or "").strip()[:20],
         "sources": obj.get("sources") if isinstance(obj.get("sources"), list) else [],
+        # `fx` 是全片质感层（颗粒/暗角/扫光…）。白名单过滤：模型写错词就忽略，
+        # 不要因为一个拼错的特效名让整片退回默认。
+        "fx": [str(x) for x in (obj.get("fx") or [])
+               if str(x) in ("grain", "vignette", "breath", "flash", "sweep", "scanline")],
         "shots": shots,
         # 三次都没命中时长、最后按比例缩过 → 如实带出去（`make` 会写进 duration_note）
         **({"scaled_from": obj["scaled_from"]} if obj.get("scaled_from") else {}),
@@ -526,7 +536,8 @@ async def make(prompt: str, *, seconds: float = 60.0,
                         continue
                     cand = wrap_story_scene(body, shots[i], index=i, bg=film_bg)
                     code_i, _ = assemble([cand], [secs[i]], ["cut"], fps=fps,
-                                         motifs=[parse_motif_at(cand)])
+                                         motifs=[parse_motif_at(cand)],
+                                         fx=plan_obj.get("fx"))
                     ev = await shot_evidence(code_i, [secs[i]], aspect=aspect,
                                              fps=fps, only=1)
                     rd = (ev[0].get("readings") if ev else {}) or {}
@@ -564,7 +575,8 @@ async def make(prompt: str, *, seconds: float = 60.0,
     def rebuild() -> tuple[str, dict[str, Any]]:
         """拼装一次。**每次都重新读 motif 锚点**——重写过的镜位置会变。"""
         return assemble(bodies, secs, kinds, fps=fps,
-                        motifs=[parse_motif_at(b) for b in bodies])
+                        motifs=[parse_motif_at(b) for b in bodies],
+                        fx=plan_obj.get("fx"))
 
     code, tl = rebuild()
 

@@ -81,9 +81,14 @@ async def reshoot(proj: dict[str, Any], shot_no: int, *, note: str = "",
     bodies[i] = wrap_story_scene(body, scene, index=i)
 
     def rebuild() -> tuple[str, dict[str, Any]]:
-        """重新拼装。要**重读锚点**——重写过的镜位置变了，沿用旧锚点会接空。"""
+        """重新拼装。要**重读锚点**——重写过的镜位置变了，沿用旧锚点会接空。
+
+        `fx` 也要跟着工程走（2026-10-27）：不传就落到 `DEFAULT_FX`，
+        于是"改一镜"会顺手把这条片子的扫光/白闪换成颗粒+暗角——改一镜不该改整片观感。
+        """
         return assemble(bodies, secs, kinds, fps=fps,
-                        motifs=[parse_motif_at(b) for b in bodies])
+                        motifs=[parse_motif_at(b) for b in bodies],
+                        fx=plan.get("fx"))
 
     async def check() -> tuple[str, dict[str, Any], dict[str, Any]]:
         code, tl = rebuild()
