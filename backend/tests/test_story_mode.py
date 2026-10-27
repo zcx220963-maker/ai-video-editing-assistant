@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from open_storyline.simple import (  # noqa: E402
-    caption as cap_mod, film, morph, qa, scene, story, system, table as table_mod)
+    caption as cap_mod, film, morph, qa, scene, story, system)
 
 _CHECKS = 0
 _FAILS = 0
@@ -79,8 +79,11 @@ def main() -> int:
     check(wrapped.count("const Scene") == 1, "整段只有一个 `const Scene`")
     check("<Camera " in wrapped and "<Inner03 dur={dur} />" in wrapped, "外层套运镜")
     check(film._looks_complete(wrapped), "包完仍是完整组件")
-    check({"Camera", "RichCaption", "ChapterMark", "TimeMark"}
-          <= set(system.used_components(wrapped)), "文字层三件 + 运镜都在外层")
+    # 2026-10-27：`ChapterMark` / `TimeMark` 的注入已删——`normalize()` 是白名单，
+    # `chapter` / `time` 两个字段从来没被保留过，那两个分支一次都没触发。
+    # 现在外层只剩「运镜 + 字幕」两件（字幕还要点名 overlay 才补）。
+    check({"Camera", "RichCaption"} <= set(system.used_components(wrapped)),
+          "外层只剩运镜 + 字幕两件")
     check("bottom={0.08}" in wrapped, "字幕默认按底部锚定（long 句不会溢出画面下沿）")
     # 提亮层：提示词写"亮度 ≥ 38/255"，模型稳定做到 27——它对绝对亮度没有直觉。
     # 所以在最后一道确定性代码里补，而不是继续往提示词里加数字。
@@ -118,35 +121,16 @@ def main() -> int:
     check("WebkitTextStroke" in system.SYSTEM_TSX and "scrim = 0" in system.SYSTEM_TSX,
           "去掉了底部黑条（scrim 默认 0），改成描边 + 双层阴影")
 
-    print("\n③c 对照表：分镜只给数据，排版由组件算")
-    # 为什么必须这样：表格是"数据 → 坐标"的映射。实测两次在提示词里明写
-    # 「散落各国对照表」，模型画出来的 <text> 是 0 个——它只会把数据念进字幕。
-    tbl_scene = {**SCENE, "table": {"title": "散落各国", "link": "敦煌",
-                                    "cols": ["地点", "件数"],
-                                    "rows": [["伦敦", "13000"], ["巴黎", "7000"]]}}
-    wt = film.wrap_story_scene(inner, tbl_scene, index=0)
-    check("<CompareTable" in wt, "有 table 数据 → 外层画对照表")
-    check('cols={["地点", "件数"]}' in wt, "列名原样传进组件（不在这里重排）")
-    check('[["伦敦", "13000"], ["巴黎", "7000"]]' in wt, "行数据原样传进组件")
-    check("link" in wt and "敦煌" in wt, "link 给了就传（左侧虚线锚点）")
-    # 校验与截断：列 <2 / 行空 / 非 dict 都不画，但整片照出（表格是加分项不是前置条件）
-    check(cap_mod.__name__ and table_mod.plan({**SCENE, "table": {"cols": ["只有一列"],
-                                                                "rows": [["x"]]}}) is None,
-          "只有一列 → 不画（表格至少要两列）")
-    check(table_mod.plan({**SCENE, "table": {"cols": ["a", "b"], "rows": []}}) is None,
-          "没有行 → 不画")
-    check(table_mod.plan({**SCENE, "table": "不是字典"}) is None, "形状错 → 不画，不炸")
-    many = {"cols": ["a", "b"], "rows": [[str(i), str(i)] for i in range(20)]}
-    got_many = table_mod.plan({**SCENE, "table": many})
-    check(len(got_many["rows"]) == table_mod.MAX_ROWS,
-          f"行数截到 {table_mod.MAX_ROWS}（再多字号就小到看不清，该拆成两镜）")
-    short = table_mod.plan({**SCENE, "table": {"cols": ["a", "b"], "rows": [["x"]]}})
-    check(short["rows"][0] == ["x", ""], "行比列短 → 补空串（不在这里补，组件会错位）")
+    print("\n③c 对照表：已随外层注入一起删（2026-10-27）")
+    # 原来这里钉「分镜只给数据，外层画 `CompareTable`」。但 `showrunner.normalize()`
+    # 是白名单式转换，`table` 字段**从来没被保留过**——这条腿一次都没触发过。
+    # 画法全交给模型之后，对照表也归写手自己画（它画得比固定组件更贴画面）。
+    # 组件本体留在 system.py（清单与实现一致那条仍成立），只是不再由外层注入。
     check("<CompareTable" not in film.wrap_story_scene(inner, SCENE, index=0),
-          "没给 table → 不画（老片子行为不变）")
+          "外层不再注入对照表（table 字段已不在白名单里）")
     check("CompareTable" in system.SYSTEM_TSX and
           any(m["name"] == "CompareTable" for m in system.MANIFEST),
-          "组件清单与实现都在（清单写错模型就调不到）")
+          "组件清单与实现仍一致（清单写错模型就调不到）")
 
     print("\n④ 高亮词必须是正文子串")
     # 高亮只活在外层字幕里（`hi` 是 `RichCaption` 的参数），所以这里点名 overlay；

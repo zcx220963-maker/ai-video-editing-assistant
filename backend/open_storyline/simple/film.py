@@ -25,8 +25,6 @@ from pathlib import Path
 from typing import Any
 
 from . import facts, kernel, qa, system
-from .director import (  # noqa: F401  —— 提示词搬去 director.py
-    PLAN_SYSTEM as _PLAN_SYSTEM, STORY_SYSTEM as _STORY_SYSTEM)
 # 三条确定性修补搬去 `fixes.py`（2026-10-26）：它们必须能在 **lint 之前**被调用，
 # 而 lint 在 kernel / story 里跑，那两个模块反向 import film 就是循环。
 # 这里重新导出，`assemble()` 与 `tests/test_simple_film.py` 的旧名字照旧可用。
@@ -45,7 +43,7 @@ from .morph import MORPH_HUE, parse_motif_at, shared_hops  # noqa: F401
 from .scene import (  # noqa: F401  —— 包装层搬去了 scene.py，这里继续对外暴露
     _caption_fit, _scene_fingerprint, safe_story_scene, wrap_story_scene)
 from .story import (  # noqa: F401
-    _STORY_SCENE_SYSTEM, plan_story, write_scene_story_code)
+    _STORY_SCENE_SYSTEM, write_scene_story_code)
 from ..motion import remotion_client as rc
 
 #: 单镜最长 5.2 秒——这是"看起来不像 PPT"的硬指标之一（对标片 60s/17镜/最长5.20s）。
@@ -120,15 +118,22 @@ TRANS_CYCLE = ("slide", "zoom", "wipe", "blur", "slide", "cut")
 
 
 def estimate_seconds(text: str) -> float:
-    """用户没说时长时，按**内容量**估一个（30~180 秒，取 5 的整数倍）。
+    """用户没说时长时，按**内容量**估一个（**60~180** 秒，取 5 的整数倍）。
 
-    分句每个多 25 秒、每字 0.6 秒、底 30 秒。原来 `seconds` 缺省 6.0（夹到 8 秒）——
-    用户只说"做个关于 X 的视频"就得到 8 秒，**那是默认值在替他做决定**。
+    分句每个多 25 秒、每字 0.6 秒、底 30 秒，最后夹到 60~180。
+
+    **下限 60 是 2026-10-27 定的**：用户明确要「一分钟起」。理由不是审美——
+    60 秒 ≈ 9~10 镜、约 20 次模型调用、整体 5~6 分钟，是「试一次」的合理成本；
+    30 秒讲不完一个知识点，8 秒更是被默认值替用户做了决定（原来的病）。
+    上限仍是 180：再长就该让用户明说，不该替他猜。
+
+    注意**别把 `kernel.DEFAULT_SECONDS`（6.0）也改成 60**：那个是「一段代码渲多长」，
+    服务于 `stills()` / `render()` / `takes.draft()`，语义完全不同。
     """
     raw = str(text or "").strip()
     n = len([p for p in re.split(r"[，,、；;。！？!?\n]+", raw) if p.strip()])
     sec = 30.0 + 25.0 * (n - 1) + 0.6 * len(raw)
-    return float(max(30, min(180, round(sec / 5) * 5)))
+    return float(max(60, min(180, round(sec / 5) * 5)))
 
 
 def transitions_for(scenes: list[dict[str, Any]]) -> list[str]:
@@ -355,7 +360,8 @@ async def make_film(prompt: str, *, seconds: float = 60.0,
                     on_stage: Any = None,
                     voice: bool = True,
                     mode: str = "auto",
-                    scenes: Any = None) -> dict[str, Any]:
+                    scenes: Any = None,
+                    bgm_path: Any = None) -> dict[str, Any]:
     """一句话 → 一条成片。**现在只走一条路**（2026-10-26）。
 
     旧的 `explainer` / `story` 两条路已不再被调用（留在下面叫 `_make_legacy`，
@@ -366,7 +372,8 @@ async def make_film(prompt: str, *, seconds: float = 60.0,
     """
     return await sr.make(prompt, seconds=seconds, aspect=aspect, fps=fps,
                          llm=llm, user_id=user_id, conversation_id=conversation_id,
-                         on_stage=on_stage, voice=voice, scenes=scenes)
+                         on_stage=on_stage, voice=voice, scenes=scenes,
+                         bgm_path=bgm_path)
 
 
 async def shot_stills(code: str, tl: dict[str, Any], index: int, *,

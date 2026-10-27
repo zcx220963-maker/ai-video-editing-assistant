@@ -100,7 +100,8 @@ class PlanShortFilmNode(_ShortFilmNode):
         "prompt": {"type": "string",
                    "description": "要讲什么。可以带讲法（「从瑞利散射讲到日落变红」）"},
         "seconds": {"type": "number",
-                    "description": "目标时长（秒），8~240，默认 30。镜数由内容定，不按这个数均分"},
+                    "description": "目标时长（秒），8~240。**不传就按内容量估**（60 起、最多 180）——"
+                                   "镜数由内容定，不按这个数均分"},
         "aspect": {"type": "string", "enum": ["portrait", "landscape", "square"],
                    "description": "画幅，默认 portrait（竖屏）"},
     }, required=["prompt"])
@@ -109,7 +110,10 @@ class PlanShortFilmNode(_ShortFilmNode):
         prompt = str(inputs.get("prompt") or state.user_request or "").strip()
         if len(prompt) < 4:
             raise ValueError("prompt 太短，至少给一个完整主题（例如「为什么天空是蓝色的」）")
-        seconds = float(inputs.get("seconds") or 30.0)
+        # 没传就**按内容量估**（60 起、最多 180）。原来这里写死 30：
+        # 用户只给一句话时，30 秒这个数不是从内容算出来的，是拍的。
+        _raw_sec = inputs.get("seconds")
+        seconds = float(_raw_sec) if _raw_sec else pipeline.estimate_seconds(prompt)
         aspect = kernel.norm_aspect(inputs.get("aspect"))
         user_id, conv_id = self._ident(state)
         plan_obj, calls = await showrunner.plan(

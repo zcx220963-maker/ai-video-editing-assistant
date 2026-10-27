@@ -18,7 +18,7 @@ import json
 import re
 from typing import Any
 
-from . import caption, table
+from . import caption
 
 #: 运镜四档轮换。推/拉/横移/微推——同一档连用两镜会看出"卡住"。
 _STORY_ZOOM = ((1.0, 1.10), (1.12, 1.0), (1.0, 1.06), (1.08, 1.02))
@@ -76,8 +76,6 @@ def wrap_story_scene(body: str, scene: dict[str, Any], *, index: int,
     px, py = _STORY_PAN[index % len(_STORY_PAN)]
     text = str(scene.get("text") or "").strip()
     hi = str(scene.get("hi") or "").strip()
-    chapter = str(scene.get("chapter") or "").strip()
-    tmark = str(scene.get("time") or "").strip()
     if hi and text and hi not in text:
         hi = ""
 
@@ -116,25 +114,11 @@ def wrap_story_scene(body: str, scene: dict[str, Any], *, index: int,
         f"      <AbsoluteFill style={{{{ backgroundColor: '#ffffff',"
         f" opacity: {GRADE_OPACITY} }}}} />",
     ]
-    if chapter and not own:
-        lines.append(f"      <ChapterMark index={q(chapter)} hue={q(fg)} t={{t}} />")
-    if tmark and not own:
-        lines.append(f"      <TimeMark text={q(tmark)} hue={q(fg)} t={{t}} />")
     cap = caption.plan(scene)
     if text and cap["mode"] == "overlay" and not own:
         lines.append(f"      <RichCaption text={q(text)} hi={q(hi)} t={{t}} color={q(fg)}"
                      f" bottom={{{cap['bottom']}}} size={{{cap['size']}}}"
                      f" align={q(cap['align'])} />")
-    # 对照表：数据由分镜给，排版由组件算。表格是"数据→坐标"，让模型重画必然歪
-    # （列宽不齐、行高不一、数值不对齐）——实测两次它都只把数据念进字幕。
-    # 导演提示词里写的是「表格由外层画，你只给数据」（director.py），所以这条腿
-    # 不能缺；模型自己写了 `<AbsoluteFill>` 就按"外层不插手"的同一口径让位。
-    tbl = table.plan(scene)
-    if tbl and not own:
-        lines.append(f"      <CompareTable title={q(tbl['title'])}"
-                     f" cols={{{json.dumps(tbl['cols'], ensure_ascii=False)}}}"
-                     f" rows={{{json.dumps(tbl['rows'], ensure_ascii=False)}}}"
-                     f" link={q(tbl['link'])} t={{t}} />")
     lines += ["    </AbsoluteFill>", "  );", "};"]
     return inner + "\n" + "\n".join(lines)
 

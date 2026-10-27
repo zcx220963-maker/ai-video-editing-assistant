@@ -136,9 +136,29 @@ async def _candidates(storage: Any, user_id: str, prompt: str, *,
     return []
 
 
+async def resolve(storage: Any, user_id: str, prompt: str, *, work_dir: Path,
+                  need_sec: float, name: str) -> dict[str, Any] | None:
+    """点名的那首 → dict（含 `path`），取不到返回 None。
+
+    **抽出来是为了卡拍**（2026-10-27）：`beat sync` 要在**写镜之前**就知道配乐是哪一首
+    （镜长得先对好拍，画面才按新时长渲）。所以调用方要先 `resolve` 一次拿到 path 传给
+    `make_film(bgm_path=...)`，再把同一个 dict 用 `picked=` 交给 `mix_into`——
+    两处必须是**同一首**，否则拍点和实际配乐对不上。
+    """
+    got = (await pick(storage, user_id, prompt, work_dir=work_dir,
+                      need_sec=need_sec, force=name)) if storage is not None else None
+    if got is None:
+        from open_storyline.simple import mix as mx
+        local = mx.pick_local(name)
+        if local is not None:
+            got = {"path": local, "filename": local.name, "material_id": "",
+                   "origin": "local_dir", "duration": 0.0}
+    return got
+
+
 async def mix_into(track: Path, dst: Path, *, storage: Any, user_id: str,
                    prompt: str, total_sec: float, work_dir: Path,
-                   bgm_name: str = ""
+                   bgm_name: str = "", picked: dict[str, Any] | None = None
                    ) -> tuple[Path, dict[str, Any] | None]:
     """给一条旁白轨加上配乐，返回 ``(音轨, 配乐说明)``。
 
@@ -147,8 +167,10 @@ async def mix_into(track: Path, dst: Path, *, storage: Any, user_id: str,
 
     **`bgm_name` 为空就不配乐**（2026-10-26 改）。以前是按 prompt 自动挑，
     于是"用户压根没提配乐"也会被塞一首——那首歌跟片子没关系，只是名字凑巧
-    和主题撞上了几个字。现在只有用户**点名**了才配，点的那首**循环铺满整长**
-    （`mix.add_bgm` 用 `-stream_loop -1`），短了也不换。
+    和主题撞上了几个字。现在只有用户**点名**了才配，点的那首**循环铺满整长**，
+    短了也不换。
+
+    `picked` 是调用方已经 `resolve` 好的那一首（卡拍要用同一个），给了就不再重挑。
 
     降级：曲库（materials.origin=bgm） → 本地目录（SIMPLE_BGM_DIR） → 不加。
     任何一级失败都只是"这条片子没配乐"，不抛。
@@ -156,15 +178,10 @@ async def mix_into(track: Path, dst: Path, *, storage: Any, user_id: str,
     from open_storyline.simple import mix as mx
 
     name = str(bgm_name or "").strip()
-    if not name:
+    if not name and picked is None:
         return track, None
-    got = await pick(storage, user_id, prompt, work_dir=work_dir,
-                     need_sec=total_sec, force=name) if storage is not None else None
-    if got is None:
-        local = mx.pick_local(name)
-        if local is not None:
-            got = {"path": local, "filename": local.name, "material_id": "",
-                   "origin": "local_dir", "duration": 0.0}
+    got = picked or await resolve(storage, user_id, prompt, work_dir=work_dir,
+                                  need_sec=total_sec, name=name)
     if got is None:
         return track, None
     try:

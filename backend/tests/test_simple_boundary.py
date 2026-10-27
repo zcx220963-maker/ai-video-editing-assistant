@@ -178,7 +178,7 @@ def main() -> int:
                       ("scene.py", 215), ("review.py", 170), ("export.py", 230),
                       ("morph.py", 110), ("kernel.py", 380), ("qa.py", 310),
                       ("voice.py", 230), ("mix.py", 100), ("ffmpeg.py", 55),
-                      ("caption.py", 135), ("table.py", 70), ("director.py", 100),
+                      ("caption.py", 135), ("beats.py", 160), ("director.py", 100),
                       ("facts.py", 135), ("project.py", 160),
                       # system.py 是 TSX 载荷（29 件组件），加一件必然长——
                       # 它不是"塞屎山"，是"设计系统多了一件"。

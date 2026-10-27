@@ -209,11 +209,25 @@ class MakeShortVideoTool(Tool):
         user_id, conv_id = _ident()
 
         await kernel.ensure_storage()
+        # **先把配乐定下来再写镜**（2026-10-27）：卡拍要在写镜之前知道拍点，
+        # 因为镜长要先按拍点补好、画面才按新时长渲。同一首后面交给 `mix_into`，
+        # 两处必须一致，否则拍点和实际配乐对不上。
+        _picked = None
+        if str(bgm or "").strip():
+            try:
+                from .. import bgm as bgm_pick
+                _picked = await bgm_pick.resolve(
+                    self._storage, user_id, text,
+                    work_dir=kernel.out_dir() / "bgm", need_sec=sec,
+                    name=str(bgm).strip())
+            except Exception:  # noqa: BLE001 —— 配乐解析失败不该拦出片
+                _picked = None
         try:
             got = await film.make_film(text, seconds=sec, aspect=asp,
                                        user_id=user_id, conversation_id=conv_id,
                                        voice=bool(voice), mode=mode,
-                                       scenes=scenes or None)
+                                       scenes=scenes or None,
+                                       bgm_path=(_picked or {}).get("path"))
         except kernel.KernelError as exc:
             return _json({"ok": False, "stage": exc.stage, "error": str(exc),
                           "lint_errors": exc.lint_errors[:5]})
@@ -243,10 +257,14 @@ class MakeShortVideoTool(Tool):
             "calls": got["calls"],
             "transitions": got["transitions"],
             "coverage": round(float((got.get("coverage") or {}).get("ratio") or 0), 3),
-            # 组件覆盖率现在**恒接近 0**（画法全交给模型后，它不再用设计系统组件，
-            # 全用裸 SVG）。所以真正该看的是"有几种不同的画法"——`variety` 越接近
-            # `shots` 越好。报告里两个都给，别让人对着 0.0 以为片子坏了。
+            # 组件覆盖率**恒接近 0**（画法全交给模型后，它不再用设计系统组件，
+            # 全用裸 SVG）。真正该看的是"有几种不同的画法"——`variety` 越接近
+            # `shots` 越好。`coverage` 只为兼容旧消费方保留，附一句说明防止误读。
+            "coverage_note": "画法已全交给模型，组件覆盖率恒≈0，不是故障；看 variety",
             "variety": int(got.get("variety") or 0),
+            # 卡拍：`{"bpm","beats","snapped","pad_total"}`；没配乐或检不出拍时是
+            # `{"skipped": 原因}`。如实报，别让用户以为"切点一定卡在拍上"。
+            "beat_sync": got.get("beat_sync") or {},
             "audit": {
                 "ratio": round(float((got.get("audit") or {}).get("ratio") or 0), 3),
                 # `defects` 是客观缺陷（空帧/全黑），`concerns` 是模型看图给的意见。
@@ -257,6 +275,18 @@ class MakeShortVideoTool(Tool):
             },
             "fallback_shots": got.get("fallback") or [],
             "mp4_url": "",
+        }
+        # **质量门槛要说出来**（2026-10-27）。原来 `audit.ratio = 0.0`（26 镜全不合格）
+        # 也照样静默交付——真机发生过一次「交付了一条 26 镜全黑的片子」。
+        # 这里不改 `ok`（片子确实渲出来了），但给出一个明确的 verdict，
+        # 让调用方和用户都知道"这条没达标，别直接发"。
+        _ratio = out["audit"]["ratio"]
+        out["quality"] = {
+            "pass_ratio": _ratio,
+            "verdict": "ok" if _ratio >= 0.6 else "below_bar",
+            "note": ("" if _ratio >= 0.6 else
+                     f"只有 {_ratio:.0%} 的镜通过画面自检（门槛 60%）——"
+                     f"建议用 reshoot_shot 重画不合格的那几镜，别直接发布"),
         }
         # 出处账：每个数字能不能说清从哪来。**不拦片**，只在报告里如实写。
         # 视觉自检看不出"这个数是编的"，而编一个数字是这条链路里最贵的错。
@@ -315,7 +345,7 @@ class MakeShortVideoTool(Tool):
                     track, kernel.out_dir() / f"track-{fid}-bgm.m4a",
                     storage=self._storage, user_id=user_id, prompt=text,
                     total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm",
-                    bgm_name=bgm)
+                    bgm_name=bgm, picked=_picked)
                 out["bgm"] = (tune or {}).get("filename") or ""
                 out["voice"] = "ok"
                 out["voice_failed_shots"] = vinfo.get("failed") or []

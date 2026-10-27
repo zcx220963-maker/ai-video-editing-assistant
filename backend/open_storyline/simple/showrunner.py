@@ -417,14 +417,14 @@ async def make(prompt: str, *, seconds: float = 60.0,
                aspect: str = kernel.DEFAULT_ASPECT, fps: int = kernel.DEFAULT_FPS,
                llm: Any = None, user_id: str = "", conversation_id: str = "",
                on_stage: Any = None, voice: bool = True,
-               scenes: Any = None) -> dict[str, Any]:
+               scenes: Any = None, bgm_path: Any = None) -> dict[str, Any]:
     """一句话 → 一条成片。返回的字典与旧 `film.make_film` 同形（`short_video` 直接吃）。
 
     四步：导演 → 旁白校验 → 逐镜写 → 评审回路。代码只做「渲、抽帧、给模型看、记账」。
     """
     # 延迟 import：film 在模块级 import 本文件，这里不能反过来。
     from . import system, voice as vo
-    from .film import (assemble, parse_motif_at, safe_story_scene,
+    from .film import (TRANS_FRAMES, assemble, parse_motif_at, safe_story_scene,
                        transitions_for_story, wrap_story_scene, _scene_fingerprint)
 
     def tick(stage: str, done: int, total: int) -> None:
@@ -476,6 +476,30 @@ async def make(prompt: str, *, seconds: float = 60.0,
                              f"{kernel.MAX_SECONDS:g} 秒——减少镜数，或让每句字幕更短。")
         else:
             narr["degraded"] = True
+
+    # ── ②.5 卡拍：切点往最近的拍点靠 ────────────────────────────────────────
+    # 需求文档点名要求的能力（「数学规划 —— beat sync」），简洁线原来没有：
+    # 镜长是导演按内容给的，切点跟音乐毫无关系。**只在点名了配乐时做**，
+    # 且只往后补、封顶 MAX_PAD_SEC——补太多等于作废导演的镜长判断。
+    kinds = transitions_for_story(shots)
+    plan_obj["transitions"] = kinds
+    beat_info: dict[str, Any] = {}
+    if bgm_path:
+        try:
+            from . import beats as bt
+            _info = bt.detect_beats(bgm_path, work=kernel.out_dir() / "beats")
+            if _info.get("beats"):
+                _seams = [TRANS_FRAMES / float(fps) if k == "fade" else 0.0 for k in kinds]
+                _pads = bt.snap_pads(secs, _seams, _info["beats"])
+                if any(p > 0 for p in _pads):
+                    secs = [round(s + p, 2) for s, p in zip(secs, _pads)]
+                beat_info = {"bpm": _info.get("bpm"), "beats": len(_info["beats"]),
+                             "snapped": sum(1 for p in _pads if p > 0),
+                             "pad_total": round(sum(_pads), 2)}
+            else:
+                beat_info = {"skipped": _info.get("reason") or "检不出拍"}
+        except Exception as exc:  # noqa: BLE001 —— 卡拍是增益，失败不该拦出片
+            beat_info = {"skipped": f"{type(exc).__name__}: {exc}"[:80]}
 
     # ── ③ 逐镜写（并发） ───────────────────────────────────────────────────
     tick("scenes", 0, n)
@@ -537,9 +561,6 @@ async def make(prompt: str, *, seconds: float = 60.0,
             raws.append(r[1])
     calls += n
 
-    kinds = transitions_for_story(shots)
-    plan_obj["transitions"] = kinds
-
     def rebuild() -> tuple[str, dict[str, Any]]:
         """拼装一次。**每次都重新读 motif 锚点**——重写过的镜位置会变。"""
         return assemble(bodies, secs, kinds, fps=fps,
@@ -576,9 +597,12 @@ async def make(prompt: str, *, seconds: float = 60.0,
         if not notes:
             break
         fixed = 0
+        # 每轮能修几镜跟镜数走（2026-10-27）：固定 8 对 26 镜的片子等于"最多修三成"，
+        # 而且 `tries` 排序保证的是"轮得到"，不是"修得完"。取一半，封顶仍是 8 的两倍。
+        _budget = max(MAX_FIX_PER_ROUND, n // 2)
         for shot_no, hint in sorted(notes.items(),
                                    key=lambda kv: (tries.get(kv[0], 0), kv[0])
-                                   )[:MAX_FIX_PER_ROUND]:
+                                   )[:_budget]:
             i = shot_no - 1
             if not (0 <= i < n):
                 continue
@@ -688,6 +712,7 @@ async def make(prompt: str, *, seconds: float = 60.0,
         "rewritten": rewritten, "patched": [], "fallback": [],
         "picture": "code", "scene_errors": scene_errors,
         "variety": len({_scene_fingerprint(b) for b in bodies}),
+        "beat_sync": beat_info,
         "timeline": tl, "transitions": kinds,
         "bodies": bodies, "scenes": shots,
         "elements": {i + 1: system.element_count(b) for i, b in enumerate(bodies)},

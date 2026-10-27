@@ -58,6 +58,7 @@ async def run(
     voice_on: bool = True,
     scenes: Any = None,
     on_stage: Callable[[str, int, int], None] | None = None,
+    bgm_path: Any = None,
 ) -> dict[str, Any]:
     """一句话出片的第一段：分镜 → N 镜代码 → 质检（渲染由调用方接着做）。
 
@@ -68,7 +69,7 @@ async def run(
         prompt, seconds=seconds, aspect=aspect,
         user_id=user_id, conversation_id=conversation_id or "",
         on_stage=on_stage, voice=voice_on, mode=mode or "auto",
-        scenes=scenes or None,
+        scenes=scenes or None, bgm_path=bgm_path,
     )
     got.setdefault("title", (got.get("plan") or {}).get("title") or "")
     audit = facts.audit_sources(got.get("plan") or {})
