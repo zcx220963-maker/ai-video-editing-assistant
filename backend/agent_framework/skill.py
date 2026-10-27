@@ -196,21 +196,51 @@ class Skill:
         return "\n".join(lines)
 
 
-def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
-    """极简 frontmatter 解析：--- 包裹的 key: value 行 + 其后正文。"""
-    meta: dict[str, str] = {}
+def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    """frontmatter 解析：优先 PyYAML（R13），失败回退极简 key:value。
+
+    为什么留回退：PyYAML 不是硬依赖，而「整份技能读不出来」比「多行 tags 解析不了」
+    严重得多——回退路径只丢高级语法，不丢技能。
+
+    为什么把值**一律拍平成字符串**：下游（`_parse_requires` / `_is_true` /
+    `declared_sections`）都按字符串写。YAML 会给出 list/bool/None，直接透传会让
+    `requires: [CLI: ffmpeg]` 变成对 list 调 `.strip()`。这里统一拍平，
+    「YAML 只是写法更宽松，读出来的形状不变」。
+    """
+    meta: dict[str, Any] = {}
     if not text.startswith("---"):
         return meta, text.strip()
     lines = text.splitlines()
-    # 第一段 '---' 之后到下一个 '---'
     i = 1
     while i < len(lines) and lines[i].strip() != "---":
-        line = lines[i]
+        i += 1
+    raw = "\n".join(lines[1:i])
+    body = "\n".join(lines[i + 1:]).strip() if i < len(lines) else ""
+
+    def _flat(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple)):
+            return ", ".join(str(v) for v in value)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    try:
+        import yaml
+
+        got = yaml.safe_load(raw) if raw.strip() else {}
+        if isinstance(got, dict):
+            return {str(k): _flat(v) for k, v in got.items()}, body
+    except Exception:  # noqa: BLE001  没装 PyYAML 或 YAML 写坏了 → 回退
+        pass
+
+    for line in raw.splitlines():
         if ":" in line:
             key, _, value = line.partition(":")
             meta[key.strip()] = value.strip().strip('"').strip("'")
-        i += 1
-    body = "\n".join(lines[i + 1 :]).strip() if i < len(lines) else ""
     return meta, body
 
 

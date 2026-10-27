@@ -19,8 +19,10 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
+from .hooks import AgentHook
 from .identity import current_identity_or
 from .memory_compact import (
     CompactReport,
@@ -169,6 +171,56 @@ class MemoryStore:
         cats = categories or list(CATEGORIES)
         got = await self._mem.stamps(self.user_id)
         return {cat: str(got[cat]) for cat in cats if got.get(cat)}
+
+
+class MemoryIterationHook(AgentHook):
+    """每轮把记忆重新注入 system（R12）。
+
+    **默认不启用**（`MEMORY_EVERY_ITERATION=1` 才挂）：注入点从「每 run 一次」变成
+    「每轮一次」，会改 prompt 形状与 token 账，不能静默切换。
+
+    幂等：靠一个标记注释定位并**原地替换**，不会每轮堆一条 system 消息。
+    """
+
+    MARKER = "<!--memory:auto-->"
+
+    def __init__(self, store: MemoryStore, categories: list[str] | None = None,
+                 max_chars: int = 1200) -> None:
+        self.store = store
+        self.categories = list(categories or CATEGORIES)
+        self.max_chars = max_chars
+        self._last = ""
+
+    async def before_iteration(self, context: Any) -> None:
+        parts: list[str] = []
+        for cat in self.categories:
+            try:
+                text = await self.store.read(cat)
+            except Exception:  # noqa: BLE001  读记忆失败不该打断这一轮
+                continue
+            if str(text or "").strip():
+                parts.append(f"[{cat}]\n{str(text).strip()}")
+        block = "\n\n".join(parts)[: self.max_chars]
+        if not block or block == self._last:
+            return
+        messages = getattr(context, "messages", None)
+        if not messages:
+            return
+        self._last = block
+        msg = {"role": "system",
+               "content": f"{self.MARKER}\n<memory>\n{block}\n</memory>"}
+        for i, m in enumerate(messages):
+            if m.get("role") == "system" and self.MARKER in str(m.get("content") or ""):
+                messages[i] = msg
+                return
+        messages.insert(1 if messages[0].get("role") == "system" else 0, msg)
+
+
+def make_iteration_hook(storage: Any) -> MemoryIterationHook | None:
+    """按环境变量决定要不要挂（默认不挂，行为不变）。"""
+    if os.getenv("MEMORY_EVERY_ITERATION", "") not in ("1", "true", "yes"):
+        return None
+    return MemoryIterationHook(MemoryStore(storage))
 
 
 class MemoryContextSource:

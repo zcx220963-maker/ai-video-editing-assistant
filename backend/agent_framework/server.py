@@ -70,6 +70,7 @@ from .connection_manager import ConnectionManager
 from .broadcast import OUTBOUND_CHANNEL, OutboundBroadcaster
 from .storage import Cond
 from .consumer import CHAT_TOPIC, SessionConsumer, session_key
+from .worker import AgentWorker
 from .heartbeat import Heartbeat
 from .ingest import IngestRejected, ingest_bytes
 from .memory import CATEGORIES, MemoryContextSource, MemoryStore
@@ -909,7 +910,12 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         _mask_credentials_in_access_logs()   # uvicorn 已配好日志，此刻装才不会被 dictConfig 冲掉
-        consumer.start()          # 先注册回调
+        # 外层循环收成有名字的对象（R4）：它只负责「订阅」，消费循环仍由 mq.start() 驱动。
+        # 以前这一句是 consumer.start()，读者看不出「主循环到底在哪」。
+        worker = AgentWorker(mq, handler=consumer._handle,
+                             topic=consumer.topic, group=consumer.group)
+        worker.subscribe()
+        app.state.agent_worker = worker
         if broadcaster is not None:
             await broadcaster.start()   # OutBound → Redis 频道 → 各实例本地注册表
         else:

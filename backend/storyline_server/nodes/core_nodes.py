@@ -4128,6 +4128,19 @@ REAL_NODE_CLASSES = [
 ]
 
 
+#: 设计 §22 的 18 项基线（**工具名**口径，映射见文档附录 D）。
+#: `NODE_PROFILE=design_baseline` 时只暴露这些，用于「严格对齐设计」的验收；
+#: 产品档不受它约束。**不含 `plan_timeline`**——设计清单里没有它（设计自身矛盾，
+#: 见文档 X6），但产品档必须保留，否则设计自己的 WORKFLOW SKILL 走不通。
+DESIGN_BASELINE_NODES = [
+    "load_media", "search_media", "split_shots", "asr", "speech_rough_cut",
+    "generate_ai_transition", "understand_clips", "filter_clips", "group_clips",
+    "generate_script", "script_template_rec", "generate_voiceover", "select_BGM",
+    "transition_rec", "text_rec", "plan_timeline_pro",
+    "plan_timeline_ai_transition", "render_video",
+]
+
+
 def build_real_registry(settings: Settings, providers: Providers, storage: Storage,
                         allowed: list[str] | None = None) -> NodeRegistry:
     """实例化真实节点；allowed 为 TOML available_nodes 白名单。"""
@@ -4142,6 +4155,10 @@ def build_real_registry(settings: Settings, providers: Providers, storage: Stora
     from .web_nodes import RenderWebNode
     from .simple_nodes import SimpleFilmNode
     reg = NodeRegistry()
+    # 节点档位（R16）：design_baseline = 严格按设计的 18 项（验收用）；product = 产品全量。
+    # 显式传入的 allowed（TOML 白名单）优先，档位只在没给白名单时兜底。
+    if allowed is None and os.getenv("NODE_PROFILE", "product") == "design_baseline":
+        allowed = list(DESIGN_BASELINE_NODES)
     name_to_cls = {cls.name: cls for cls in [*REAL_NODE_CLASSES, RenderWebNode, SimpleFilmNode]}
 
     def _factory(cls: type) -> Any:

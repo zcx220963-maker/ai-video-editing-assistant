@@ -73,7 +73,8 @@ from agent_framework.hooks import (
 )
 from agent_framework.llm import LLMClient
 from agent_framework.llm_openai import get_default_llm
-from agent_framework.memory import MemoryContextSource, MemoryStore, register_memory_tools
+from agent_framework.memory import (MemoryContextSource, MemoryStore,
+                                    make_iteration_hook, register_memory_tools)
 from agent_framework.mq import MessageQueue, build_message_queue
 from agent_framework.server import create_app
 from agent_framework.session import SessionManager
@@ -510,6 +511,10 @@ def build_runtime(
     if observability:
         hook_list += [LoggingHook(), MetricsHook()]
     hooks = CompositeHook(hook_list)
+    # R12：每轮注入记忆（默认关闭，MEMORY_EVERY_ITERATION=1 才挂）。
+    _mem_hook = make_iteration_hook(storage) if use_memory else None
+    if _mem_hook is not None:
+        hooks.add(_mem_hook)
     agent = Agent(
         llm=llm,
         registry=registry,
