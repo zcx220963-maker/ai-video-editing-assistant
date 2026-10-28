@@ -178,8 +178,9 @@ openchatcut-src/
 /.git-rewrite/
 
 # ---- 启动用不到的部分（2026-10-15：仓库只留「克隆下来能构建、能启动」所需的文件）----
-# 文档：README 之外的设计文档本地保留
-/docs/
+# 文档：README 之外的设计文档本地保留；唯一例外是 README 引用的架构总览图（否则 README 坏链）
+/docs/*
+!/docs/architecture-overview.svg
 # 素材入库与巡检脚本、素材供给探活记录：运行时代码与镜像都不用它们
 /scripts/*
 # 例外：框架对账脚本是验收门（R20），克隆后要能直接跑
