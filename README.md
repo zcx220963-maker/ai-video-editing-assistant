@@ -8,16 +8,7 @@
 
 ## 架构总览
 
-```mermaid
-flowchart TB
-  L1["① 接入与并发 · Kafka 8 分区<br/>会话级串行 / 跨会话 32 并行"]
-  L2["② Agent 内核 · Main/Once Loop ≤200 轮<br/>七层上下文 · 65 工具（30+33+2）"]
-  L3["③ 横切能力 · Hook 11 方法 / 9 业务钩子<br/>Checkpoint 续跑 · 记忆 · Skill"]
-  L4["④ 协作层 · SubAgent · Agent Team<br/>任务板 + A2A · Cron"]
-  L5["⑤ 领域编排 · MCP 33 = 25 节点 + 8 契约<br/>自研 DAG 引擎（严格无环）"]
-  L6["⑥ 基础设施 · PG 23 表 + MinIO<br/>Remotion 渲染 · 发布 · 8 容器"]
-  L1 --> L2 --> L3 --> L4 --> L5 --> L6
-```
+![架构总览](architecture-overview.svg)
 
 **三条贯穿始终的原则**：并发安全由声明推导（不靠模型自觉）；压缩只压内容、不压控制流；代码只拦空镜，审美交看图模型。
 
