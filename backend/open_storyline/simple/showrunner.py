@@ -17,12 +17,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
+import shutil
+import time
 from typing import Any
 
 from . import kernel, qa
 from .kernel import KernelError
+
+#: 续跑缓存的存活时间（秒）。同一个 prompt 在这个窗口内重来就复用已写好的镜。
+#: 2 小时而不是永久：键里没有模型随机性，明天说同一句话该得到另一条片子。
+RESUME_TTL = 7200.0
 
 #: 镜数上下限。上限 40 是**护栏**（防它写 40 镜），不是审美判据。
 MIN_SHOTS, MAX_SHOTS = 3, 40
@@ -431,6 +438,48 @@ def adopt(scenes: Any) -> dict[str, Any]:
     return normalize({"shots": rows})
 
 
+def _resume_key(prompt: str, seconds: float, aspect: str, fps: int) -> str:
+    """续跑缓存的键：**只由请求参数决定**，不含模型随机性。
+
+    不能用 `film_id` 当键——那个每次调用新生成（`project.new_id()`），中断后重来
+    一定是另一个 id，用它做键永远复用不到。这是这套缓存必须按请求参数索引的原因。
+    """
+    raw = f"{prompt.strip()}|{seconds:g}|{aspect}|{fps}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _resume_dir(key: str):
+    d = kernel.out_dir() / ".resume" / key
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _resume_hit(d: Any, i: int, sig: str, tone: str) -> tuple[str, str] | None:
+    """这一镜在缓存里有定稿吗？有就返回 `(包装后的组件, 模型原稿)`。
+
+    两道校验缺一不可：`sig`（秒数 + 字幕）保证还是那一镜，`tone` 保证整片画法没换。
+    """
+    try:
+        meta = json.loads((d / f"s{i + 1:02d}.json").read_text(encoding="utf-8"))
+        if meta.get("sig") != sig or meta.get("tone") != tone:
+            return None
+        return ((d / f"s{i + 1:02d}.tsx").read_text(encoding="utf-8"),
+                str(meta.get("raw") or ""))
+    except (OSError, ValueError):
+        return None
+
+
+def _persist_shot(d: Any, i: int, sig: str, tone: str, cand: str, body: str) -> None:
+    """一镜定稿就落盘。**兜底镜不落**——复用一个兜底比重写一遍更糟。"""
+    try:
+        (d / f"s{i + 1:02d}.tsx").write_text(cand, encoding="utf-8")
+        (d / f"s{i + 1:02d}.json").write_text(
+            json.dumps({"sig": sig, "tone": tone, "raw": body}, ensure_ascii=False),
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
 async def make(prompt: str, *, seconds: float = 60.0,
                aspect: str = kernel.DEFAULT_ASPECT, fps: int = kernel.DEFAULT_FPS,
                llm: Any = None, user_id: str = "", conversation_id: str = "",
@@ -452,14 +501,38 @@ async def make(prompt: str, *, seconds: float = 60.0,
             except Exception:  # noqa: BLE001
                 pass
 
+    # ── 续跑缓存：中断/停止/失败后重来，不重写已经定稿的镜 ──────────────────
+    # 以前写一镜只在内存里，工程目录要等 `make` 返回后才建 → 22 镜里写好的 17 镜
+    # 在中断时全丢，重来等于重付 17 次调用。
+    rkey = _resume_key(prompt, seconds, aspect, fps)
+    rdir = _resume_dir(rkey)
+    cached: dict[str, Any] | None = None
+    try:
+        _blob = json.loads((rdir / "plan.json").read_text(encoding="utf-8"))
+        if time.time() - float(_blob.get("at") or 0.0) <= RESUME_TTL:
+            cached = _blob
+    except (OSError, ValueError):
+        cached = None
+
     # ── ① 导演：镜数与镜长由 LLM 给 ────────────────────────────────────────
     tick("plan", 0, 0)
+    reused_plan = False
     if scenes:
         plan_obj, calls = adopt(scenes), 0
+    elif cached and isinstance(cached.get("plan"), dict):
+        # 分镜也复用：不复用的话重来时导演给一份新分镜，秒数/字幕全变，已写好的镜一个都对不上。
+        plan_obj, calls = cached["plan"], 0
+        reused_plan = True
     else:
         plan_obj, calls = await plan(prompt, seconds=seconds, aspect=aspect,
                                      llm=llm, user_id=user_id,
                                      conversation_id=conversation_id)
+        try:
+            (rdir / "plan.json").write_text(
+                json.dumps({"at": time.time(), "plan": plan_obj}, ensure_ascii=False),
+                encoding="utf-8")
+        except OSError:
+            pass
     shots = plan_obj["shots"]
     n = len(shots)
     secs = [float(s["sec"]) for s in shots]
@@ -468,6 +541,7 @@ async def make(prompt: str, *, seconds: float = 60.0,
     _m = re.search(r"#[0-9a-fA-F]{6}", tone)
     film_bg = _m.group(0) if _m else ""
     motif = str(plan_obj.get("motif") or "")
+    reused_shots = 0
 
     # ── ② 旁白：**只校验，不改值** ─────────────────────────────────────────
     #
@@ -520,14 +594,23 @@ async def make(prompt: str, *, seconds: float = 60.0,
             beat_info = {"skipped": f"{type(exc).__name__}: {exc}"[:80]}
 
     # ── ③ 逐镜写（并发） ───────────────────────────────────────────────────
+    # 复用指纹：秒数 + 字幕。**必须在旁白校验与卡拍之后算**——那两步都会改 `secs`。
+    sig = [f"{secs[i]:g}|{str(shots[i].get('text') or '')}" for i in range(n)]
     tick("scenes", 0, n)
     sem = asyncio.Semaphore(4)
     done = 0
     scene_errors: list[str] = []
 
     async def one(i: int) -> tuple[str, str]:
-        nonlocal done
+        nonlocal done, reused_shots
         async with sem:
+            # 缓存命中：这一镜上次已经定稿，直接读盘，**不调模型**。
+            hit = _resume_hit(rdir, i, sig[i], tone)
+            if hit is not None:
+                reused_shots += 1
+                done += 1
+                tick("scenes", done, n)
+                return hit
             kw = dict(total=n, tone=tone, shots=shots, aspect=aspect, llm=llm,
                       user_id=user_id, conversation_id=conversation_id, motif=motif)
             try:
@@ -550,6 +633,8 @@ async def make(prompt: str, *, seconds: float = 60.0,
                                              fps=fps, only=1)
                     rd = (ev[0].get("readings") if ev else {}) or {}
                     if not qa.is_blank(rd):
+                        # 定稿就落盘：中断在这里之后，重来不用重写这一镜。
+                        _persist_shot(rdir, i, sig[i], tone, cand, body)
                         return cand, body          # 这一镜成了，定稿
                     warns = (ev[0].get("warnings") if ev else []) or []
                     hint = qa.readout_fix(rd, warnings=warns) or \
@@ -723,12 +808,18 @@ async def make(prompt: str, *, seconds: float = 60.0,
             "over": [],
         }
 
+    # 全片定稿：续跑缓存可以清了。留着它只会让"同一句话再要一条"捞回旧镜。
+    # 只在**成功走到这里**时清——中途抛异常要留着，那正是它存在的意义。
+    shutil.rmtree(rdir, ignore_errors=True)
+
     return {
         "code": code,
         # `scenes` 是给 `facts.audit_sources` 用的（它读 plan["scenes"] 的 text）：
         # 出处账按镜盘数字，键名沿用旧的，免得两处各改一遍。
         "plan": {**plan_obj, "scenes": shots},
         "secs": secs, "calls": calls, "shots": n, "mode": "auto",
+        # 续跑读数：这次复用了导演 / 几镜。第一次跑全是 0，中断重来才有数。
+        "reused_plan": reused_plan, "reused_shots": reused_shots,
         "coverage": system.coverage(raws), "audit": audit,
         "rewritten": rewritten, "patched": [], "fallback": [],
         "picture": "code", "scene_errors": scene_errors,

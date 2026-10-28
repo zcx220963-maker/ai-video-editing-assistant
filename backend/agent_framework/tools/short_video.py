@@ -255,6 +255,10 @@ class MakeShortVideoTool(Tool):
             "shots": got["shots"],
             "seconds": got["total_sec"],
             "calls": got["calls"],
+            # 续跑读数：这次复用了导演 / 几镜。第一次跑全是 0；中断或停止后重来才有数。
+            # 有数就说明**没重复付钱**——报告里可以顺口说一句。
+            "reused": {"plan": bool(got.get("reused_plan")),
+                       "shots": int(got.get("reused_shots") or 0)},
             "transitions": got["transitions"],
             "coverage": round(float((got.get("coverage") or {}).get("ratio") or 0), 3),
             # 组件覆盖率**恒接近 0**（画法全交给模型后，它不再用设计系统组件，

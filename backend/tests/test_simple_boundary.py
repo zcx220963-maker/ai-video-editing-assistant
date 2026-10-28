@@ -92,7 +92,14 @@ CORE_LINE_BUDGET = 510
 #:   ⑰ 浏览器控制台回传链（server.mjs onBrowserLog → remotion_client.with_warnings →
 #:      kernel.stills_pairs → shot_evidence.warnings → qa.readout_fix）：静帧渲黑时
 #:      把 console.error 连同 file:line 带回，给模型和人都能直接定位。
-PACKAGE_LINE_BUDGET = 4160
+#: 2026-10-28 十四次数：加「写镜镜级落盘 + 续跑缓存」后 4,215，预算提到 4,220。
+#:   买的是：`_persist_shot`（一镜定稿立刻落盘）、`_resume_key` / `_resume_hit`
+#:   （按**请求参数**哈希找缓存，不能用 film_id——那个每次新生成）、分镜也复用、
+#:   回执报 `reused`。此前写一镜只在内存里，工程目录要等 `make` 返回后才建 →
+#:   22 镜里写好的 17 镜在中断/停止时全丢，重来等于重付 17 次调用。
+#:   实测续跑：导演 0 次、只写没定稿的 3 镜、`reused_shots=3`；
+#:   tone 变了或缓存过期则一镜都不复用（见 `test_resume.py` 的 13 条）。
+PACKAGE_LINE_BUDGET = 4220
 
 #: 不许出现在 import 里的东西。
 BANNED = ("code_spec", "open_storyline.nodes", "storage.repositories",
