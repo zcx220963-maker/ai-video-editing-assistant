@@ -117,10 +117,4 @@ docker-compose.yml   存储层（默认）+ 应用层（profile: app）
 
 ## 许可证
 
-本项目采用 [PolyForm Noncommercial License 1.0.0](LICENSE)，为非商业许可证：
-
-- **允许**：学习、阅读、克隆运行、个人研究、教学、非营利组织内部使用，以及在此基础上修改。
-- **禁止**：任何商业用途，包括出售、提供付费服务，或用于以营利为目的的产品与业务。
-- **须保留**：版权与许可声明，即 `LICENSE` 顶部的 Required Notice 一行；修改之处需明确标注。
-
-商业授权请联系作者。第三方依赖各依其自身许可证（MIT、Apache-2.0 等），不受本许可证约束。
+[PolyForm Noncommercial License 1.0.0](LICENSE) —— 非商业许可：学习、研究、教学、非营利用途可自由使用与修改；商业用途需联系作者授权。详见 `LICENSE`。
