@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS ce_run_idx ON checkpoint_entries(run_id, seq);
 -- 且只在「真的挂起过一次审批」的库上复现（真机踩到过：checkpoints_status_check）。
 ALTER TABLE checkpoints DROP CONSTRAINT IF EXISTS checkpoints_status_check;
 ALTER TABLE checkpoints ADD CONSTRAINT checkpoints_status_check
-  CHECK (status IN ('running','completed','failed','superseded','awaiting_approval'));
+  CHECK (status IN ('running','completed','failed','superseded','awaiting_approval','cancelled'));
 
 -- 一次性变换：老库里 checkpoints.messages 那一列装着整条工作上下文，把它迁成链首的
 -- full 一致点，然后删列——此后正文只有一条去处（checkpoint_entries），不会两套并存。
@@ -77,9 +77,12 @@ CREATE INDEX IF NOT EXISTS ck_plan_idx ON checkpoints(plan_run_id);
 -- HITL 审批断点：status 增 'awaiting_approval'——执行到标注需审批的工具时挂起，
 -- 待批动作落在 approval 列；批准后从同一一致点继续，拒绝则回喂拒绝结果。
 -- 挂起态不在 running/failed 里，崩溃恢复候选天然看不到它（人工挂了就是等人工，不是等重启）。
+-- 用户「停止」（R22，2026-10-28）再加 'cancelled'：停在最近一致点、等人点「继续」。
+-- 它同样不在 running/failed 里——重启替用户重按「继续」是事故；`resume()` 只拒 completed，
+-- 所以「继续」这条路照样接得起来。这条 ADD 与 schema.sql 建表期那份**逐项相等**。
 ALTER TABLE checkpoints DROP CONSTRAINT IF EXISTS checkpoints_status_check;
 ALTER TABLE checkpoints ADD CONSTRAINT checkpoints_status_check
-  CHECK (status IN ('running','completed','failed','superseded','awaiting_approval'));
+  CHECK (status IN ('running','completed','failed','superseded','awaiting_approval','cancelled'));
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS approval jsonb NOT NULL DEFAULT '{}';
 
 -- 多副本执行语义：认领该 run 的实例 id 与租约到期时刻。恢复时按 (status, lease) 原子领取，

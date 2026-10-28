@@ -156,14 +156,19 @@ async def resolve(storage: Any, user_id: str, prompt: str, *, work_dir: Path,
     return got
 
 
-async def mix_into(track: Path, dst: Path, *, storage: Any, user_id: str,
+async def mix_into(track: Path | None, dst: Path, *, storage: Any, user_id: str,
                    prompt: str, total_sec: float, work_dir: Path,
                    bgm_name: str = "", picked: dict[str, Any] | None = None
-                   ) -> tuple[Path, dict[str, Any] | None]:
-    """给一条旁白轨加上配乐，返回 ``(音轨, 配乐说明)``。
+                   ) -> tuple[Path | None, dict[str, Any] | None]:
+    """给音轨加上配乐，返回 ``(音轨, 配乐说明)``。
 
     这是**唯一**该被调用的入口：两条出片路径（网页 `/simple/video`、对话里的
     `make_short_video`）都走它，所以"有没有配乐"这件事只有一个答案。
+
+    旁白与配乐是**两条独立**的可选轨（2026-10-28 改）：`track=None` 表示这条
+    片子没有旁白，此时返回的是**配乐自己那条轨**（不是 None）——"不要人声、
+    只要配乐"是一条正常的片子，不该出一份无声文件。原来这个入口只在有旁白的
+    分支里被调用，于是那种组合连配乐都不加。
 
     **`bgm_name` 为空就不配乐**（2026-10-26 改）。以前是按 prompt 自动挑，
     于是"用户压根没提配乐"也会被塞一首——那首歌跟片子没关系，只是名字凑巧

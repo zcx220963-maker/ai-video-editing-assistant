@@ -263,7 +263,8 @@ async def test_schema_static() -> None:
              "materials.kind": ("video", "audio", "image"),
              "materials.origin": ("upload", "library", "bgm", "url", "render", "art"),
              "render_jobs.status": ("queued", "running", "done", "failed"),
-             "checkpoints.status": ("running", "completed", "failed", "superseded", "awaiting_approval"),
+             "checkpoints.status": ("running", "completed", "failed", "superseded",
+                                    "awaiting_approval", "cancelled"),
              # `summary` 是 R10-T47 的压缩摘要行（`summary_store.SUMMARY_KIND`）、
              # `tool_call` / `tool_result` 是 R10 的逐调用恢复点，由 `migrations.sql:14-19`
              # 放宽进来；`schema.sql:217` 与它同口径。

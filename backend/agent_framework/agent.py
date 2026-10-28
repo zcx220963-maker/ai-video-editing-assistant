@@ -26,6 +26,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
+from . import cancel as cancel_mod
 from . import cost as cost_mod
 from . import judge as judge_mod
 from .ask_gate import (looks_like_asking_user, looks_like_plan_invite,
@@ -888,8 +889,18 @@ def _visible_tool_definitions(reg: Any, *, user_id: str | None,
     return kept
 
 
-def _stop_reason(state: RunState, messages: Sequence[Any]) -> str:
-    """这一轮叫模型之前该不该停：``budget`` 花费到线 / ``stalled`` 原地打转 / 空串＝接着跑。"""
+def _stop_reason(state: RunState, messages: Sequence[Any],
+                 run_id: str = "") -> str:
+    """这一轮叫模型之前该不该停：``cancelled`` 用户叫停 / ``budget`` 花费到线 /
+    ``stalled`` 原地打转 / 空串＝接着跑。
+
+    用户叫停排在最前：它是**立即**语义（点了就是不想再等），不该被「再让位一轮」
+    或预算的判断改写。判在这里而不是循环里，是因为 `_drive` 的行数上限就钉在 90 行
+    （`test_plan_layout` ④）——再多一行「不算骨架」，「停下来」这件小事就会把那个
+    结构约束挤破。
+    """
+    if run_id and cancel_mod.is_cancelled(run_id):
+        return "cancelled"
     if _over_budget(state):
         return "budget"
     if _stuck_rounds(messages, floor=state.stall_floor) >= _STALL_ROUNDS:
@@ -1560,10 +1571,14 @@ class AgentOnceRun:
         limit = _iteration_limit(self.config.max_iterations, start_iteration, resuming)
         r.iter_limit = limit
         _open_budget(r.state, resuming=resuming, messages=r.messages)
+        # 停止标记是带外立的（HTTP 端点设事件，见 `cancel.py`）；进来先撤旧登记：
+        # 上一次点过的「停」不能把这一次（续跑）一进循环就叫停。
+        cancel_mod.clear(r.run_id or "")
         try:
             try:
                 while r.iteration < limit:
-                    if stop := _stop_reason(r.state, r.messages):   # 花费封顶 / 原地打转
+                    # 检查点①：每轮开头判该不该停（用户叫停 / 花费封顶 / 原地打转）。
+                    if stop := _stop_reason(r.state, r.messages, r.run_id or ""):
                         note = await self._stall_gate(r, stop)
                         if note is None:
                             break
@@ -1599,6 +1614,10 @@ class AgentOnceRun:
                     if r.final is not None:
                         break
                     continue
+            except cancel_mod.RunCancelled:
+                # 用户叫停（检查点②③在模型流/工具执行/渲染代查里抛出），不是失败：
+                # 走 `_deliver` 的 cancelled 分支——状态 cancelled、租约归还、界面说「已停下」。
+                r.stop_reason = "cancelled"
             except BaseException:
                 # 真实进程被 kill 时此处不执行，但上一致点已落盘，仍可恢复。
                 if r.cp is not None:
@@ -1609,6 +1628,7 @@ class AgentOnceRun:
 
             return await self._deliver(r, message)
         finally:
+            cancel_mod.clear(r.run_id or "")
             _current_hooks.reset(hooks_token)
             _current_hook_ctx.reset(ctx_token)
 
@@ -2232,7 +2252,12 @@ class AgentOnceRun:
         session = r.ctx.session
         qa_parts = r.state.qa_parts
         final = r.final
-        if r.stop_reason == "budget":
+        if r.stop_reason == "cancelled":
+            # 用户点「停止」：不是出错，也不是跑完。说清三件事——停在第几轮、
+            # 已经做出来的东西还在、点「继续」从最近一致点接着跑（不是从头重来）。
+            final = (f"[已经按你的要求停下（第 {r.iteration} 轮）。已经跑出来的产物都还在；"
+                     "点下面的「继续」会从最近一致点接着跑，不会从头重来。]")
+        elif r.stop_reason == "budget":
             per = cost_mod.run_budget_yuan()
             final = (f"[这一条已经花了 {cost_mod.fmt_yuan(r.state.spent_yuan)}，到了每条 "
                      f"{cost_mod.fmt_yuan(r.state.budget_yuan)} 的花费上限，先停下。"
@@ -2277,7 +2302,16 @@ class AgentOnceRun:
 
         # 终答进收尾一致点：回看/分叉取这条 run 时，缺最后一句就不是一轮的终态。
         if r.cp is not None:
-            if r.reached_limit:
+            if r.stop_reason == "cancelled":
+                # 用户叫停单列一档：`mark_failed` 会让前端弹「失败 + 续跑」，
+                # 而这句话该说的是「你让我停的」。状态记 cancelled —— 崩溃对账
+                # （running/failed）不认它，重启不会替用户重按「继续」；
+                # 但 `resume()` 只拒 completed，所以「继续」这条路照样接得起来。
+                r.state.persist(r.cp)
+                await self.checkpoint.cancel(
+                    r.cp, iteration=r.iteration,
+                    messages=[*r.messages, assistant(final or "")])
+            elif r.reached_limit:
                 # 撞迭代上限是**被打断**，不是成功收尾。原先这里照样 complete()，
                 # 于是 checkpoint 落成 completed、_UNFINISHED={running,failed} 把它排除，
                 # /runs/active 查不到、consumer 的自动续跑也捞不回来——用户看到
@@ -2355,6 +2389,9 @@ class AgentOnceRun:
         resuming: bool,
     ) -> LLMResponse:
         """发起一次 LLM 调用。stream 且后端支持流式时逐块回调 on_stream，并聚合为整条响应。"""
+        # 「停下来」在模型这一段也要生效：用户点停止时最常见的画面就是「正在生成」。
+        # 流式那半段逐块看标记（不打断单个 chunk 的等待），非流式整段调用走 guard 竞速。
+        run_id = str((ctx.extras or {}).get("run_id") or "")
         if stream and hasattr(self.llm, "complete_stream"):
             delays = [0.0] + [_STREAM_RETRY_SLEEP * (i + 1)
                               for i in range(_STREAM_RETRIES)]
@@ -2369,6 +2406,7 @@ class AgentOnceRun:
                 agen = self.llm.complete_stream(messages, tools)
                 ait = agen.__aiter__()
                 finished = False
+                stop_now = False
                 try:
                     while True:
                         # 逐块等，且**每块**都有上限：连接有心跳、内容不来时，
@@ -2378,6 +2416,12 @@ class AgentOnceRun:
                                 ait.__anext__(), timeout=_STREAM_STALL_SEC)
                         except StopAsyncIteration:
                             finished = True
+                            break
+                        # 停止只在块与块之间判：每块都判，长回答不会把「停」拖到收尾。
+                        # 抛出动作放在 try 外（见下方）——这里的 except 会把 Exception
+                        # 当成断线去重发，RunCancelled 落进去会被白白重试一轮。
+                        if cancel_mod.is_cancelled(run_id):
+                            stop_now = True
                             break
                         if chunk.delta:
                             parts.append(chunk.delta)
@@ -2403,6 +2447,8 @@ class AgentOnceRun:
                             await aclose()
                         except Exception:  # noqa: BLE001 —— 关流失败不该盖住真错因
                             pass
+                if stop_now:
+                    raise cancel_mod.RunCancelled(run_id)
                 if finished:
                     break
             await self.hooks.on_stream_end(ctx, resuming=resuming)
@@ -2412,7 +2458,9 @@ class AgentOnceRun:
                 await self.hooks.on_llm_usage(ctx, usage)
             return resp
 
-        resp = await self.llm.complete(messages, tools)
+        # 非流式（或后端没有流式口）：整段调用可能几十秒不吐字，必须能被打断，
+        # 否则用户在那段时间里点「停止」只会看到按钮一直是「正在停」。
+        resp = await cancel_mod.guard(run_id, self.llm.complete(messages, tools))
         if stream:
             # 后端不支持流式：整段作为一次 delta，保证 hook 语义一致。
             if resp.content:
@@ -3181,8 +3229,19 @@ class AgentOnceRun:
                             iteration=int(getattr(ctx, "iteration", 0) or 0))
                     except Exception:  # noqa: BLE001  恢复点写失败不该拦工具
                         logger.warning("写 tool_call 恢复点失败", exc_info=True)
-                r = await asyncio.wait_for(
-                    reg.execute(tc.name, tc.arguments), timeout=call_timeout)
+                # 停止的检查点②：工具调用本身。用户在等一次长任务（出片节点十几分钟）
+                # 时点停止，只靠循环顶部那条检查要等这一次调用回来才看得到——那时
+                # 一整条片子已经渲完了。`guard` 把工具协程与停止请求赛跑，谁先到算谁。
+                r = await cancel_mod.guard(
+                    cp_run_id, reg.execute(tc.name, tc.arguments),
+                    timeout=call_timeout)
+            except cancel_mod.RunCancelled:
+                # 先把这颗气泡在界面上收掉（否则工具卡永远停在「运行中」），再往上抛：
+                # 撤销发生在 `_run_tool_round` 的 gather 里，异常穿透到 `_drive` 收尾。
+                await self.hooks.after_tool_call(
+                    ctx, tc.name, tc.arguments, None, time.monotonic() - t0,
+                    error=ToolError(tc.name, "已被用户停止"), call_id=tc.id)
+                raise
             except TimeoutError:
                 r = ToolError(
                     tc.name,
@@ -3253,6 +3312,11 @@ class AgentOnceRun:
             gathered = await asyncio.gather(
                 *(_exec_one(tc) for tc in batch), return_exceptions=True)
             for tc, r in zip(batch, gathered):
+                if isinstance(r, cancel_mod.RunCancelled):
+                    # 用户叫停：`return_exceptions=True` 会把它包成一个**值**，
+                    # 不在这里挑出来就会被下一条当成普通异常、包成 ToolError 回喂给
+                    # 模型——「停下」于是变成「这个工具坏了」，模型还会换个工具再试。
+                    raise r
                 if isinstance(r, ToolError):
                     # `_exec_one` 把失败当**返回值**交给调用方（工具错误本来就是回喂给
                     # 模型的数据），而 ``return_exceptions=True`` 会把**抛出**的异常也包成
@@ -3503,7 +3567,14 @@ class AgentOnceRun:
         n_poll = 0
         last_beat = time.monotonic()
         cp = ctx.extras.get("checkpoint")
+        follow_run_id = str((ctx.extras or {}).get("run_id") or "")
         while pending:
+            # 停止的检查点③：渲染代查。片子渲到一半用户点「停止」，这一步是唯一
+            # 能及时接住的地方——每轮轮询之间只有几秒，不像等一次工具调用那样十几分钟。
+            # 代查停下不等于把渲染服务里的 Job 掐掉（那是一个独立进程里的活），
+            # 停的是「本 run 继续陪它耗」；产物照常落地，后续仍可用 render_status 取。
+            if cancel_mod.is_cancelled(follow_run_id):
+                raise cancel_mod.RunCancelled(follow_run_id)
             art = pending.pop(0)
             if time.monotonic() >= deadline:
                 unresolved.append(art)

@@ -63,10 +63,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 # 2026-10-24：`style_authoring` / `style_pack_gen` / `style_templates` 三件套已随
 # 「风格包」通道一起删除——视觉风格一律由 skill 提供，项目里不再有风格包这种东西。
 from . import model_probe, motion_preview, secrets, uploads
+from . import cancel as cancel_mod
 from .agent import Agent
 from .auth import Authenticator
 from .catalog import get_catalog
-from .connection_manager import ConnectionManager
+from .connection_manager import OUTBOUND_TOPIC, ConnectionManager
 from .broadcast import OUTBOUND_CHANNEL, OutboundBroadcaster
 from .storage import Cond
 from .consumer import CHAT_TOPIC, SessionConsumer, session_key
@@ -93,7 +94,8 @@ from .mq import MessageQueue
 from .tools.mcp import MCPServerConfig
 from .storage import IntegrityConflict, Storage, ref_key
 from .tool import is_tool_error
-from .checkpoint import STATUS_AWAITING_APPROVAL, CheckpointManager
+from .checkpoint import (STATUS_AWAITING_APPROVAL, STATUS_RUNNING,
+                         CheckpointManager)
 from .skill_flows import (clean_steps, draft_body, extract_steps,
                           first_user_request, merge_runs, pick_skill_name)
 from .tools.skill_deps import deps_report, format_report, has_work
@@ -1911,6 +1913,33 @@ def create_app(
             "action": {"op": "resume", "run_id": run_id, "at_seq": req.at_seq},
         })
         return ChatQueuedResponse(run_id=run_id, status="queued")
+
+    @app.post("/runs/{run_id}/cancel")
+    async def run_cancel(run_id: str,
+                         user_id: str = Depends(auth.http_user_id)) -> dict[str, Any]:
+        """停止一条正在跑的执行：停在最近一致点，之后由「继续」接上。
+
+        三条口径：
+        1. **不投 MQ**。同会话是串行的（`SessionDispatcher` 一条 session 一个 actor），
+           一帧带 action 的消息会排在**正在跑的那条 run 后面**，等它跑完才被读到——
+           那时已经没什么可停的。所以这里直接在本进程立停止标记（见 `cancel.py`），
+           执行循环在三个检查点（每轮开头 / 工具执行 / 渲染代查）自己看。
+        2. **不是失败**。状态落 `cancelled`，不进崩溃对账（重启不会替用户重按「继续」），
+           但 `resume()` 只拒 completed，所以「继续」这条路照样接得起来。
+        3. **立刻回一帧**。按钮不能等到循环真的停下来才变——长任务里那要几秒到几十秒。
+           这一帧只表示「已收到，正在停」，真正的终态由随后的 `answer` 帧给。
+        """
+        row = await _owned_run_row(run_id, user_id)
+        if str(row.get("status") or "") != STATUS_RUNNING:
+            raise HTTPException(
+                409, f"执行 {run_id} 当前不在运行中（可能已经结束），没有可停止的任务。")
+        cancel_mod.request(run_id)
+        sid = str(row["session_id"])
+        await mq.publish(OUTBOUND_TOPIC, sid, {
+            "type": "cancelled", "session_id": sid, "run_id": run_id,
+            "status": "stopping",
+        })
+        return {"ok": True, "run_id": run_id, "status": "stopping"}
 
     @app.post("/runs/{run_id}/approve", response_model=ChatQueuedResponse)
     async def run_approve(run_id: str, req: RunApproveRequest,

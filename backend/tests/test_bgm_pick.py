@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_framework import bgm  # noqa: E402
 from open_storyline.simple import mix  # noqa: E402
+from open_storyline.simple.ffmpeg import duration  # noqa: E402
 
 _CHECKS = 0
 _FAILS = 0
@@ -158,13 +159,19 @@ def main() -> int:
         raise RuntimeError("只看参数，不真跑")
 
     mix.run = spy
+    td4 = tempfile.TemporaryDirectory()
     try:
-        mix.add_bgm(Path("/tmp/v.m4a"), Path("/tmp/o.m4a"), total_sec=90.0,
+        # 旁白轨要**真实存在**：`add_bgm` 把"路径不存在"当成"没有旁白"
+        # （TTS 失败时不该连配乐一起没有），假路径会走进独奏支路。
+        vo = Path(td4.name) / "v.m4a"
+        vo.write_bytes(b"\0" * 2048)
+        mix.add_bgm(vo, Path(td4.name) / "o.m4a", total_sec=90.0,
                     bgm=Path("/tmp/b.mp3"))
     except RuntimeError:
         pass
     finally:
         mix.run = orig
+        td4.cleanup()
     graph = seen[0] if seen else ""
     check("normalize=0" in graph,
           "`amix` 显式 normalize=0（缺省 1 会把旁白除 2，听起来就是「声音小」）")
@@ -173,6 +180,77 @@ def main() -> int:
           "首尾淡入淡出（否则循环接缝会有一声「咔」）")
     check("atrim=0:90.000" in graph, "铺满到整片长度")
     check("stream_loop" in graph, "短曲循环铺满")
+
+    print("\n④-b 没有旁白：配乐照样铺，但不做侧链（2026-10-28 修）")
+    # 原来配乐只在"有旁白"的分支里被调用，于是 voice=false + 点名配乐出的是无声片。
+    seen.clear()
+    mix.run = spy
+    try:
+        mix.add_bgm(None, Path("/tmp/o2.m4a"), total_sec=90.0, bgm=Path("/tmp/b.mp3"))
+    except RuntimeError:
+        pass
+    finally:
+        mix.run = orig
+    solo = seen[0] if seen else ""
+    check("sidechaincompress" not in solo, "没有旁白时不做侧链（没有键可压）")
+    check(f"volume={mix.BGM_SOLO_GAIN}" in solo,
+          f"独奏音量是 {mix.BGM_SOLO_GAIN}（0.20 是给旁白让路的数）")
+    check("atrim=0:90.000" in solo, "时长按片子总长断，不挂在旁白上")
+    check("afade=t=in" in solo and "afade=t=out" in solo, "独奏也要首尾淡入淡出")
+
+    seen.clear()
+    mix.run = spy
+    try:
+        mix.add_bgm(Path("/tmp/nope.m4a"), Path("/tmp/o3.m4a"), total_sec=90.0,
+                    bgm=Path("/tmp/b.mp3"))
+    except RuntimeError:
+        pass
+    finally:
+        mix.run = orig
+    check("sidechaincompress" not in (seen[0] if seen else ""),
+          "旁白轨文件不存在也走独奏（TTS 失败不该把配乐一起拖没）")
+
+    print("\n④-c 真跑一遍独奏配乐：时长按片长断、不是空轨（2026-10-28）")
+    # 上面都在"看参数"。独奏支路以前从没被走过，参数对不代表产物对——
+    # atrim 与 stream_loop 的顺序、asetpts 的位置，错一个就是空轨或 0 秒。
+    if shutil.which("ffmpeg") is None:
+        print("  --   跳过（本机没有 ffmpeg）")
+    else:
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src.m4a"
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                 "-i", "sine=frequency=440:duration=4", "-c:a", "aac", str(src)],
+                check=True)
+            dst = Path(td) / "solo.m4a"
+            mix.add_bgm(None, dst, total_sec=9.0, bgm=src)
+            got_dur = duration(dst)
+            check(abs(got_dur - 9.0) <= 0.15,
+                  f"时长按 total_sec 断（{got_dur:.2f}s / 9.0s）")
+            probe = subprocess.run(
+                ["ffmpeg", "-v", "info", "-i", str(dst), "-af", "volumedetect",
+                 "-f", "null", "-"], capture_output=True, text=True)
+            mean = ""
+            for line in (probe.stderr or "").splitlines():
+                if "mean_volume:" in line:
+                    mean = line.rsplit("mean_volume:", 1)[1].strip()
+            try:
+                db = float(mean.split()[0])
+            except (ValueError, IndexError):
+                db = -999.0
+            check(db > -60.0, f"不是静音（mean_volume {db:.1f} dB）")
+
+            # 走 `bgm.mix_into(track=None)`：调用方拿到必须是**一条真轨**。
+            # 返回 None 的话，`render_and_publish(track=None)` 会当成"没音轨"而不封装。
+            via_track, tune = asyncio.run(bgm.mix_into(
+                None, Path(td) / "via.m4a", storage=_Storage({}), user_id="u1",
+                prompt="x", total_sec=9.0, work_dir=Path(td),
+                picked={"path": src, "filename": "src.m4a", "origin": "bgm"}))
+            check(via_track is not None and Path(via_track).exists(),
+                  "mix_into(track=None) 返回一条真音轨（不是 None）")
+            check((tune or {}).get("filename") == "src.m4a",
+                  "配乐说明里带着用的是哪首")
 
     print("\n⑤ 本地兜底目录：没曲库时扔几个 mp3 也能出片")
     if shutil.which("ffmpeg") is None:

@@ -37,6 +37,7 @@
 
 from __future__ import annotations
 
+import shutil
 from typing import Any
 
 from agent_framework.orchestration import BaseNode, NodeConfig, NodeState
@@ -144,6 +145,8 @@ class WriteShortShotsNode(_ShortFilmNode):
         "按分镜逐镜写画面代码，渲帧给模型自己看、不合格的只重画那几镜（≤3 轮），"
         "然后拼成一条完整片子存成工程。**不渲成片**，1~3 分钟。"
         "上游 `plan_short_film` 的分镜会自动从 Store 读；也可以直接传 `scenes` 覆盖。"
+        "旁白与配乐是两条独立音轨：`voice=false` 也能单独配乐（`bgm` 会写进工程，"
+        "`render_short_film` 直接用它）。"
         "出片前想先看画面，传 `preview=true` 会回每镜一张静帧链接。"
     )
     required_nodes = ["plan_short_film"]
@@ -155,6 +158,10 @@ class WriteShortShotsNode(_ShortFilmNode):
                                   "不传就用 Store 里上游那一份"},
         "seconds": {"type": "number", "description": "目标时长（秒）；不传用上游的"},
         "voice": {"type": "boolean", "description": "是否配旁白（默认 true）"},
+        "bgm": {"type": "string",
+                "description": "配乐。曲名（如「We Never」）或附件音频的 material_id。"
+                               "**不填就不配乐**；与 `voice` 无关——关掉旁白时它就是唯一音轨。"
+                               "短于片长会循环铺满，不换歌"},
         "preview": {"type": "boolean",
                     "description": "true=额外回每镜一张静帧链接（多花约 30 秒）"},
     })
@@ -175,10 +182,24 @@ class WriteShortShotsNode(_ShortFilmNode):
                         or 30.0)
 
         await kernel.ensure_storage()
+        # 配乐先定下来再写镜：卡拍要在写镜之前知道拍点（与 `make_short_video` 同一套）。
+        bgm_name = str(inputs.get("bgm") or "").strip()
+        _picked = None
+        if bgm_name:
+            try:
+                from agent_framework import bgm as bgm_pick
+
+                _picked = await bgm_pick.resolve(
+                    self.storage, user_id, prompt,
+                    work_dir=kernel.out_dir() / "bgm", need_sec=seconds, name=bgm_name)
+            except Exception:  # noqa: BLE001 —— 配乐解析失败不该拦写镜
+                _picked = None
+
         got = await showrunner.make(
             prompt, seconds=seconds, aspect=aspect,
             user_id=user_id, conversation_id=conv_id,
-            voice=bool(inputs.get("voice", True)), scenes=scenes)
+            voice=bool(inputs.get("voice", True)), scenes=scenes,
+            bgm_path=(_picked or {}).get("path"))
 
         film_id = project.new_id()
         try:
@@ -195,6 +216,39 @@ class WriteShortShotsNode(_ShortFilmNode):
             # 落盘失败不影响继续渲，但改一镜就没工程可读了——如实说。
             film_id = film_id or ""
 
+        # 音轨（2026-10-28）：旁白与配乐是两条独立可选轨，合成后写进**工程**，
+        # `render_short_film` 照工程里的 audio 用（它不认 bgm 参数，也不该重挑歌）。
+        audio_name, bgm_used, audio_error = "", "", ""
+        if film_id:
+            try:
+                from pathlib import Path
+
+                track = None
+                vinfo = got.get("voice") or {}
+                if vinfo and not vinfo.get("degraded"):
+                    from ..simple import voice as vo
+
+                    track = vo.build_track(
+                        [Path(p) if p else None for p in vinfo.get("files") or []],
+                        got["secs"], kernel.out_dir() / f"track-{film_id}.m4a")
+                if bgm_name or _picked is not None:
+                    from agent_framework import bgm as bgm_pick
+
+                    track, tune = await bgm_pick.mix_into(
+                        track, project.dir_of(film_id) / "audio.m4a",
+                        storage=self.storage, user_id=user_id, prompt=prompt,
+                        total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm",
+                        bgm_name=bgm_name, picked=_picked)
+                    bgm_used = (tune or {}).get("filename") or ""
+                if track is not None:
+                    dst = project.dir_of(film_id) / "audio.m4a"
+                    if Path(track).resolve() != dst.resolve():
+                        shutil.copyfile(track, dst)
+                    project.update(film_id, audio="audio.m4a")
+                    audio_name = "audio.m4a"
+            except Exception as exc:  # noqa: BLE001 —— 音轨失败不该拦写镜
+                audio_error = f"{type(exc).__name__}: {exc}"
+
         out: dict[str, Any] = {
             "film_id": film_id,
             "title": str((got.get("plan") or {}).get("title") or ""),
@@ -206,7 +260,13 @@ class WriteShortShotsNode(_ShortFilmNode):
             "audit": {"ratio": (got.get("audit") or {}).get("ratio", 0),
                       "bad": (got.get("audit") or {}).get("bad") or []},
             "variety": got.get("variety"),
+            "voice": ("none" if not (got.get("voice") or {}) else
+                      ("failed" if (got.get("voice") or {}).get("degraded") else "ok")),
+            "audio": audio_name,
+            "bgm": bgm_used,
         }
+        if audio_error:
+            out["audio_error"] = audio_error
         if inputs.get("preview"):
             out["stills"] = await _publish_stills(got, aspect=aspect, user_id=user_id,
                                                  storage=self.storage)

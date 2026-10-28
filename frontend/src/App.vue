@@ -215,7 +215,7 @@ async function checkActiveRun(cid) {
     const j = await r.json();
     // 没有「在途」也没有「等审批」的 run ≠ 这个会话没出过事：**死在半路**也是没有
     // 在途 run，而服务端 /runs/active 对 failed 一个字都不回。见下面的兜底。
-    if (!j.run) { await offerResumeIfNewestFailed(cid); return; }
+    if (!j.run) { await offerResumeIfInterrupted(cid); return; }
     if (j.run.status === "running") {
       busy[cid] = j.run.run_id;
       msgs(cid).push({
@@ -279,17 +279,20 @@ async function checkActiveRun(cid) {
   } catch (_) { /* 查不到不影响正常使用 */ }
 }
 
-// 冷启动兜底之二：上一个任务**死在半路**时，界面上得有一个能点的东西。
+// 冷启动兜底之二：上一个任务**停在半路**时，界面上得有一个能点的东西。
 //
-// 服务端 /runs/active 只认「在途」和「等审批」两种，一条 failed 的 run 它一个字都不回，
+// 「停在半路」有两种，服务端 /runs/active 都一个字不回（它只认「在途」和「等审批」）：
+//  * ``failed``——跑坏了；
+//  * ``cancelled``——用户自己点的「停止」（2026-10-28 加）。
 // 前端原先就跟着 `if (!j.run) return` 走了。于是真机上出现过这样一幕
 // （2026-10-16，run 9272c7f59501 那 20 镜）：编辑器容器被重建、MCP 会话失效，
 // 第 89 轮整条链停死；用户刷新前端——**界面看起来只是"停了"**，既没有报错也没有按钮，
 // 只能自己翻执行记录才找得到那条「从最新一致点续跑」。
+// 主动停止那一路同理：点完停止、刷新一下，没有这条兜底就再也找不到「继续」了。
 //
-// 只认**最新那条**是 failed：会话里后面若又跑过（completed / 等审批 / 在途），
+// 只认**最新那条**是这两种状态：会话里后面若又跑过（completed / 等审批 / 在途），
 // 说明用户已经往下走了，不再翻旧账。
-async function offerResumeIfNewestFailed(cid) {
+async function offerResumeIfInterrupted(cid) {
   if (cid !== active.value) return;
   try {
     await ensureIdentity();
@@ -297,7 +300,8 @@ async function offerResumeIfNewestFailed(cid) {
     if (!r.ok) return;
     const j = await r.json();
     const run = (j.runs || [])[0];               // 服务端按「最近的在前」排
-    if (!run || run.status !== "failed") return;
+    if (!run || !["failed", "cancelled"].includes(String(run.status || ""))) return;
+    const stopped = run.status === "cancelled";
     // **去重靠扫列表，不靠一张旁挂的"提过没有"表**：这条路径的每一个调用方
     // （openConv / reloadAfterReconnect）都在它之前刚跑过 loadHistory，
     // 而 loadHistory 是整体重建 `histories[cid]`。用旁挂表就会出现
@@ -305,8 +309,11 @@ async function offerResumeIfNewestFailed(cid) {
     // 就以列表为准。
     if (msgs(cid).some((m) => m.resume && m.resume.run_id === run.run_id)) return;
     msgs(cid).push({
-      role: "assistant", state: "error", resume: run,
-      text: `⚠️ 上一个任务在第 ${run.iteration} 轮**失败**了，整条链停在半路。`
+      role: "assistant", state: stopped ? "done" : "error", resume: run,
+      text: stopped
+        ? `⏹ 任务停在第 ${run.iteration} 轮。已经跑出来的产物都还在，`
+          + `可以从最近一致点接着跑——不会从头重来。`
+        : `⚠️ 上一个任务在第 ${run.iteration} 轮**失败**了，整条链停在半路。`
           + `已经跑出来的产物都还在工作区里，可以从最新一致点接着跑——不会从头重来。`,
     });
     scrollDown();
@@ -347,6 +354,7 @@ const histories = reactive({});
 // 每个会话的 WS 与在途状态
 const socks = {};
 const busy = reactive({});   // convId -> 等待中的 run_id
+const stopping = reactive({});   // convId -> 已点「停止」，正在收尾（终态等 answer 帧）
 const streamCur = {};        // convId -> 当前流式气泡
 // convId -> 已经弹过的那道题签名。见 checkActiveRun 的说明：
 // 它是「不要因为一次重连就把用户选到一半的卡片重建掉」的那道闸。
@@ -1524,6 +1532,8 @@ const forking = ref(false);
 
 const RUN_STATUS_TEXT = {
   running: "进行中", completed: "已完成", failed: "失败", superseded: "已让位",
+  // 用户自己点的停止：与「失败」分开写，否则执行记录里会看到一个没见过的英文词。
+  cancelled: "已停止",
 };
 function runStatusText(s) {
   return RUN_STATUS_TEXT[s] || s || "—";
@@ -3793,6 +3803,9 @@ function onFrame(cid, p) {
     streamCur[cid] = null;
   } else if (p.type === "answer") {
     if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
+    // 这一轮是不是「点了停止之后的收尾」：是的话，答复定稿后要顺手补上「继续」——
+    // 否则用户停完想接着跑，还得刷新一次页面才看得见那颗按钮。
+    const wasStopping = !!stopping[cid];
     const cur = streamCur[cid];
     const list = msgs(cid);
     const last = list[list.length - 1];
@@ -3809,6 +3822,8 @@ function onFrame(cid, p) {
     streamCur[cid] = null;
     const pendingAudit = p.run_id ? runAudit[p.run_id] : currentAudit(cid);
     busy[cid] = null;
+    stopping[cid] = false;
+    if (wasStopping) offerResumeIfInterrupted(cid);
     // 对账只观测：答复定稿后把「计划外 / 未履行 + 偏离理由」作为一条角标补进流里，
     // 与刷新后从 qa.parts 重放出来的那一条同形（历史与实时看到同一份结论）。
     if (pendingAudit && auditCount(pendingAudit)) {
@@ -3819,6 +3834,12 @@ function onFrame(cid, p) {
       }, p.run_id);
     }
     scrollDown();
+  } else if (p.type === "cancelled") {
+    // 停止请求已收到（服务端刚立起标记，执行循环还要几秒才停）。这一帧只做一件事：
+    // 把按钮收成「正在停」。终态那句话与「继续」按钮都等随后的 answer 帧——
+    // 在这里就清 busy 会让用户以为已经停了，接着发的新消息反而排在还没停的那条后面。
+    if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
+    stopping[cid] = true;
   } else if (p.type === "media") {
     // 成片回投：MediaCardHook 从 render_video 工具结果捕获 media_url → 播放卡片
     if (busy[cid] && p.run_id && p.run_id !== busy[cid]) return;
@@ -4005,6 +4026,41 @@ async function send() {
     if (j.run_id) busy[cid] = j.run_id;
   } catch (e) {
     msgs(cid).push({ role: "assistant", text: "投递失败：" + e.message, state: "error" });
+  }
+}
+
+// 停止：POST /runs/{id}/cancel。
+//
+// **必须是 HTTP，不能是 WS/MQ 一帧「停止」**：同会话是串行的，那一帧会排在正在跑的
+// 这条 run 后面，等它跑完才被读到——那时已经没有什么可停的了。HTTP 端点直接在服务端
+// 本进程立一个停止标记，执行循环在三个检查点（每轮开头 / 工具执行 / 渲染代查）自己看。
+//
+// 语义是「停在这个一致点」，不是「杀掉」：已经做出来的产物都还在，续跑从最近一致点
+// 接着走（与崩溃恢复同一条路）。按钮在收到 `cancelled` 帧后变「正在停」，等 `answer`
+// 帧落地才恢复成「落笔」，那时气泡里会补一颗「从最新一致点续跑」。
+async function stopRun() {
+  const cid = active.value;
+  const rid = busy[cid];
+  if (!rid || stopping[cid]) return;
+  stopping[cid] = true;
+  try {
+    await ensureIdentity();
+    const r = await fetch(`/runs/${encodeURIComponent(rid)}/cancel`, {
+      method: "POST", headers: authHeaders(),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 409) {
+      // 这一跑在点下去的那一刻已经收尾了：不是失败，也没有"没送达"。
+      // 按钮还原即可，收尾那句话和「继续」由随后的 answer 帧照常补上。
+      stopping[cid] = false;
+      return;
+    }
+    if (!r.ok) throw new Error(j.detail || ("HTTP " + r.status));
+  } catch (e) {
+    // 没送到：按钮还原成「停止」，让用户再点一次（不能说"正在停"却什么都不会发生）。
+    stopping[cid] = false;
+    msgs(cid).push({ role: "assistant", state: "error", text: "停止请求没送达：" + e.message });
+    scrollDown();
   }
 }
 
@@ -5420,8 +5476,9 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
               </div>
               <span class="txt"><template v-for="(s, j) in segs(m.text)" :key="j"><b v-if="s.b">{{ s.t }}</b><span v-else>{{ s.t }}</span></template></span>
               <span v-if="m.state === 'streaming'" class="caret">▍</span>
-              <!-- 死在半路的那条 run（见 offerResumeIfNewestFailed）：与执行记录面板里
-                   那颗按钮同一段 `doResume`，只是把入口摆到用户真正会看的地方。 -->
+              <!-- 停在半路的那条 run（见 offerResumeIfInterrupted）：与执行记录面板里
+                   那颗按钮同一段 `doResume`，只是把入口摆到用户真正会看的地方。
+                   两种来路：跑坏了（failed）、或用户自己点了停止（cancelled）。 -->
               <div v-if="m.resume" class="ru-actions">
                 <button class="clip ghost" :disabled="forking" @click="resumeFromBubble(m)">
                   {{ forking ? "提交中…" : "从最新一致点续跑" }}
@@ -5619,7 +5676,15 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
             placeholder="把想法落在此处，Enter 落笔，Shift+Enter 换行；素材点「＋素材」/拖入或「＋链接」贴网址，会挂在输入框上方随消息发出…"
             @keydown="onKey"
           ></textarea>
-          <button class="send" :class="{ off: !draft.trim() && !atts(active).length }" @click="send">落笔 ➤</button>
+          <!-- 任务在跑时这颗按钮换成「停止」：发送是箭头、停止是方块，形状本身就
+               告诉用户这一下不是继续发。点下去停在最近一致点，收尾后气泡里会出现
+               「从最新一致点续跑」。 -->
+          <button v-if="busy[active]" class="send stop" :class="{ pending: stopping[active] }"
+                  :title="stopping[active] ? '正在停下…' : '停下来（停在最近的一致点，之后可以继续）'"
+                  @click="stopRun">
+            <span class="stop-glyph"></span>
+          </button>
+          <button v-else class="send" :class="{ off: !draft.trim() && !atts(active).length }" @click="send">落笔 ➤</button>
         </div>
       </footer>
     </main>
@@ -7660,6 +7725,11 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 }
 .send:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--vermilion-deep); }
 .send.off { background: var(--line); color: #fff8ec; box-shadow: 0 4px 0 #c4b493; cursor: default; }
+/* 停止按钮：与「落笔」同一位置同一个尺寸，只把字换成实心方块——任务在跑时那一格
+   只能是「停止」，不能让用户在上面再点一次发送。 */
+.send.stop { display: inline-flex; align-items: center; justify-content: center; padding: 15px 24px; }
+.send.stop .stop-glyph { width: 14px; height: 14px; background: #fff8ec; border-radius: 2px; }
+.send.stop.pending { opacity: 0.55; cursor: wait; }
 
 /* 素材上传 */
 .clip {
@@ -8286,6 +8356,7 @@ onBeforeUnmount(() => Object.values(socks).forEach((s) => s.close && s.close()))
 .ru-status.running { border-color: var(--gold); color: #7a5a12; }
 .ru-status.completed { border-color: rgba(60, 120, 60, 0.5); color: #2f6b34; }
 .ru-status.failed { border-color: var(--vermilion-deep); color: var(--vermilion-deep); }
+.ru-status.cancelled { border-color: var(--line); color: var(--ink-soft); font-style: italic; }
 .ru-status.superseded { opacity: 0.55; text-decoration: line-through; }
 .ru-meta {
   display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px;

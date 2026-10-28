@@ -326,6 +326,10 @@ class MakeShortVideoTool(Tool):
         # 渲 + 合流 + 上传原来在这里、`render_short_film`、HTTP、节点里各抄了一遍，
         # 改一处忘另一处（`media_url` 那次就是这么漏的）。现在只走
         # `pipeline.render_and_publish`。
+        #
+        # 旁白与配乐是**两条独立**的可选轨（2026-10-28 修）：原来配乐挂在下面
+        # `elif vinfo:` 里，于是 `voice=false` + 点名 BGM 出的是**无声片**——
+        # 配乐一次都没被读。现在 `vinfo` 只决定"有没有旁白"，配乐单独判断。
         track = None
         vinfo = got.get("voice") or {}
         if vinfo.get("degraded"):
@@ -336,17 +340,9 @@ class MakeShortVideoTool(Tool):
                 from open_storyline.simple import pipeline as _pl
 
                 vo = _pl.voice
-                from .. import bgm as bgm_pick
                 track = vo.build_track(
                     [Path(p) if p else None for p in vinfo.get("files") or []],
                     got["secs"], kernel.out_dir() / f"track-{fid}.m4a")
-                # 配乐**只在点名时才加**（2026-10-26 改）：不填 `bgm` 就静音出片。
-                track, tune = await bgm_pick.mix_into(
-                    track, kernel.out_dir() / f"track-{fid}-bgm.m4a",
-                    storage=self._storage, user_id=user_id, prompt=text,
-                    total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm",
-                    bgm_name=bgm, picked=_picked)
-                out["bgm"] = (tune or {}).get("filename") or ""
                 out["voice"] = "ok"
                 out["voice_failed_shots"] = vinfo.get("failed") or []
                 out["voice_over_shots"] = vinfo.get("over") or []
@@ -354,6 +350,23 @@ class MakeShortVideoTool(Tool):
                 out["voice"] = "failed"
                 out["voice_error"] = f"{type(exc).__name__}: {exc}"
                 track = None
+        else:
+            out["voice"] = "none"
+
+        # 配乐**只在点名时才加**（2026-10-26 改）：不填 `bgm` 就不配乐。
+        # 但与旁白无关——没有旁白时，配乐自己就是这条片子的音轨。
+        if str(bgm or "").strip() or _picked is not None:
+            try:
+                from .. import bgm as bgm_pick
+
+                track, tune = await bgm_pick.mix_into(
+                    track, kernel.out_dir() / f"track-{fid}-bgm.m4a",
+                    storage=self._storage, user_id=user_id, prompt=text,
+                    total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm",
+                    bgm_name=bgm, picked=_picked)
+                out["bgm"] = (tune or {}).get("filename") or ""
+            except Exception as exc:  # noqa: BLE001 —— 配乐失败不该拦出片
+                out["bgm_error"] = f"{type(exc).__name__}: {exc}"
 
         try:
             made = await pipeline.render_and_publish(
@@ -377,8 +390,9 @@ class MakeShortVideoTool(Tool):
         out["video"] = made["object_key"]
         out["duration"] = round(float(made["duration"]), 1)
         out["size_mb"] = made["size_mb"]
-        if made.get("voice") == "ok":
-            out.setdefault("voice", "ok")
+        # `voice` 报的是**旁白**（none/ok/failed）；`audio` 报的是"这条片子有没有
+        # 音轨"——只有配乐时 voice=none 但 audio=ok，两个字段不要混着看。
+        out["audio"] = made.get("voice") or "none"
         # `render_and_publish` 已经把 `render_ms` 一起算好了（R18 收口时它接过了
         # `kernel.render` 的返回值）。这里原来还写着 `res`——那个变量在收口时就没了，
         # 于是整条链跑完、片子也上传了，**回执却在这一行抛 NameError**，

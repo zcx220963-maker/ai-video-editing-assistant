@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   iteration      integer NOT NULL DEFAULT 0,
   head_seq       integer NOT NULL DEFAULT 0,
   status         text NOT NULL DEFAULT 'running'
-                 CHECK (status IN ('running','completed','failed','superseded','awaiting_approval')),
+                 CHECK (status IN ('running','completed','failed','superseded','awaiting_approval','cancelled')),
   -- 本次执行占用的剪辑产物作用域 {storyline_session, artifact_id}：fork 按它复制产物集
   scope          jsonb NOT NULL DEFAULT '{}',
   forked_from    text,

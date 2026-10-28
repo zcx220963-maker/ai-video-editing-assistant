@@ -20,11 +20,15 @@ import hashlib
 import os
 from pathlib import Path
 
-from .ffmpeg import duration, run
+from .bgmloop import seamless_loop as _seamless_loop
+from .ffmpeg import run
 from .kernel import KernelError
 
 #: BGM 音量（相对旁白）。有侧链闪避之后可以给到 0.20；0.12 是"没有闪避时"的保守值。
 BGM_GAIN = 0.20
+#: 没有旁白时的配乐音量。0.20 是"让路给人声"的数；独奏时曲子就是唯一的声音，
+#: 用接近满档、但留一点余量给循环接缝的交叉淡化（母带峰值本来就顶到 0 dB）。
+BGM_SOLO_GAIN = 0.80
 BGM_FADE_IN = 1.5        # 淡入（秒）。0 会让第一帧"啪"一下有音乐。
 BGM_FADE_OUT = 2.0       # 淡出（秒）。会被夹到总长的一半以内——4 秒的片子不能淡 2 秒。
 BGM_ENV = "SIMPLE_BGM_DIR"   # 本地兜底目录。没有就不加配乐。
@@ -46,55 +50,43 @@ def pick_local(seed: str) -> Path | None:
     return files[idx]
 
 
-#: 交叉淡化宽度的上下限（秒）。接缝无缝化就靠它——见 `_seamless_loop`。
-XFADE_MAX, XFADE_MIN, XFADE_RATIO = 2.0, 0.4, 0.03
-
-
-def _seamless_loop(bgm: Path, work: Path) -> Path:
-    """把一首曲子做成**接缝无缝**的循环源（长度 = 原长 − xf）。
-
-    **为什么必须做**（2026-10-27）：原来直接用 `-stream_loop -1` 硬接。实测 90 秒的曲
-    铺 175 秒，t=90s 处 RMS 从 -15.5 dB 掉到 -26.7 dB（掉 11 dB），听感是"音乐断了一下"。
-    **为什么不串多个 `acrossfade`**：实测串三段只出 86 秒——接在 `acrossfade` 后面会吞掉
-    第三段。做法是"把尾巴淡进开头"：`[尾巴][开头]acrossfade` 得 xf 秒过渡块，再接原曲
-    中段 → 总长 `原长 − xf`；它末尾正好接得回开头，铺多少遍都不会断。
-    """
-    dur = duration(bgm)
-    xf = min(XFADE_MAX, max(XFADE_MIN, dur * XFADE_RATIO)) if dur > 0 else 0.0
-    if dur <= xf * 3:
-        return bgm                      # 太短，不值得做（也避免除零/越界）
-    out = work / "bgm-loop.m4a"
-    run(["-i", str(bgm), "-filter_complex",
-         f"[0:a]atrim=0:{xf:.3f},asetpts=PTS-STARTPTS[head];"
-         f"[0:a]atrim={dur - xf:.3f}:{dur:.3f},asetpts=PTS-STARTPTS[tail];"
-         f"[0:a]atrim={xf:.3f}:{dur - xf:.3f},asetpts=PTS-STARTPTS[mid];"
-         f"[tail][head]acrossfade=d={xf:.3f}:c1=tri:c2=tri[blend];"
-         f"[blend][mid]concat=n=2:v=0:a=1[a]",
-         "-map", "[a]", "-c:a", "aac", "-b:a", "192k", str(out)])
-    return out
-
-
-def add_bgm(track: Path, dst: Path, *, total_sec: float, bgm: Path,
+def add_bgm(track: Path | None, dst: Path, *, total_sec: float, bgm: Path,
             gain: float = BGM_GAIN) -> Path:
-    """把 BGM 循环铺到整长，**闪避**到旁白之下，再与旁白混成一条。
+    """把 BGM 循环铺到整长，再与旁白混成一条；**没有旁白就只铺配乐**。
 
-    无缝化 → 铺满 → 首尾淡入淡出 → 侧链压缩 → 混音。`[0:a]asplit=2` 是因为旁白要
-    **用两次**：一次当键去压音乐，一次进混音。
+    旁白与配乐是两条**独立**的可选轨（2026-10-28 修）：这条片子没有旁白，
+    不该连配乐一起没有。`track=None` 走独奏支路——不做侧链、不压到 0.20，
+    时长按 `total_sec` 断；有旁白仍走原来那张图（`amix normalize=0` + 侧链闪避），
+    输出与改动前逐字节一致。
+
+    有旁白：无缝化 → 铺满 → 首尾淡入淡出 → 侧链压缩 → 混音。`[0:a]asplit=2`
+    是因为旁白要用两次：一次当键去压音乐，一次进混音。
+    无旁白：无缝化 → 铺满 → 首尾淡入淡出，一条轨就是成品。
     """
     total = max(1.0, float(total_sec))
     fade_out = min(BGM_FADE_OUT, total * 0.5)
     out_at = max(0.0, total - fade_out)
     loop = _seamless_loop(bgm, dst.parent)
-    run([
-        "-i", str(track), "-stream_loop", "-1", "-i", str(loop),
-        "-filter_complex",
-        f"[1:a]volume={gain},atrim=0:{total:.3f},asetpts=PTS-STARTPTS,"
-        f"afade=t=in:st=0:d={min(BGM_FADE_IN, total * 0.5):.3f},"
-        f"afade=t=out:st={out_at:.3f}:d={fade_out:.3f}[bg];"
-        f"[0:a]asplit=2[vo][key];"
-        f"[bg][key]sidechaincompress=threshold=0.03:ratio=6:attack=15:release=350[duck];"
-        f"[vo][duck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]",
-        "-map", "[a]", "-c:a", "aac", "-b:a", "160k", str(dst)])
+    fade_in = min(BGM_FADE_IN, total * 0.5)
+    if track is None or not Path(track).exists():
+        run([
+            "-stream_loop", "-1", "-i", str(loop),
+            "-filter_complex",
+            f"[0:a]volume={BGM_SOLO_GAIN},atrim=0:{total:.3f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:st=0:d={fade_in:.3f},"
+            f"afade=t=out:st={out_at:.3f}:d={fade_out:.3f}[a]",
+            "-map", "[a]", "-c:a", "aac", "-b:a", "192k", str(dst)])
+    else:
+        run([
+            "-i", str(track), "-stream_loop", "-1", "-i", str(loop),
+            "-filter_complex",
+            f"[1:a]volume={gain},atrim=0:{total:.3f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:st=0:d={fade_in:.3f},"
+            f"afade=t=out:st={out_at:.3f}:d={fade_out:.3f}[bg];"
+            f"[0:a]asplit=2[vo][key];"
+            f"[bg][key]sidechaincompress=threshold=0.03:ratio=6:attack=15:release=350[duck];"
+            f"[vo][duck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]",
+            "-map", "[a]", "-c:a", "aac", "-b:a", "160k", str(dst)])
     if not dst.exists() or dst.stat().st_size < 1024:
         raise KernelError("voice", "配乐混音失败（产物为空）")
     return dst

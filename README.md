@@ -26,7 +26,11 @@
 - **改一镜**：`reshoot_shot` 只重写第 N 镜并出 2 张静帧，**1 次调用**；满意了再
   `render_short_film` 重渲整片（音轨照用，不重新生成）。
 - **导出工程**：`export_film_project` 导成能直接 `npm i && npx remotion render` 的工程。
-- **曲库配乐**：从 `materials`（`origin=bgm`）按主题挑曲，**侧链闪避**到旁白之下，首尾淡入淡出。
+- **曲库配乐**：从 `materials`（`origin=bgm`）按主题挑曲。旁白与配乐是**两条独立可选轨**：
+  有旁白时侧链闪避到人声之下；无旁白时配乐单独成轨（独奏音量、首尾淡入淡出、接缝交叉淡化后循环铺满）。
+- **随时叫停、从一致点续跑**：任务跑起来后，输入框那颗「落笔」变成方块停止键，点一下在最近的
+  一致性点收手——状态记 `cancelled`，**不进崩溃恢复队列**（不会被自动重放烧 token），
+  气泡里给「从最新一致点续跑」，点了接着跑。
 - **出处账**：每个数字都要能说清从哪来；缺出处的镜会在报告里点名，**不假装核实过**。
 - **逐帧质检 + 三层兜底**：每镜渲 3 帧量内容占比与平均亮度，不合格就带**具体读数**打回重写
   （"亮度只有 17/255"而不是"亮一点"）；重写两轮仍不合格才用兜底，并在报告里单独列出来。
@@ -83,11 +87,12 @@ docker compose --profile app up -d --build    # 应用层：剪辑服务 + 渲�
 **验证启动**：`docker ps` 中 `creation-app`、`creation-editor`、`creation-remotion` 均为 `healthy`，
 且 `docker logs creation-app` 出现 `[startup] Storyline 已接入 … 个剪辑节点`。若提示「无剪辑能力」，见常见问题。
 
-**修改代码后**需重建镜像与容器，仅重建镜像不会替换正在运行的进程：
+**修改代码后**分两种：
 
-```bash
-docker compose --profile app up -d --build
-```
+- 后端（`agent_framework/`、`open_storyline/`、`examples/`、`prompts/`）已 bind mount 进容器，
+  改完 `docker compose restart app`（涉及剪辑服务时连 `editor` 一起）几秒生效，不必重建镜像；
+- 前端产物（`frontend/dist`）烤在镜像里，改了前端要重建：`docker compose --profile app up -d --build`。
+  依赖（`requirements*.txt`、`package-lock.json`）变了同样要重建。
 
 ## 本机开发
 
@@ -120,6 +125,9 @@ cd ../frontend && npm install && npm run build                    # 前端产物
 - **全自动 / 先出计划**：输入框旁的切换按钮。默认「全自动」，Agent 直接执行；「先出计划」会先给出
   可逐项调整的计划卡再执行。服务端缺省入口通过 `run_server.py --entry auto|plan` 设置。
 - **一个输入口**：画面、图片、文字都可以直接作为参考放进对话；不需要先去素材库整理。
+- **中途停下**：任务运行期间输入框右下角是方块停止键（`POST /runs/{id}/cancel`），点一下在最近的
+  一致性点停住，气泡里出现「从最新一致点续跑」。计划卡等你确认那一格没有任务在跑，此时点停止无效；
+  若这一跑刚好自己收尾（`409`），前端也当作正常结束、不报错。
 - **计划确认卡**：渲染前弹出，含每镜预览图、文案与整片参数。选择「我还要改」并说明修改点，
   Agent 修改后会再次请求确认。
 - **配乐**：上传音频，或将歌曲放入曲库后直接以曲名指认；成片长于配乐时自动循环，并按旁白闪避。
@@ -177,17 +185,18 @@ cd ../frontend && npm install && npm run build                    # 前端产物
 backend/
   agent_framework/       Agent 框架：对话主循环、工具注册与并发、上下文与压缩、技能、记忆、
                          执行快照（checkpoint）、计划门（plan/）、确认门、HTTP/WS 服务、存储层（storage/）
-  storyline_server/      剪辑服务（MCP）：剪辑节点（nodes/）、零素材出片链（simple/）、渲染调度
-    simple/              **零素材出片的全部实现**（约 3,700 行，不含 TSX 载荷）
-                         film 编排 · story 画法 · scene 包装 · caption 字幕 · table 对照表
-                         director 分镜提示词 · voice 旁白 · mix 配乐 · facts 出处账
-                         qa 逐帧质检 · review 视觉自检 · morph 跨镜接力 · edit 改一镜
-                         export 导出工程 · project 工程落盘 · kernel 渲染 · deliver 上传
+  open_storyline/        剪辑服务（MCP）：剪辑节点（nodes/）、零素材出片链（simple/）、渲染调度
+                          （motion/：代码渲染、逐帧闸、拍点与母版）
+    simple/              **零素材出片的全部实现**（约 5,300 行，不含 TSX 载荷）
+                         showrunner 导演（分镜/写镜/判定）· film 编排 · story 画法 · scene 包装
+                         caption 字幕 · beats 拍点 · voice 旁白 · mix 配乐 · bgmloop 无缝循环
+                         facts 出处账 · qa 逐帧质检 · review 视觉自检 · morph 跨镜接力
+                         edit 改一镜 · export 导出工程 · project 工程落盘 · kernel 渲染 · deliver 上传
   prompts/               提示词库（Markdown，改文案不改代码）
   examples/
     skills/              内置技能（含零素材出片 short_video_skill）
     storyline/           剪辑服务配置（config.toml / config.docker.toml）
-  tests/                 后端测试套件（162 个文件，直接 `python tests/test_xxx.py` 跑，不需要 pytest）
+  tests/                 后端测试套件（163 个文件，直接 `python tests/test_xxx.py` 跑，不需要 pytest）
   run_server.py          主服务入口（:8000）
   run_storyline.py       剪辑服务入口（:8001）
 remotion/                Remotion 渲染服务（server.mjs、母版 FilmLayout、设计 token、代码检查规则、
@@ -209,11 +218,16 @@ cd backend
 python tests/test_simple_boundary.py     # 简洁线的边界（单文件上限 / import 边界 / 组件清单一致）
 python tests/test_simple_film.py         # 编排、时间表算术、判据、字幕、补留白
 python tests/test_story_mode.py          # 叙事画法、字幕三层、对照表、跨镜接力
+python tests/test_run_cancel.py          # 停止：三处检查点、cancelled 终态、续跑
 python tests/test_import_all.py          # 所有模块能 import（删东西时最先红的那条）
 ```
 
 测试是**自带 `check()` 的独立脚本**，直接 `python tests/test_xxx.py` 跑，不需要 pytest。
-容器里跑：`docker exec <容器> python /app/tests/test_xxx.py`。
+容器里跑要带上 `PYTHONPATH=/app`（测试自己只把 `backend/` 放进搜索路径，主包名要从 `/app` 起才算对）：
+
+```bash
+docker exec -e PYTHONPATH=/app -e PYTHONIOENCODING=utf-8 <容器> python /app/tests/test_xxx.py
+```
 
 - **构建期自检**：渲染服务镜像构建时会跑镜头代码检查规则的自测（`remotion/tests/gate1-lint.mjs`、
   `draw-parts.mjs`），不通过则构建失败。
@@ -227,7 +241,7 @@ python tests/test_import_all.py          # 所有模块能 import（删东西时
 | 回复「无剪辑能力」 | 剪辑服务未启动或未连接。本机方式需先起 :8001 再起 :8000；容器方式确认 `creation-editor` 为 `healthy` 后重启 `creation-app` |
 | 所有对话返回 402 或鉴权失败 | 模型账户余额不足或密钥错误，在「设置」中重新填写，无需重启 |
 | 页面可打开但媒体无法播放 | `MINIO_PUBLIC_ENDPOINT` 不是浏览器可达的地址；从其他机器访问时改为本机局域网 IP:9000，并放行该端口 |
-| 修改代码后未生效 | 容器方式需执行 `docker compose --profile app up -d --build` 重建容器；修改技能或提示词后同样需要重启 `app` 容器，它在启动时将技能同步进数据库 |
+| 修改代码后未生效 | 后端代码是 bind mount，`docker compose restart app` 即可（技能与提示词在启动时同步进数据库，也要重启）；前端改了必须重建镜像（`--build`），因为 `frontend/dist` 烤在镜像里 |
 | 首次语音转写耗时较长 | 首次运行会下载 faster-whisper 模型权重，此后常驻本地 |
 | 构建时 apt 报 `Failed to fetch` | 网络或代理对个别软件包丢包，重试构建或更换网络 |
 | 零素材出片渲染耗时较长 | 渲染服务用 CPU 软件渲染，约 0.4~0.5 秒/帧；60 秒片子约 15 分钟。可提高 `DG_RENDER_SLOTS`，需注意内存 |

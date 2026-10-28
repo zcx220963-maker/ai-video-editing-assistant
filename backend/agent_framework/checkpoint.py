@@ -42,6 +42,10 @@ STATUS_SUPERSEDED = "superseded"
 # HITL 审批断点：执行到标注「需人工审批」的工具时挂起，等用户批准/拒绝后从同一一致点继续。
 # 它是**活的等待态**（等人工），故意不进 _UNFINISHED——崩溃恢复不该把等人工的 run 拽起来跑。
 STATUS_AWAITING_APPROVAL = "awaiting_approval"
+# 用户点了「停止」：停在最近一致点，等人点「继续」。**不进 _UNFINISHED**——
+# 它不是待处理的活，用户没再发话就不该被重启拉起（重启替用户重按「继续」是事故，
+# 见 `claim_recoverable` 那一段）。但 `resume()` 只拒 completed，所以它接得住续跑。
+STATUS_CANCELLED = "cancelled"
 _UNFINISHED = {STATUS_RUNNING, STATUS_FAILED}
 
 
@@ -272,6 +276,22 @@ class CheckpointManager:
         # 失败仍归还认领：这条 run 已不在途，owner 留着只会让它看起来「有人在跑」。
         # 注意它**不再**是启动自动重放的候选（`claim_recoverable` 只认 running）——
         # 重放由用户的「继续」发起，预算也就由用户重新给。
+        if cp.owner_instance_id:
+            await self._repo.release_lease(cp.run_id, cp.owner_instance_id)
+
+    async def cancel(self, cp: Checkpoint, *, iteration: int,
+                     messages: list[Message]) -> None:
+        """用户点了「停止」：把这一轮定格在最近一致点。
+
+        与 `mark_failed` 的区别只在状态字样与后果：`failed` 是「跑坏了」，
+        `cancelled` 是「用户叫停」——前端据此给的是「继续」，不是「失败告警」；
+        崩溃对账（`list_unfinished` / `claim_recoverable`）两边都不认。
+        租约一样归还：这条 run 已经不在途，owner 留着只会让它看起来「有人在跑」。
+        """
+        cp.iteration = iteration
+        cp.messages = list(messages)
+        cp.status = STATUS_CANCELLED
+        await self.save(cp)
         if cp.owner_instance_id:
             await self._repo.release_lease(cp.run_id, cp.owner_instance_id)
 

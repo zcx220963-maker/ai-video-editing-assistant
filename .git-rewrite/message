@@ -1,5 +1,0 @@
-chore: 摘除 OpenChatCut 的收尾——本地参考克隆已删，两条忽略规则改成防将来重克隆
-
-同日清理：删 OpenChatCut 卷与两个旧镜像(~10GB)、docker 构建缓存回收 25.78GB、
-12 行 sess-* 遗留产物行(3 artifacts + 9 render_jobs + 6 checkpoints)、
-27 个今早匿名身份及其 5 个孤儿会话的 21 artifacts / 7 render_jobs / 67 对象。

@@ -85,6 +85,16 @@ def main() -> None:
     check("mp4_url" in tuple(RenderShortFilmNode.ephemeral),
           "mp4_url 是 ephemeral：会过期的直链不进共享库")
 
+    # ---- 4a. 音轨：旁白与配乐是两条独立可选轨（2026-10-28 修）----
+    props = (WriteShortShotsNode.input_schema or {}).get("properties") or {}
+    check("bgm" in props, "写镜节点收 bgm（点名才配）")
+    check("voice" in props, "写镜节点仍收 voice（两条轨各管各的）")
+    nodes_src = src("open_storyline/nodes/simple_nodes.py")
+    check('project.update(film_id, audio="audio.m4a")' in nodes_src,
+          "写镜把配乐/旁白落成工程音轨（渲染节点照用，不用再传 track）")
+    check("bgm_name=bgm_name, picked=_picked" in nodes_src,
+          "写镜走 `bgm.mix_into` 同一个入口，卡拍与混音用同一首")
+
     # ---- 4b. 渲染是分钟级，必须登记进 LONG_RUNNING_NODES ----
     from open_storyline.server import LONG_RUNNING_NODES
 

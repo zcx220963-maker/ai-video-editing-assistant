@@ -108,6 +108,20 @@ async def _run_film(job: dict[str, Any], *, storage: Any) -> None:
             job["stage"] = stage
             job["progress"] = {"stage": stage, "done": done, "total": total}
 
+        # 配乐先定下来再写镜（与对话里的 `make_short_video` 同一套）：卡拍要在
+        # 写镜之前知道拍点，镜长要先按拍点补好，画面才按新时长渲。
+        _picked = None
+        if str(job.get("bgm") or "").strip():
+            try:
+                from . import bgm as bgm_pick
+
+                _picked = await bgm_pick.resolve(
+                    storage, job["user_id"], job["prompt"],
+                    work_dir=kernel.out_dir() / "bgm", need_sec=job["seconds"],
+                    name=job["bgm"])
+            except Exception:  # noqa: BLE001 —— 配乐解析失败不该拦出片
+                _picked = None
+
         try:
             got = await film.make_film(
                 job["prompt"], seconds=job["seconds"], aspect=job["aspect"],
@@ -115,7 +129,8 @@ async def _run_film(job: dict[str, Any], *, storage: Any) -> None:
                 conversation_id=job.get("conversation_id") or "",
                 on_stage=on_stage, voice=bool(job.get("voice", True)),
                 mode=job.get("style") or "auto",
-                scenes=job.get("scenes") or None)
+                scenes=job.get("scenes") or None,
+                bgm_path=(_picked or {}).get("path"))
         except KernelError as exc:
             job.update(status="failed", stage=exc.stage, error=str(exc),
                        lint_errors=exc.lint_errors)
@@ -164,32 +179,39 @@ async def _run_film(job: dict[str, Any], *, storage: Any) -> None:
         job["stage"] = "render"
         t0 = time.time()
 
-        # 音轨：旁白 → 加配乐（曲库）→ 交给统一渲染交付。失败不整条失败（无声仍是片子）。
+        # 音轨：旁白 / 配乐是两条**独立**的可选轨（2026-10-28 修）。
+        # 原来配乐挂在"有旁白"的分支里，于是 voice=false + 点名配乐出的是无声片。
         track = None
         vinfo = got.get("voice") or {}
         if vinfo and not vinfo.get("degraded"):
             try:
                 from pathlib import Path
                 from open_storyline.simple import voice as vo
-                from . import bgm as bgm_pick
                 track = vo.build_track(
                     [Path(p) if p else None for p in vinfo.get("files") or []],
                     got["secs"], kernel.out_dir() / f"track-{job['id']}.m4a")
-                # 配乐走**曲库**（materials.origin=bgm），取不到退本地目录，再取不到就不加。
-                # 这一步以前漏了：`voice.pick_bgm` 只读 SIMPLE_BGM_DIR，而容器里没有那个
-                # 目录——于是"配了曲库"在成片里等于没配。
-                track, tune = await bgm_pick.mix_into(
-                    track, kernel.out_dir() / f"track-{job['id']}-bgm.m4a",
-                    storage=storage, user_id=job["user_id"], prompt=job["prompt"],
-                    total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm",
-                    bgm_name=job.get("bgm") or "")
-                job["bgm"] = (tune or {}).get("filename") or ""
                 job["voice"] = "ok"
             except Exception as exc:  # noqa: BLE001
                 job["voice"] = f"failed: {type(exc).__name__}: {exc}"
                 track = None
         else:
             job["voice"] = "none"
+
+        # 配乐走**曲库**（materials.origin=bgm），取不到退本地目录，再取不到就不加。
+        # 这一步以前漏了：`voice.pick_bgm` 只读 SIMPLE_BGM_DIR，而容器里没有那个
+        # 目录——于是"配了曲库"在成片里等于没配。
+        if str(job.get("bgm") or "").strip() or _picked is not None:
+            try:
+                from . import bgm as bgm_pick
+
+                track, tune = await bgm_pick.mix_into(
+                    track, kernel.out_dir() / f"track-{job['id']}-bgm.m4a",
+                    storage=storage, user_id=job["user_id"], prompt=job["prompt"],
+                    total_sec=got["total_sec"], work_dir=kernel.out_dir() / "bgm",
+                    bgm_name=job.get("bgm") or "", picked=_picked)
+                job["bgm"] = (tune or {}).get("filename") or ""
+            except Exception as exc:  # noqa: BLE001 —— 配乐失败不该拦出片
+                job["bgm_error"] = f"{type(exc).__name__}: {exc}"
 
         # 渲 + 合流 + 上传**只有一份实现**（`pipeline.render_and_publish`）：
         # 这段原来在 HTTP、原生工具、节点里各抄了一遍，改一处忘另一处。
